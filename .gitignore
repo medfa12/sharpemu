@@ -44,3 +44,7 @@ ehthumbs.db
 inspiration/
 
 .claude/
+
+# Local game dumps / packages (never commit copyrighted content)
+games/
+*.pkg
