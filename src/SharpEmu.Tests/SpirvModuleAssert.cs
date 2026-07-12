@@ -64,7 +64,7 @@ internal static class SpirvModuleAssert
             module.Instructions,
             i => i.Opcode == OpCapability && i.Words[1] == CapabilityShader);
 
-        var entryPoint = Assert.Single(module.Instructions.Where(i => i.Opcode == OpEntryPoint));
+        var entryPoint = Assert.Single(module.Instructions, i => i.Opcode == OpEntryPoint);
         Assert.Equal(executionModel, entryPoint.Words[1]);
 
         Assert.Equal(

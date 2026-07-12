@@ -94,8 +94,8 @@ public sealed class SpirvModuleBuilderTests
         var parsed = SpirvModuleAssert.Parse(module.Build());
 
         // SPIR-V forbids duplicate type declarations — each must appear exactly once.
-        Assert.Single(parsed.Instructions.Where(i => i.Opcode == OpTypeVoid));
-        Assert.Single(parsed.Instructions.Where(i => i.Opcode == OpTypeFloat));
+        Assert.Single(parsed.Instructions, i => i.Opcode == OpTypeVoid);
+        Assert.Single(parsed.Instructions, i => i.Opcode == OpTypeFloat);
         Assert.Equal(2, parsed.Instructions.Count(i => i.Opcode == OpTypeInt));     // signed + unsigned
         Assert.Equal(2, parsed.Instructions.Count(i => i.Opcode == OpTypeVector));  // vec4 + vec2
     }
