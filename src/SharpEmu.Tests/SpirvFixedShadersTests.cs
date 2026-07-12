@@ -1,7 +1,6 @@
 // Copyright (C) 2026 SharpEmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-using System.Buffers.Binary;
 using SharpEmu.Libs.Agc;
 using Xunit;
 
@@ -15,55 +14,8 @@ namespace SharpEmu.Tests;
 /// </summary>
 public sealed class SpirvFixedShadersTests
 {
-    private const uint SpirvMagic = 0x0723_0203;
-    private const ushort OpEntryPoint = 15;
-    private const ushort OpCapability = 17;
-    private const ushort OpFunction = 54;
-    private const ushort OpFunctionEnd = 56;
-    private const ushort OpLabel = 248;
-    private const ushort OpReturn = 253;
-    private const uint CapabilityShader = 1;
     private const uint ExecutionModelVertex = 0;
     private const uint ExecutionModelFragment = 4;
-
-    private sealed record ParsedModule(
-        uint Version,
-        uint Bound,
-        List<(ushort Opcode, uint[] Words)> Instructions);
-
-    private static ParsedModule Parse(byte[] binary)
-    {
-        Assert.True(binary.Length >= 20, "SPIR-V module must have a 5-word header.");
-        Assert.Equal(0, binary.Length % 4);
-
-        var words = new uint[binary.Length / 4];
-        for (var i = 0; i < words.Length; i++)
-        {
-            words[i] = BinaryPrimitives.ReadUInt32LittleEndian(binary.AsSpan(i * 4));
-        }
-
-        Assert.Equal(SpirvMagic, words[0]);
-        var version = words[1];
-        var bound = words[3];
-        Assert.Equal(0u, words[4]); // reserved schema word
-
-        var instructions = new List<(ushort, uint[])>();
-        var offset = 5;
-        while (offset < words.Length)
-        {
-            var wordCount = (ushort)(words[offset] >> 16);
-            var opcode = (ushort)(words[offset] & 0xFFFF);
-            Assert.True(wordCount > 0, $"Zero word count at word offset {offset}.");
-            Assert.True(
-                offset + wordCount <= words.Length,
-                $"Instruction 0x{opcode:X} at offset {offset} overruns the module.");
-            instructions.Add((opcode, words[offset..(offset + wordCount)]));
-            offset += wordCount;
-        }
-
-        Assert.Equal(words.Length, offset); // stream ends exactly at module end
-        return new ParsedModule(version, bound, instructions);
-    }
 
     public static TheoryData<uint> AttributeCounts => new() { 0u, 1u, 4u };
 
@@ -71,12 +23,11 @@ public sealed class SpirvFixedShadersTests
     [MemberData(nameof(AttributeCounts))]
     public void FullscreenVertex_IsStructurallyValidSpirv(uint attributeCount)
     {
-        var module = Parse(SpirvFixedShaders.CreateFullscreenVertex(attributeCount));
+        var module = SpirvModuleAssert.Parse(SpirvFixedShaders.CreateFullscreenVertex(attributeCount));
 
-        AssertCommonInvariants(module, ExecutionModelVertex, minResultBearingInstructions: 12);
+        var entryPoint = AssertCommonInvariants(module, ExecutionModelVertex, minResultBearingInstructions: 12);
 
         // vertexIndex + position + one interface entry per attribute
-        var entryPoint = Assert.Single(module.Instructions.Where(i => i.Opcode == OpEntryPoint));
         var interfaceCount = CountEntryPointInterfaces(entryPoint.Words);
         Assert.Equal(2 + attributeCount, interfaceCount);
     }
@@ -84,28 +35,17 @@ public sealed class SpirvFixedShadersTests
     [Fact]
     public void CopyFragment_IsStructurallyValidSpirv()
     {
-        var module = Parse(SpirvFixedShaders.CreateCopyFragment());
+        var module = SpirvModuleAssert.Parse(SpirvFixedShaders.CreateCopyFragment());
 
         AssertCommonInvariants(module, ExecutionModelFragment, minResultBearingInstructions: 6);
     }
 
-    private static void AssertCommonInvariants(
-        ParsedModule module,
+    private static (ushort Opcode, uint[] Words) AssertCommonInvariants(
+        SpirvModuleAssert.ParsedModule module,
         uint executionModel,
         int minResultBearingInstructions)
     {
-        Assert.Contains(
-            module.Instructions,
-            i => i.Opcode == OpCapability && i.Words[1] == CapabilityShader);
-
-        var entryPoint = Assert.Single(module.Instructions.Where(i => i.Opcode == OpEntryPoint));
-        Assert.Equal(executionModel, entryPoint.Words[1]);
-
-        Assert.Equal(
-            module.Instructions.Count(i => i.Opcode == OpFunction),
-            module.Instructions.Count(i => i.Opcode == OpFunctionEnd));
-        Assert.Contains(module.Instructions, i => i.Opcode == OpLabel);
-        Assert.Contains(module.Instructions, i => i.Opcode == OpReturn);
+        var entryPoint = SpirvModuleAssert.AssertShaderModule(module, executionModel);
 
         // Every result ID must stay below the declared bound; every used ID must be non-zero.
         var checkedInstructions = 0;
@@ -123,6 +63,7 @@ public sealed class SpirvFixedShadersTests
         Assert.True(
             checkedInstructions >= minResultBearingInstructions,
             $"Expected at least {minResultBearingInstructions} result-bearing instructions, checked {checkedInstructions}.");
+        return entryPoint;
     }
 
     private static uint CountEntryPointInterfaces(uint[] entryPointWords)
