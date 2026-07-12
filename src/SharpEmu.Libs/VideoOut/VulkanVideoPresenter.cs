@@ -181,6 +181,26 @@ internal static unsafe class VulkanVideoPresenter
     private static bool _splashHidden;
     private static long _enqueuedGuestWorkSequence;
     private static long _completedGuestWorkSequence;
+    private static long _presentedFrameTotal;
+    private static string? _selectedDeviceName;
+    private static volatile bool _closeRequested;
+
+    internal static long PresentedFrameTotal => Interlocked.Read(ref _presentedFrameTotal);
+
+    internal static string? SelectedDeviceName => Volatile.Read(ref _selectedDeviceName);
+
+    internal static bool HasStopped
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _closed;
+            }
+        }
+    }
+
+    internal static void RequestClose() => _closeRequested = true;
 
     public static void EnsureStarted(uint width, uint height)
     {
@@ -239,6 +259,7 @@ internal static unsafe class VulkanVideoPresenter
                     TranslatedDraw: null,
                     RequiredGuestWorkSequence: _enqueuedGuestWorkSequence,
                     IsSplash: false);
+            _closeRequested = false;
             _thread = new Thread(Run)
             {
                 IsBackground = true,
@@ -303,6 +324,7 @@ internal static unsafe class VulkanVideoPresenter
 
             _windowWidth = width;
             _windowHeight = height;
+            _closeRequested = false;
             _thread = new Thread(Run)
             {
                 IsBackground = true,
@@ -1060,16 +1082,25 @@ internal static unsafe class VulkanVideoPresenter
             WaitForRenderDocAttachIfRequested();
             _vk = Vk.GetApi();
             CreateInstance();
+            TraceInitStep("instance");
             CreateSurface();
+            TraceInitStep("surface");
             SelectPhysicalDevice();
             CreateDevice();
+            TraceInitStep("device");
             CreateSwapchain();
+            TraceInitStep("swapchain");
             CreateCommandResources();
+            TraceInitStep("command-resources");
             CreateGuestDrawResources();
+            TraceInitStep("guest-draw-resources");
             _vulkanReady = true;
             Console.Error.WriteLine(
                 $"[LOADER][INFO] Vulkan VideoOut ready: {_extent.Width}x{_extent.Height}, format={_swapchainFormat}");
         }
+
+        private static void TraceInitStep(string step) =>
+            Console.Error.WriteLine($"[LOADER][INFO] Vulkan VideoOut init: {step} ok");
 
         private static void WaitForRenderDocAttachIfRequested()
         {
@@ -1443,6 +1474,14 @@ internal static unsafe class VulkanVideoPresenter
 
                     _physicalDevice = device;
                     _queueFamilyIndex = index;
+                    _vk.GetPhysicalDeviceProperties(device, out var properties);
+                    var deviceName = SilkMarshal.PtrToString((nint)properties.DeviceName) ?? "<unknown>";
+                    var apiVersion = (Version32)properties.ApiVersion;
+                    Volatile.Write(ref _selectedDeviceName, deviceName);
+                    Console.Error.WriteLine(
+                        $"[LOADER][INFO] Vulkan VideoOut device: {deviceName} " +
+                        $"(type={properties.DeviceType}, api={apiVersion.Major}.{apiVersion.Minor}.{apiVersion.Patch}, " +
+                        $"driver=0x{properties.DriverVersion:X8})");
                     return;
                 }
             }
@@ -1604,9 +1643,11 @@ internal static unsafe class VulkanVideoPresenter
 
         private void CreateSwapchain()
         {
+            TraceInitStep("swapchain: querying surface capabilities");
             Check(
                 _surfaceApi.GetPhysicalDeviceSurfaceCapabilities(_physicalDevice, _surface, out var capabilities),
                 "vkGetPhysicalDeviceSurfaceCapabilitiesKHR");
+            TraceInitStep("swapchain: querying surface formats");
 
             uint formatCount = 0;
             Check(
@@ -1650,7 +1691,9 @@ internal static unsafe class VulkanVideoPresenter
                 Clipped = true,
             };
 
+            TraceInitStep($"swapchain: creating {_extent.Width}x{_extent.Height} format={surfaceFormat.Format} images={imageCount}");
             Check(_swapchainApi.CreateSwapchain(_device, &createInfo, null, out _swapchain), "vkCreateSwapchainKHR");
+            TraceInitStep("swapchain: created, fetching images");
 
             uint swapchainImageCount = 0;
             Check(
@@ -4936,6 +4979,12 @@ internal static unsafe class VulkanVideoPresenter
 
         private void Render(double _)
         {
+            if (_closeRequested)
+            {
+                _window.Close();
+                return;
+            }
+
             if (!_vulkanReady)
             {
                 return;
@@ -5186,6 +5235,7 @@ internal static unsafe class VulkanVideoPresenter
             CheckSwapchainResult(presentResult, "vkQueuePresentKHR");
             recreateAfterPresent |= presentResult == Result.SuboptimalKhr;
             Check(_vk.QueueWaitIdle(_queue), "vkQueueWaitIdle");
+            Interlocked.Increment(ref _presentedFrameTotal);
             VideoOutExports.ReportPresentedFrame();
             if (_swapchainReadbackPending)
             {
