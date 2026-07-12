@@ -101,7 +101,7 @@ jobs:
         run: dotnet build SharpEmu.slnx -c Release --no-restore
 
       - name: Run tests
-        run: dotnet test src/SharpEmu.Tests/SharpEmu.Tests.csproj -c Release --no-build
+        run: dotnet test SharpEmu.slnx -c Release --no-build
 
       - name: Publish win-x64 CLI
         run: dotnet publish src/SharpEmu.CLI/SharpEmu.CLI.csproj -c Release -r win-x64 --self-contained true --no-restore -p:PublishDir="${env:PUBLISH_DIR}"

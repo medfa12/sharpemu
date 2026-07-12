@@ -73,7 +73,7 @@ public sealed class SpirvFixedShadersTests
     {
         var module = Parse(SpirvFixedShaders.CreateFullscreenVertex(attributeCount));
 
-        AssertCommonInvariants(module, ExecutionModelVertex);
+        AssertCommonInvariants(module, ExecutionModelVertex, minResultBearingInstructions: 12);
 
         // vertexIndex + position + one interface entry per attribute
         var entryPoint = Assert.Single(module.Instructions.Where(i => i.Opcode == OpEntryPoint));
@@ -86,10 +86,13 @@ public sealed class SpirvFixedShadersTests
     {
         var module = Parse(SpirvFixedShaders.CreateCopyFragment());
 
-        AssertCommonInvariants(module, ExecutionModelFragment);
+        AssertCommonInvariants(module, ExecutionModelFragment, minResultBearingInstructions: 6);
     }
 
-    private static void AssertCommonInvariants(ParsedModule module, uint executionModel)
+    private static void AssertCommonInvariants(
+        ParsedModule module,
+        uint executionModel,
+        int minResultBearingInstructions)
     {
         Assert.Contains(
             module.Instructions,
@@ -105,13 +108,21 @@ public sealed class SpirvFixedShadersTests
         Assert.Contains(module.Instructions, i => i.Opcode == OpReturn);
 
         // Every result ID must stay below the declared bound; every used ID must be non-zero.
+        var checkedInstructions = 0;
         foreach (var (opcode, words) in module.Instructions)
         {
             foreach (var word in ResultIds(opcode, words))
             {
                 Assert.InRange(word, 1u, module.Bound - 1);
+                checkedInstructions++;
             }
         }
+
+        // Guards against the opcode set drifting from what the shaders emit and
+        // this check silently degrading to a no-op.
+        Assert.True(
+            checkedInstructions >= minResultBearingInstructions,
+            $"Expected at least {minResultBearingInstructions} result-bearing instructions, checked {checkedInstructions}.");
     }
 
     private static uint CountEntryPointInterfaces(uint[] entryPointWords)
@@ -136,9 +147,12 @@ public sealed class SpirvFixedShadersTests
 
     private static IEnumerable<uint> ResultIds(ushort opcode, uint[] words)
     {
-        // Opcodes used by the fixed shaders whose result ID is word 2 (type + result).
-        var hasTypeAndResult = opcode is 43 or 44 or 54 or 61 or 77 or 79 or 82 or 87
-            or 112 or 124 or 129 or 131 or 194 or 196;
+        // Opcodes emitted by the fixed shaders whose result ID is word 2 (type + result),
+        // matching SpirvModuleBuilder's SpirvOp values.
+        var hasTypeAndResult = (SpirvOp)opcode is SpirvOp.Constant or SpirvOp.Function
+            or SpirvOp.Load or SpirvOp.VectorShuffle or SpirvOp.CompositeConstruct
+            or SpirvOp.ImageSampleExplicitLod or SpirvOp.ConvertUToF
+            or SpirvOp.FSub or SpirvOp.FMul or SpirvOp.ShiftLeftLogical or SpirvOp.BitwiseAnd;
         if (hasTypeAndResult && words.Length > 2)
         {
             yield return words[2];

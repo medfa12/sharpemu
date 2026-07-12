@@ -24,7 +24,8 @@ public sealed class AerolibTests
         Assert.Equal(sample.Value, byNid.ExportName);
 
         Assert.True(catalog.TryGetByExportName(byNid.ExportName, out var byName));
-        Assert.Equal(byName.ExportName, byNid.ExportName);
+        Assert.Equal(byNid.Nid, byName.Nid);
+        Assert.Equal(byNid.ExportName, byName.ExportName);
     }
 
     [Fact]
