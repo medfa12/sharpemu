@@ -15,60 +15,11 @@ public sealed class Gen5ShaderMetadataReaderTests
     private const ulong DirectOffsets = 0x3000;
     private const ulong ResourceTableBase = 0x4000;
 
-    /// <summary>Sparse byte-addressable guest memory backed by a dictionary.</summary>
-    private sealed class SparseMemory : ICpuMemory
-    {
-        private readonly Dictionary<ulong, byte> _bytes = new();
-
-        public void WriteUInt16(ulong address, ushort value)
-        {
-            Span<byte> buffer = stackalloc byte[2];
-            BinaryPrimitives.WriteUInt16LittleEndian(buffer, value);
-            Write(address, buffer);
-        }
-
-        public void WriteUInt64(ulong address, ulong value)
-        {
-            Span<byte> buffer = stackalloc byte[8];
-            BinaryPrimitives.WriteUInt64LittleEndian(buffer, value);
-            Write(address, buffer);
-        }
-
-        private void Write(ulong address, ReadOnlySpan<byte> source)
-        {
-            for (var i = 0; i < source.Length; i++)
-            {
-                _bytes[address + (ulong)i] = source[i];
-            }
-        }
-
-        public bool TryRead(ulong virtualAddress, Span<byte> destination)
-        {
-            for (var i = 0; i < destination.Length; i++)
-            {
-                if (!_bytes.TryGetValue(virtualAddress + (ulong)i, out var value))
-                {
-                    return false;
-                }
-
-                destination[i] = value;
-            }
-
-            return true;
-        }
-
-        public bool TryWrite(ulong virtualAddress, ReadOnlySpan<byte> source)
-        {
-            Write(virtualAddress, source);
-            return true;
-        }
-    }
-
-    private static SparseMemory BuildBaseLayout(
+    private static SparseGuestMemory BuildBaseLayout(
         ushort directResourceCount = 0,
         ushort[]? resourceCounts = null)
     {
-        var memory = new SparseMemory();
+        var memory = new SparseGuestMemory();
         memory.WriteUInt64(ShaderHeader + 0x08, UserData);
         memory.WriteUInt64(UserData, directResourceCount == 0 ? 0UL : DirectOffsets);
 
@@ -92,7 +43,7 @@ public sealed class Gen5ShaderMetadataReaderTests
         return memory;
     }
 
-    private static bool TryRead(SparseMemory memory, out Gen5ShaderMetadata metadata)
+    private static bool TryRead(SparseGuestMemory memory, out Gen5ShaderMetadata metadata)
         => Gen5ShaderMetadataReader.TryRead(
             new CpuContext(memory, Generation.Gen5),
             ShaderHeader,
@@ -153,7 +104,7 @@ public sealed class Gen5ShaderMetadataReaderTests
     [Fact]
     public void TryRead_NullUserDataPointer_Fails()
     {
-        var memory = new SparseMemory();
+        var memory = new SparseGuestMemory();
         memory.WriteUInt64(ShaderHeader + 0x08, 0);
 
         Assert.False(TryRead(memory, out _));
@@ -162,7 +113,7 @@ public sealed class Gen5ShaderMetadataReaderTests
     [Fact]
     public void TryRead_UnmappedUserData_Fails()
     {
-        var memory = new SparseMemory();
+        var memory = new SparseGuestMemory();
         memory.WriteUInt64(ShaderHeader + 0x08, UserData); // user data itself never written
 
         Assert.False(TryRead(memory, out _));
