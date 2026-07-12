@@ -63,6 +63,19 @@ internal static partial class Program
 
         Console.Error.WriteLine($"[DEBUG] SharpEmu starting with {args.Length} args");
 
+        if (TryParsePresentTest(args, out var presentTestSeconds))
+        {
+            // The self-test replaces a normal run; refuse extra arguments so an
+            // eboot path is never silently ignored.
+            if (presentTestSeconds is not { } seconds || args.Length != 1)
+            {
+                PrintUsage();
+                return 1;
+            }
+
+            return SharpEmu.Libs.VideoOut.VulkanPresenterSelfTest.Run(1280, 720, seconds);
+        }
+
         if (!isMitigatedChild && TryRunMitigatedChild(args, out var childExitCode))
         {
             return childExitCode;
@@ -460,6 +473,34 @@ internal static partial class Program
     {
         Log.Info("Usage: SharpEmu.CLI [--strict] [--trace-imports[=N]] [--cpu-engine=<native>] [--log-level=<level>] <path-to-eboot.bin>");
         Log.Info(@"Example: SharpEmu.CLI --cpu-engine=native --trace-imports=64 --log-level=debug ""E:\Games\...\eboot.bin""");
+        Log.Info("       SharpEmu.CLI --present-test[=<seconds>]  (verify the Vulkan presenter without a game image)");
+    }
+
+    private static bool TryParsePresentTest(string[] args, out int? durationSeconds)
+    {
+        const string flag = "--present-test";
+        const string flagWithValue = "--present-test=";
+        durationSeconds = null;
+        foreach (var argument in args)
+        {
+            if (string.Equals(argument, flag, StringComparison.OrdinalIgnoreCase))
+            {
+                durationSeconds = 10;
+                return true;
+            }
+
+            if (argument.StartsWith(flagWithValue, StringComparison.OrdinalIgnoreCase))
+            {
+                if (int.TryParse(argument[flagWithValue.Length..], out var seconds) && seconds > 0)
+                {
+                    durationSeconds = seconds;
+                }
+
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private static bool TryParseArguments(
