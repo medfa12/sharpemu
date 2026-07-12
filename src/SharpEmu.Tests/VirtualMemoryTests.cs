@@ -128,7 +128,7 @@ public sealed class VirtualMemoryTests
     }
 
     [Fact]
-    public void TryRead_PastEndOfRegion_ReturnsFalse()
+    public void TryRead_PastEndOfRegionIntoGap_ReturnsFalse()
     {
         var memory = new VirtualMemory();
         memory.Map(Base, 0x10, 0, ReadOnlySpan<byte>.Empty, ProgramHeaderFlags.Read);
@@ -137,15 +137,47 @@ public sealed class VirtualMemoryTests
     }
 
     [Fact]
-    public void TryRead_AcrossAdjacentRegions_ReturnsFalse()
+    public void TryRead_AcrossAdjacentRegions_StitchesData()
     {
-        // Documents current behavior: regions are independent backing arrays, so a
-        // read spanning two contiguously mapped regions fails rather than stitching.
         var memory = new VirtualMemory();
-        memory.Map(Base, 0x10, 0, ReadOnlySpan<byte>.Empty, ProgramHeaderFlags.Read);
-        memory.Map(Base + 0x10, 0x10, 0, ReadOnlySpan<byte>.Empty, ProgramHeaderFlags.Read);
+        byte[] first = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+        byte[] second = [17, 18, 19, 20, 21, 22, 23, 24];
+        memory.Map(Base, 0x10, 0, first, ProgramHeaderFlags.Read);
+        memory.Map(Base + 0x10, 0x10, 0, second, ProgramHeaderFlags.Read);
 
-        Assert.False(memory.TryRead(Base + 0x08, new byte[0x10]));
+        var buffer = new byte[0x10];
+        Assert.True(memory.TryRead(Base + 0x08, buffer));
+        Assert.Equal(new byte[] { 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24 }, buffer);
+    }
+
+    [Fact]
+    public void TryWrite_AcrossAdjacentRegions_StitchesData()
+    {
+        var memory = new VirtualMemory();
+        memory.Map(Base, 0x10, 0, ReadOnlySpan<byte>.Empty, ProgramHeaderFlags.Read | ProgramHeaderFlags.Write);
+        memory.Map(Base + 0x10, 0x10, 0, ReadOnlySpan<byte>.Empty, ProgramHeaderFlags.Read | ProgramHeaderFlags.Write);
+
+        byte[] payload = [0xAA, 0xBB, 0xCC, 0xDD];
+        Assert.True(memory.TryWrite(Base + 0x0E, payload));
+
+        var buffer = new byte[4];
+        Assert.True(memory.TryRead(Base + 0x0E, buffer));
+        Assert.Equal(payload, buffer);
+    }
+
+    [Fact]
+    public void TryWrite_SpanningIntoGap_FailsWithoutPartialWrite()
+    {
+        var memory = new VirtualMemory();
+        byte[] original = [1, 2, 3, 4];
+        memory.Map(Base, 4, 0, original, ProgramHeaderFlags.Read | ProgramHeaderFlags.Write);
+        // No region mapped after Base + 4.
+
+        Assert.False(memory.TryWrite(Base + 2, new byte[] { 9, 9, 9, 9 }));
+
+        var buffer = new byte[4];
+        Assert.True(memory.TryRead(Base, buffer));
+        Assert.Equal(original, buffer); // untouched — no partial write
     }
 
     [Fact]

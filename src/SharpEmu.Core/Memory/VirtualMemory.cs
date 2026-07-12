@@ -74,12 +74,24 @@ public sealed class VirtualMemory : IVirtualMemory
     {
         lock (_gate)
         {
-            if (!TryResolveRegion(virtualAddress, destination.Length, out var region, out var offset))
+            if (destination.IsEmpty)
             {
-                return false;
+                return TryResolveRegion(virtualAddress, out _, out _);
             }
 
-            region.BackingMemory.AsSpan(offset, destination.Length).CopyTo(destination);
+            var completed = 0;
+            while (completed < destination.Length)
+            {
+                if (!TryResolveRegion(virtualAddress + (ulong)completed, out var region, out var offset))
+                {
+                    return false;
+                }
+
+                var available = Math.Min(destination.Length - completed, region.BackingMemory.Length - offset);
+                region.BackingMemory.AsSpan(offset, available).CopyTo(destination[completed..]);
+                completed += available;
+            }
+
             return true;
         }
     }
@@ -88,17 +100,37 @@ public sealed class VirtualMemory : IVirtualMemory
     {
         lock (_gate)
         {
-            if (!TryResolveRegion(virtualAddress, source.Length, out var region, out var offset))
+            if (source.IsEmpty)
             {
-                return false;
+                return TryResolveRegion(virtualAddress, out _, out _);
             }
 
-            source.CopyTo(region.BackingMemory.AsSpan(offset, source.Length));
+            // Validate the whole range first so partially applied writes never happen.
+            var validated = 0;
+            while (validated < source.Length)
+            {
+                if (!TryResolveRegion(virtualAddress + (ulong)validated, out var region, out var offset))
+                {
+                    return false;
+                }
+
+                validated += Math.Min(source.Length - validated, region.BackingMemory.Length - offset);
+            }
+
+            var completed = 0;
+            while (completed < source.Length)
+            {
+                TryResolveRegion(virtualAddress + (ulong)completed, out var region, out var offset);
+                var available = Math.Min(source.Length - completed, region.BackingMemory.Length - offset);
+                source.Slice(completed, available).CopyTo(region.BackingMemory.AsSpan(offset, available));
+                completed += available;
+            }
+
             return true;
         }
     }
 
-    private bool TryResolveRegion(ulong virtualAddress, int length, out MappedRegion region, out int offset)
+    private bool TryResolveRegion(ulong virtualAddress, out MappedRegion region, out int offset)
     {
         foreach (var candidate in _regions)
         {
@@ -107,14 +139,8 @@ public sealed class VirtualMemory : IVirtualMemory
                 continue;
             }
 
-            var candidateOffset = checked((int)(virtualAddress - candidate.Region.VirtualAddress));
-            if (candidateOffset + length > candidate.BackingMemory.Length)
-            {
-                break;
-            }
-
             region = candidate;
-            offset = candidateOffset;
+            offset = checked((int)(virtualAddress - candidate.Region.VirtualAddress));
             return true;
         }
 
