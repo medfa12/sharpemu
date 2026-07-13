@@ -374,6 +374,34 @@ public static class KernelRuntimeCompatExports
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
+    [SysAbiExport(
+        Nid = "DLORcroUqbc",
+        ExportName = "sceKernelGetOpenPsId",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int KernelGetOpenPsId(CpuContext ctx)
+    {
+        // (OrbisKernelOpenPsId* out) — a 16-byte per-console identifier.
+        // A fixed non-zero id keeps titles that hash or compare it happy.
+        var idAddress = ctx[CpuRegister.Rdi];
+        if (idAddress == 0)
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+
+        Span<byte> psId = stackalloc byte[16];
+        psId.Clear();
+        psId[0] = 0x53; // 'S'
+        psId[1] = 0x45; // 'E'
+        if (!ctx.Memory.TryWrite(idAddress, psId))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
     public static void ConfigureProcessProcParamAddress(ulong procParamAddress)
     {
         lock (_stateGate)
@@ -696,6 +724,19 @@ public static class KernelRuntimeCompatExports
                 $"[LOADER][TRACE] get_gpi: mask=0x{bitMask:X8}");
         }
         ctx[CpuRegister.Rax] = bitMask;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "mkgXxsoxWHg",
+        ExportName = "sceKernelClearVirtualRangeName",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int KernelClearVirtualRangeName(CpuContext ctx)
+    {
+        // (void* start, size_t length) — range names are debug metadata the
+        // emulator does not track, so clearing one always succeeds.
+        ctx[CpuRegister.Rax] = 0;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 

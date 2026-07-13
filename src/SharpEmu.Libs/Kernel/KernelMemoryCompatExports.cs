@@ -1788,6 +1788,93 @@ public static class KernelMemoryCompatExports
     public static int KernelRead(CpuContext ctx) => KernelReadUnderscore(ctx);
 
     [SysAbiExport(
+        Nid = "+r3rMFwItV4",
+        ExportName = "sceKernelPread",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int KernelPread(CpuContext ctx)
+    {
+        // (fd, void* buf, size_t nbyte, off_t offset) — reads at the given
+        // offset without moving the descriptor's file position.
+        var fd = unchecked((int)ctx[CpuRegister.Rdi]);
+        var bufferAddress = ctx[CpuRegister.Rsi];
+        var requested = (int)Math.Min(ctx[CpuRegister.Rdx], int.MaxValue);
+        var offset = unchecked((long)ctx[CpuRegister.Rcx]);
+        if (requested < 0 || offset < 0 || (requested > 0 && bufferAddress == 0))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+
+        if (requested == 0)
+        {
+            ctx[CpuRegister.Rax] = 0;
+            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+        }
+
+        FileStream? stream;
+        lock (_fdGate)
+        {
+            _openFiles.TryGetValue(fd, out stream);
+        }
+
+        if (stream is null)
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
+        }
+
+        var buffer = GC.AllocateUninitializedArray<byte>(requested);
+        int read;
+        try
+        {
+            read = RandomAccess.Read(stream.SafeFileHandle, buffer.AsSpan(0, requested), offset);
+        }
+        catch (IOException)
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+
+        if (read > 0 && !ctx.Memory.TryWrite(bufferAddress, buffer.AsSpan(0, read)))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        LogIoTrace("pread", stream.Name, $"fd={fd} req={requested} read={read} offset={offset}");
+        ctx[CpuRegister.Rax] = unchecked((ulong)read);
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "fTx66l5iWIA",
+        ExportName = "sceKernelFsync",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int KernelFsync(CpuContext ctx)
+    {
+        var fd = unchecked((int)ctx[CpuRegister.Rdi]);
+        FileStream? stream;
+        lock (_fdGate)
+        {
+            _openFiles.TryGetValue(fd, out stream);
+        }
+
+        if (stream is null)
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
+        }
+
+        try
+        {
+            stream.Flush(flushToDisk: true);
+        }
+        catch (IOException)
+        {
+        }
+
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
         Nid = "Oy6IpwgtYOk",
         ExportName = "lseek",
         Target = Generation.Gen4 | Generation.Gen5,
@@ -2232,6 +2319,28 @@ public static class KernelMemoryCompatExports
     }
 
     [SysAbiExport(
+        Nid = "n1-v6FgU7MQ",
+        ExportName = "sceKernelConfiguredFlexibleMemorySize",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int KernelConfiguredFlexibleMemorySize(CpuContext ctx)
+    {
+        var outSizeAddress = ctx[CpuRegister.Rdi];
+        if (outSizeAddress == 0)
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+
+        if (!ctx.TryWriteUInt64(outSizeAddress, FlexibleMemorySizeBytes))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
         Nid = "rTXw65xmLIA",
         ExportName = "sceKernelAllocateDirectMemory",
         Target = Generation.Gen4 | Generation.Gen5,
@@ -2484,6 +2593,28 @@ public static class KernelMemoryCompatExports
         }
 
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "BQQniolj9tQ",
+        ExportName = "sceKernelMapDirectMemory2",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int KernelMapDirectMemory2(CpuContext ctx)
+    {
+        // (void** addr, size_t len, int type, int prot, int flags,
+        //  off_t directMemoryStart, size_t alignment) — same as
+        // sceKernelMapDirectMemory with a memory-type argument inserted third,
+        // which pushes alignment to the stack. The type only affects caching
+        // attributes, so shuffle the registers back and delegate.
+        var alignment = 0UL;
+        _ = ctx.TryReadUInt64(ctx[CpuRegister.Rsp] + sizeof(ulong), out alignment);
+
+        ctx[CpuRegister.Rdx] = ctx[CpuRegister.Rcx];
+        ctx[CpuRegister.Rcx] = ctx[CpuRegister.R8];
+        ctx[CpuRegister.R8] = ctx[CpuRegister.R9];
+        ctx[CpuRegister.R9] = alignment;
+        return KernelMapDirectMemory(ctx);
     }
 
     [SysAbiExport(
