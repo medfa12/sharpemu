@@ -10,6 +10,7 @@ namespace SharpEmu.Libs.SystemService;
 public static class SystemServiceExports
 {
     private const int OrbisSystemServiceErrorParameter = unchecked((int)0x80A10003);
+    private const int OrbisSystemServiceErrorNoEvent = unchecked((int)0x80A10004);
     private const int SystemServiceStatusSize = 0x0C;
     private const int DisplaySafeAreaInfoSize = sizeof(float) + 128;
 
@@ -94,6 +95,52 @@ public static class SystemServiceExports
     public static int SystemServiceHideSplashScreen(CpuContext ctx)
     {
         VulkanVideoPresenter.HideSplashScreen();
+        return ctx.SetReturn(0);
+    }
+
+    [SysAbiExport(
+        Nid = "656LMQSrg6U",
+        ExportName = "sceSystemServiceReceiveEvent",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceSystemService")]
+    public static int SystemServiceReceiveEvent(CpuContext ctx)
+    {
+        // No system events (resume, entitlement updates, url open, ...) are
+        // ever queued; games poll this each frame and treat NO_EVENT as idle.
+        var eventAddress = ctx[CpuRegister.Rdi];
+        return eventAddress == 0
+            ? ctx.SetReturn(OrbisSystemServiceErrorParameter)
+            : ctx.SetReturn(OrbisSystemServiceErrorNoEvent);
+    }
+
+    [SysAbiExport(
+        Nid = "3RQ5aQfnstU",
+        ExportName = "sceSystemServiceGetNoticeScreenSkipFlag",
+        Target = Generation.Gen5,
+        LibraryName = "libSceSystemService")]
+    public static int SystemServiceGetNoticeScreenSkipFlag(CpuContext ctx)
+    {
+        // Skip flag off: the title shows its own startup notices as usual.
+        var flagAddress = ctx[CpuRegister.Rdi];
+        if (flagAddress == 0)
+        {
+            return ctx.SetReturn(OrbisSystemServiceErrorParameter);
+        }
+
+        return ctx.TryWriteInt32(flagAddress, 0)
+            ? ctx.SetReturn(0)
+            : ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+    }
+
+    [SysAbiExport(
+        Nid = "mPpPxv5CZt4",
+        ExportName = "sceSystemServiceGetHdrToneMapLuminance",
+        Target = Generation.Gen5,
+        LibraryName = "libSceSystemService")]
+    public static int SystemServiceGetHdrToneMapLuminance(CpuContext ctx)
+    {
+        // Out-parameter layout is undocumented; reporting success without
+        // touching guest memory lets HDR-agnostic titles proceed.
         return ctx.SetReturn(0);
     }
 }

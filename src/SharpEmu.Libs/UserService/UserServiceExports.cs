@@ -152,4 +152,69 @@ public static class UserServiceExports
             ? ctx.SetReturn(0)
             : ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
     }
+
+    [SysAbiExport(
+        Nid = "bwFjS+bX9mA",
+        ExportName = "sceUserServiceTerminate",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceUserService")]
+    public static int UserServiceTerminate(CpuContext ctx)
+    {
+        Interlocked.Exchange(ref _loginEventDelivered, 0);
+        return ctx.SetReturn(0);
+    }
+
+    [SysAbiExport(
+        Nid = "-3Y5GO+-i78",
+        ExportName = "sceUserServiceGetAccessibilityTriggerEffect",
+        Target = Generation.Gen5,
+        LibraryName = "libSceUserService")]
+    public static int UserServiceGetAccessibilityTriggerEffect(CpuContext ctx)
+    {
+        return WriteAccessibilitySetting(ctx);
+    }
+
+    [SysAbiExport(
+        Nid = "qWYHOFwqCxY",
+        ExportName = "sceUserServiceGetAccessibilityVibration",
+        Target = Generation.Gen5,
+        LibraryName = "libSceUserService")]
+    public static int UserServiceGetAccessibilityVibration(CpuContext ctx)
+    {
+        return WriteAccessibilitySetting(ctx);
+    }
+
+    [SysAbiExport(
+        Nid = "-sD02mFDBh4",
+        ExportName = "sceUserServiceGetGamePresets",
+        Target = Generation.Gen5,
+        LibraryName = "libSceUserService")]
+    public static int UserServiceGetGamePresets(CpuContext ctx)
+    {
+        // No console-level game presets configured; hand back a zeroed value
+        // so the title falls through to its own defaults.
+        return WriteAccessibilitySetting(ctx);
+    }
+
+    // Per-user setting getters: (userId, int* outValue). The setting is off /
+    // default (0) for the primary user; unknown users are rejected the same
+    // way the other per-user getters are.
+    private static int WriteAccessibilitySetting(CpuContext ctx)
+    {
+        var userId = unchecked((int)ctx[CpuRegister.Rdi]);
+        var valueAddress = ctx[CpuRegister.Rsi];
+        if (userId != PrimaryUserId)
+        {
+            return ctx.SetReturn(OrbisUserServiceErrorInvalidParameter);
+        }
+
+        if (valueAddress == 0)
+        {
+            return ctx.SetReturn(OrbisUserServiceErrorInvalidArgument);
+        }
+
+        return ctx.TryWriteInt32(valueAddress, 0)
+            ? ctx.SetReturn(0)
+            : ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+    }
 }

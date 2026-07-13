@@ -12,6 +12,7 @@ public static class ShareExports
 
     private static int _initialized;
     private static string _contentParam = string.Empty;
+    private static long _contentEventCallback;
 
     [SysAbiExport(
         Nid = "nBDD66kiFW8",
@@ -59,6 +60,50 @@ public static class ShareExports
         }
 
         TraceShare($"set_content_param len={contentParam.Length} preview='{FormatTraceString(contentParam)}'");
+        return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
+    }
+
+    [SysAbiExport(
+        Nid = "0IL1keINExQ",
+        ExportName = "sceShareTerminate",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceShareUtility")]
+    public static int ShareTerminate(CpuContext ctx)
+    {
+        Interlocked.Exchange(ref _initialized, 0);
+        TraceShare("terminate");
+        return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
+    }
+
+    [SysAbiExport(
+        Nid = "Sygnk9dr5WQ",
+        ExportName = "sceShareRegisterContentEventCallback",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceShareUtility")]
+    public static int ShareRegisterContentEventCallback(CpuContext ctx)
+    {
+        // (callback, userData) — remembered but never invoked; no share
+        // content events are generated.
+        var callback = ctx[CpuRegister.Rdi];
+        if (callback == 0)
+        {
+            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        Interlocked.Exchange(ref _contentEventCallback, unchecked((long)callback));
+        TraceShare($"register_content_event_callback cb=0x{callback:X}");
+        return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
+    }
+
+    [SysAbiExport(
+        Nid = "KnsfHKmZqFA",
+        ExportName = "sceShareUnregisterContentEventCallback",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceShareUtility")]
+    public static int ShareUnregisterContentEventCallback(CpuContext ctx)
+    {
+        Interlocked.Exchange(ref _contentEventCallback, 0);
+        TraceShare("unregister_content_event_callback");
         return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
     }
 
