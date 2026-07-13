@@ -6,6 +6,7 @@ using SharpEmu.Core.Cpu;
 using SharpEmu.GUI;
 using SharpEmu.HLE;
 using SharpEmu.Logging;
+using System.Globalization;
 using System.Runtime.InteropServices;
 using System.Text;
 
@@ -47,6 +48,21 @@ internal static partial class Program
         }
     }
 
+    // Identifies which build is actually executing. Boot logs are collected off
+    // a remote machine, where a stale binary and a fresh one are otherwise
+    // indistinguishable in the output.
+    private static void LogBinaryStamp()
+    {
+        foreach (var name in new[] { "SharpEmu.dll", "SharpEmu.Libs.dll", "SharpEmu.Core.dll" })
+        {
+            var path = Path.Combine(AppContext.BaseDirectory, name);
+            var stamp = File.Exists(path)
+                ? File.GetLastWriteTimeUtc(path).ToString("yyyy-MM-dd HH:mm:ss'Z'", CultureInfo.InvariantCulture)
+                : "missing";
+            Console.Error.WriteLine($"[DEBUG] binary {name} built={stamp}");
+        }
+    }
+
     private static int Run(string[] args)
     {
         args = NormalizeInternalArguments(args, out var isMitigatedChild);
@@ -62,6 +78,7 @@ internal static partial class Program
         EnsureCliConsole();
 
         Console.Error.WriteLine($"[DEBUG] SharpEmu starting with {args.Length} args");
+        LogBinaryStamp();
 
         if (TryParsePresentTest(args, out var presentTestSeconds))
         {
