@@ -672,19 +672,17 @@ public static class PlayGoExports
         var app0Root = Environment.GetEnvironmentVariable("SHARPEMU_APP0_DIR");
         if (string.IsNullOrWhiteSpace(app0Root))
         {
+            // Without an app0 mount there is no title to describe; open fails
+            // with NOT_SUPPORT the way a non-playgo package would.
             return PlayGoMetadata.Empty;
         }
 
-        var playGoDat = Path.Combine(app0Root, "sce_sys", "playgo-chunk.dat");
-        var scenarioJson = Path.Combine(app0Root, "sce_sys", "playgo-scenario.json");
+        // Chunk metadata (playgo-chunk.dat and friends) lives in package
+        // headers that filesystem dumps usually do not carry, so its absence
+        // says nothing about the title. Treat the title as playgo-enabled and
+        // fully installed; an empty chunk table answers every chunk id as
+        // present at local-fast locus.
         var chunkDefsXml = Path.Combine(app0Root, "playgo-chunkdefs.xml");
-
-        var hasMetadata = File.Exists(playGoDat) || File.Exists(scenarioJson) || File.Exists(chunkDefsXml);
-        if (!hasMetadata)
-        {
-            return PlayGoMetadata.Empty;
-        }
-
         var chunkIds = LoadChunkIds(chunkDefsXml);
         return new PlayGoMetadata(true, chunkIds);
     }
