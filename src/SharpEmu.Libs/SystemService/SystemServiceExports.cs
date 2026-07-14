@@ -143,4 +143,11 @@ public static class SystemServiceExports
         // touching guest memory lets HDR-agnostic titles proceed.
         return ctx.SetReturn(0);
     }
+
+    [SysAbiExport(
+        Nid = "3s8cHiCBKBE",
+        ExportName = "sceSystemServiceReportAbnormalTermination",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceSystemService")]
+    public static int SystemServiceReportAbnormalTermination(CpuContext ctx) => ctx.SetReturn(0);
 }

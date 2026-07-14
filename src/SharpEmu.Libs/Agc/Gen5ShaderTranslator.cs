@@ -621,6 +621,8 @@ internal static class Gen5ShaderTranslator
             0x10 => "SSendmsg",
             0x16 => "STtraceData",
             0x20 => "SInstPrefetch",
+            0x21 => "SClause",
+            0x23 => "SWaitcntDepctr",
             _ => string.Empty,
         };
 
@@ -718,7 +720,7 @@ internal static class Gen5ShaderTranslator
         }
 
         var src0 = word & 0x1FF;
-        sizeDwords = opcode is 0x20 or 0x21 || src0 is 0xF9 or 0xFA or 0xFF ? 2u : 1u;
+        sizeDwords = opcode is 0x20 or 0x21 or 0x2C or 0x2D || src0 is 0xF9 or 0xFA or 0xFF ? 2u : 1u;
         error = string.Empty;
         name = opcode switch
         {
@@ -757,7 +759,9 @@ internal static class Gen5ShaderTranslator
             0x28 => "VAddcU32",
             0x29 => "VSubbU32",
             0x2A => "VSubbrevU32",
-            0x2B => "VLdexpF32",
+            0x2B => "VFmacF32",
+            0x2C => "VFmamkF32",
+            0x2D => "VFmaakF32",
             0x2F => "VCvtPkrtzF16F32",
             0x30 => "VCvtPkU16U32",
             0x31 => "VCvtPkI16I32",
@@ -870,6 +874,7 @@ internal static class Gen5ShaderTranslator
             0x10F => "VMinF32",
             0x110 => "VMaxF32",
             0x11F => "VMacF32",
+            0x12B => "VFmacF32",
             0x12F => "VCvtPkrtzF16F32",
             0x141 => "VMadF32",
             0x143 => "VMadU32U24",
@@ -897,6 +902,7 @@ internal static class Gen5ShaderTranslator
             0x169 => "VMulLoU32",
             0x16A => "VMulHiU32",
             0x16B => "VMulLoI32",
+            0x16C => "VMulHiI32",
             0x360 => "VMadU32U16",
             0x361 => "VMulLoU32",
             0x362 => "VLdexpF32",
@@ -1379,7 +1385,7 @@ internal static class Gen5ShaderTranslator
                         Gen5Operand.Source(word & 0x1FF, literal),
                         Gen5Operand.Vector((word >> 9) & 0xFF),
                     ];
-                    if (opcode == "VMadMkF32" && literal.HasValue)
+                    if (opcode is "VMadMkF32" or "VFmamkF32" && literal.HasValue)
                     {
                         sources =
                         [
@@ -1388,7 +1394,7 @@ internal static class Gen5ShaderTranslator
                             sources[1],
                         ];
                     }
-                    else if (opcode == "VMadAkF32" && literal.HasValue)
+                    else if (opcode is "VMadAkF32" or "VFmaakF32" && literal.HasValue)
                     {
                         sources =
                         [

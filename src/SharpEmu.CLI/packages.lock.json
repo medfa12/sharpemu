@@ -211,11 +211,15 @@
           "Avalonia.Desktop": "[11.3.18, )",
           "Avalonia.Fonts.Inter": "[11.3.18, )",
           "Avalonia.Themes.Fluent": "[11.3.18, )",
+          "SharpEmu.Logging": "[1.0.0, )",
           "Tmds.DBus.Protocol": "[0.21.3, )"
         }
       },
       "sharpemu.hle": {
-        "type": "Project"
+        "type": "Project",
+        "dependencies": {
+          "SharpEmu.Logging": "[1.0.0, )"
+        }
       },
       "sharpemu.libs": {
         "type": "Project",

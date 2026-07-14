@@ -75,14 +75,22 @@ public static class ImeExports
         LibraryName = "libSceIme")]
     public static int ImeUpdate(CpuContext ctx)
     {
-        // (OrbisImeEventHandler handler) — nothing to deliver, but the pump
-        // must succeed while a keyboard listener is registered.
-        if (Interlocked.Read(ref _keyboardHandler) == 0)
-        {
-            return ctx.SetReturn(ErrorNotOpened);
-        }
-
+        // Nothing to deliver. Titles (Quake among them) pump this from their
+        // frame loop AND from bring-up paths before any keyboard is opened, so
+        // it must report success ("no pending IME events") in both cases rather
+        // than erroring when no listener is registered yet.
         return ctx.SetReturn(0);
+    }
+
+    [SysAbiExport(
+        Nid = "dKadqZFgKKQ",
+        ExportName = "sceImeKeyboardGetResourceId",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceIme")]
+    public static int ImeKeyboardGetResourceId(CpuContext ctx)
+    {
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
     internal static void ResetForTests()

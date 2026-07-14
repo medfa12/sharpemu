@@ -204,12 +204,15 @@ public sealed class MouseImeTests : IDisposable
     }
 
     [Fact]
-    public void ImeUpdate_WithoutOpen_ReturnsNotOpened()
+    public void ImeUpdate_WithoutOpen_Succeeds()
     {
+        // The update pump reports "no pending events" (0) even before a
+        // keyboard is opened: titles call it from bring-up paths and must not
+        // see an error there.
         var ctx = NewContext(out _);
         ctx[CpuRegister.Rdi] = HandlerAddress;
         ImeExports.ImeUpdate(ctx);
-        Assert.Equal(ImeErrorNotOpened, Result(ctx));
+        Assert.Equal(0, Result(ctx));
     }
 
     [Fact]
@@ -227,7 +230,8 @@ public sealed class MouseImeTests : IDisposable
         ImeExports.ImeKeyboardClose(ctx);
         Assert.Equal(0, Result(ctx));
 
+        // Update still succeeds after close -- the pump never errors.
         ImeExports.ImeUpdate(ctx);
-        Assert.Equal(ImeErrorNotOpened, Result(ctx));
+        Assert.Equal(0, Result(ctx));
     }
 }

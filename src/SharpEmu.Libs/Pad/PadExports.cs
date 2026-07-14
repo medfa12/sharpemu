@@ -31,6 +31,7 @@ public static class PadExports
     {
         _initialized = true;
         DualSenseReader.EnsureStarted();
+        XInputReader.EnsureStarted();
         return ctx.SetReturn(0);
     }
 
@@ -61,9 +62,12 @@ public static class PadExports
         }
 
         DualSenseReader.EnsureStarted();
+        XInputReader.EnsureStarted();
         Console.Error.WriteLine(DualSenseReader.TryGetState(out _)
             ? "[LOADER][INFO] Controls: DualSense connected (keyboard fallback also active)."
-            : "[LOADER][INFO] Keyboard controls: Arrow keys = D-pad, WASD = left stick, IJKL = right stick, Z/Enter = Cross, X/Esc = Circle, C = Square, V = Triangle, Q = L1, E = R1, R = L2, F = R2, Tab/Backspace = Options. A DualSense will be used automatically when plugged in.");
+            : XInputReader.TryGetState(out _)
+                ? "[LOADER][INFO] Controls: Xbox controller connected (keyboard fallback also active)."
+                : "[LOADER][INFO] Keyboard controls: Arrow keys = D-pad, WASD = left stick, IJKL = right stick, Z/Enter = Cross, X/Esc = Circle, C = Square, V = Triangle, Q = L1, E = R1, R = L2, F = R2, Tab/Backspace = Options. A DualSense or Xbox controller will be used automatically when plugged in.");
         return ctx.SetReturn(PrimaryPadHandle);
     }
 
@@ -175,6 +179,16 @@ public static class PadExports
     }
 
     [SysAbiExport(
+        Nid = "2JgFB2n9oUM",
+        ExportName = "scePadSetTriggerEffect",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libScePad")]
+    public static int PadSetTriggerEffect(CpuContext ctx)
+    {
+        return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_OK);
+    }
+
+    [SysAbiExport(
         Nid = "yFVnOdGxvZY",
         ExportName = "scePadSetVibration",
         Target = Generation.Gen4 | Generation.Gen5,
@@ -201,6 +215,7 @@ public static class PadExports
         }
 
         DualSenseReader.SetRumble(parameter[0], parameter[1]);
+        XInputReader.SetRumble(parameter[0], parameter[1]);
         return ctx.SetReturn(0);
     }
 
@@ -275,6 +290,17 @@ public static class PadExports
             rightY = MergeAxis(pad.RightY, rightY);
             l2 = Math.Max(l2, pad.L2);
             r2 = Math.Max(r2, pad.R2);
+        }
+
+        if (XInputReader.TryGetState(out var xpad))
+        {
+            buttons |= xpad.Buttons;
+            leftX = MergeAxis(xpad.LeftX, leftX);
+            leftY = MergeAxis(xpad.LeftY, leftY);
+            rightX = MergeAxis(xpad.RightX, rightX);
+            rightY = MergeAxis(xpad.RightY, rightY);
+            l2 = Math.Max(l2, xpad.L2);
+            r2 = Math.Max(r2, xpad.R2);
         }
 
         BinaryPrimitives.WriteUInt32LittleEndian(data[0x00..], buttons);

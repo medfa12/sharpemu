@@ -10,9 +10,9 @@ public static class AudioOut2Exports
 {
     // Sized from guest evidence, not SDK headers: titles keep the
     // SceAudioOut2ContextParam on the stack with the frame canary close behind
-    // it, and an oversized ResetParam write (the earlier 0x80) zeroes that
-    // canary -> __stack_chk_fail kills audio init. Stay small and only write the
-    // prefix we populate.
+    // it (Quake's sits at param+0x60), and an oversized ResetParam write (the
+    // earlier 0x80) zeroes that canary -> __stack_chk_fail kills audio init.
+    // Stay well below 0x60 and only write the prefix we populate.
     private const int AudioOut2ContextParamSize = 0x30;
     private const int AudioOut2ContextMemorySize = 0x10000;
     private const uint AudioOut2QueueCapacity = 4;
