@@ -2290,7 +2290,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 	private unsafe void PatchTlsPatterns()
 	{
-		const ulong MaxScanBytes = 33554432uL;
+		const ulong MaxScanBytes = 536870912uL;
 		ulong num = _entryPoint;
 		ulong num2 = num + MaxScanBytes;
 		int num3 = 0;
