@@ -2417,6 +2417,13 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		}
 	}
 
+	// The engine's GPU/streaming sub-allocators grow downward from a pool's top
+	// and legitimately address memory below the pool's mapped base. Real
+	// hardware reserves that headroom as one contiguous range; we only map the
+	// requested span, so treat a bounded band just below any mapped region as
+	// guest-owned and let the lazy-commit handler back it on first write.
+	private const ulong DownwardHeadroomBandBytes = 0x4000_0000UL;
+
 	private bool IsGuestOwnedLazyCommitAddress(ulong address, out string owner)
 	{
 		var cpuContext = ActiveCpuContext;
@@ -2427,6 +2434,14 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				if (ContainsAddress(region.VirtualAddress, region.MemorySize, address))
 				{
 					owner = $"vmem:0x{region.VirtualAddress:X16}+0x{region.MemorySize:X}";
+					return true;
+				}
+
+				if (region.VirtualAddress != 0 &&
+					address < region.VirtualAddress &&
+					region.VirtualAddress - address <= DownwardHeadroomBandBytes)
+				{
+					owner = $"vmem-headroom:0x{region.VirtualAddress:X16}-0x{region.VirtualAddress - address:X}";
 					return true;
 				}
 			}
