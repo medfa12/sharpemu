@@ -8,9 +8,13 @@ namespace SharpEmu.Libs.Audio;
 
 public static class AudioOut2Exports
 {
-    private const int AudioOut2ContextParamSize = 0x80;
+    // Sized from guest evidence, not SDK headers: titles keep the
+    // SceAudioOut2ContextParam on the stack with the frame canary close behind
+    // it, and an oversized ResetParam write (the earlier 0x80) zeroes that
+    // canary -> __stack_chk_fail kills audio init. Stay small and only write the
+    // prefix we populate.
+    private const int AudioOut2ContextParamSize = 0x30;
     private const int AudioOut2ContextMemorySize = 0x10000;
-    private const int AudioOut2ContextMemoryAlignment = 0x10000;
     private const uint AudioOut2QueueCapacity = 4;
     private static long _nextContextHandle = 1;
     private static long _nextUserHandle = 1;
@@ -70,21 +74,17 @@ public static class AudioOut2Exports
     public static int AudioOut2ContextQueryMemory(CpuContext ctx)
     {
         var paramAddress = ctx[CpuRegister.Rdi];
-        var memoryInfoAddress = ctx[CpuRegister.Rsi];
-        if (paramAddress == 0 || memoryInfoAddress == 0)
+        var outMemorySizeAddress = ctx[CpuRegister.Rsi];
+        if (paramAddress == 0 || outMemorySizeAddress == 0)
         {
             return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
         }
 
-        Span<byte> memoryInfo = stackalloc byte[0x20];
-        memoryInfo.Clear();
-        BinaryPrimitives.WriteUInt64LittleEndian(memoryInfo[0x00..], AudioOut2ContextMemorySize);
-        BinaryPrimitives.WriteUInt64LittleEndian(memoryInfo[0x08..], AudioOut2ContextMemoryAlignment);
-        BinaryPrimitives.WriteUInt64LittleEndian(memoryInfo[0x10..], AudioOut2ContextMemorySize);
-        BinaryPrimitives.WriteUInt64LittleEndian(memoryInfo[0x18..], AudioOut2ContextMemoryAlignment);
-
-        Trace($"context_query_memory param=0x{paramAddress:X} size=0x{AudioOut2ContextMemorySize:X} align=0x{AudioOut2ContextMemoryAlignment:X}");
-        return ctx.Memory.TryWrite(memoryInfoAddress, memoryInfo)
+        // The caller expects a single u64 (required memory size) written back
+        // through rsi -- not a struct. The earlier 0x20-byte write overran the
+        // caller's slot and smashed whatever followed it.
+        Trace($"context_query_memory param=0x{paramAddress:X} size=0x{AudioOut2ContextMemorySize:X}");
+        return ctx.TryWriteUInt64(outMemorySizeAddress, AudioOut2ContextMemorySize)
             ? ctx.SetReturn(0)
             : ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
     }
