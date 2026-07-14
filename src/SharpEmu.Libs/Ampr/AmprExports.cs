@@ -36,6 +36,7 @@ public static class AmprExports
         public ulong Buffer;
         public ulong Size;
         public ulong WriteOffset;
+        public int CommandCount;
     }
 
     private sealed class CachedHostFile
@@ -407,6 +408,35 @@ public static class AmprExports
     }
 
     [SysAbiExport(
+        Nid = "gzndltBEzWc",
+        ExportName = "sceAmprCommandBufferGetNumCommands",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAmpr")]
+    public static int CommandBufferGetNumCommands(CpuContext ctx)
+    {
+        var commandBuffer = ctx[CpuRegister.Rdi];
+        if (commandBuffer == 0)
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+
+        if (!TryGetCommandBufferState(ctx, commandBuffer, out _, out _, out var state) || state is null)
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        int count;
+        lock (state)
+        {
+            count = state.CommandCount;
+        }
+
+        TraceAmpr(ctx, "get_num_commands", commandBuffer, (ulong)(uint)count, 0);
+        ctx[CpuRegister.Rax] = (ulong)(uint)count;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
         Nid = "H896Pt-yB4I",
         ExportName = "sceAmprCommandBufferWriteKernelEventQueue_04_00",
         Target = Generation.Gen5,
@@ -603,6 +633,10 @@ public static class AmprExports
             state.Buffer = buffer;
             state.Size = size;
             state.WriteOffset = writeOffset;
+            if (writeOffset == 0)
+            {
+                state.CommandCount = 0;
+            }
         }
     }
 
@@ -635,6 +669,7 @@ public static class AmprExports
                 state.Buffer = buffer;
                 state.Size = size;
                 state.WriteOffset = 0;
+                state.CommandCount = 0;
             }
 
             return true;
@@ -865,6 +900,7 @@ public static class AmprExports
             }
 
             state.WriteOffset += recordSize;
+            state.CommandCount++;
         }
 
         return true;

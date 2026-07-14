@@ -34,6 +34,18 @@ public static class JsonExports
     }
 
     [SysAbiExport(
+        Nid = "WTtYf+cNnXI",
+        ExportName = "_ZN3sce4Json5ValueD1Ev",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceJson")]
+    public static int ValueDestructor(CpuContext ctx)
+    {
+        TraceJson("Value.dtor", ctx[CpuRegister.Rdi], 0);
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
         Nid = "cK6bYHf-Q5E",
         ExportName = "_ZN3sce4Json11InitializerC1Ev",
         Target = Generation.Gen4 | Generation.Gen5,

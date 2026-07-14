@@ -51,6 +51,16 @@ public static class NpUniversalDataSystemExports
     }
 
     [SysAbiExport(
+        Nid = "p+GcLqwpL9M",
+        ExportName = "sceNpUniversalDataSystemCreateEvent",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceNpUniversalDataSystem")]
+    public static int NpUniversalDataSystemCreateEvent(CpuContext ctx)
+    {
+        return ctx.SetReturn(0, typeof(long));
+    }
+
+    [SysAbiExport(
         Nid = "hT0IAEvN+M0",
         ExportName = "sceNpUniversalDataSystemCreateHandle",
         Target = Generation.Gen4 | Generation.Gen5,
