@@ -1438,8 +1438,11 @@ public static class AgcExports
 
         var increment = (uint)(incrementRaw & 0xFF);
         var writeConfirm = (uint)(writeConfirmRaw & 0xFF);
+        // destinationAddress == 0 is legal: callers that intend to relocate the
+        // packet build it with a null placeholder destination and fill it in later
+        // via sceAgcWriteDataPatchSetAddressOrOffset (Astro Bot stages WriteData
+        // packets on the stack this way for its GPU completion labels).
         if (commandBufferAddress == 0 ||
-            destinationAddress == 0 ||
             dataAddress == 0 ||
             dwordCount > 0x3FFD)
         {
