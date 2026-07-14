@@ -115,6 +115,10 @@ public sealed partial class DirectExecutionBackend
 			{
 				return -1;
 			}
+			if (exceptionCode == 3221225477u && TryHandleNullFieldCompare(exceptionRecord, contextRecord, rip))
+			{
+				return -1;
+			}
 			if (IsBenignHostDebugException(exceptionCode))
 			{
 				return -1;
@@ -1136,6 +1140,136 @@ public sealed partial class DirectExecutionBackend
 
 		WriteCtxU64(contextRecord, GpRegisterContextOffsets[destRegister], 0);
 		WriteCtxU64(contextRecord, 248, rip + 3);
+		return true;
+	}
+
+	// Sibling to TryHandleNullFieldLoad above, for a different shape of the
+	// same "getter-shaped code touches an empty/never-populated field"
+	// scenario: a `cmp dword ptr [reg], imm8` / `cmp dword ptr [reg+disp8],
+	// imm8` guard (opcode 0x83 /7, i.e. group-1 CMP with an 8-bit immediate)
+	// reading a count/flags dword through a near-null base pointer, e.g. a
+	// container's element count checked before iterating it. Synthesizing
+	// "the read returned 0" here means computing the CMP's flags as if the
+	// dword were 0 -- which is what lets the game's own zero-elements guard
+	// clause take its empty/bail-out branch instead of treating a null
+	// container as if it held real data. Same narrow scoping as the sibling
+	// handler: only READ access, only this one opcode-group encoding, only
+	// register-indirect with zero or 8-bit displacement (no SIB, no
+	// RIP-relative, no disp32), only when the faulting address itself is
+	// near-null.
+	private static unsafe bool TryHandleNullFieldCompare(EXCEPTION_RECORD* exceptionRecord, void* contextRecord, ulong rip)
+	{
+		if (exceptionRecord->NumberParameters < 2)
+		{
+			return false;
+		}
+
+		ulong accessType = *exceptionRecord->ExceptionInformation;
+		ulong target = exceptionRecord->ExceptionInformation[1];
+		if (accessType != 0 || target >= NearNullGuardLimit)
+		{
+			return false;
+		}
+
+		if (rip < 65536 || rip >= 140737488355328L || !IsHostRangeReadable(rip, 1))
+		{
+			return false;
+		}
+
+		int index = 0;
+		byte first = *(byte*)(rip + (ulong)index);
+		bool hasRex = first >= 0x40 && first <= 0x4F;
+		byte rexByte = hasRex ? first : (byte)0;
+		if (hasRex)
+		{
+			index++;
+		}
+
+		if (!IsHostRangeReadable(rip, (ulong)index + 1) || *(byte*)(rip + (ulong)index) != 0x83)
+		{
+			return false;
+		}
+		index++;
+
+		if (!IsHostRangeReadable(rip, (ulong)index + 1))
+		{
+			return false;
+		}
+
+		byte modRm = *(byte*)(rip + (ulong)index);
+		int mod = (modRm >> 6) & 0x3;
+		int reg = (modRm >> 3) & 0x7;
+		int rm = modRm & 0x7;
+		if (reg != 7 || rm == 0x4 || mod > 1 || (mod == 0 && rm == 0x5))
+		{
+			// Only the CMP (/7) form of opcode-group 1, and only [reg] /
+			// [reg+disp8] addressing -- no SIB byte, no RIP-relative, no
+			// disp32.
+			return false;
+		}
+		index++;
+
+		long disp = 0;
+		if (mod == 1)
+		{
+			if (!IsHostRangeReadable(rip, (ulong)index + 1))
+			{
+				return false;
+			}
+
+			disp = *(sbyte*)(rip + (ulong)index);
+			index++;
+		}
+
+		if (!IsHostRangeReadable(rip, (ulong)index + 1))
+		{
+			return false;
+		}
+
+		sbyte imm8 = *(sbyte*)(rip + (ulong)index);
+		index++;
+
+		bool rexB = (rexByte & 0x1) != 0;
+		int baseRegister = rm | (rexB ? 0x8 : 0);
+
+		ulong baseValue = ReadCtxU64(contextRecord, GpRegisterContextOffsets[baseRegister]);
+		if (unchecked((ulong)((long)baseValue + disp)) != target)
+		{
+			// Sanity check: the decoded base+disp must actually be the
+			// address that faulted.
+			return false;
+		}
+
+		Console.Error.WriteLine(
+			$"[LOADER][WARN] Guest null-field compare tolerated: rip=0x{rip:X16} reads [0x{target:X}] cmp 0x{(byte)imm8:X2} -> synthesizing 0");
+		Console.Error.Flush();
+
+		int result = -imm8;
+		const int EFlagsOffset = 68;
+		const uint CF = 1u << 0;
+		const uint ZF = 1u << 6;
+		const uint SF = 1u << 7;
+		const uint OF = 1u << 11;
+		uint eflags = ReadCtxU32(contextRecord, EFlagsOffset);
+		eflags &= ~(CF | ZF | SF | OF);
+		if (result == 0)
+		{
+			eflags |= ZF;
+		}
+		if (result < 0)
+		{
+			eflags |= SF;
+		}
+		if (imm8 != 0)
+		{
+			// Subtracting any nonzero value from unsigned 0 always borrows.
+			eflags |= CF;
+		}
+		// OF: both operands fit in a signed byte's range, so 0 - imm8 never
+		// overflows a 32-bit signed subtraction -- OF stays clear.
+		WriteCtxU32(contextRecord, EFlagsOffset, eflags);
+
+		WriteCtxU64(contextRecord, 248, rip + (ulong)index);
 		return true;
 	}
 
