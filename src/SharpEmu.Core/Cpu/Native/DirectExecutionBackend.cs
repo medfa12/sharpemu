@@ -1471,6 +1471,18 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			return false;
 		}
 
+		// This transfer's stub jmp's the native RSP straight to target.Rsp,
+		// which for a fiber switch is often a game-provided stack carved from
+		// a pool we back lazily on fault. Once the jmp lands, the guest can
+		// execute for a while before its own stack traffic happens to touch a
+		// fresh page; if that first touch faults while RSP is ALREADY on
+		// unbacked memory, Windows cannot even deliver the exception (it must
+		// write the dispatch frame below RSP first) and the process dies with
+		// no VEH catch, no managed hook, no trace. This call runs from
+		// ordinary managed code before the jmp, so it can safely commit ahead
+		// of time -- no chicken-and-egg risk here, unlike inside the VEH.
+		EnsureGuestStackDeliverable(target.Rsp);
+
 		transferStub = GetOrCreateGuestContextTransferStub();
 		if (transferStub == 0)
 		{
@@ -1502,6 +1514,61 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		frame[13] = target.R14;
 		frame[14] = target.R15;
 		return true;
+	}
+
+	// Backs a generous margin at and below a stack pointer the guest is
+	// about to start running on, before the switch happens. Unlike the VEH's
+	// fault-time commit (which cannot always run -- see the comment at the
+	// call site), this executes from ordinary managed code, so it is safe to
+	// commit eagerly. A page state of MEM_RESERVE/MEM_FREE outside any guest-
+	// owned lazy region (a real, already-backed allocation) is left alone.
+	private const ulong GuestStackTransferMarginBytes = 0x0010_0000UL; // 1 MiB
+
+	private unsafe void EnsureGuestStackDeliverable(ulong rsp)
+	{
+		if (rsp < 65536 || rsp >= 140737488355328L)
+		{
+			return;
+		}
+
+		if (!IsGuestOwnedLazyCommitAddress(rsp, out _))
+		{
+			return;
+		}
+
+		ulong top = (rsp & 0xFFFFFFFFFFFFF000uL) + 4096;
+		ulong bottom = rsp > GuestStackTransferMarginBytes
+			? (rsp - GuestStackTransferMarginBytes) & 0xFFFFFFFFFFFFF000uL
+			: 65536;
+
+		ulong page = bottom;
+		while (page < top)
+		{
+			if (VirtualQuery((void*)page, out var mbi, (nuint)sizeof(MEMORY_BASIC_INFORMATION64)) == 0)
+			{
+				return;
+			}
+
+			ulong regionEnd = mbi.RegionSize > ulong.MaxValue - mbi.BaseAddress
+				? ulong.MaxValue
+				: mbi.BaseAddress + mbi.RegionSize;
+			ulong runEnd = Math.Min(regionEnd, top);
+			if (runEnd <= page)
+			{
+				return;
+			}
+
+			if (mbi.State == 8192) // MEM_RESERVE
+			{
+				VirtualAlloc((void*)page, (nuint)(runEnd - page), 4096u, 4u); // MEM_COMMIT, PAGE_READWRITE
+			}
+			else if (mbi.State == 65536) // MEM_FREE
+			{
+				VirtualAlloc((void*)page, (nuint)(runEnd - page), 12288u, 4u); // MEM_RESERVE|MEM_COMMIT, PAGE_READWRITE
+			}
+
+			page = runEnd;
+		}
 	}
 
 	private unsafe nint GetOrCreateGuestContextTransferStub()
@@ -2870,6 +2937,12 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			GsBase = callerContext.GsBase != 0 ? callerContext.GsBase : fallbackTlsBase,
 		};
 		context[CpuRegister.Rsp] = AlignDown(callbackStackBase + callbackStackSize, 16) - sizeof(ulong);
+		// A game-supplied stackAddress is frequently carved from a pool we
+		// back lazily on fault; see the identical comment at
+		// TryPrepareGuestContextTransfer for why an eager commit here (from
+		// safe, ordinary managed code) is required rather than relying on the
+		// VEH alone.
+		EnsureGuestStackDeliverable(context[CpuRegister.Rsp]);
 		context[CpuRegister.Rdi] = arg0;
 		context[CpuRegister.Rsi] = arg1;
 		context[CpuRegister.Rdx] = 0;
