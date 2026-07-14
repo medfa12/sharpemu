@@ -107,6 +107,14 @@ public sealed partial class DirectExecutionBackend
 			{
 				return -1;
 			}
+			if (exceptionCode == 3221225477u && TryHandleGuestAssertTrap(contextRecord, rip))
+			{
+				return -1;
+			}
+			if (exceptionCode == 3221225477u && TryHandleNullFieldLoad(exceptionRecord, contextRecord, rip))
+			{
+				return -1;
+			}
 			if (IsBenignHostDebugException(exceptionCode))
 			{
 				return -1;
@@ -305,6 +313,24 @@ public sealed partial class DirectExecutionBackend
 
 			Console.Error.WriteLine("[LOADER][INFO] =========================================");
 			Console.Error.Flush();
+			return 0;
+		}
+		catch (Exception ex)
+		{
+			// This method is invoked by Windows as a native callback with no
+			// managed frame above it. A .NET exception escaping here crosses
+			// that boundary and is fatal-and-unrecoverable by CoreCLR design
+			// -- worse, silently so, since the crash happens mid-exception-
+			// dispatch before any of our own logging has a chance to run.
+			try
+			{
+				Console.Error.WriteLine($"[LOADER][FATAL] VectoredHandler itself threw: {ex}");
+				Console.Error.Flush();
+			}
+			catch
+			{
+			}
+
 			return 0;
 		}
 		finally
@@ -958,6 +984,200 @@ public sealed partial class DirectExecutionBackend
 		return true;
 	}
 
+	// This engine compiles its assert macro as: log the message via a
+	// helper call, then execute a software interrupt (observed: `int 0x41`)
+	// unconditionally, followed immediately by a jmp to the normal
+	// post-assert continuation point. On real PS5 hardware that software
+	// interrupt is a defined trap gate the kernel handles (log-and-return
+	// for a non-fatal assert in a retail/CERT build); Windows has no
+	// handler for these custom, engine-defined vectors, so the CPU's
+	// attempt to service the interrupt surfaces to us as a read AV at
+	// target=0xFFFFFFFFFFFFFFFF with RIP pointing at the `int N` opcode
+	// itself. Any `int N` hit this way is almost certainly the same
+	// pattern regardless of N -- the game defines its own small set of
+	// debug-trap vectors -- so this is not limited to 0x41. Two vectors are
+	// excluded defensively: 0x2E (legacy Windows/NT syscall gate) and 0x80
+	// (Linux syscall-compat convention), in case Windows ever has real
+	// machinery wired to either, however unlikely on a 64-bit host.
+	// Recognizing the shape and skipping the two-byte instruction
+	// reproduces "log and continue" instead of a hard crash.
+	private static unsafe bool TryHandleGuestAssertTrap(void* contextRecord, ulong rip)
+	{
+		if (rip < 65536 || rip >= 140737488355328L || !IsHostRangeReadable(rip, 2))
+		{
+			return false;
+		}
+
+		if (*(byte*)rip != 0xCD)
+		{
+			return false;
+		}
+
+		byte vector = *(byte*)(rip + 1);
+		if (vector == 0x2E || vector == 0x80)
+		{
+			return false;
+		}
+
+		// The log helper's formatted buffer often starts one byte before RSI
+		// (a leading newline sits at RSI-1, observed empirically), but RSI-1
+		// can cross into an unmapped preceding page depending on allocator
+		// layout -- try the one-byte-earlier read first for a cleaner
+		// message, falling back to RSI itself (missing only its first
+		// character) rather than losing the message entirely.
+		ulong rsi = ReadCtxU64(contextRecord, 168);
+		if (TryReadGuestAssertMessage(rsi - 1, out var message) ||
+			TryReadGuestAssertMessage(rsi, out message))
+		{
+			Console.Error.WriteLine($"[LOADER][WARN] Guest engine assert (int 0x{vector:X2}, non-fatal, continuing): {message}");
+		}
+		else
+		{
+			Console.Error.WriteLine($"[LOADER][WARN] Guest engine assert (int 0x{vector:X2}, non-fatal, continuing) at 0x{rip:X16}");
+		}
+
+		Console.Error.Flush();
+		WriteCtxU64(contextRecord, 248, rip + 2);
+		return true;
+	}
+
+	// Context-record byte offsets for GP registers 0-15 in x86-64 ModRM
+	// encoding order (rax,rcx,rdx,rbx,rsp,rbp,rsi,rdi,r8-r15), matching the
+	// offsets already used throughout this file (rax=120 ... r15=240).
+	private static readonly int[] GpRegisterContextOffsets =
+	[
+		120, 128, 136, 144, 152, 160, 168, 176,
+		184, 192, 200, 208, 216, 224, 232, 240,
+	];
+
+	// Some getter-shaped code loads a field straight out of a not-yet-
+	// populated object (e.g. `mov rdi, [rax]` where rax is a container's
+	// begin-pointer and the container is still empty) without a null check,
+	// immediately after a soft-continued assert whose message already
+	// signals the underlying condition is known and tolerated by the
+	// engine's own retail-build design. Real hardware would fault here too
+	// if this path were genuinely reached with no valid object -- but on
+	// real hardware it normally isn't, because some earlier step we don't
+	// yet emulate would have populated the field. Rather than hard-crash,
+	// this narrowly recognizes the single `REX.W mov r64, [r64]` pattern
+	// (opcode 0x8B, mod=00, no SIB/RIP-relative operand -- i.e. plain
+	// register-indirect with zero displacement) reading through a near-null
+	// pointer, synthesizes "the read returned 0" by zeroing the destination
+	// register, and steps over the 3-byte instruction. This mirrors a
+	// documented compatibility technique used by several console emulators
+	// (a backed "zero page" for near-null reads) without actually mapping
+	// guest memory at address 0, which Windows will not allow. Deliberately
+	// narrow: only READ access, only this one exact encoding, only when the
+	// faulting address itself is near-null -- a write or execute fault at
+	// the same address is a materially different, more serious bug class
+	// and is left to crash normally.
+	private const ulong NearNullGuardLimit = 0x10000UL;
+
+	private static unsafe bool TryHandleNullFieldLoad(EXCEPTION_RECORD* exceptionRecord, void* contextRecord, ulong rip)
+	{
+		if (exceptionRecord->NumberParameters < 2)
+		{
+			return false;
+		}
+
+		ulong accessType = *exceptionRecord->ExceptionInformation;
+		ulong target = exceptionRecord->ExceptionInformation[1];
+		if (accessType != 0 || target >= NearNullGuardLimit)
+		{
+			return false;
+		}
+
+		if (rip < 65536 || rip >= 140737488355328L || !IsHostRangeReadable(rip, 3))
+		{
+			return false;
+		}
+
+		byte rexByte = *(byte*)rip;
+		if (rexByte < 0x48 || rexByte > 0x4F)
+		{
+			// Require REX.W (64-bit operand size); this pattern is only
+			// meaningful for pointer-sized loads.
+			return false;
+		}
+
+		if (*(byte*)(rip + 1) != 0x8B)
+		{
+			return false;
+		}
+
+		byte modRm = *(byte*)(rip + 2);
+		int mod = (modRm >> 6) & 0x3;
+		int reg = (modRm >> 3) & 0x7;
+		int rm = modRm & 0x7;
+		if (mod != 0 || rm == 0x4 || rm == 0x5)
+		{
+			// Only bare [reg] addressing (no SIB byte, no RIP-relative, no
+			// displacement) is handled -- anything else needs a fuller
+			// decoder this narrow check deliberately does not attempt.
+			return false;
+		}
+
+		bool rexR = (rexByte & 0x4) != 0;
+		bool rexB = (rexByte & 0x1) != 0;
+		int destRegister = reg | (rexR ? 0x8 : 0);
+		int sourceRegister = rm | (rexB ? 0x8 : 0);
+
+		ulong sourceValue = ReadCtxU64(contextRecord, GpRegisterContextOffsets[sourceRegister]);
+		if (sourceValue != target)
+		{
+			// Sanity check: the register we decoded as the memory operand's
+			// base must actually hold the address that faulted.
+			return false;
+		}
+
+		Console.Error.WriteLine(
+			$"[LOADER][WARN] Guest null-field load tolerated: rip=0x{rip:X16} reads [0x{target:X}] -> synthesizing 0");
+		Console.Error.Flush();
+
+		WriteCtxU64(contextRecord, GpRegisterContextOffsets[destRegister], 0);
+		WriteCtxU64(contextRecord, 248, rip + 3);
+		return true;
+	}
+
+	private static unsafe bool TryReadGuestAssertMessage(ulong address, out string message)
+	{
+		message = string.Empty;
+		const int maxLength = 400;
+		if (!IsHostRangeReadable(address, 1))
+		{
+			return false;
+		}
+
+		var bytes = new List<byte>(maxLength);
+		for (var i = 0; i < maxLength; i++)
+		{
+			var current = address + (ulong)i;
+			if ((current & 0xFFFUL) == 0 && !IsHostRangeReadable(current, 1))
+			{
+				break;
+			}
+
+			var b = *(byte*)current;
+			if (b == 0)
+			{
+				break;
+			}
+
+			bytes.Add(b);
+		}
+
+		if (bytes.Count == 0)
+		{
+			return false;
+		}
+
+		message = System.Text.Encoding.ASCII.GetString(bytes.ToArray())
+			.Replace("\r\n", " | ", StringComparison.Ordinal)
+			.Replace('\n', ' ')
+			.Trim();
+		return message.Length > 0;
+	}
+
 	private unsafe bool TryHandleLazyCommittedPage(EXCEPTION_RECORD* exceptionRecord, ulong rip, ulong rsp)
 	{
 		if (exceptionRecord->NumberParameters < 2)
@@ -1049,6 +1269,7 @@ public sealed partial class DirectExecutionBackend
 			}
 
 			TryCommitRange(pageBase + 4096, 4096uL, commitProtect);
+			BackStackPointerIfNeeded(rsp);
 			if (traceLazyCommit)
 			{
 				Console.Error.WriteLine($"[LOADER][TRACE] lazy-reserve-commit#{traceIndex}: addr=0x{committedBase:X16} size=0x{committedSize:X16} access={accessType} protect=0x{commitProtect:X8}");
@@ -1108,11 +1329,56 @@ public sealed partial class DirectExecutionBackend
 		}
 
 		TryCommitRange(pageBase + 4096, 4096uL, commitProtect);
+		BackStackPointerIfNeeded(rsp);
 		if (traceLazyCommit)
 		{
 			Console.Error.WriteLine($"[LOADER][TRACE] lazy-commit#{traceIndex}: addr=0x{committedBase:X16} size=0x{committedSize:X16} access={accessType} protect=0x{commitProtect:X8}");
 		}
 		return true;
+
+		// Backing the fault address is not enough: exception dispatch itself
+		// writes a trap frame onto the faulting thread's OWN stack, below its
+		// current RSP, before any handler -- including this one -- gets to
+		// run. If RSP is sitting in guest-owned memory we manage lazily (this
+		// pool's downward headroom, or a guest-provided lazy stack) and that
+		// page is still unbacked, the NEXT fault on this thread (a stack push,
+		// or the dispatch frame for any unrelated fault) cannot be delivered
+		// at all: no VEH, no managed hook, no watchdog line, just a silent
+		// process kill. Proactively commit around RSP too, best-effort.
+		void BackStackPointerIfNeeded(ulong stackPointer)
+		{
+			if (stackPointer < 65536 || stackPointer >= 140737488355328L)
+			{
+				return;
+			}
+			if (!IsGuestOwnedLazyCommitAddress(stackPointer, out _))
+			{
+				return;
+			}
+			if (VirtualQuery((void*)stackPointer, out var spMbi, (nuint)sizeof(MEMORY_BASIC_INFORMATION64)) == 0 ||
+				spMbi.State == 4096)
+			{
+				return;
+			}
+
+			ulong spPageBase = stackPointer & 0xFFFFFFFFFFFFF000uL;
+			if (spMbi.State == 65536)
+			{
+				if (!TryGetLazyCommitWindow(stackPointer, spMbi.BaseAddress, spMbi.RegionSize, out var spWindowBase, out var spWindowSize) ||
+					!TryReserveThenCommit(spWindowBase, spWindowSize, spWindowBase, spWindowSize, commitProtect))
+				{
+					TryReserveThenCommit(spPageBase, 65536uL, spPageBase, 65536uL, commitProtect);
+				}
+			}
+			else if (spMbi.State == 8192)
+			{
+				if (!TryGetLazyCommitWindow(stackPointer, spMbi.BaseAddress, spMbi.RegionSize, out var spCommitBase, out var spCommitSize) ||
+					!TryCommitRange(spCommitBase, spCommitSize, commitProtect))
+				{
+					TryCommitRange(spPageBase, 65536uL, commitProtect);
+				}
+			}
+		}
 
 		static bool TryGetLazyCommitWindow(ulong fault, ulong regionBase, ulong regionSize, out ulong baseAddress, out ulong length)
 		{
