@@ -8,6 +8,7 @@ using System.Globalization;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Threading;
+using SharpEmu.Core.Cpu;
 using SharpEmu.Core.Cpu.Disasm;
 using SharpEmu.HLE;
 
@@ -1005,7 +1006,7 @@ public sealed partial class DirectExecutionBackend
 	// machinery wired to either, however unlikely on a 64-bit host.
 	// Recognizing the shape and skipping the two-byte instruction
 	// reproduces "log and continue" instead of a hard crash.
-	private static unsafe bool TryHandleGuestAssertTrap(void* contextRecord, ulong rip)
+	private unsafe bool TryHandleGuestAssertTrap(void* contextRecord, ulong rip)
 	{
 		if (rip < 65536 || rip >= 140737488355328L || !IsHostRangeReadable(rip, 2))
 		{
@@ -1034,6 +1035,10 @@ public sealed partial class DirectExecutionBackend
 			TryReadGuestAssertMessage(rsi, out message))
 		{
 			Console.Error.WriteLine($"[LOADER][WARN] Guest engine assert (int 0x{vector:X2}, non-fatal, continuing): {message}");
+			if (message.Contains("defaultBusses", StringComparison.Ordinal))
+			{
+				TryPatchEmptyDefaultBusses(contextRecord);
+			}
 		}
 		else
 		{
@@ -1043,6 +1048,96 @@ public sealed partial class DirectExecutionBackend
 		Console.Error.Flush();
 		WriteCtxU64(contextRecord, 248, rip + 2);
 		return true;
+	}
+
+	// The soft-continue above lets boot get past this specific assert (the
+	// SoundManager invariant "exactly one default audio bus exists"), but
+	// the code right after it unconditionally dereferences
+	// defaultBusses.begin() regardless of whether the check actually
+	// passed -- on real hardware that path is only reached once something
+	// else has already registered a bus, which this emulator doesn't yet
+	// model. Tolerating the resulting null-pointer reads one instruction
+	// encoding at a time (as TryHandleNullFieldLoad/Compare above do) is a
+	// fundamentally reactive whack-a-mole: each new field access the game
+	// walks off that null needs its own narrow recognizer, and some of them
+	// are writes -- a materially riskier class to paper over than a read,
+	// since there's no safe "pretend this succeeded" for a write to an
+	// address that was never real memory to begin with.
+	//
+	// Instead, this patches the vector's begin/end pointers directly, once,
+	// to reference a small zeroed guest object -- fixing the actual empty
+	// container rather than every symptom of it being empty. r14 holds
+	// SoundManager's global singleton pointer at this exact trap site
+	// (loaded well before the size check and never overwritten before here
+	// -- confirmed via disassembly of the surrounding code), and
+	// defaultBusses lives at [r14+0x2730] (begin) / [r14+0x2738] (end); the
+	// checked invariant is `end - begin == 0x18`, i.e. exactly one 24-byte
+	// element. A zeroed placeholder object reads back as "no
+	// capabilities/no entries" for whatever fields the game's own code goes
+	// on to check, matching the safe-default convention this codebase
+	// already uses elsewhere for not-yet-modeled state (e.g. the AudioOut2
+	// queue-level stubs always reporting an empty, ready queue).
+	private unsafe void TryPatchEmptyDefaultBusses(void* contextRecord)
+	{
+		ulong soundManager = ReadCtxU64(contextRecord, 232); // r14
+		if (soundManager < 65536 || !IsHostRangeReadable(soundManager, 0x2740))
+		{
+			return;
+		}
+
+		ulong begin = *(ulong*)(soundManager + 0x2730);
+		if (begin != 0)
+		{
+			// Already patched (or genuinely populated by something else) --
+			// idempotent no-op, since this trap fires repeatedly.
+			return;
+		}
+
+		var context = ActiveCpuContext;
+		if (context is null || !TryGetGuestMemoryAllocator(context, out var allocator))
+		{
+			return;
+		}
+
+		const ulong busObjectSize = 0x1000;
+		const ulong elementSize = 0x18;
+		if (!allocator.TryAllocateGuestMemory(busObjectSize, 0x1000, out var busObject) ||
+			!IsHostRangeReadable(busObject, busObjectSize))
+		{
+			return;
+		}
+
+		// The element's only field this codebase constructs is its first
+		// qword, a pointer to the actual bus object; the allocator already
+		// returns zeroed memory, so everything past that first field (and
+		// the whole bus object) reads back as zero without needing to
+		// touch it explicitly.
+		*(ulong*)busObject = busObject + elementSize;
+
+		*(ulong*)(soundManager + 0x2730) = busObject;
+		*(ulong*)(soundManager + 0x2738) = busObject + elementSize;
+
+		Console.Error.WriteLine(
+			$"[LOADER][WARN] Patched empty defaultBusses at 0x{soundManager:X16} with a zeroed placeholder bus at 0x{busObject:X16}");
+		Console.Error.Flush();
+	}
+
+	private static bool TryGetGuestMemoryAllocator(CpuContext context, out IGuestMemoryAllocator allocator)
+	{
+		if (context.Memory is IGuestMemoryAllocator direct)
+		{
+			allocator = direct;
+			return true;
+		}
+
+		if (context.Memory is TrackedCpuMemory tracked && tracked.Inner is IGuestMemoryAllocator inner)
+		{
+			allocator = inner;
+			return true;
+		}
+
+		allocator = null!;
+		return false;
 	}
 
 	// Context-record byte offsets for GP registers 0-15 in x86-64 ModRM
