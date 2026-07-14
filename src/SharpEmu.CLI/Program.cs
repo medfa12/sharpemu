@@ -29,6 +29,8 @@ internal static partial class Program
     private const int ATTACH_PARENT_PROCESS = -1;
     private const int STD_OUTPUT_HANDLE = -11;
     private const int STD_ERROR_HANDLE = -12;
+    private const int STD_INPUT_HANDLE = -10;
+    private const int STARTF_USESTDHANDLES = 0x00000100;
     private const uint GENERIC_READ = 0x80000000;
     private const uint GENERIC_WRITE = 0x40000000;
     private const uint FILE_SHARE_READ = 0x00000001;
@@ -292,6 +294,18 @@ internal static partial class Program
         var commandLine = BuildCommandLine(processPath, childArgs);
         var startupInfoEx = new STARTUPINFOEX();
         startupInfoEx.StartupInfo.cb = Marshal.SizeOf<STARTUPINFOEX>();
+        // Propagate our own standard handles to the mitigated child and mark
+        // them inheritable below (bInheritHandles=true). Without this, a
+        // harness that redirects OUR stdout/stderr (a file, a pipe) never
+        // sees anything the child writes -- the child's Console.Out/Error
+        // would resolve to a fresh, unredirected console instead. This is
+        // what let this relaunch be skipped in test harnesses via
+        // SHARPEMU_DISABLE_MITIGATION_RELAUNCH, silently leaving CFG/CET
+        // enabled for the process that actually runs guest code.
+        startupInfoEx.StartupInfo.dwFlags |= STARTF_USESTDHANDLES;
+        startupInfoEx.StartupInfo.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+        startupInfoEx.StartupInfo.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
+        startupInfoEx.StartupInfo.hStdError = GetStdHandle(STD_ERROR_HANDLE);
 
         nint attributeList = 0;
         nint mitigationPolicies = 0;
@@ -336,7 +350,7 @@ internal static partial class Program
                 cmdLineBuilder,
                 0,
                 0,
-                false,
+                true,
                 EXTENDED_STARTUPINFO_PRESENT,
                 0,
                 Environment.CurrentDirectory,
