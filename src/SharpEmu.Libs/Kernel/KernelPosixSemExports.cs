@@ -9,20 +9,42 @@ namespace SharpEmu.Libs.Kernel;
 /// <summary>
 /// POSIX unnamed semaphores (sem_init/sem_wait/sem_post/sem_destroy and the
 /// try/timed/getvalue variants). The guest passes the address of its own sem_t
-/// storage; we key a host <see cref="SemaphoreSlim"/> off that address rather
-/// than interpreting the opaque sem_t layout. sem_wait blocks the calling
-/// host thread (guest threads run 1:1 on host threads), so a producer thread's
-/// sem_post wakes it -- the same synchronous host-blocking model the pthread
-/// mutex path uses.
+/// storage; we key state off that address rather than interpreting the opaque
+/// sem_t layout.
+///
+/// A blocking sem_wait parks the calling guest thread through the guest
+/// scheduler (the same continuation path sceKernelWaitSema uses) so the thread
+/// resumes cleanly through the import trampoline. Only a host-owned thread that
+/// cannot park falls back to blocking the host thread directly on the gate --
+/// blocking a schedulable guest thread inside the import handler would leave it
+/// parked on a foreign stack and corrupt its resume.
 /// </summary>
 public static class KernelPosixSemExports
 {
     private const int SemValueMax = int.MaxValue;
 
-    private static readonly ConcurrentDictionary<ulong, SemaphoreSlim> _sems = new();
+    private sealed class PosixSemaphoreState
+    {
+        public int Count;
+        public int WaitingThreads;
+        public object Gate { get; } = new();
+    }
 
-    private static SemaphoreSlim Resolve(ulong sem, int initialIfMissing)
-        => _sems.GetOrAdd(sem, _ => new SemaphoreSlim(Math.Clamp(initialIfMissing, 0, SemValueMax), SemValueMax));
+    private sealed class PosixSemaphoreWaiter
+    {
+        // Written and read only under the owning semaphore's Gate.
+        public int? Result { get; set; }
+    }
+
+    private static readonly ConcurrentDictionary<ulong, PosixSemaphoreState> _sems = new();
+
+    private static PosixSemaphoreState Resolve(ulong sem, int initialIfMissing)
+        => _sems.GetOrAdd(sem, _ => new PosixSemaphoreState
+        {
+            Count = Math.Clamp(initialIfMissing, 0, SemValueMax),
+        });
+
+    private static string GetWakeKey(ulong sem) => $"posix_sem:0x{sem:X}";
 
     private static void Trace(string message)
     {
@@ -47,12 +69,7 @@ public static class KernelPosixSemExports
             return ctx.SetReturn(-1);
         }
 
-        var fresh = new SemaphoreSlim(Math.Clamp(value, 0, SemValueMax), SemValueMax);
-        if (_sems.TryRemove(sem, out var old))
-        {
-            old.Dispose();
-        }
-
+        var fresh = new PosixSemaphoreState { Count = Math.Clamp(value, 0, SemValueMax) };
         _sems[sem] = fresh;
         Trace($"init sem=0x{sem:X} value={value}");
         return ctx.SetReturn(0);
@@ -71,8 +88,7 @@ public static class KernelPosixSemExports
             return ctx.SetReturn(-1);
         }
 
-        Resolve(sem, 0).Wait();
-        return ctx.SetReturn(0);
+        return Wait(ctx, sem);
     }
 
     [SysAbiExport(
@@ -88,8 +104,18 @@ public static class KernelPosixSemExports
             return ctx.SetReturn(-1);
         }
 
+        var state = Resolve(sem, 0);
+        lock (state.Gate)
+        {
+            if (state.Count >= 1)
+            {
+                state.Count--;
+                return ctx.SetReturn(0);
+            }
+        }
+
         // Not available -> -1 (guest maps to EAGAIN); the sem stays untouched.
-        return ctx.SetReturn(Resolve(sem, 0).Wait(0) ? 0 : -1);
+        return ctx.SetReturn(-1);
     }
 
     [SysAbiExport(
@@ -108,8 +134,7 @@ public static class KernelPosixSemExports
             return ctx.SetReturn(-1);
         }
 
-        Resolve(sem, 0).Wait();
-        return ctx.SetReturn(0);
+        return Wait(ctx, sem);
     }
 
     [SysAbiExport(
@@ -125,16 +150,22 @@ public static class KernelPosixSemExports
             return ctx.SetReturn(-1);
         }
 
-        try
+        var state = Resolve(sem, 0);
+        lock (state.Gate)
         {
-            Resolve(sem, 0).Release();
-        }
-        catch (SemaphoreFullException)
-        {
-            // Already at SEM_VALUE_MAX; a real sem would return EOVERFLOW, but
-            // dropping the extra post keeps the count sane without erroring.
+            if (state.Count < SemValueMax)
+            {
+                state.Count++;
+            }
+
+            // Wake any host-owned waiter parked on the gate; guest-scheduler
+            // waiters are woken separately below. PulseAll under the gate is
+            // lock-order safe (it touches no other lock).
+            Monitor.PulseAll(state.Gate);
         }
 
+        _ = GuestThreadExecution.Scheduler?.WakeBlockedThreads(GetWakeKey(sem));
+        Trace($"post sem=0x{sem:X} count={state.Count}");
         return ctx.SetReturn(0);
     }
 
@@ -153,7 +184,7 @@ public static class KernelPosixSemExports
             return ctx.SetReturn(-1);
         }
 
-        var count = _sems.TryGetValue(sem, out var s) ? s.CurrentCount : 0;
+        var count = _sems.TryGetValue(sem, out var state) ? Volatile.Read(ref state.Count) : 0;
         return ctx.TryWriteInt32(outValue, count)
             ? ctx.SetReturn(0)
             : ctx.SetReturn(-1);
@@ -167,22 +198,125 @@ public static class KernelPosixSemExports
     public static int SemDestroy(CpuContext ctx)
     {
         var sem = ctx[CpuRegister.Rdi];
-        if (sem != 0 && _sems.TryRemove(sem, out var s))
+        if (sem != 0 && _sems.TryRemove(sem, out var state))
         {
-            s.Dispose();
+            // Release any host-owned waiter still parked on the gate.
+            lock (state.Gate)
+            {
+                Monitor.PulseAll(state.Gate);
+            }
+
+            _ = GuestThreadExecution.Scheduler?.WakeBlockedThreads(GetWakeKey(sem));
         }
 
         Trace($"destroy sem=0x{sem:X}");
         return ctx.SetReturn(0);
     }
 
-    internal static void ResetForTests()
+    private static int Wait(CpuContext ctx, ulong sem)
     {
-        foreach (var s in _sems.Values)
+        var state = Resolve(sem, 0);
+        lock (state.Gate)
         {
-            s.Dispose();
+            if (state.Count >= 1)
+            {
+                state.Count--;
+                return ctx.SetReturn(0);
+            }
+
+            var waiter = new PosixSemaphoreWaiter();
+            if (!GuestThreadExecution.RequestCurrentThreadBlock(
+                    ctx,
+                    "sem_wait",
+                    GetWakeKey(sem),
+                    resumeHandler: () => CompleteBlockedWait(state, waiter),
+                    wakeHandler: () => TryConsumeBlockedWait(state, waiter)))
+            {
+                // Host-owned thread: it cannot park in the guest scheduler, so block
+                // the host thread on the gate until a sem_post pulses it.
+                return HostBlockingWait(ctx, state);
+            }
+
+            state.WaitingThreads++;
+            Trace($"wait-block sem=0x{sem:X} count={state.Count} waiters={state.WaitingThreads}");
+            return ctx.SetReturn(0);
+        }
+    }
+
+    // Wake handler: runs under the scheduler's guest-thread gate (lock order:
+    // scheduler gate -> semaphore gate). Returns true iff the waiter has a final
+    // result and should be re-readied; false leaves it parked.
+    private static bool TryConsumeBlockedWait(PosixSemaphoreState state, PosixSemaphoreWaiter waiter)
+    {
+        lock (state.Gate)
+        {
+            return TryConsumeBlockedWaitLocked(state, waiter);
+        }
+    }
+
+    private static bool TryConsumeBlockedWaitLocked(PosixSemaphoreState state, PosixSemaphoreWaiter waiter)
+    {
+        if (waiter.Result is not null)
+        {
+            return true;
         }
 
+        if (state.Count >= 1)
+        {
+            state.Count--;
+            waiter.Result = 0;
+            state.WaitingThreads = Math.Max(0, state.WaitingThreads - 1);
+            return true;
+        }
+
+        return false;
+    }
+
+    // Resume handler: runs on the woken guest thread outside the scheduler gate;
+    // its return value becomes the guest's RAX for the resumed sem_wait.
+    private static int CompleteBlockedWait(PosixSemaphoreState state, PosixSemaphoreWaiter waiter)
+    {
+        lock (state.Gate)
+        {
+            if (waiter.Result is null && !TryConsumeBlockedWaitLocked(state, waiter))
+            {
+                // Nothing readies a parked waiter without the wake handler resolving
+                // it, so reaching here means the scheduler contract changed. Report
+                // success anyway (the destroy path wakes waiters unconditionally).
+                waiter.Result = 0;
+                state.WaitingThreads = Math.Max(0, state.WaitingThreads - 1);
+            }
+
+            return waiter.Result!.Value;
+        }
+    }
+
+    // Blocks the calling host thread on the gate until the count is available.
+    // Must be called while already holding <paramref name="state"/>.Gate:
+    // Monitor.Wait atomically releases the gate while parked and reacquires it on
+    // wake, so a concurrent sem_post cannot slip a PulseAll between the check and
+    // the wait. Used only for host-owned threads that cannot park.
+    private static int HostBlockingWait(CpuContext ctx, PosixSemaphoreState state)
+    {
+        state.WaitingThreads++;
+        try
+        {
+            while (state.Count < 1)
+            {
+                Monitor.Wait(state.Gate);
+            }
+
+            state.Count--;
+            return ctx.SetReturn(0);
+        }
+        finally
+        {
+            state.WaitingThreads = Math.Max(0, state.WaitingThreads - 1);
+        }
+    }
+
+    internal static void ResetForTests()
+    {
         _sems.Clear();
     }
 }
