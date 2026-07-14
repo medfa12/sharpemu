@@ -82,4 +82,78 @@ public sealed class Gen5SpirvCompileTests
         Assert.True(ok, $"outputKind={outputKind}: {error}");
         SpirvModuleAssert.Parse(shader.Spirv);
     }
+
+    [Theory]
+    [InlineData((int)Gen5PixelOutputKind.Float)]
+    [InlineData((int)Gen5PixelOutputKind.Uint)]
+    [InlineData((int)Gen5PixelOutputKind.Sint)]
+    public void PixelShader_PartialExportMask_PadsDisabledChannelsWithMatchingType(int outputKindValue)
+    {
+        // Real game shaders export only some channels (e.g. R,G) and leave the
+        // rest disabled. Disabled channels must be padded with a zero of the
+        // output's component type; padding a v4float with uint zeros produces an
+        // OpCompositeConstruct the driver rejects (NVVM compilation failed).
+        var outputKind = (Gen5PixelOutputKind)outputKindValue;
+        var words = (uint[])FullscreenBarycentricPs.Clone();
+        var exportIndex = Array.IndexOf(words, 0xF8001C0Fu);
+        Assert.True(exportIndex >= 0, "expected an EXP instruction with EN=0xF");
+        words[exportIndex] = 0xF8001C03u; // EN = 0x3 -> channels 2 and 3 disabled
+
+        var (state, evaluation, _) = DecodeAndEvaluate(words);
+        var ok = Gen5SpirvTranslator.TryCompilePixelShader(
+            state, evaluation, outputKind, out var shader, out var error);
+        Assert.True(ok, $"outputKind={outputKind}: {error}");
+
+        AssertVectorCompositeConstituentsMatchComponentType(shader.Spirv);
+    }
+
+    // The disabled-channel padding is emitted as an OpConstant, so a mismatched
+    // pad shows up as an integer-typed constant fed into a float-vector
+    // OpCompositeConstruct -- exactly what the driver rejects. Constants have an
+    // unambiguous [result-type, result-id, literal] layout, so keying off them
+    // avoids the no-result opcodes (OpStore etc.) that would corrupt a general
+    // id->type map.
+    private static void AssertVectorCompositeConstituentsMatchComponentType(byte[] spirv)
+    {
+        const ushort OpTypeInt = 21, OpTypeFloat = 22, OpTypeVector = 23,
+            OpConstant = 43, OpConstantComposite = 44, OpCompositeConstruct = 80;
+        var module = SpirvModuleAssert.Parse(spirv);
+
+        var scalarKind = new Dictionary<uint, string>();   // type id -> "int"/"float"
+        var vectorComponent = new Dictionary<uint, uint>(); // vector type id -> component type id
+        var constantType = new Dictionary<uint, uint>();    // constant id -> its type id
+
+        foreach (var (opcode, w) in module.Instructions)
+        {
+            switch (opcode)
+            {
+                case OpTypeInt: scalarKind[w[1]] = "int"; break;
+                case OpTypeFloat: scalarKind[w[1]] = "float"; break;
+                case OpTypeVector: vectorComponent[w[1]] = w[2]; break;
+                case OpConstant:
+                case OpConstantComposite: constantType[w[2]] = w[1]; break;
+            }
+        }
+
+        foreach (var (opcode, w) in module.Instructions)
+        {
+            if (opcode != OpCompositeConstruct ||
+                !vectorComponent.TryGetValue(w[1], out var componentType) ||
+                scalarKind.GetValueOrDefault(componentType) != "float")
+            {
+                continue;
+            }
+
+            for (var operand = 3; operand < w.Length; operand++)
+            {
+                if (constantType.TryGetValue(w[operand], out var type) &&
+                    scalarKind.TryGetValue(type, out var kind))
+                {
+                    Assert.True(
+                        kind == "float",
+                        $"OpCompositeConstruct into a float vector has a {kind} constant constituent (id {w[operand]}).");
+                }
+            }
+        }
+    }
 }

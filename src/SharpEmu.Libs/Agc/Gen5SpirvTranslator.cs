@@ -2078,9 +2078,16 @@ internal static partial class Gen5SpirvTranslator
                     var enabled = (export.EnableMask & (1u << component)) != 0;
                     if (!enabled)
                     {
-                        values[component] = _outputKind == Gen5PixelOutputKind.Sint
-                            ? Bitcast(_intType, UInt(0))
-                            : UInt(0);
+                        // Pad disabled channels with a zero whose type matches the
+                        // output vector's component type, otherwise CompositeConstruct
+                        // mixes uint constituents into a v4float and the driver rejects
+                        // the module. Mirror the enabled-component type mapping below.
+                        values[component] = _outputKind switch
+                        {
+                            Gen5PixelOutputKind.Uint => UInt(0),
+                            Gen5PixelOutputKind.Sint => Bitcast(_intType, UInt(0)),
+                            _ => Float(0f),
+                        };
                         continue;
                     }
 
