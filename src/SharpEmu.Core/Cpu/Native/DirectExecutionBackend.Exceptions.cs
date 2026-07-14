@@ -196,6 +196,14 @@ public sealed partial class DirectExecutionBackend
 
 			}
 
+			// A write AV inside guest code is almost always the tail end of the
+			// guest's OWN allocator/object-graph logic (a vtable call, a field
+			// read) rather than an unresolved import. Dumping what each
+			// register-as-pointer points to turns the crash log itself into a
+			// mini object dump, so the pool/allocator state that produced the
+			// bad address is visible without a second disassembly round trip.
+			DumpGuestPointerRegisters(rdi, rsi, rdx, rcx, r8, r9, r12, r13, r14, r15, rax, rbx);
+
 			try
 			{
 				Console.Error.WriteLine("[LOADER][INFO]   Stack qwords (RSP..):");
@@ -308,6 +316,70 @@ public sealed partial class DirectExecutionBackend
 	private static bool IsBenignHostDebugException(uint exceptionCode)
 	{
 		return exceptionCode is DBG_PRINTEXCEPTION_C or DBG_PRINTEXCEPTION_WIDE_C or MS_VC_THREADNAME_EXCEPTION;
+	}
+
+	private static unsafe void DumpGuestPointerRegisters(params ulong[] candidates)
+	{
+		var names = new[] { "rdi", "rsi", "rdx", "rcx", "r8", "r9", "r12", "r13", "r14", "r15", "rax", "rbx" };
+		Console.Error.WriteLine("[LOADER][INFO]   Register-as-pointer dumps:");
+		for (var i = 0; i < candidates.Length && i < names.Length; i++)
+		{
+			var address = candidates[i];
+			// Guest heap/object pointers land well below the kernel/stack
+			// range; skip small integers and host-range values so the dump
+			// stays limited to plausible guest object pointers.
+			if (address < 0x1_0000 || address > 0x0000_7FFF_FFFF_FFFF)
+			{
+				continue;
+			}
+
+			// A faulted read here re-enters the vectored handler and aborts the
+			// process, so probe commit/protection state instead of trusting a
+			// try/catch around the dereference.
+			if (!IsHostRangeReadable(address, 24 * sizeof(ulong)))
+			{
+				Console.Error.WriteLine($"[LOADER][INFO]     *{names[i]} (0x{address:X16}): unreadable");
+				continue;
+			}
+
+			var qwords = new ulong[24];
+			for (var q = 0; q < qwords.Length; q++)
+			{
+				qwords[q] = *(ulong*)(address + (ulong)(q * 8));
+			}
+
+			Console.Error.WriteLine(
+				$"[LOADER][INFO]     *{names[i]} (0x{address:X16}): " +
+				string.Join(' ', Array.ConvertAll(qwords, v => $"0x{v:X16}")));
+		}
+	}
+
+	private static unsafe bool IsHostRangeReadable(ulong address, ulong length)
+	{
+		var cursor = address;
+		var end = address + length;
+		while (cursor < end)
+		{
+			if (VirtualQuery((void*)cursor, out var mbi, (nuint)sizeof(MEMORY_BASIC_INFORMATION64)) == 0)
+			{
+				return false;
+			}
+
+			if (mbi.State != MEM_COMMIT || !IsReadableProtection(mbi.Protect) || (mbi.Protect & PAGE_GUARD) != 0)
+			{
+				return false;
+			}
+
+			var regionEnd = mbi.BaseAddress + mbi.RegionSize;
+			if (regionEnd <= cursor)
+			{
+				return false;
+			}
+
+			cursor = regionEnd;
+		}
+
+		return true;
 	}
 
 	private unsafe static void LogNestedVectoredException(void* exceptionInfo)

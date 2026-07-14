@@ -38,6 +38,7 @@ internal static partial class Program
     [STAThread]
     private static int Main(string[] args)
     {
+        InstallProcessDeathDiagnostics();
         try
         {
             return Run(args);
@@ -46,6 +47,29 @@ internal static partial class Program
         {
             SharpEmuLog.Shutdown();
         }
+    }
+
+    // The boot can terminate the process without a caught exception (a guest
+    // AV the VEH declines, a background-thread throw, a direct Environment.Exit).
+    // These hooks name the cause in the remote log instead of leaving a silent
+    // exit.
+    private static void InstallProcessDeathDiagnostics()
+    {
+        AppDomain.CurrentDomain.UnhandledException += static (_, e) =>
+        {
+            var ex = e.ExceptionObject as Exception;
+            Console.Error.WriteLine(
+                $"[DEBUG] UNHANDLED EXCEPTION terminating={e.IsTerminating} {ex?.GetType().FullName}: {ex?.Message}");
+            Console.Error.WriteLine(ex?.StackTrace ?? "(no stack)");
+            Console.Error.Flush();
+        };
+
+        AppDomain.CurrentDomain.ProcessExit += static (_, _) =>
+        {
+            Console.Error.WriteLine(
+                $"[DEBUG] PROCESS EXIT code={Environment.ExitCode} managedThread=0x{Environment.CurrentManagedThreadId:X}");
+            Console.Error.Flush();
+        };
     }
 
     // Identifies which build is actually executing. Boot logs are collected off
