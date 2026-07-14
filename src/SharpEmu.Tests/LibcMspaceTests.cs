@@ -287,4 +287,120 @@ public sealed class LibcMspaceTests : IDisposable
 
         Assert.Equal(0UL, Malloc(ctx, mspace, 8));
     }
+
+    private static ulong Free(CpuContext ctx, ulong mspace, ulong pointer)
+    {
+        ctx[CpuRegister.Rdi] = mspace;
+        ctx[CpuRegister.Rsi] = pointer;
+        LibcMspaceExports.LibcMspaceFree(ctx);
+        return ctx[CpuRegister.Rax];
+    }
+
+    private static ulong Realloc(CpuContext ctx, ulong mspace, ulong pointer, ulong size)
+    {
+        ctx[CpuRegister.Rdi] = mspace;
+        ctx[CpuRegister.Rsi] = pointer;
+        ctx[CpuRegister.Rdx] = size;
+        LibcMspaceExports.LibcMspaceRealloc(ctx);
+        return ctx[CpuRegister.Rax];
+    }
+
+    private static ulong Memalign(CpuContext ctx, ulong mspace, ulong alignment, ulong size)
+    {
+        ctx[CpuRegister.Rdi] = mspace;
+        ctx[CpuRegister.Rsi] = alignment;
+        ctx[CpuRegister.Rdx] = size;
+        LibcMspaceExports.LibcMspaceMemalign(ctx);
+        return ctx[CpuRegister.Rax];
+    }
+
+    // Regression guard for the "random data-structure corruption during heavy
+    // allocation" failure class: hammer the arena with a mixed malloc / free /
+    // realloc / memalign workload and assert every live chunk (its 16-byte
+    // header plus payload) stays disjoint from every other live chunk. An
+    // allocator that ever hands back a region overlapping a still-live one
+    // silently corrupts whatever the guest built there -- exactly the shape of
+    // a std::map node whose child pointer gets clobbered mid-boot.
+    [Fact]
+    public void MixedWorkload_NeverHandsOutOverlappingChunks()
+    {
+        var ctx = NewContext(out _);
+        // Large arena so pressure comes from the free-list reuse paths, not
+        // capacity exhaustion.
+        var mspace = CreateArena(ctx, capacity: 0x0100_0000);
+        const ulong headerSize = 16;
+
+        // (payloadStart, chunkStart, chunkEnd) for each live allocation.
+        var live = new List<(ulong Payload, ulong Start, ulong End)>();
+
+        void AssertDisjoint(ulong payload, ulong size, string op)
+        {
+            Assert.NotEqual(0UL, payload);
+            var start = payload - headerSize;
+            var end = payload + size;
+            foreach (var (_, otherStart, otherEnd) in live)
+            {
+                var overlaps = start < otherEnd && otherStart < end;
+                Assert.False(
+                    overlaps,
+                    $"{op} returned chunk [0x{start:X},0x{end:X}) overlapping live [0x{otherStart:X},0x{otherEnd:X})");
+            }
+
+            live.Add((payload, start, end));
+        }
+
+        // Deterministic LCG so a failure reproduces exactly.
+        ulong rng = 0x9E3779B97F4A7C15UL;
+        uint Next()
+        {
+            rng = rng * 6364136223846793005UL + 1442695040888963407UL;
+            return (uint)(rng >> 33);
+        }
+
+        var sizes = new ulong[] { 8, 16, 24, 32, 0x18, 0x3B8, 0x40, 0x80, 0x100, 1, 0x200 };
+
+        for (var i = 0; i < 4000; i++)
+        {
+            var pick = Next() % 10;
+            if (pick < 5 || live.Count == 0)
+            {
+                var size = sizes[Next() % (uint)sizes.Length];
+                var p = Malloc(ctx, mspace, size);
+                if (p != 0)
+                {
+                    AssertDisjoint(p, size, "malloc");
+                }
+            }
+            else if (pick < 7)
+            {
+                var idx = (int)(Next() % (uint)live.Count);
+                var victim = live[idx];
+                live.RemoveAt(idx);
+                Free(ctx, mspace, victim.Payload);
+            }
+            else if (pick < 9)
+            {
+                var idx = (int)(Next() % (uint)live.Count);
+                var victim = live[idx];
+                live.RemoveAt(idx);
+                var size = sizes[Next() % (uint)sizes.Length];
+                var p = Realloc(ctx, mspace, victim.Payload, size);
+                if (p != 0)
+                {
+                    AssertDisjoint(p, size, "realloc");
+                }
+            }
+            else
+            {
+                var alignment = 1UL << (int)(3 + Next() % 4); // 8,16,32,64
+                var size = sizes[Next() % (uint)sizes.Length];
+                var p = Memalign(ctx, mspace, alignment, size);
+                if (p != 0)
+                {
+                    Assert.True(p % alignment == 0, $"memalign 0x{p:X} not {alignment}-aligned");
+                    AssertDisjoint(p, size, "memalign");
+                }
+            }
+        }
+    }
 }
