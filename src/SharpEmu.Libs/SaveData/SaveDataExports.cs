@@ -244,6 +244,313 @@ public static class SaveDataExports
         }
     }
 
+    // --- Save data memory (sceSaveData*SaveDataMemory2) ---
+    // Struct layouts verified against shadPS4 savedata.cpp and Astro Bot's call
+    // sites at 0x8010823A7 (Setup2), 0x801082846 (Get2), and 0x801082A9E (Set2).
+    //
+    // OrbisSaveDataMemorySetup2 (64 bytes, rdi):
+    //   +0x00 u32 option, +0x04 s32 userId, +0x08 u64 memorySize,
+    //   +0x10 u64 iconMemorySize, +0x18 initParam*, +0x20 initIcon*, +0x28 u32 slotId
+    // OrbisSaveDataMemorySetupResult (rsi, may be NULL): +0x00 u64 existedMemorySize
+    // OrbisSaveDataMemoryGet2 (64 bytes, rdi):
+    //   +0x00 s32 userId, +0x08 OrbisSaveDataMemoryData* data, +0x10 param*,
+    //   +0x18 icon*, +0x20 u32 slotId
+    // OrbisSaveDataMemorySet2 (72 bytes, rdi):
+    //   +0x00 s32 userId, +0x08 OrbisSaveDataMemoryData* data, +0x10 param*,
+    //   +0x18 icon*, +0x20 u32 dataNum, +0x24 u32 slotId
+    // OrbisSaveDataMemoryData (64 bytes):
+    //   +0x00 void* buf, +0x08 u64 bufSize, +0x10 s64 offset
+    private const int OrbisSaveDataErrorMemoryNotReady = unchecked((int)0x809F0012);
+    private const ulong SaveDataMemoryMaxSize = 64UL * 1024 * 1024;
+    private const int SaveDataMemoryDataSize = 0x40;
+    private static readonly Dictionary<(int UserId, uint SlotId), byte[]> _memorySlots = [];
+
+    [SysAbiExport(
+        Nid = "oQySEUfgXRA",
+        ExportName = "sceSaveDataSetupSaveDataMemory2",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceSaveData")]
+    public static int SaveDataSetupSaveDataMemory2(CpuContext ctx)
+    {
+        var setupAddress = ctx[CpuRegister.Rdi];
+        var resultAddress = ctx[CpuRegister.Rsi];
+        if (setupAddress == 0)
+        {
+            return ctx.SetReturn(OrbisSaveDataErrorParameter);
+        }
+
+        if (!ctx.TryReadUInt32(setupAddress + 0x00, out var option) ||
+            !ctx.TryReadInt32(setupAddress + 0x04, out var userId) ||
+            !ctx.TryReadUInt64(setupAddress + 0x08, out var memorySize) ||
+            !ctx.TryReadUInt64(setupAddress + 0x10, out var iconMemorySize) ||
+            !ctx.TryReadUInt32(setupAddress + 0x28, out var slotId))
+        {
+            return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        if (userId < 0 || memorySize > SaveDataMemoryMaxSize)
+        {
+            return ctx.SetReturn(OrbisSaveDataErrorParameter);
+        }
+
+        ulong existedSize;
+        lock (_stateGate)
+        {
+            var key = (userId, slotId);
+            if (_memorySlots.TryGetValue(key, out var existing))
+            {
+                existedSize = (ulong)existing.LongLength;
+            }
+            else
+            {
+                var persisted = TryLoadSaveDataMemory(userId, slotId);
+                existedSize = persisted is null ? 0 : (ulong)persisted.LongLength;
+                var buffer = new byte[Math.Max(memorySize, existedSize)];
+                persisted?.CopyTo(buffer, 0);
+                _memorySlots[key] = buffer;
+            }
+        }
+
+        if (resultAddress != 0 && !ctx.TryWriteUInt64(resultAddress, existedSize))
+        {
+            return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        TraceSaveData(
+            $"setup_save_data_memory2 user={userId} slot={slotId} option=0x{option:X} " +
+            $"memory_size={memorySize} icon_memory_size={iconMemorySize} existed_size={existedSize}");
+        return ctx.SetReturn(0);
+    }
+
+    [SysAbiExport(
+        Nid = "QwOO7vegnV8",
+        ExportName = "sceSaveDataGetSaveDataMemory2",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceSaveData")]
+    public static int SaveDataGetSaveDataMemory2(CpuContext ctx)
+    {
+        var getAddress = ctx[CpuRegister.Rdi];
+        if (getAddress == 0)
+        {
+            return ctx.SetReturn(OrbisSaveDataErrorParameter);
+        }
+
+        if (!ctx.TryReadInt32(getAddress + 0x00, out var userId) ||
+            !ctx.TryReadUInt64(getAddress + 0x08, out var dataAddress) ||
+            !ctx.TryReadUInt64(getAddress + 0x10, out var paramAddress) ||
+            !ctx.TryReadUInt64(getAddress + 0x18, out var iconAddress) ||
+            !ctx.TryReadUInt32(getAddress + 0x20, out var slotId))
+        {
+            return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        byte[]? slot;
+        lock (_stateGate)
+        {
+            _memorySlots.TryGetValue((userId, slotId), out slot);
+        }
+
+        if (slot is null)
+        {
+            return ctx.SetReturn(OrbisSaveDataErrorMemoryNotReady);
+        }
+
+        if (dataAddress != 0)
+        {
+            if (!TryReadMemoryData(ctx, dataAddress, out var data))
+            {
+                return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+            }
+
+            if (!TryCheckMemoryDataRange(data, slot, out var offset, out var count))
+            {
+                return ctx.SetReturn(OrbisSaveDataErrorParameter);
+            }
+
+            byte[] chunk;
+            lock (_stateGate)
+            {
+                chunk = slot.AsSpan(offset, count).ToArray();
+            }
+
+            if (count > 0 && !ctx.Memory.TryWrite(data.BufAddress, chunk))
+            {
+                return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+            }
+        }
+
+        // Astro Bot passes param == NULL and icon == NULL here; we do not
+        // synthesize either to avoid writing fields we cannot justify.
+        TraceSaveData(
+            $"get_save_data_memory2 user={userId} slot={slotId} data=0x{dataAddress:X} " +
+            $"param=0x{paramAddress:X} icon=0x{iconAddress:X}");
+        return ctx.SetReturn(0);
+    }
+
+    [SysAbiExport(
+        Nid = "cduy9v4YmT4",
+        ExportName = "sceSaveDataSetSaveDataMemory2",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceSaveData")]
+    public static int SaveDataSetSaveDataMemory2(CpuContext ctx)
+    {
+        var setAddress = ctx[CpuRegister.Rdi];
+        if (setAddress == 0)
+        {
+            return ctx.SetReturn(OrbisSaveDataErrorParameter);
+        }
+
+        if (!ctx.TryReadInt32(setAddress + 0x00, out var userId) ||
+            !ctx.TryReadUInt64(setAddress + 0x08, out var dataAddress) ||
+            !ctx.TryReadUInt32(setAddress + 0x20, out var dataNum) ||
+            !ctx.TryReadUInt32(setAddress + 0x24, out var slotId))
+        {
+            return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        byte[]? slot;
+        lock (_stateGate)
+        {
+            _memorySlots.TryGetValue((userId, slotId), out slot);
+        }
+
+        if (slot is null)
+        {
+            return ctx.SetReturn(OrbisSaveDataErrorMemoryNotReady);
+        }
+
+        if (dataAddress != 0)
+        {
+            var entryCount = Math.Max(dataNum, 1u);
+            for (var i = 0u; i < entryCount; i++)
+            {
+                var entryAddress = dataAddress + ((ulong)i * SaveDataMemoryDataSize);
+                if (!TryReadMemoryData(ctx, entryAddress, out var data))
+                {
+                    return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+                }
+
+                if (!TryCheckMemoryDataRange(data, slot, out var offset, out var count))
+                {
+                    return ctx.SetReturn(OrbisSaveDataErrorParameter);
+                }
+
+                if (count == 0)
+                {
+                    continue;
+                }
+
+                var chunk = new byte[count];
+                if (!ctx.Memory.TryRead(data.BufAddress, chunk))
+                {
+                    return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+                }
+
+                lock (_stateGate)
+                {
+                    chunk.CopyTo(slot.AsSpan(offset, count));
+                }
+            }
+
+            PersistSaveDataMemory(userId, slotId, slot);
+        }
+
+        TraceSaveData(
+            $"set_save_data_memory2 user={userId} slot={slotId} data=0x{dataAddress:X} data_num={dataNum}");
+        return ctx.SetReturn(0);
+    }
+
+    private static bool TryReadMemoryData(CpuContext ctx, ulong address, out MemoryData data)
+    {
+        data = default;
+        if (!ctx.TryReadUInt64(address + 0x00, out var bufAddress) ||
+            !ctx.TryReadUInt64(address + 0x08, out var bufSize) ||
+            !ctx.TryReadUInt64(address + 0x10, out var offset))
+        {
+            return false;
+        }
+
+        data = new MemoryData(bufAddress, bufSize, unchecked((long)offset));
+        return true;
+    }
+
+    private static bool TryCheckMemoryDataRange(MemoryData data, byte[] slot, out int offset, out int count)
+    {
+        offset = 0;
+        count = 0;
+        if (data.Offset < 0 ||
+            data.Offset > slot.LongLength ||
+            data.BufSize > (ulong)(slot.LongLength - data.Offset))
+        {
+            return false;
+        }
+
+        if (data.BufSize > 0 && data.BufAddress == 0)
+        {
+            return false;
+        }
+
+        offset = checked((int)data.Offset);
+        count = checked((int)data.BufSize);
+        return true;
+    }
+
+    private static string ResolveSaveDataMemoryPath(int userId, uint slotId)
+    {
+        var directory = Path.Combine(
+            ResolveTitleSaveRoot(userId, ResolveConfiguredTitleId()),
+            slotId == 0 ? "sce_sdmemory" : $"sce_sdmemory{slotId}");
+        return Path.Combine(directory, "memory.dat");
+    }
+
+    private static byte[]? TryLoadSaveDataMemory(int userId, uint slotId)
+    {
+        try
+        {
+            var path = ResolveSaveDataMemoryPath(userId, slotId);
+            if (!File.Exists(path))
+            {
+                return null;
+            }
+
+            var bytes = File.ReadAllBytes(path);
+            return (ulong)bytes.LongLength <= SaveDataMemoryMaxSize ? bytes : null;
+        }
+        catch (IOException)
+        {
+            return null;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return null;
+        }
+    }
+
+    private static void PersistSaveDataMemory(int userId, uint slotId, byte[] slot)
+    {
+        try
+        {
+            var path = ResolveSaveDataMemoryPath(userId, slotId);
+            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            byte[] snapshot;
+            lock (_stateGate)
+            {
+                snapshot = (byte[])slot.Clone();
+            }
+
+            File.WriteAllBytes(path, snapshot);
+        }
+        catch (IOException)
+        {
+            // Guest memory copy already succeeded; persistence is best-effort.
+        }
+        catch (UnauthorizedAccessException)
+        {
+        }
+    }
+
+    private readonly record struct MemoryData(ulong BufAddress, ulong BufSize, long Offset);
+
     private static int _nextTransactionResource;
     [SysAbiExport(
         Nid = "gjRZNnw0JPE",
