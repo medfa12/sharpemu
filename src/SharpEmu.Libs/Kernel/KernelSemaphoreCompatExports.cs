@@ -94,6 +94,7 @@ public static class KernelSemaphoreCompatExports
             lock (state.Gate)
             {
                 state.Deleted = true;
+                Monitor.PulseAll(state.Gate);
             }
 
             _ = GuestThreadExecution.Scheduler?.WakeBlockedThreads(GetSemaphoreWakeKey(handle));
@@ -192,8 +193,13 @@ public static class KernelSemaphoreCompatExports
                         resumeHandler: () => CompleteBlockedSemaWait(semaphore, waiter),
                         wakeHandler: () => TryConsumeBlockedSemaWait(semaphore, waiter)))
                 {
-                    TraceSemaphore($"wait-would-block handle=0x{handle:X8} name='{semaphore.Name}' need={needCount} count={semaphore.Count}");
-                    return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_TRY_AGAIN);
+                    // Host-owned thread: it cannot park in the guest scheduler, but an
+                    // infinite sceKernelWaitSema must still block. Wait on the semaphore's
+                    // own gate -- a producer's SignalSema/Cancel/Delete pulses it and we
+                    // re-check the count. This is the same 1:1 host-blocking model the
+                    // pthread-mutex and POSIX-sem paths use; returning EAGAIN here instead
+                    // makes callers that treat a blocking wait as infallible spin forever.
+                    return HostBlockingWait(ctx, semaphore, handle, needCount);
                 }
 
                 semaphore.WaitingThreads++;
@@ -277,6 +283,10 @@ public static class KernelSemaphoreCompatExports
             }
 
             semaphore.Count += signalCount;
+            // Wake any host-owned waiters parked on the gate (guest-scheduler
+            // waiters are woken separately below). PulseAll under the gate is
+            // lock-order safe: it touches no other lock.
+            Monitor.PulseAll(semaphore.Gate);
             TraceSemaphore($"signal handle=0x{handle:X8} name='{semaphore.Name}' signal={signalCount} count={semaphore.Count} waiters={semaphore.WaitingThreads}");
         }
 
@@ -318,6 +328,7 @@ public static class KernelSemaphoreCompatExports
 
             semaphore.Count = setCount < 0 ? semaphore.InitialCount : setCount;
             semaphore.CancelEpoch++;
+            Monitor.PulseAll(semaphore.Gate);
             // WaitingThreads is NOT zeroed here: each canceled waiter decrements it
             // exactly once in its wake handler. Zeroing here as well would double-count
             // and silently absorb the increment of a waiter that parks between this
@@ -347,6 +358,7 @@ public static class KernelSemaphoreCompatExports
         lock (semaphore.Gate)
         {
             semaphore.Deleted = true;
+            Monitor.PulseAll(semaphore.Gate);
         }
 
         _ = GuestThreadExecution.Scheduler?.WakeBlockedThreads(GetSemaphoreWakeKey(handle));
@@ -454,6 +466,47 @@ public static class KernelSemaphoreCompatExports
         }
 
         return result;
+    }
+
+    // Blocks the calling host thread on the semaphore until the requested count is
+    // available, the semaphore is deleted, or a cancel bumps the epoch. Must be
+    // called while already holding <paramref name="semaphore"/>.Gate: Monitor.Wait
+    // atomically releases the gate while parked and reacquires it on wake, so a
+    // concurrent SignalSema cannot slip a PulseAll between our count check and the
+    // wait. Used for host-owned threads that cannot park in the guest scheduler.
+    private static int HostBlockingWait(CpuContext ctx, KernelSemaphoreState semaphore, uint handle, int needCount)
+    {
+        var cancelEpochAtBlock = semaphore.CancelEpoch;
+        semaphore.WaitingThreads++;
+        TraceSemaphore($"host-wait-block handle=0x{handle:X8} name='{semaphore.Name}' need={needCount} count={semaphore.Count} waiters={semaphore.WaitingThreads}");
+        try
+        {
+            while (true)
+            {
+                if (semaphore.Deleted)
+                {
+                    return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_DELETED);
+                }
+
+                if (semaphore.CancelEpoch != cancelEpochAtBlock)
+                {
+                    return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_CANCELED);
+                }
+
+                if (semaphore.Count >= needCount)
+                {
+                    semaphore.Count -= needCount;
+                    TraceSemaphore($"host-wait-wake handle=0x{handle:X8} name='{semaphore.Name}' need={needCount} count={semaphore.Count}");
+                    return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
+                }
+
+                Monitor.Wait(semaphore.Gate);
+            }
+        }
+        finally
+        {
+            semaphore.WaitingThreads = Math.Max(0, semaphore.WaitingThreads - 1);
+        }
     }
 
     private static void TraceSemaphore(string message)

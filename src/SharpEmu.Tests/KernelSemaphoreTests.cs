@@ -10,7 +10,9 @@ namespace SharpEmu.Tests;
 
 /// <summary>
 /// sceKernelCreate/Poll/Signal/Cancel/DeleteSema semantics driven through the
-/// guest ABI. sceKernelWaitSema is excluded — it blocks on the guest scheduler.
+/// guest ABI. sceKernelWaitSema is exercised only on the host-blocking fallback
+/// path (a non-guest test thread cannot park in the guest scheduler); its
+/// scheduler-parking path is covered by the scheduler tests.
 /// </summary>
 public sealed class KernelSemaphoreTests
 {
@@ -68,6 +70,14 @@ public sealed class KernelSemaphoreTests
         ctx[CpuRegister.Rdi] = handle;
         ctx[CpuRegister.Rsi] = unchecked((ulong)(long)needCount);
         return (OrbisGen2Result)KernelSemaphoreCompatExports.KernelPollSema(ctx);
+    }
+
+    private static OrbisGen2Result Wait(CpuContext ctx, uint handle, int needCount, ulong timeoutAddress = 0)
+    {
+        ctx[CpuRegister.Rdi] = handle;
+        ctx[CpuRegister.Rsi] = unchecked((ulong)(long)needCount);
+        ctx[CpuRegister.Rdx] = timeoutAddress;
+        return (OrbisGen2Result)KernelSemaphoreCompatExports.KernelWaitSema(ctx);
     }
 
     private static OrbisGen2Result Signal(CpuContext ctx, uint handle, int signalCount)
@@ -225,6 +235,47 @@ public sealed class KernelSemaphoreTests
         Assert.Equal(OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND, Poll(ctx, handle, 1));
         Assert.Equal(OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND, Signal(ctx, handle, 1));
         Assert.Equal(OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND, Cancel(ctx, handle, 1));
+    }
+
+    [Fact]
+    public void Wait_HostThread_ReturnsImmediatelyWhenCountAvailable()
+    {
+        var ctx = NewContext();
+        var handle = CreateOk(ctx, initialCount: 2, maxCount: 2);
+
+        // Count already satisfies the request, so the wait completes without
+        // parking -- it never reaches the host-blocking fallback.
+        Assert.Equal(OrbisGen2Result.ORBIS_GEN2_OK, Wait(ctx, handle, 1));
+        Assert.Equal(OrbisGen2Result.ORBIS_GEN2_OK, Wait(ctx, handle, 1));
+        Assert.Equal(OrbisGen2Result.ORBIS_GEN2_ERROR_BUSY, Poll(ctx, handle, 1));
+    }
+
+    [Fact]
+    public async Task Wait_HostThread_BlocksUntilSignaled()
+    {
+        var ctx = NewContext();
+        var handle = CreateOk(ctx, initialCount: 0, maxCount: 1);
+
+        var waitResult = OrbisGen2Result.ORBIS_GEN2_ERROR_TRY_AGAIN;
+        var waitStarted = new ManualResetEventSlim(false);
+        var waiter = Task.Run(() =>
+        {
+            var waitCtx = NewContext();
+            waitStarted.Set();
+            waitResult = Wait(waitCtx, handle, 1);
+        });
+
+        Assert.True(waitStarted.Wait(TimeSpan.FromSeconds(2)));
+        // The whole point of the fix: an infinite wait must actually block a
+        // host thread, not return EAGAIN immediately.
+        var early = await Task.WhenAny(waiter, Task.Delay(TimeSpan.FromMilliseconds(150)));
+        Assert.NotSame(waiter, early);
+
+        Assert.Equal(OrbisGen2Result.ORBIS_GEN2_OK, Signal(ctx, handle, 1));
+        var woke = await Task.WhenAny(waiter, Task.Delay(TimeSpan.FromSeconds(5)));
+        Assert.Same(waiter, woke);
+        await waiter;
+        Assert.Equal(OrbisGen2Result.ORBIS_GEN2_OK, waitResult);
     }
 
     [Fact]
