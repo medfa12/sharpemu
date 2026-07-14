@@ -1063,18 +1063,19 @@ public sealed partial class DirectExecutionBackend
 	// if this path were genuinely reached with no valid object -- but on
 	// real hardware it normally isn't, because some earlier step we don't
 	// yet emulate would have populated the field. Rather than hard-crash,
-	// this narrowly recognizes the single `REX.W mov r64, [r64]` pattern
-	// (opcode 0x8B, mod=00, no SIB/RIP-relative operand -- i.e. plain
-	// register-indirect with zero displacement) reading through a near-null
-	// pointer, synthesizes "the read returned 0" by zeroing the destination
-	// register, and steps over the 3-byte instruction. This mirrors a
-	// documented compatibility technique used by several console emulators
-	// (a backed "zero page" for near-null reads) without actually mapping
-	// guest memory at address 0, which Windows will not allow. Deliberately
-	// narrow: only READ access, only this one exact encoding, only when the
-	// faulting address itself is near-null -- a write or execute fault at
-	// the same address is a materially different, more serious bug class
-	// and is left to crash normally.
+	// this narrowly recognizes the `REX.W mov r64, [r64]` / `REX.W mov r64,
+	// [r64+disp8]` pattern (opcode 0x8B, mod=00 or mod=01, no SIB/
+	// RIP-relative operand -- i.e. plain register-indirect with zero or an
+	// 8-bit displacement) reading through a near-null pointer, synthesizes
+	// "the read returned 0" by zeroing the destination register, and steps
+	// over the instruction. This mirrors a documented compatibility
+	// technique used by several console emulators (a backed "zero page" for
+	// near-null reads) without actually mapping guest memory at address 0,
+	// which Windows will not allow. Deliberately narrow: only READ access,
+	// only this one exact encoding family, only when the faulting address
+	// itself is near-null -- a write or execute fault at the same address is
+	// a materially different, more serious bug class and is left to crash
+	// normally.
 	private const ulong NearNullGuardLimit = 0x10000UL;
 
 	private static unsafe bool TryHandleNullFieldLoad(EXCEPTION_RECORD* exceptionRecord, void* contextRecord, ulong rip)
@@ -1113,12 +1114,26 @@ public sealed partial class DirectExecutionBackend
 		int mod = (modRm >> 6) & 0x3;
 		int reg = (modRm >> 3) & 0x7;
 		int rm = modRm & 0x7;
-		if (mod != 0 || rm == 0x4 || rm == 0x5)
+		if (mod > 1 || rm == 0x4 || (mod == 0 && rm == 0x5))
 		{
-			// Only bare [reg] addressing (no SIB byte, no RIP-relative, no
-			// displacement) is handled -- anything else needs a fuller
-			// decoder this narrow check deliberately does not attempt.
+			// Only [reg] / [reg+disp8] addressing (no SIB byte, no
+			// RIP-relative, no disp32) is handled -- anything else needs a
+			// fuller decoder this narrow check deliberately does not
+			// attempt.
 			return false;
+		}
+
+		int instructionLength = 3;
+		long disp = 0;
+		if (mod == 1)
+		{
+			if (!IsHostRangeReadable(rip, 4))
+			{
+				return false;
+			}
+
+			disp = *(sbyte*)(rip + 3);
+			instructionLength = 4;
 		}
 
 		bool rexR = (rexByte & 0x4) != 0;
@@ -1127,10 +1142,11 @@ public sealed partial class DirectExecutionBackend
 		int sourceRegister = rm | (rexB ? 0x8 : 0);
 
 		ulong sourceValue = ReadCtxU64(contextRecord, GpRegisterContextOffsets[sourceRegister]);
-		if (sourceValue != target)
+		if (unchecked((ulong)((long)sourceValue + disp)) != target)
 		{
 			// Sanity check: the register we decoded as the memory operand's
-			// base must actually hold the address that faulted.
+			// base (plus any displacement) must actually hold the address
+			// that faulted.
 			return false;
 		}
 
@@ -1139,7 +1155,7 @@ public sealed partial class DirectExecutionBackend
 		Console.Error.Flush();
 
 		WriteCtxU64(contextRecord, GpRegisterContextOffsets[destRegister], 0);
-		WriteCtxU64(contextRecord, 248, rip + 3);
+		WriteCtxU64(contextRecord, 248, rip + (ulong)instructionLength);
 		return true;
 	}
 
