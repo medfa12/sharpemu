@@ -460,6 +460,23 @@ public static class SaveDataExports
         return ctx.SetReturn(0);
     }
 
+    [SysAbiExport(
+        Nid = "WAzWTZm1H+I",
+        ExportName = "sceSaveDataTransferringMount",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceSaveData")]
+    public static int SaveDataTransferringMount(CpuContext ctx)
+    {
+        // No transferable (PS4) save data exists in the emulator: report
+        // NOT_FOUND so the game takes its no-transfer path instead of a
+        // kernel-space 0x80020002 its libSceSaveData wrappers were not
+        // written to interpret. The mount-result output (rsi) is
+        // intentionally left unwritten on this failure path.
+        TraceSaveData(
+            $"transferring_mount mount=0x{ctx[CpuRegister.Rdi]:X} result=0x{ctx[CpuRegister.Rsi]:X} -> NOT_FOUND");
+        return ctx.SetReturn(OrbisSaveDataErrorNotFound);
+    }
+
     private static bool TryReadMemoryData(CpuContext ctx, ulong address, out MemoryData data)
     {
         data = default;

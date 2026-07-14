@@ -129,6 +129,10 @@ public sealed partial class DirectExecutionBackend
 			{
 				return -1;
 			}
+			if (exceptionCode == 3221225501u && TryHandleSse4aInstruction(contextRecord, rip))
+			{
+				return -1;
+			}
 			if (IsBenignHostDebugException(exceptionCode))
 			{
 				return -1;
@@ -1391,6 +1395,132 @@ public sealed partial class DirectExecutionBackend
 
 		WriteCtxU64(contextRecord, 248, rip + (ulong)index);
 		return true;
+	}
+
+	private static int _sse4aEmulatedLogCount;
+
+	// SSE4A EXTRQ/INSERTQ emulation. Guest code is compiled for the PS5's
+	// Zen 2 and legally uses AMD-only SSE4A bit-field instructions that
+	// raise #UD (0xC000001D) on Intel hosts -- Astro Bot hits EXTRQ
+	// (66 0F 78 C2 28 00) at 0x80047F43B in its RGBA8 color-unpack path.
+	// Emulates all four encodings and resumes, mirroring shadPS4's
+	// cpu_patches.cpp behavior on non-AMD hosts.
+	private static unsafe bool TryHandleSse4aInstruction(void* contextRecord, ulong rip)
+	{
+		if (rip < 65536 || rip >= 140737488355328L || !IsHostRangeReadable(rip, 8))
+		{
+			return false;
+		}
+
+		byte* code = (byte*)rip;
+		int index = 0;
+		byte prefix = code[index++];
+		if (prefix != 0x66 && prefix != 0xF2)
+		{
+			return false;
+		}
+
+		byte rex = 0;
+		if (code[index] >= 0x40 && code[index] <= 0x4F)
+		{
+			rex = code[index];
+			index++;
+		}
+
+		if (code[index] != 0x0F)
+		{
+			return false;
+		}
+		index++;
+
+		byte opcode = code[index];
+		if (opcode != 0x78 && opcode != 0x79)
+		{
+			return false;
+		}
+		index++;
+
+		byte modRm = code[index];
+		index++;
+		if ((modRm >> 6) != 0x3)
+		{
+			// EXTRQ/INSERTQ only exist as register-register forms.
+			return false;
+		}
+
+		bool isInsert = prefix == 0xF2;
+		int regField = ((modRm >> 3) & 0x7) | (((rex & 0x4) != 0) ? 8 : 0);
+		int rmField = (modRm & 0x7) | (((rex & 0x1) != 0) ? 8 : 0);
+		if (!isInsert && opcode == 0x78 && ((modRm >> 3) & 0x7) != 0)
+		{
+			// EXTRQ immediate form is 66 0F 78 /0 -- reg field is an opcode extension.
+			return false;
+		}
+
+		int len;
+		int idx;
+		int dstXmm;
+		int srcXmm;
+		if (opcode == 0x78)
+		{
+			// Immediate forms: modrm is followed by imm8 length, imm8 index.
+			len = code[index] & 0x3F;
+			idx = code[index + 1] & 0x3F;
+			index += 2;
+			dstXmm = isInsert ? regField : rmField;
+			srcXmm = rmField;
+		}
+		else
+		{
+			// Register forms: length/index come from the source register.
+			dstXmm = regField;
+			srcXmm = rmField;
+			ulong* selector = XmmContextSlot(contextRecord, srcXmm);
+			if (isInsert)
+			{
+				// INSERTQ xmm1, xmm2: length = xmm2[69:64], index = xmm2[77:72].
+				len = (int)(selector[1] & 0x3F);
+				idx = (int)((selector[1] >> 8) & 0x3F);
+			}
+			else
+			{
+				// EXTRQ xmm1, xmm2: length = xmm2[5:0], index = xmm2[13:8].
+				len = (int)(selector[0] & 0x3F);
+				idx = (int)((selector[0] >> 8) & 0x3F);
+			}
+		}
+
+		// Per AMD APM: a length field of 0 selects 64 bits.
+		ulong mask = len == 0 ? ulong.MaxValue : (1UL << len) - 1;
+		ulong* dst = XmmContextSlot(contextRecord, dstXmm);
+		if (isInsert)
+		{
+			ulong* src = XmmContextSlot(contextRecord, srcXmm);
+			dst[0] = (dst[0] & ~(mask << idx)) | ((src[0] & mask) << idx);
+		}
+		else
+		{
+			dst[0] = (dst[0] >> idx) & mask;
+		}
+
+		if (_sse4aEmulatedLogCount < 16 && ++_sse4aEmulatedLogCount <= 16)
+		{
+			Console.Error.WriteLine(
+				$"[LOADER][WARN] SSE4A {(isInsert ? "INSERTQ" : "EXTRQ")} emulated at rip=0x{rip:X16} len={(len == 0 ? 64 : len)} idx={idx}");
+			Console.Error.Flush();
+		}
+
+		WriteCtxU64(contextRecord, 248, rip + (ulong)index);
+		return true;
+	}
+
+	// Xmm0 lives at offset 0x1A0 in the amd64 CONTEXT record: this file
+	// already indexes the same CONTEXT layout raw (Rax=0x78, Rsp=0x98,
+	// Rip=0xF8, EFlags=0x44); FltSave (XSAVE_FORMAT) is at 0x100 and
+	// XmmRegisters at 0xA0 within it, 16 bytes per register.
+	private static unsafe ulong* XmmContextSlot(void* contextRecord, int register)
+	{
+		return (ulong*)((byte*)contextRecord + 0x1A0 + register * 16);
 	}
 
 	private static unsafe bool TryReadGuestAssertMessage(ulong address, out string message)
