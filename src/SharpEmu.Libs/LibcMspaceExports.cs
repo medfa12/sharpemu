@@ -58,9 +58,23 @@ public static class LibcMspaceExports
     // access violation inside the title's own allocator wrapper.
     private static int _traceBudget = 16;
 
+    // Stats calls are rare and often feed title-side heap sizing decisions, so
+    // they get their own budget instead of competing with per-malloc tracing.
+    private static int _statsTraceBudget = 64;
+
     private static void Trace(string message)
     {
         if (Interlocked.Decrement(ref _traceBudget) < 0)
+        {
+            return;
+        }
+
+        Console.Error.WriteLine($"[LOADER][INFO] mspace.{message}");
+    }
+
+    private static void TraceStats(string message)
+    {
+        if (Interlocked.Decrement(ref _statsTraceBudget) < 0)
         {
             return;
         }
@@ -84,7 +98,7 @@ public static class LibcMspaceExports
         }
 
         _arenas[baseAddress] = new MspaceArena(baseAddress, capacity);
-        Trace($"create base=0x{baseAddress:X} capacity=0x{capacity:X}");
+        TraceStats($"create base=0x{baseAddress:X} capacity=0x{capacity:X}");
         return ReturnPointer(ctx, baseAddress);
     }
 
@@ -280,6 +294,7 @@ public static class LibcMspaceExports
                  ctx.TryWriteUInt64(statsAddress + 0x10, arena.Capacity) &&
                  ctx.TryWriteUInt64(statsAddress + 0x18, peak) &&
                  ctx.TryWriteUInt64(statsAddress + 0x20, used);
+        TraceStats($"stats mspace=0x{mspace:X} capacity=0x{arena.Capacity:X} peak=0x{peak:X} used=0x{used:X}");
         return ok
             ? ctx.SetReturn(0)
             : ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);

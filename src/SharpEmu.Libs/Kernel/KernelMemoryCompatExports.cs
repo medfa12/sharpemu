@@ -109,6 +109,14 @@ public static class KernelMemoryCompatExports
     private static readonly ConcurrentDictionary<string, ulong> _aprFileSizeCache = new(StringComparer.OrdinalIgnoreCase);
     private static long _nextFileDescriptor = 2;
     private static ulong _nextPhysicalAddress;
+
+    // Emulator-chosen guest addresses (HLE scratch objects, hint-less
+    // mappings) live far above the game-managed ranges. Titles compute pool
+    // addresses relative to their own direct-memory mappings and expect the
+    // space right after a mapping to stay free for the next one, exactly as
+    // the real kernel lays them out; a foreign allocation squatting there
+    // shifts relocated mappings and poisons the game's derived pointers.
+    private const ulong EmulatorChosenAddressBase = 0x6000_0000_0000UL;
     private static ulong _nextVirtualAddress;
     private static ulong _mainDirectMemoryPoolBase = UnsetMainDirectMemoryPoolBase;
     private static ulong _allocatedFlexibleBytes;
@@ -198,7 +206,7 @@ public static class KernelMemoryCompatExports
         lock (_memoryGate)
         {
             var desiredAddress = AlignUp(
-                _nextVirtualAddress == 0 ? 0x1_0000_0000UL : _nextVirtualAddress,
+                _nextVirtualAddress == 0 ? EmulatorChosenAddressBase : _nextVirtualAddress,
                 effectiveAlignment);
             if (!TryReserveGuestVirtualRange(ctx, desiredAddress, mappedLength, OrbisProtCpuReadWrite, effectiveAlignment, out address) ||
                 address == 0)
@@ -2272,6 +2280,12 @@ public static class KernelMemoryCompatExports
                 return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
             }
 
+            if (ShouldTraceDirectMemory())
+            {
+                Console.Error.WriteLine(
+                    $"[LOADER][TRACE] dmem_available_range: search=[0x{searchStart:X16},0x{searchEnd:X16}) align=0x{alignment:X} candidate=0x{candidate:X16} size=0x{rangeAvailable:X16}");
+            }
+
             return (int)OrbisGen2Result.ORBIS_GEN2_OK;
         }
 
@@ -2284,6 +2298,11 @@ public static class KernelMemoryCompatExports
         if (!ctx.TryWriteUInt64(outSizeAddress, totalAvailable))
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        if (ShouldTraceDirectMemory())
+        {
+            Console.Error.WriteLine($"[LOADER][TRACE] dmem_available_total: available=0x{totalAvailable:X16}");
         }
 
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
@@ -2654,7 +2673,7 @@ public static class KernelMemoryCompatExports
                 ? requestedAddress
                 : directMemoryStart != 0
                     ? AlignUp(directMemoryStart, effectiveAlignment)
-                    : AlignUp(_nextVirtualAddress == 0 ? 0x1_0000_0000UL : _nextVirtualAddress, effectiveAlignment);
+                    : AlignUp(_nextVirtualAddress == 0 ? EmulatorChosenAddressBase : _nextVirtualAddress, effectiveAlignment);
 
             var reserved = false;
             if (fixedMapping && requestedAddress != 0)
@@ -2700,7 +2719,6 @@ public static class KernelMemoryCompatExports
                 return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
             }
 
-            _nextVirtualAddress = Math.Max(_nextVirtualAddress, mappedAddress + length);
             _mappedRegions[mappedAddress] = new MappedRegion(
                 mappedAddress,
                 length,
@@ -2760,7 +2778,7 @@ public static class KernelMemoryCompatExports
             var fixedMapping = (flags & 0x10UL) != 0;
             var desiredAddress = requestedAddress != 0
                 ? requestedAddress
-                : AlignUp(_nextVirtualAddress == 0 ? 0x1_0000_0000UL : _nextVirtualAddress, 0x1000UL);
+                : AlignUp(_nextVirtualAddress == 0 ? EmulatorChosenAddressBase : _nextVirtualAddress, 0x1000UL);
 
             if (fixedMapping && requestedAddress != 0)
             {
@@ -2790,7 +2808,6 @@ public static class KernelMemoryCompatExports
                 return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
             }
 
-            _nextVirtualAddress = Math.Max(_nextVirtualAddress, mappedAddress + length);
             _allocatedFlexibleBytes = Math.Min(FlexibleMemorySizeBytes, _allocatedFlexibleBytes + length);
             _mappedRegions[mappedAddress] = new MappedRegion(
                 mappedAddress,
@@ -2942,6 +2959,12 @@ public static class KernelMemoryCompatExports
         {
             if (!TryFindVirtualQueryRegionLocked(queryAddress, findNext: (flags & 0x1) != 0, out region))
             {
+                if (ShouldTraceDirectMemory())
+                {
+                    Console.Error.WriteLine(
+                        $"[LOADER][TRACE] virtual_query: addr=0x{queryAddress:X16} flags=0x{flags:X} NOT_FOUND");
+                }
+
                 return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
             }
 
@@ -2957,6 +2980,11 @@ public static class KernelMemoryCompatExports
         var regionEnd = TryAddU64(region.Address, region.Length, out var exclusiveEnd)
             ? exclusiveEnd
             : ulong.MaxValue;
+        if (ShouldTraceDirectMemory())
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][TRACE] virtual_query: addr=0x{queryAddress:X16} flags=0x{flags:X} region=[0x{region.Address:X16},0x{regionEnd:X16}) direct=0x{region.DirectStart:X16}");
+        }
         var stateFlags = 0u;
         if (region.IsFlexible)
         {
@@ -3039,8 +3067,19 @@ public static class KernelMemoryCompatExports
                     return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
                 }
 
+                if (ShouldTraceDirectMemory())
+                {
+                    Console.Error.WriteLine(
+                        $"[LOADER][TRACE] query_protection: addr=0x{queryAddress:X16} region=[0x{region.Address:X16},0x{region.Address + region.Length:X16}) prot=0x{region.Protection:X}");
+                }
+
                 return (int)OrbisGen2Result.ORBIS_GEN2_OK;
             }
+        }
+
+        if (ShouldTraceDirectMemory())
+        {
+            Console.Error.WriteLine($"[LOADER][TRACE] query_protection: addr=0x{queryAddress:X16} NOT_FOUND");
         }
 
         return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
@@ -3078,8 +3117,19 @@ public static class KernelMemoryCompatExports
                     return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
                 }
 
+                if (ShouldTraceDirectMemory())
+                {
+                    Console.Error.WriteLine(
+                        $"[LOADER][TRACE] dmem_query: offset=0x{offset:X16} start=0x{block.Start:X16} end=0x{block.Start + block.Length:X16} type=0x{block.MemoryType:X}");
+                }
+
                 return (int)OrbisGen2Result.ORBIS_GEN2_OK;
             }
+        }
+
+        if (ShouldTraceDirectMemory())
+        {
+            Console.Error.WriteLine($"[LOADER][TRACE] dmem_query: offset=0x{offset:X16} NOT_FOUND");
         }
 
         return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
@@ -4090,7 +4140,7 @@ public static class KernelMemoryCompatExports
         var effectiveAlignment = alignment == 0 ? 0x1000UL : alignment;
         if (_nextVirtualAddress == 0)
         {
-            _nextVirtualAddress = 0x0100_0000UL;
+            _nextVirtualAddress = EmulatorChosenAddressBase;
         }
 
         var probeCandidates = new[]
