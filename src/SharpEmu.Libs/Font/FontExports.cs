@@ -71,8 +71,9 @@ public static class FontExports
         Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceFont")]
     public static int FontOpenFontMemory(CpuContext ctx)
     {
-        // Out-handle is the trailing pointer argument; probe the likely slots.
-        _ = TryHandOutHandleProbed(ctx);
+        // (library, void* memory, size, options, OrbisFontHandle* out) -> out in R8,
+        // confirmed at the game's call site (mov r8,<slot>; mov [slot],0 first).
+        _ = TryHandOutHandle(ctx, ctx[CpuRegister.R8], out _);
         ctx[CpuRegister.Rax] = 0;
         return 0;
     }
@@ -81,7 +82,9 @@ public static class FontExports
         Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceFont")]
     public static int FontOpenFontInstance(CpuContext ctx)
     {
-        _ = TryHandOutHandleProbed(ctx);
+        // (library, openDetail, OrbisFontHandle* out) -> out in RDX, confirmed at
+        // the call site (mov rdx,<slot>; xor esi,esi).
+        _ = TryHandOutHandle(ctx, ctx[CpuRegister.Rdx], out _);
         ctx[CpuRegister.Rax] = 0;
         return 0;
     }
@@ -90,29 +93,11 @@ public static class FontExports
         Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceFont")]
     public static int FontOpenFontSet(CpuContext ctx)
     {
-        _ = TryHandOutHandleProbed(ctx);
+        // (library, fontSet, mode, options, OrbisFontHandle* out) -> out in R8,
+        // confirmed at the call site (mov r8,<slot>; mov [slot],0 first).
+        _ = TryHandOutHandle(ctx, ctx[CpuRegister.R8], out _);
         ctx[CpuRegister.Rax] = 0;
         return 0;
-    }
-
-    // Open* calls put the out-handle in a trailing argument whose position
-    // varies; write to the first argument register that points at a writable
-    // 8-byte guest slot. Guarded by TryWriteUInt64, so a miss is harmless.
-    private static bool TryHandOutHandleProbed(CpuContext ctx)
-    {
-        foreach (var reg in new[] { CpuRegister.R9, CpuRegister.R8, CpuRegister.Rcx })
-        {
-            var candidate = ctx[reg];
-            if (candidate != 0 && ctx.TryReadUInt64(candidate, out _))
-            {
-                if (TryHandOutHandle(ctx, candidate, out _))
-                {
-                    return true;
-                }
-            }
-        }
-
-        return false;
     }
 
     // Everything below sets up render state, queries layout, or tears objects
