@@ -171,6 +171,7 @@ internal static unsafe class VulkanVideoPresenter
     private static readonly Dictionary<ulong, uint> _gpuGuestImages = new();
     private static readonly HashSet<(ulong Address, uint Width, uint Height)>
         _tracedGuestImageSubmissions = [];
+    private static readonly HashSet<ulong> _dumpedFailedDrawShaders = [];
     private static Thread? _thread;
     private static Presentation? _latestPresentation;
     private static byte[]? _copyFragmentSpirv;
@@ -4674,6 +4675,27 @@ internal static unsafe class VulkanVideoPresenter
                 Console.Error.WriteLine(
                     $"[LOADER][ERROR] Vulkan offscreen draw failed " +
                     $"addr=0x{work.Target.Address:X16}: {exception.Message}");
+
+                // Dump the offending SPIR-V once per distinct shader so a failing
+                // translation can be disassembled/validated offline. Base64 keeps
+                // it inside the (uploaded) stderr log without touching disk.
+                bool firstFailure;
+                lock (_gate)
+                {
+                    firstFailure = _dumpedFailedDrawShaders.Add(work.Target.Address);
+                }
+
+                if (firstFailure)
+                {
+                    Console.Error.WriteLine(
+                        $"[LOADER][SPIRVDUMP] addr=0x{work.Target.Address:X16} " +
+                        $"vs_bytes={work.Draw.VertexSpirv.Length} " +
+                        $"ps_bytes={work.Draw.PixelSpirv.Length}");
+                    Console.Error.WriteLine(
+                        $"[LOADER][SPIRVDUMP] addr=0x{work.Target.Address:X16} vs_b64={Convert.ToBase64String(work.Draw.VertexSpirv)}");
+                    Console.Error.WriteLine(
+                        $"[LOADER][SPIRVDUMP] addr=0x{work.Target.Address:X16} ps_b64={Convert.ToBase64String(work.Draw.PixelSpirv)}");
+                }
             }
             finally
             {
