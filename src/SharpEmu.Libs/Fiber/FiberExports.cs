@@ -673,6 +673,7 @@ public static class FiberExports
 
         var stackEnd = fields.ContextAddress + fields.ContextSize;
         var entryRsp = (stackEnd & ~15UL) - sizeof(ulong);
+        EnsureFiberStackCommitted(ctx, fields.ContextAddress, fields.ContextSize);
         if (!ctx.TryWriteUInt64(entryRsp, 0))
         {
             return false;
@@ -875,6 +876,33 @@ public static class FiberExports
             flags,
             name);
         return true;
+    }
+
+    // The fiber runs natively with RSP inside this context buffer, which
+    // games commonly carve from reserve-only pools the emulator otherwise
+    // backs lazily on the guest's own fault. Only entryRsp (one qword at the
+    // top) is ever touched before the fiber starts, so a stack push into the
+    // untouched remainder faults while RSP itself is on unbacked memory --
+    // the host OS then cannot even deliver the exception (it needs to write
+    // the dispatch frame below RSP first) and the process dies silently
+    // before any handler runs. Touch every page now so the whole stack is
+    // committed before the first switch onto it. Reads route through the
+    // host memory layer's own commit-on-demand path, so this backs the
+    // range without altering its contents.
+    private static void EnsureFiberStackCommitted(CpuContext ctx, ulong contextAddress, ulong contextSize)
+    {
+        if (contextAddress == 0 || contextSize == 0)
+        {
+            return;
+        }
+
+        var page = contextAddress & ~0xFFFUL;
+        var end = contextAddress + contextSize;
+        while (page < end)
+        {
+            _ = ctx.TryReadByte(page, out _);
+            page += 0x1000;
+        }
     }
 
     private static void FillContextSizeCheck(CpuContext ctx, ulong address, ulong size)
