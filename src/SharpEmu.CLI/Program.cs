@@ -136,6 +136,16 @@ internal static partial class Program
             return childExitCode;
         }
 
+        // Optional RenderDoc capture: load renderdoc.dll now (before the Vulkan
+        // instance is created inside runtime.Run) so its capture layer activates
+        // in this process, which is where the guest drives the GPU.
+        if (string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_RENDERDOC"), "1", StringComparison.Ordinal))
+        {
+            SharpEmu.Libs.VideoOut.RenderDocCapture.Initialize(
+                Environment.GetEnvironmentVariable("SHARPEMU_RENDERDOC_DLL") ?? "renderdoc.dll",
+                Environment.GetEnvironmentVariable("SHARPEMU_RENDERDOC_CAPTURE") ?? "sharpemu_capture");
+        }
+
         if (!TryParseArguments(args, out var ebootPath, out var runtimeOptions, out var logLevel, out var logFilePath))
         {
             PrintUsage();

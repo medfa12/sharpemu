@@ -1913,6 +1913,15 @@ internal static unsafe class VulkanVideoPresenter
         private bool _tracedPresentedSwapchain;
         private int _swapchainCaptureCount;
         private long _totalPresentCount;
+        // Fire a RenderDoc capture at the first present after this many seconds.
+        // Time-based (not present-count based) because the guest flips rarely, so
+        // a fixed frame index would never be reached; a delay reliably lands on a
+        // present after the menu has had time to render.
+        private static readonly double RenderDocCaptureDelaySeconds =
+            double.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_RENDERDOC_DELAY"), out var d) && d > 0
+                ? d
+                : 60;
+        private static readonly System.Diagnostics.Stopwatch RenderDocClock = new();
         private int _frameDumpBudget = 6;
         private bool _swapchainReadbackPending;
         private bool _deviceLost;
@@ -2029,6 +2038,13 @@ internal static unsafe class VulkanVideoPresenter
             public GuestImageResource? GuestImage;
             public ulong CpuContentFingerprint;
             public bool UpdatesCpuContent;
+            // When set, this texture's content is produced on the GPU by an
+            // earlier pass (a compute ImageStore / render target) at the same
+            // guest address that could not be view-aliased into the sampled
+            // format. Instead of uploading empty guest memory, the recorder
+            // blits/copies from this producer image into our own image, so the
+            // sampler reads real GPU content (Kyty-style copy-on-sample bridge).
+            public GuestImageResource? CopySource;
         }
 
         private sealed class GlobalBufferResource
@@ -7379,7 +7395,9 @@ internal static unsafe class VulkanVideoPresenter
                         $"nonzero_bytes={nonzeroBytes}/{byteCount} " +
                         $"nonblack_pixels={nonblackPixels}/{(ulong)image.Width * image.Height} " +
                         $"center={center} hash=0x{hash:X16}");
-                    if (nonblackPixels > 0 && image.Format == Format.R8G8B8A8Unorm)
+                    var isRgba8 = image.Format == Format.R8G8B8A8Unorm;
+                    var isHdr16 = image.Format == Format.R16G16B16A16Sfloat;
+                    if (nonblackPixels > 0 && (isRgba8 || isHdr16))
                     {
                         const int outWidth = 960;
                         const int outHeight = 540;
@@ -7392,11 +7410,26 @@ internal static unsafe class VulkanVideoPresenter
                             for (var ox = 0; ox < outWidth; ox++)
                             {
                                 var sx = ox * srcW / outWidth;
-                                var si = (sy * srcW + sx) * 4;
                                 var di = (oy * outWidth + ox) * 3;
-                                rgb[di] = bytes[si];
-                                rgb[di + 1] = bytes[si + 1];
-                                rgb[di + 2] = bytes[si + 2];
+                                if (isRgba8)
+                                {
+                                    var si = (sy * srcW + sx) * 4;
+                                    rgb[di] = bytes[si];
+                                    rgb[di + 1] = bytes[si + 1];
+                                    rgb[di + 2] = bytes[si + 2];
+                                }
+                                else
+                                {
+                                    var si = (sy * srcW + sx) * 8;
+                                    for (var c = 0; c < 3; c++)
+                                    {
+                                        var h = BitConverter.UInt16BitsToHalf(
+                                            BitConverter.ToUInt16(bytes.Slice(si + c * 2, 2)));
+                                        var v = (float)h;
+                                        v = v <= 0f ? 0f : v >= 1f ? 1f : v;
+                                        rgb[di + c] = (byte)(v * 255f + 0.5f);
+                                    }
+                                }
                             }
                         }
 
@@ -8180,6 +8213,18 @@ internal static unsafe class VulkanVideoPresenter
             GuestImageResource source)
         {
             _totalPresentCount++;
+            if (RenderDocCapture.IsActive)
+            {
+                if (!RenderDocClock.IsRunning)
+                {
+                    RenderDocClock.Start();
+                }
+                else if (RenderDocClock.Elapsed.TotalSeconds >= RenderDocCaptureDelaySeconds)
+                {
+                    RenderDocCapture.TriggerNextFrame();
+                }
+            }
+
             var traceDestination =
                 ShouldTracePresentedGuestImageContentsForDiagnostics() &&
                 _swapchainCaptureCount < 80 &&
