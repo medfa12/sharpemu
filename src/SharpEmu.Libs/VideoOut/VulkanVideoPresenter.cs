@@ -1165,6 +1165,7 @@ internal static unsafe class VulkanVideoPresenter
         private readonly VulkanDeviceMemoryLedger _deviceMemoryLedger = new();
         private PhysicalDeviceMemoryProperties _memoryProperties;
         private int _deviceLocalHeapIndex = -1;
+        private int _hostVisibleHeapIndex = -1;
         private bool _supportsMemoryBudget;
         private ulong _useStamp;
         private bool _reclaimInProgress;
@@ -1190,6 +1191,13 @@ internal static unsafe class VulkanVideoPresenter
         private readonly Dictionary<HostBufferPoolKey, Stack<HostBufferAllocation>>
             _hostBufferPool = new();
         private readonly Dictionary<ulong, HostBufferAllocation> _hostBufferAllocations = new();
+        private readonly object _hostBufferPoolGate = new();
+        private ulong _pooledHostBufferBytes;
+
+        // Idle (recycled, not in flight) host-visible bytes to retain. Beyond
+        // this the buffer is destroyed instead of pooled. In-flight buffers are
+        // additionally bounded by MaxInFlightGuestSubmissions.
+        private const ulong MaxPooledHostBufferBytes = 768UL * 1024 * 1024;
         private readonly Queue<PendingGuestSubmission> _pendingGuestSubmissions = new();
 
         private readonly record struct GraphicsPipelineKey(
@@ -1987,33 +1995,44 @@ internal static unsafe class VulkanVideoPresenter
             _memoryProperties = properties;
             var heaps = &properties.MemoryHeaps.Element0;
             ulong heapBytes = 0;
+            ulong hostHeapBytes = 0;
             for (var index = 0; index < (int)properties.MemoryHeapCount; index++)
             {
-                if ((heaps[index].Flags & MemoryHeapFlags.DeviceLocalBit) != 0 &&
-                    heaps[index].Size > heapBytes)
+                var deviceLocalHeap =
+                    (heaps[index].Flags & MemoryHeapFlags.DeviceLocalBit) != 0;
+                if (deviceLocalHeap && heaps[index].Size > heapBytes)
                 {
                     _deviceLocalHeapIndex = index;
                     heapBytes = heaps[index].Size;
+                }
+                else if (!deviceLocalHeap && heaps[index].Size > hostHeapBytes)
+                {
+                    _hostVisibleHeapIndex = index;
+                    hostHeapBytes = heaps[index].Size;
                 }
             }
 
             _supportsMemoryBudget = _vk.IsDeviceExtensionPresent(
                 _physicalDevice,
                 "VK_EXT_memory_budget");
-            var budget = heapBytes;
-            ulong driverUsage = 0;
-            if (_supportsMemoryBudget && _deviceLocalHeapIndex >= 0)
+            var budgetProperties = new PhysicalDeviceMemoryBudgetPropertiesEXT
             {
-                var budgetProperties = new PhysicalDeviceMemoryBudgetPropertiesEXT
-                {
-                    SType = StructureType.PhysicalDeviceMemoryBudgetPropertiesExt,
-                };
+                SType = StructureType.PhysicalDeviceMemoryBudgetPropertiesExt,
+            };
+            if (_supportsMemoryBudget)
+            {
                 var properties2 = new PhysicalDeviceMemoryProperties2
                 {
                     SType = StructureType.PhysicalDeviceMemoryProperties2,
                     PNext = &budgetProperties,
                 };
                 _vk.GetPhysicalDeviceMemoryProperties2(_physicalDevice, &properties2);
+            }
+
+            var budget = heapBytes;
+            ulong driverUsage = 0;
+            if (_supportsMemoryBudget && _deviceLocalHeapIndex >= 0)
+            {
                 var driverBudget = budgetProperties.HeapBudget[_deviceLocalHeapIndex];
                 if (driverBudget != 0)
                 {
@@ -2023,19 +2042,66 @@ internal static unsafe class VulkanVideoPresenter
                 driverUsage = budgetProperties.HeapUsage[_deviceLocalHeapIndex];
             }
 
-            // Keep live device-local usage below 80% of the effective budget so
-            // driver-internal and swapchain allocations still fit.
+            var hostBudget = hostHeapBytes;
+            if (_supportsMemoryBudget && _hostVisibleHeapIndex >= 0)
+            {
+                var driverBudget = budgetProperties.HeapBudget[_hostVisibleHeapIndex];
+                if (driverBudget != 0)
+                {
+                    hostBudget = Math.Min(hostBudget, driverBudget);
+                }
+            }
+
+            // Keep live usage below 80% of each heap's effective budget so
+            // driver-internal and swapchain allocations still fit. On UMA
+            // devices every heap is device-local, so hostBudget stays zero and
+            // the host-visible check is disabled; the heap-based classifier
+            // then routes every allocation into the device-local budget.
             _deviceMemoryLedger.BudgetBytes = budget * 8 / 10;
+            _deviceMemoryLedger.HostVisibleBudgetBytes = hostBudget * 8 / 10;
             Console.Error.WriteLine(
                 $"[LOADER][VKMEM] device-local heap={heapBytes / (1024 * 1024)}MB " +
                 $"driver_budget={budget / (1024 * 1024)}MB " +
                 $"driver_usage={driverUsage / (1024 * 1024)}MB " +
                 $"cap={_deviceMemoryLedger.BudgetBytes / (1024 * 1024)}MB " +
+                $"host-visible heap={hostHeapBytes / (1024 * 1024)}MB " +
+                $"cap={_deviceMemoryLedger.HostVisibleBudgetBytes / (1024 * 1024)}MB " +
                 $"budget_ext={_supportsMemoryBudget}");
+
+            // Full heap/type breakdown so heap exhaustion is diagnosable (the
+            // summary above only covers the largest heap of each kind).
+            for (var index = 0; index < (int)properties.MemoryHeapCount; index++)
+            {
+                var line =
+                    $"[LOADER][VKMEM] heap[{index}] " +
+                    $"size={heaps[index].Size / (1024 * 1024)}MB " +
+                    $"flags={heaps[index].Flags}";
+                if (_supportsMemoryBudget)
+                {
+                    line +=
+                        $" budget={budgetProperties.HeapBudget[index] / (1024 * 1024)}MB" +
+                        $" usage={budgetProperties.HeapUsage[index] / (1024 * 1024)}MB";
+                }
+
+                Console.Error.WriteLine(line);
+            }
+
+            var memoryTypes = &properties.MemoryTypes.Element0;
+            for (var index = 0; index < (int)properties.MemoryTypeCount; index++)
+            {
+                Console.Error.WriteLine(
+                    $"[LOADER][VKMEM] type[{index}] heap={memoryTypes[index].HeapIndex} " +
+                    $"flags={memoryTypes[index].PropertyFlags}");
+            }
         }
 
         private bool IsDeviceLocalMemoryType(uint memoryTypeIndex)
         {
+            // Classify by the heap the type allocates from, not the type's own
+            // property flags: a DeviceLocal|HostVisible (BAR) type consumes the
+            // device-local heap while HostVisible|HostCoherent staging types
+            // consume the system-RAM heap, and it is heaps that run out. The
+            // heap decides which budget the allocation counts against.
             var properties = _memoryProperties;
             if (memoryTypeIndex >= properties.MemoryTypeCount)
             {
@@ -2043,8 +2109,9 @@ internal static unsafe class VulkanVideoPresenter
             }
 
             var memoryTypes = &properties.MemoryTypes.Element0;
-            return (memoryTypes[memoryTypeIndex].PropertyFlags &
-                    MemoryPropertyFlags.DeviceLocalBit) != 0;
+            var heaps = &properties.MemoryHeaps.Element0;
+            var heapIndex = (int)memoryTypes[memoryTypeIndex].HeapIndex;
+            return (heaps[heapIndex].Flags & MemoryHeapFlags.DeviceLocalBit) != 0;
         }
 
         private void CreatePipelineCache()
@@ -3640,33 +3707,10 @@ internal static unsafe class VulkanVideoPresenter
                 if ((ulong)texture.RgbaPixels.Length == expectedSize &&
                     texture.RgbaPixels.AsSpan().IndexOfAnyExcept((byte)0) >= 0)
                 {
-                    resource.StagingBuffer = CreateBuffer(
-                        expectedSize,
+                    resource.StagingBuffer = CreateHostBuffer(
+                        texture.RgbaPixels,
                         BufferUsageFlags.TransferSrcBit,
-                        MemoryPropertyFlags.HostVisibleBit |
-                        MemoryPropertyFlags.HostCoherentBit,
                         out resource.StagingMemory);
-
-                    void* mapped;
-                    Check(
-                        _vk.MapMemory(
-                            _device,
-                            resource.StagingMemory,
-                            0,
-                            expectedSize,
-                            0,
-                            &mapped),
-                        "vkMapMemory(storage texture)");
-                    fixed (byte* source = texture.RgbaPixels)
-                    {
-                        System.Buffer.MemoryCopy(
-                            source,
-                            mapped,
-                            texture.RgbaPixels.Length,
-                            texture.RgbaPixels.Length);
-                    }
-
-                    _vk.UnmapMemory(_device, resource.StagingMemory);
                     resource.NeedsUpload = true;
                     guestImage.InitialUploadPending = true;
                     TraceVulkanShader(
@@ -3948,19 +3992,13 @@ internal static unsafe class VulkanVideoPresenter
             byte[] pixels,
             string debugName)
         {
-            var size = (ulong)pixels.Length;
-            var buffer = CreateBuffer(
-                size,
+            // Pooled: texture uploads churn 25-50MB host-visible staging buffers
+            // every frame; allocating fresh device memory per upload exhausts and
+            // fragments the host-visible heap even while device-local use is tiny.
+            var buffer = CreateHostBuffer(
+                pixels,
                 BufferUsageFlags.TransferSrcBit,
-                MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit,
                 out var memory);
-            void* mapped;
-            Check(_vk.MapMemory(_device, memory, 0, size, 0, &mapped), "vkMapMemory(texture)");
-            fixed (byte* source = pixels)
-            {
-                System.Buffer.MemoryCopy(source, mapped, pixels.Length, pixels.Length);
-            }
-            _vk.UnmapMemory(_device, memory);
             SetDebugName(ObjectType.Buffer, buffer.Handle, debugName);
             return (buffer, memory);
         }
@@ -4248,18 +4286,18 @@ internal static unsafe class VulkanVideoPresenter
             var size = (ulong)Math.Max(data.Length, sizeof(uint));
             var capacity = BitOperations.RoundUpToPowerOf2(size);
             var key = new HostBufferPoolKey(usage, capacity);
-            if (!_hostBufferPool.TryGetValue(key, out var available))
+            HostBufferAllocation? allocation = null;
+            lock (_hostBufferPoolGate)
             {
-                available = new Stack<HostBufferAllocation>();
-                _hostBufferPool.Add(key, available);
+                if (_hostBufferPool.TryGetValue(key, out var available) &&
+                    available.TryPop(out var pooled))
+                {
+                    allocation = pooled;
+                    _pooledHostBufferBytes -= capacity;
+                }
             }
 
-            HostBufferAllocation allocation;
-            if (available.TryPop(out var pooled))
-            {
-                allocation = pooled;
-            }
-            else
+            if (allocation is null)
             {
                 var buffer = CreateBuffer(
                     capacity,
@@ -4267,7 +4305,10 @@ internal static unsafe class VulkanVideoPresenter
                     MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit,
                     out var allocatedMemory);
                 allocation = new HostBufferAllocation(buffer, allocatedMemory, key);
-                _hostBufferAllocations.Add(buffer.Handle, allocation);
+                lock (_hostBufferPoolGate)
+                {
+                    _hostBufferAllocations.Add(buffer.Handle, allocation);
+                }
             }
 
             memory = allocation.Memory;
@@ -4299,15 +4340,50 @@ internal static unsafe class VulkanVideoPresenter
                 return;
             }
 
-            if (_hostBufferAllocations.TryGetValue(buffer.Handle, out var allocation) &&
-                allocation.Memory.Handle == memory.Handle)
+            lock (_hostBufferPoolGate)
             {
-                _hostBufferPool[allocation.Key].Push(allocation);
-                return;
+                if (_hostBufferAllocations.TryGetValue(buffer.Handle, out var allocation) &&
+                    allocation.Memory.Handle == memory.Handle)
+                {
+                    if (_pooledHostBufferBytes + allocation.Key.Capacity <=
+                        MaxPooledHostBufferBytes)
+                    {
+                        _pooledHostBufferBytes += allocation.Key.Capacity;
+                        if (!_hostBufferPool.TryGetValue(allocation.Key, out var available))
+                        {
+                            available = new Stack<HostBufferAllocation>();
+                            _hostBufferPool.Add(allocation.Key, available);
+                        }
+
+                        available.Push(allocation);
+                        return;
+                    }
+
+                    // Pool is at capacity; drop this buffer entirely.
+                    _hostBufferAllocations.Remove(buffer.Handle);
+                }
             }
 
             _vk.DestroyBuffer(_device, buffer, null);
             FreeDeviceMemory(memory);
+        }
+
+        private void TrimHostBufferPool()
+        {
+            lock (_hostBufferPoolGate)
+            {
+                foreach (var available in _hostBufferPool.Values)
+                {
+                    while (available.TryPop(out var allocation))
+                    {
+                        _hostBufferAllocations.Remove(allocation.Buffer.Handle);
+                        _vk.DestroyBuffer(_device, allocation.Buffer, null);
+                        FreeDeviceMemory(allocation.Memory);
+                    }
+                }
+
+                _pooledHostBufferBytes = 0;
+            }
         }
 
         private static PrimitiveTopology GetPrimitiveTopology(uint primitiveType) =>
@@ -4753,7 +4829,9 @@ internal static unsafe class VulkanVideoPresenter
             {
                 Console.Error.WriteLine(
                     $"[LOADER][VKMEM] {tag} size={size / (1024 * 1024)}MB gross={gross / (1024 * 1024)}MB " +
-                    $"live={_deviceMemoryLedger.LiveDeviceLocalBytes / (1024 * 1024)}MB alloc#{n} images={_guestImages.Count}");
+                    $"live={_deviceMemoryLedger.LiveDeviceLocalBytes / (1024 * 1024)}MB " +
+                    $"live_host={_deviceMemoryLedger.LiveHostVisibleBytes / (1024 * 1024)}MB " +
+                    $"alloc#{n} images={_guestImages.Count}");
             }
         }
 
@@ -4765,17 +4843,37 @@ internal static unsafe class VulkanVideoPresenter
                 EvictLeastRecentlyUsedGuestImages(
                     _deviceMemoryLedger.BytesOverBudget(allocationInfo.AllocationSize));
             }
+            else if (!deviceLocal &&
+                     _deviceMemoryLedger.WouldExceedHostVisibleBudget(allocationInfo.AllocationSize))
+            {
+                ReclaimHostVisibleMemory();
+            }
 
             TraceVkAlloc(allocationInfo.AllocationSize, tag);
             var result = _vk.AllocateMemory(_device, &allocationInfo, null, out var memory);
             if (result is Result.ErrorOutOfDeviceMemory or Result.ErrorOutOfHostMemory)
             {
+                var memoryProperties = _memoryProperties;
+                var heapIndex = (&memoryProperties.MemoryTypes.Element0)
+                    [(int)allocationInfo.MemoryTypeIndex].HeapIndex;
                 Console.Error.WriteLine(
                     $"[LOADER][VKMEM] {tag} alloc size={allocationInfo.AllocationSize / (1024 * 1024)}MB " +
                     $"failed with {result} " +
-                    $"live={_deviceMemoryLedger.LiveDeviceLocalBytes / (1024 * 1024)}MB; " +
+                    $"type={allocationInfo.MemoryTypeIndex} heap={heapIndex} " +
+                    $"deviceLocal={deviceLocal} " +
+                    $"pooledHost={_pooledHostBufferBytes / (1024 * 1024)}MB " +
+                    $"live={_deviceMemoryLedger.LiveDeviceLocalBytes / (1024 * 1024)}MB " +
+                    $"live_host={_deviceMemoryLedger.LiveHostVisibleBytes / (1024 * 1024)}MB; " +
                     "reclaiming and retrying");
-                EvictLeastRecentlyUsedGuestImages(ulong.MaxValue);
+                if (deviceLocal)
+                {
+                    EvictLeastRecentlyUsedGuestImages(ulong.MaxValue);
+                }
+                else
+                {
+                    ReclaimHostVisibleMemory();
+                }
+
                 result = _vk.AllocateMemory(_device, &allocationInfo, null, out memory);
             }
 
@@ -4846,6 +4944,34 @@ internal static unsafe class VulkanVideoPresenter
                     $"live={_deviceMemoryLedger.LiveDeviceLocalBytes / (1024 * 1024)}MB " +
                     $"cap={_deviceMemoryLedger.BudgetBytes / (1024 * 1024)}MB " +
                     $"images={_guestImages.Count}");
+            }
+            finally
+            {
+                _reclaimInProgress = false;
+            }
+        }
+
+        private void ReclaimHostVisibleMemory()
+        {
+            if (_reclaimInProgress)
+            {
+                return;
+            }
+
+            _reclaimInProgress = true;
+            try
+            {
+                // Retiring in-flight submissions recycles the per-draw host
+                // buffers and texture staging buffers they still hold into the
+                // pool; trimming afterwards actually returns the memory.
+                CompletePendingPresentation(wait: true);
+                WaitForAllGuestSubmissions();
+                TrimHostBufferPool();
+
+                Console.Error.WriteLine(
+                    "[LOADER][VKMEM] reclaimed host-visible memory " +
+                    $"live_host={_deviceMemoryLedger.LiveHostVisibleBytes / (1024 * 1024)}MB " +
+                    $"cap_host={_deviceMemoryLedger.HostVisibleBudgetBytes / (1024 * 1024)}MB");
             }
             finally
             {
@@ -7133,12 +7259,9 @@ internal static unsafe class VulkanVideoPresenter
                     FreeDeviceMemory(texture.ImageMemory);
                 }
 
-                if (texture.StagingBuffer.Handle != 0)
-                {
-                    _vk.DestroyBuffer(_device, texture.StagingBuffer, null);
-                }
-
-                FreeDeviceMemory(texture.StagingMemory);
+                // Only reached after the submission fence signaled (or before
+                // submission on unwind), so the pooled staging buffer is idle.
+                RecycleHostBuffer(texture.StagingBuffer, texture.StagingMemory);
 
                 if (texture.NeedsUpload &&
                     texture.GuestImage is { Initialized: false } guestImage)
@@ -7662,6 +7785,7 @@ internal static unsafe class VulkanVideoPresenter
             }
             _hostBufferAllocations.Clear();
             _hostBufferPool.Clear();
+            _pooledHostBufferBytes = 0;
             foreach (var guestImage in _guestImages.Values)
             {
                 DestroyGuestImage(guestImage);

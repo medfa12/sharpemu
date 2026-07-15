@@ -37,6 +37,65 @@ public sealed class VulkanDeviceMemoryLedgerTests
         ledger.Track(1, 512 * Mega, deviceLocal: false);
 
         Assert.Equal(0UL, ledger.LiveDeviceLocalBytes);
+        Assert.Equal(512 * Mega, ledger.LiveHostVisibleBytes);
+    }
+
+    [Fact]
+    public void TrackAndUntrack_KeepNetLiveHostVisibleBytes()
+    {
+        var ledger = new VulkanDeviceMemoryLedger();
+
+        ledger.Track(1, 32 * Mega, deviceLocal: false);
+        ledger.Track(2, 64 * Mega, deviceLocal: false);
+        ledger.Track(3, 100 * Mega, deviceLocal: true);
+        Assert.Equal(96 * Mega, ledger.LiveHostVisibleBytes);
+
+        ledger.Untrack(2);
+        Assert.Equal(32 * Mega, ledger.LiveHostVisibleBytes);
+        Assert.Equal(100 * Mega, ledger.LiveDeviceLocalBytes);
+    }
+
+    [Fact]
+    public void ReusedHandle_MovesBytesBetweenHeapCounters()
+    {
+        var ledger = new VulkanDeviceMemoryLedger();
+
+        // A handle reused with a different classification must not leave
+        // stale bytes behind in the other counter.
+        ledger.Track(5, 40 * Mega, deviceLocal: true);
+        ledger.Track(5, 40 * Mega, deviceLocal: false);
+
+        Assert.Equal(0UL, ledger.LiveDeviceLocalBytes);
+        Assert.Equal(40 * Mega, ledger.LiveHostVisibleBytes);
+        Assert.Equal(1, ledger.AllocationCount);
+    }
+
+    [Fact]
+    public void WouldExceedHostVisibleBudget_DisabledWhenBudgetUnknown()
+    {
+        var ledger = new VulkanDeviceMemoryLedger();
+        ledger.Track(1, 500 * Mega, deviceLocal: false);
+
+        Assert.False(ledger.WouldExceedHostVisibleBudget(ulong.MaxValue / 2));
+    }
+
+    [Fact]
+    public void WouldExceedHostVisibleBudget_TriggersOnlyPastTheCap()
+    {
+        var ledger = new VulkanDeviceMemoryLedger { HostVisibleBudgetBytes = 100 * Mega };
+        ledger.Track(1, 60 * Mega, deviceLocal: false);
+
+        Assert.False(ledger.WouldExceedHostVisibleBudget(40 * Mega));
+        Assert.True(ledger.WouldExceedHostVisibleBudget(41 * Mega));
+    }
+
+    [Fact]
+    public void HostVisibleBudget_IgnoresDeviceLocalBytes()
+    {
+        var ledger = new VulkanDeviceMemoryLedger { HostVisibleBudgetBytes = 100 * Mega };
+        ledger.Track(1, 90 * Mega, deviceLocal: true);
+
+        Assert.False(ledger.WouldExceedHostVisibleBudget(50 * Mega));
     }
 
     [Fact]
