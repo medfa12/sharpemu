@@ -95,6 +95,9 @@ internal static class Gen5ShaderScalarEvaluator
         var scalarRegisterSnapshots = new Dictionary<uint, IReadOnlyList<uint>>();
         var scalarConditionCode = false;
         uint? skipUntilPc = null;
+        uint[]? shadowRegisters = null;
+        var shadowExecMask = execMask;
+        var shadowConditionCode = false;
 
         foreach (var instruction in state.Program.Instructions)
         {
@@ -102,10 +105,32 @@ internal static class Gen5ShaderScalarEvaluator
             {
                 if (instruction.Pc < skipUntilPc.Value)
                 {
+                    // The SPIR-V translator emits branch-skipped blocks too, so
+                    // image instructions inside them still need bindings or the
+                    // whole draw is dropped. Evaluate the region against a
+                    // shadow register file seeded from the branch point; the
+                    // main walk's state stays untouched.
+                    if (shadowRegisters is null)
+                    {
+                        shadowRegisters = (uint[])scalarRegisters.Clone();
+                        shadowExecMask = execMask;
+                        shadowConditionCode = scalarConditionCode;
+                    }
+
+                    EvaluateSkippedInstruction(
+                        ctx,
+                        state,
+                        instruction,
+                        shadowRegisters,
+                        ref shadowExecMask,
+                        ref shadowConditionCode,
+                        resolved,
+                        scalarRegisterSnapshots);
                     continue;
                 }
 
                 skipUntilPc = null;
+                shadowRegisters = null;
             }
 
             scalarRegisterSnapshots[instruction.Pc] = (uint[])scalarRegisters.Clone();
@@ -409,6 +434,8 @@ internal static class Gen5ShaderScalarEvaluator
                     : null));
         }
 
+        ResolveRemainingImageBindings(state, scalarRegisters, resolved);
+
         evaluation = new Gen5ShaderEvaluation(
             initialScalarRegisters,
             scalarRegisters,
@@ -419,6 +446,181 @@ internal static class Gen5ShaderScalarEvaluator
             runtimeScalarRegisters,
             vertexInputBindings);
         return true;
+    }
+
+    /// <summary>
+    /// Best-effort evaluation of an instruction inside a branched-over region.
+    /// The SPIR-V translator emits every basic block, so descriptors defined in
+    /// skipped blocks still need to resolve to image bindings; failures here are
+    /// tolerated instead of failing the evaluation, and the main walk's register
+    /// file is never touched.
+    /// </summary>
+    private static void EvaluateSkippedInstruction(
+        CpuContext ctx,
+        Gen5ShaderState state,
+        Gen5ShaderInstruction instruction,
+        uint[] registers,
+        ref ulong execMask,
+        ref bool scalarConditionCode,
+        List<Gen5ImageBinding> resolved,
+        Dictionary<uint, IReadOnlyList<uint>> scalarRegisterSnapshots)
+    {
+        scalarRegisterSnapshots.TryAdd(instruction.Pc, (uint[])registers.Clone());
+
+        if (instruction.Opcode is "SEndpgm" or "SBranch" or "SSetpcB64" or "SSwappcB64")
+        {
+            return;
+        }
+
+        if (instruction.Encoding == Gen5ShaderEncoding.Sopc)
+        {
+            TryExecuteScalarCompare(instruction, registers, out scalarConditionCode, out _);
+            return;
+        }
+
+        if (instruction.Encoding == Gen5ShaderEncoding.Sopk &&
+            instruction.Opcode.StartsWith("SCmpk", StringComparison.Ordinal))
+        {
+            TryExecuteScalarCompareK(instruction, registers, out scalarConditionCode, out _);
+            return;
+        }
+
+        if (instruction.Encoding is
+            Gen5ShaderEncoding.Sop1 or
+            Gen5ShaderEncoding.Sop2 or
+            Gen5ShaderEncoding.Sopk)
+        {
+            TryExecuteScalarAlu(
+                instruction,
+                state.Program.Address,
+                registers,
+                ref execMask,
+                ref scalarConditionCode,
+                out _);
+            return;
+        }
+
+        if (instruction.Control is Gen5ScalarMemoryControl scalarMemory)
+        {
+            // Register effects only: buffer bindings for skipped scalar loads
+            // stay unregistered so currently-translating shaders keep emitting
+            // the exact same code (the translator tolerates the missing binding).
+            TryExecuteScalarLoad(
+                ctx,
+                state,
+                instruction,
+                scalarMemory,
+                registers,
+                [],
+                [],
+                [],
+                out _);
+            return;
+        }
+
+        if (instruction.Control is not Gen5ImageControl image ||
+            resolved.Any(binding => binding.Pc == instruction.Pc))
+        {
+            return;
+        }
+
+        if (!TryCopyRegisters(
+                registers,
+                image.ScalarResource,
+                ImageDescriptorDwords,
+                out var resourceDescriptor))
+        {
+            return;
+        }
+
+        IReadOnlyList<uint> samplerDescriptor = [];
+        if (UsesSampler(instruction.Opcode) &&
+            !TryCopyRegisters(
+                registers,
+                image.ScalarSampler,
+                SamplerDescriptorDwords,
+                out samplerDescriptor))
+        {
+            return;
+        }
+
+        resolved.Add(new Gen5ImageBinding(
+            instruction.Pc,
+            instruction.Opcode,
+            image,
+            resourceDescriptor,
+            samplerDescriptor,
+            instruction.Opcode is "ImageLoadMip" or "ImageStoreMip" &&
+            TryResolveVectorConstantBefore(
+                state.Program,
+                instruction.Pc,
+                image.GetAddressRegister(2),
+                out var mipLevel)
+                ? mipLevel
+                : null));
+    }
+
+    /// <summary>
+    /// Guarantees that every image instruction in the program has a binding.
+    /// The SPIR-V translator emits every basic block and fails the whole draw
+    /// on an image instruction without a binding, so image operations the walk
+    /// never reached (unresolvable descriptors, code past the first SEndpgm)
+    /// fall back to a donor descriptor: an approximate texture beats a dropped
+    /// draw and a black target.
+    /// </summary>
+    private static void ResolveRemainingImageBindings(
+        Gen5ShaderState state,
+        uint[] scalarRegisters,
+        List<Gen5ImageBinding> resolved)
+    {
+        var resolvedImagePcs = new HashSet<uint>(resolved.Select(binding => binding.Pc));
+        foreach (var instruction in state.Program.Instructions)
+        {
+            if (instruction.Control is not Gen5ImageControl image ||
+                !resolvedImagePcs.Add(instruction.Pc))
+            {
+                continue;
+            }
+
+            var needsSampler = UsesSampler(instruction.Opcode);
+            var donor =
+                resolved.FirstOrDefault(binding =>
+                    binding.Control.ScalarResource == image.ScalarResource &&
+                    (!needsSampler || binding.SamplerDescriptor.Count == SamplerDescriptorDwords)) ??
+                resolved.FirstOrDefault(binding =>
+                    !needsSampler || binding.SamplerDescriptor.Count == SamplerDescriptorDwords);
+            var resourceDescriptor =
+                donor?.ResourceDescriptor ??
+                (TryCopyRegisters(
+                        scalarRegisters,
+                        image.ScalarResource,
+                        ImageDescriptorDwords,
+                        out var registerResource)
+                    ? registerResource
+                    : new uint[ImageDescriptorDwords]);
+            IReadOnlyList<uint> samplerDescriptor = [];
+            if (needsSampler)
+            {
+                samplerDescriptor =
+                    donor?.SamplerDescriptor is { Count: SamplerDescriptorDwords } donorSampler
+                        ? donorSampler
+                        : TryCopyRegisters(
+                                scalarRegisters,
+                                image.ScalarSampler,
+                                SamplerDescriptorDwords,
+                                out var registerSampler)
+                            ? registerSampler
+                            : new uint[SamplerDescriptorDwords];
+            }
+
+            resolved.Add(new Gen5ImageBinding(
+                instruction.Pc,
+                instruction.Opcode,
+                image,
+                resourceDescriptor,
+                samplerDescriptor,
+                null));
+        }
     }
 
     private static bool TryCreateVertexInputBinding(

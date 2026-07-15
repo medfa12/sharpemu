@@ -21,6 +21,24 @@ public sealed class Gen5ShaderScalarEvaluatorTests
         public bool TryWrite(ulong virtualAddress, ReadOnlySpan<byte> source) => false;
     }
 
+    private sealed class ArrayMemory(ulong baseAddress, byte[] data) : ICpuMemory
+    {
+        public bool TryRead(ulong virtualAddress, Span<byte> destination)
+        {
+            if (virtualAddress < baseAddress ||
+                virtualAddress - baseAddress + (ulong)destination.Length > (ulong)data.Length)
+            {
+                return false;
+            }
+
+            data.AsSpan((int)(virtualAddress - baseAddress), destination.Length)
+                .CopyTo(destination);
+            return true;
+        }
+
+        public bool TryWrite(ulong virtualAddress, ReadOnlySpan<byte> source) => false;
+    }
+
     private static Gen5ShaderInstruction Sop2(uint pc, string opcode, uint dest, Gen5Operand src0, Gen5Operand src1)
         => new(pc, Gen5ShaderEncoding.Sop2, opcode, [0u], [src0, src1], [Gen5Operand.Scalar(dest)], null);
 
@@ -39,7 +57,37 @@ public sealed class Gen5ShaderScalarEvaluatorTests
 
     private static Gen5Operand Literal(uint value) => new(Gen5OperandKind.LiteralConstant, value);
 
+    private static Gen5ShaderInstruction ImageSampleLz(uint pc, uint scalarResource, uint scalarSampler)
+        => new(pc, Gen5ShaderEncoding.Mimg, "ImageSampleLz", [0u], [], [],
+            new Gen5ImageControl(
+                Dmask: 0xF,
+                VectorAddress: 0,
+                AddressRegisters: [0u, 1u],
+                VectorData: 0,
+                ScalarResource: scalarResource,
+                ScalarSampler: scalarSampler,
+                Dimension: 1,
+                IsArray: false,
+                Glc: false,
+                Slc: false));
+
+    private static Gen5ShaderInstruction SLoadDwordx8(uint pc, uint baseRegister, uint destBase)
+        => new(pc, Gen5ShaderEncoding.Smem, "SLoadDwordx8", [0u],
+            [Gen5Operand.Scalar(baseRegister)],
+            [.. Enumerable.Range(0, 8).Select(index => Gen5Operand.Scalar(destBase + (uint)index))],
+            new Gen5ScalarMemoryControl(
+                DestinationCount: 8,
+                ImmediateOffsetBytes: 0,
+                DynamicOffsetRegister: null));
+
     private static Gen5ShaderEvaluation Evaluate(
+        IReadOnlyList<uint> userData,
+        uint userDataBase,
+        params Gen5ShaderInstruction[] instructions)
+        => Evaluate(new NullMemory(), userData, userDataBase, instructions);
+
+    private static Gen5ShaderEvaluation Evaluate(
+        ICpuMemory memory,
         IReadOnlyList<uint> userData,
         uint userDataBase,
         params Gen5ShaderInstruction[] instructions)
@@ -50,7 +98,7 @@ public sealed class Gen5ShaderScalarEvaluatorTests
             Metadata: null,
             UserDataScalarRegisterBase: userDataBase);
         var ok = Gen5ShaderScalarEvaluator.TryEvaluate(
-            new CpuContext(new NullMemory(), Generation.Gen5),
+            new CpuContext(memory, Generation.Gen5),
             state,
             out var evaluation,
             out var error);
@@ -208,5 +256,81 @@ public sealed class Gen5ShaderScalarEvaluatorTests
 
         Assert.Equal(0u, evaluation.ScalarRegisters[4]);
         Assert.Equal(0xBBBB_BBBBu, evaluation.ScalarRegisters[5]); // SCC=0 selects second source
+    }
+
+    [Fact]
+    public void SBranch_SkippedImageSample_ResolvesBindingFromBranchState()
+    {
+        // T# in s8..s15 and S# in s16..s19 are user data; the image sample sits
+        // in a branched-over block that the SPIR-V translator still emits.
+        var evaluation = Evaluate(
+            [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+            userDataBase: 8,
+            Branch(0, dwordOffset: 1), // next pc 4, +4 bytes -> lands at 8
+            ImageSampleLz(4, scalarResource: 8, scalarSampler: 16),
+            EndPgm(8));
+
+        var binding = Assert.Single(evaluation.ImageBindings);
+        Assert.Equal(4u, binding.Pc);
+        Assert.Equal(new uint[] { 1, 2, 3, 4, 5, 6, 7, 8 }, binding.ResourceDescriptor);
+        Assert.Equal(new uint[] { 9, 10, 11, 12 }, binding.SamplerDescriptor);
+    }
+
+    [Fact]
+    public void SBranch_SkippedSLoadDwordx8_ResolvesImageDescriptorFromMemory()
+    {
+        // The skipped block loads its own T# from memory before sampling; the
+        // shadow walk must execute the load so the binding carries the
+        // descriptor bytes read from the guest address in s0:s1.
+        const ulong descriptorAddress = 0x2_1000_0000;
+        var descriptorWords = new uint[]
+        {
+            0xAABB_0001, 0xAABB_0002, 0xAABB_0003, 0xAABB_0004,
+            0xAABB_0005, 0xAABB_0006, 0xAABB_0007, 0xAABB_0008,
+        };
+        var memory = new byte[descriptorWords.Length * sizeof(uint)];
+        Buffer.BlockCopy(descriptorWords, 0, memory, 0, memory.Length);
+
+        var evaluation = Evaluate(
+            new ArrayMemory(descriptorAddress, memory),
+            [
+                unchecked((uint)descriptorAddress),
+                (uint)(descriptorAddress >> 32),
+                0, 0,
+                101, 102, 103, 104, // S# in s4..s7
+            ],
+            userDataBase: 0,
+            Branch(0, dwordOffset: 2), // next pc 4, +8 bytes -> lands at 12
+            SLoadDwordx8(4, baseRegister: 0, destBase: 8),
+            ImageSampleLz(8, scalarResource: 8, scalarSampler: 4),
+            EndPgm(12));
+
+        var binding = Assert.Single(evaluation.ImageBindings);
+        Assert.Equal(8u, binding.Pc);
+        Assert.Equal(descriptorWords, binding.ResourceDescriptor);
+        Assert.Equal(new uint[] { 101, 102, 103, 104 }, binding.SamplerDescriptor);
+        // The shadow walk must not leak into the main register file.
+        Assert.Equal(0u, evaluation.ScalarRegisters[8]);
+    }
+
+    [Fact]
+    public void UnreachedImageSample_FallsBackToDonorBinding()
+    {
+        // The op past SEndpgm has an unresolvable T# register range; it still
+        // needs a binding (the translator emits every block), so it borrows the
+        // resolved donor descriptor instead of failing the translation.
+        var evaluation = Evaluate(
+            [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+            userDataBase: 8,
+            ImageSampleLz(0, scalarResource: 8, scalarSampler: 16),
+            EndPgm(4),
+            ImageSampleLz(8, scalarResource: 250, scalarSampler: 16));
+
+        Assert.Equal(2, evaluation.ImageBindings.Count);
+        Assert.Equal(8u, evaluation.ImageBindings[1].Pc);
+        Assert.Equal(
+            evaluation.ImageBindings[0].ResourceDescriptor,
+            evaluation.ImageBindings[1].ResourceDescriptor);
+        Assert.Equal(new uint[] { 9, 10, 11, 12 }, evaluation.ImageBindings[1].SamplerDescriptor);
     }
 }

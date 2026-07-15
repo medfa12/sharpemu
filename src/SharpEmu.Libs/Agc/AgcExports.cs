@@ -3926,16 +3926,16 @@ public static class AgcExports
             exportEvaluation.ImageBindings.Count);
         foreach (var binding in imageBindings)
         {
-            if (!TryDecodeTextureDescriptor(binding.ResourceDescriptor, out var texture))
+            var descriptorValid = TryDecodeTextureDescriptor(binding.ResourceDescriptor, out var texture);
+            if (!descriptorValid)
             {
-                error = $"invalid texture descriptor at pc=0x{binding.Pc:X}";
-                return false;
+                texture = CreateFallbackTextureDescriptor(binding.ResourceDescriptor);
             }
 
             TraceAgcShader(
                 $"agc.texture_binding ps=0x{pixelShaderAddress:X16} es=0x{exportShaderAddress:X16} " +
                 $"pc=0x{binding.Pc:X} op={binding.Opcode} storage={(Gen5ShaderTranslator.IsStorageImageOperation(binding.Opcode) ? 1 : 0)} " +
-                $"decoded={FormatTextureDescriptor(texture)} " +
+                $"fallback={(descriptorValid ? 0 : 1)} decoded={FormatTextureDescriptor(texture)} " +
                 $"raw={FormatShaderDwords(binding.ResourceDescriptor)} sampler={FormatShaderDwords(binding.SamplerDescriptor)}");
             textures.Add(
                 new TranslatedImageBinding(

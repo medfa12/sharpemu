@@ -1570,8 +1570,17 @@ internal static partial class Gen5SpirvTranslator
             if (!_imageBindingByPc.TryGetValue(instruction.Pc, out var bindingIndex) ||
                 bindingIndex >= _imageResources.Count)
             {
-                error = "unresolved image binding";
-                return false;
+                // Last resort: sample a type-compatible bound image instead of
+                // failing the translation and dropping the whole draw.
+                var wantsStorage =
+                    Gen5ShaderTranslator.IsStorageImageOperation(instruction.Opcode);
+                bindingIndex = _imageResources.FindIndex(
+                    resource => resource.IsStorage == wantsStorage);
+                if (bindingIndex < 0)
+                {
+                    error = "unresolved image binding";
+                    return false;
+                }
             }
 
             var resource = _imageResources[bindingIndex];
