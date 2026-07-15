@@ -145,9 +145,93 @@ public static class FontExports
         Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceFont")]
     public static int FontSupportSystemFonts(CpuContext ctx) => Ok(ctx);
 
+    // The game's text engine derives its glyph-blit SOURCE pointer from the
+    // render surface's buffer field (surface+0x00), either directly or via the
+    // SurfaceImage.address we echo back from sceFontRenderCharGlyphImage*.
+    // The real library writes that struct in sceFontRenderSurfaceInit; when
+    // this call was a no-op the field stayed null and the game's per-row blit
+    // faulted on src = null + penY*widthByte + penX. If a title hands us no
+    // backing store at all, a single shared zero-filled arena stands in so
+    // every derived pixel pointer reads mapped zeros (blank glyphs, no fault).
+    private const int BlankGlyphArenaSize = 0x100000;
+    private const uint FallbackSurfaceWidthByte = 0x800;
+    private static ulong _blankGlyphArena;
+    private static readonly object BlankGlyphArenaGate = new();
+
+    private static ulong GetBlankGlyphArena(CpuContext ctx)
+    {
+        if (_blankGlyphArena != 0)
+        {
+            return _blankGlyphArena;
+        }
+
+        lock (BlankGlyphArenaGate)
+        {
+            if (_blankGlyphArena == 0 &&
+                KernelMemoryCompatExports.TryAllocateHleData(
+                    ctx, BlankGlyphArenaSize, ScratchObjectAlign, out var arena))
+            {
+                // The allocator hands back zeroed pages, but the arena is the
+                // one buffer whose contents the game consumes as pixels, so
+                // re-zero explicitly rather than trust that forever.
+                for (var offset = 0; offset < BlankGlyphArenaSize; offset += GlyphZeroFill.Length)
+                {
+                    _ = ctx.Memory.TryWrite(arena + (ulong)offset, GlyphZeroFill);
+                }
+
+                _blankGlyphArena = arena;
+            }
+        }
+
+        return _blankGlyphArena;
+    }
+
     [SysAbiExport(Nid = "gdUCnU0gHdI", ExportName = "sceFontRenderSurfaceInit",
         Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceFont")]
-    public static int FontRenderSurfaceInit(CpuContext ctx) => Ok(ctx);
+    public static int FontRenderSurfaceInit(CpuContext ctx)
+    {
+        // void sceFontRenderSurfaceInit(OrbisFontRenderSurface* surface,
+        //   void* buffer, int bufWidthByte, int pixelSizeByte, int widthPixel,
+        //   int heightPixel) -> RDI, RSI, EDX, ECX, R8D, R9D.
+        // OrbisFontRenderSurface: buffer @+0x00, widthByte @+0x08,
+        // pixelSizeByte/pad/styleFlag/pad @+0x0C, width @+0x10, height @+0x14,
+        // scissor x0/y0/x1/y1 @+0x18..0x24 (reset to the full surface here).
+        var surface = ctx[CpuRegister.Rdi];
+        if (surface == 0)
+        {
+            return Ok(ctx);
+        }
+
+        var buffer = ctx[CpuRegister.Rsi];
+        var widthByte = (uint)ctx[CpuRegister.Rdx];
+        var pixelSize = (uint)ctx[CpuRegister.Rcx] & 0xFF;
+        var width = (uint)Math.Max((int)(uint)ctx[CpuRegister.R8], 0);
+        var height = (uint)Math.Max((int)(uint)ctx[CpuRegister.R9], 0);
+        if (buffer == 0)
+        {
+            buffer = GetBlankGlyphArena(ctx);
+            if (widthByte == 0)
+            {
+                widthByte = FallbackSurfaceWidthByte;
+            }
+
+            if (pixelSize == 0)
+            {
+                pixelSize = 1;
+            }
+        }
+
+        _ = ctx.TryWriteUInt64(surface + 0x00, buffer)
+            && ctx.TryWriteUInt32(surface + 0x08, widthByte)
+            && ctx.TryWriteUInt32(surface + 0x0C, pixelSize)
+            && ctx.TryWriteUInt32(surface + 0x10, width)
+            && ctx.TryWriteUInt32(surface + 0x14, height)
+            && ctx.TryWriteUInt32(surface + 0x18, 0)
+            && ctx.TryWriteUInt32(surface + 0x1C, 0)
+            && ctx.TryWriteUInt32(surface + 0x20, width)
+            && ctx.TryWriteUInt32(surface + 0x24, height);
+        return Ok(ctx);
+    }
 
     [SysAbiExport(Nid = "oaJ1BpN2FQk", ExportName = "sceFontTextSourceInit",
         Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceFont")]
@@ -294,6 +378,13 @@ public static class FontExports
     // magic/form checks pass; everything else reads as zero. Deleted glyphs
     // are recycled so a menu that regenerates its glyph set every frame does
     // not grow guest memory without bound.
+    //
+    // The glyph object carries no bitmap-pointer field: the blit source base
+    // the game consumes is OrbisFontRenderSurface.buffer, wired by
+    // sceFontRenderSurfaceInit and backstopped inside
+    // sceFontRenderCharGlyphImageHorizontal (the null + 0x1040A memcpy fix).
+    // If some title turns out to read a bitmap pointer out of the glyph
+    // object itself, point that field at GetBlankGlyphArena here as well.
     private static readonly ConcurrentDictionary<ulong, byte> LiveGlyphs = new();
     private static readonly ConcurrentQueue<ulong> FreeGlyphs = new();
     private static readonly byte[] GlyphZeroFill = new byte[ScratchObjectSize];
@@ -411,6 +502,24 @@ public static class FontExports
         _ = ctx.TryReadUInt64(surf + 0x00, out var surfBuffer);
         _ = ctx.TryReadUInt32(surf + 0x08, out var surfWidthByte);
         _ = ctx.TryReadUInt32(surf + 0x0C, out var surfPixelWord);
+
+        // Defense in depth for surfaces that bypassed sceFontRenderSurfaceInit:
+        // never hand the caller a null image base, or its own blit computes
+        // src = null + penY*stride + penX and faults. The shared arena is
+        // mapped, zero-filled, and large enough for any in-surface offset.
+        if (surfBuffer == 0)
+        {
+            surfBuffer = GetBlankGlyphArena(ctx);
+            if (surfWidthByte == 0)
+            {
+                surfWidthByte = FallbackSurfaceWidthByte;
+            }
+
+            if ((surfPixelWord & 0xFF) == 0)
+            {
+                surfPixelWord = 1;
+            }
+        }
 
         // OrbisFontRenderOutput (0x40 bytes): stage @+0x00, SurfaceImage
         // { address @+0x08, widthByte @+0x10, pixelSizeByte/pixelFormat/pad
@@ -570,6 +679,11 @@ public static class FontExports
         LiveGlyphs.Clear();
         while (FreeGlyphs.TryDequeue(out _))
         {
+        }
+
+        lock (BlankGlyphArenaGate)
+        {
+            _blankGlyphArena = 0;
         }
     }
 }
