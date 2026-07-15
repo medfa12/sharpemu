@@ -1098,31 +1098,15 @@ internal static unsafe class VulkanVideoPresenter
 
         lock (_gate)
         {
-            if (_gpuGuestImages.TryGetValue(address, out var availableFormat) &&
-                AreAliasableGuestFormats(availableFormat, guestFormat))
-            {
-                return true;
-            }
-
-            // A target pre-registered at enqueue time holds its rendered
-            // VkImage by the time this draw executes: the work queue is FIFO,
-            // so the producing draw runs first on the render thread.
-            var isPending = _renderTargetGuestImages.TryGetValue(address, out var pendingFormat);
-            var result = isPending && AreAliasableGuestFormats(pendingFormat, guestFormat);
-            if (!result &&
-                (isPending || _availableGuestImages.ContainsKey(address)) &&
-                ShouldTracePresentedGuestImageContentsForDiagnostics() &&
-                _tracedGateRejects.Add(address))
-            {
-                Console.Error.WriteLine(
-                    "[LOADER][TRACE] vk.gate_reject addr=0x" + address.ToString("X16") +
-                    " pending=" + isPending + " pending_fmt=" + pendingFormat +
-                    " sampled_fmt=" + guestFormat +
-                    " in_gpu=" + _gpuGuestImages.ContainsKey(address) +
-                    " in_avail=" + _availableGuestImages.ContainsKey(address));
-            }
-
-            return result;
+            // Any address the GPU has rendered (this frame or a prior one) holds
+            // real content in its VkImage; guest memory for it was never written
+            // and reads back black. Prefer the rendered image even when the
+            // sampled format differs from the rendered format -- resolution binds
+            // a native-format view rather than uploading never-written memory.
+            // Genuine CPU-asset textures live only in _availableGuestImages and
+            // are deliberately not deferred here.
+            return _gpuGuestImages.ContainsKey(address) ||
+                _renderTargetGuestImages.ContainsKey(address);
         }
     }
 
@@ -3998,21 +3982,50 @@ internal static unsafe class VulkanVideoPresenter
                 };
             }
 
+            // The strict alias above needs a view in the sampled format. When a
+            // rendered target is sampled in an incompatible format (the game
+            // reuses a guest address for surfaces of different formats), that
+            // view cannot be created -- but the rendered VkImage still holds real
+            // content, whereas the guest memory behind the address was never
+            // written by the GPU and reads back black. Bind a view in the image's
+            // OWN format so the sampler reads real pixels (possibly reinterpreted)
+            // instead of an empty upload. Only for non-fallback address textures
+            // that carry no CPU pixels (i.e. deferred render-target references).
             if (texture.Address != 0 &&
                 !texture.IsFallback &&
                 texture.RgbaPixels.Length == 0 &&
-                ShouldTracePresentedGuestImageContentsForDiagnostics())
+                _guestImages.TryGetValue(texture.Address, out var renderedImage) &&
+                IsCompatibleGuestImageAlias(texture, renderedImage) &&
+                TryGetOrCreateGuestImageView(
+                    renderedImage,
+                    renderedImage.Format,
+                    mipLevel: 0,
+                    levelCount: renderedImage.MipLevels,
+                    dstSelect: texture.DstSelect,
+                    out var nativeView))
             {
-                var have = _guestImages.TryGetValue(texture.Address, out var gi);
-                Console.Error.WriteLine(
-                    "[LOADER][TRACE] vk.alias_miss addr=0x" + texture.Address.ToString("X16") +
-                    " in_guestimages=" + have +
-                    (have
-                        ? " img=" + gi.Width + "x" + gi.Height + "/" + gi.Format +
-                          " tex=" + texture.Width + "x" + texture.Height + " view=" + vkFormat +
-                          " sizeok=" + IsCompatibleGuestImageAlias(texture, gi) +
-                          " fmtok=" + IsCompatibleViewFormat(gi.Format, vkFormat)
-                        : " tex=" + texture.Width + "x" + texture.Height + " view=" + vkFormat));
+                renderedImage.LastUseStamp = _useStamp;
+                if (ShouldTracePresentedGuestImageContentsForDiagnostics() &&
+                    _tracedGateRejects.Add(texture.Address))
+                {
+                    Console.Error.WriteLine(
+                        "[LOADER][TRACE] vk.native_alias addr=0x" + texture.Address.ToString("X16") +
+                        " img_fmt=" + renderedImage.Format + " sampled_view=" + vkFormat +
+                        " img=" + renderedImage.Width + "x" + renderedImage.Height);
+                }
+
+                return new TextureResource
+                {
+                    Address = texture.Address,
+                    Image = renderedImage.Image,
+                    View = nativeView,
+                    Width = renderedImage.Width,
+                    Height = renderedImage.Height,
+                    RowLength = renderedImage.Width,
+                    DstSelect = texture.DstSelect,
+                    SamplerState = texture.Sampler,
+                    GuestImage = renderedImage,
+                };
             }
 
             return CreateTextureResource(texture);
