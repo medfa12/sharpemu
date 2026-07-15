@@ -1487,7 +1487,11 @@ internal static partial class Gen5SpirvTranslator
                 return true;
             }
 
-            if (instruction.Opcode.StartsWith("BufferStoreDword", StringComparison.Ordinal))
+            // BufferStoreDword* and BufferStoreFormat* both write control.DwordCount
+            // raw words; for float32 formats (the vertex/args case) the format
+            // store is byte-identical to a raw dword store.
+            if (instruction.Opcode.StartsWith("BufferStoreDword", StringComparison.Ordinal) ||
+                instruction.Opcode.StartsWith("BufferStoreFormat", StringComparison.Ordinal))
             {
                 EmitExecConditional(() =>
                 {
