@@ -1485,6 +1485,251 @@ internal static unsafe class VulkanVideoPresenter
         bool IsSplash,
         ulong GuestImageAddress = 0);
 
+    internal sealed class GuestImageResource
+    {
+        public ulong Address;
+        public uint Width;
+        public uint Height;
+        public uint MipLevels;
+        public Format Format;
+        public Image Image;
+        public DeviceMemory Memory;
+        public ImageView View;
+        public ImageView[] MipViews = [];
+        public Dictionary<(Format Format, uint MipLevel, uint LevelCount, uint DstSelect), ImageView> FormatViews { get; } = new();
+        public RenderPass RenderPass;
+        public Framebuffer Framebuffer;
+        public bool Initialized;
+        public bool InitialUploadPending;
+        public bool IsCpuBacked;
+        public ulong CpuContentFingerprint;
+        public ulong MemorySize;
+        public ulong LastUseStamp;
+    }
+
+    internal readonly record struct GuestSurfaceKey(ulong Address, Format Format);
+
+    /// <summary>
+    /// The guest render-image cache. Games reuse a single guest address for
+    /// surfaces of different formats within one frame, so every live surface
+    /// is keyed by (address, format): rendering a new format at an address
+    /// must not destroy the earlier surface a later pass still samples. A
+    /// per-address primary index tracks the most-recently-rendered surface,
+    /// which is what address-only flips and presents resolve to. The cache
+    /// never owns Vulkan objects; callers destroy a surface before removing
+    /// it. Render-thread state, no locking.
+    /// </summary>
+    internal sealed class GuestSurfaceCache
+    {
+        private readonly Dictionary<GuestSurfaceKey, GuestImageResource> _surfaces = new();
+        private readonly Dictionary<ulong, GuestImageResource> _primaries = new();
+
+        public int Count => _surfaces.Count;
+
+        public IEnumerable<GuestImageResource> Surfaces => _surfaces.Values;
+
+        public bool ContainsAddress(ulong address) => _primaries.ContainsKey(address);
+
+        public bool TryGetExact(ulong address, Format format, out GuestImageResource surface) =>
+            _surfaces.TryGetValue(new GuestSurfaceKey(address, format), out surface!);
+
+        public void Add(GuestImageResource surface)
+        {
+            _surfaces.Add(new GuestSurfaceKey(surface.Address, surface.Format), surface);
+            _primaries[surface.Address] = surface;
+        }
+
+        public void Promote(GuestImageResource surface)
+        {
+            _primaries[surface.Address] = surface;
+        }
+
+        /// <summary>
+        /// Removes the surface (already destroyed by the caller); returns
+        /// true when no surface remains at its address, i.e. address-level
+        /// provenance should be forgotten too.
+        /// </summary>
+        public bool Remove(GuestImageResource surface)
+        {
+            _surfaces.Remove(new GuestSurfaceKey(surface.Address, surface.Format));
+            if (_primaries.TryGetValue(surface.Address, out var primary) &&
+                ReferenceEquals(primary, surface))
+            {
+                if (FindMostRecentlyUsed(surface.Address) is { } replacement)
+                {
+                    _primaries[surface.Address] = replacement;
+                }
+                else
+                {
+                    _primaries.Remove(surface.Address);
+                }
+            }
+
+            return !_primaries.ContainsKey(surface.Address);
+        }
+
+        public void Clear()
+        {
+            _surfaces.Clear();
+            _primaries.Clear();
+        }
+
+        public bool HasInitializedSurface(ulong address)
+        {
+            foreach (var surface in _surfaces.Values)
+            {
+                if (surface.Address == address && surface.Initialized)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// Sample-path selection: the exact-format surface wins, so a pass
+        /// sampling format F at an address binds the surface actually
+        /// rendered as F there, never a different-format sibling. Otherwise
+        /// the most recently used view-compatible sibling (same Vulkan texel
+        /// class, so a mutable-format view reinterprets it) is chosen.
+        /// </summary>
+        public bool TryFindSampleAlias(
+            VulkanGuestDrawTexture texture,
+            Format viewFormat,
+            out GuestImageResource surface)
+        {
+            if (TryGetExact(texture.Address, viewFormat, out surface!) &&
+                IsCompatibleGuestImageAlias(texture, surface))
+            {
+                return true;
+            }
+
+            GuestImageResource? best = null;
+            foreach (var candidate in _surfaces.Values)
+            {
+                if (candidate.Address != texture.Address ||
+                    !IsCompatibleViewFormat(candidate.Format, viewFormat) ||
+                    !IsCompatibleGuestImageAlias(texture, candidate))
+                {
+                    continue;
+                }
+
+                if (best is null || candidate.LastUseStamp > best.LastUseStamp)
+                {
+                    best = candidate;
+                }
+            }
+
+            surface = best!;
+            return best is not null;
+        }
+
+        /// <summary>
+        /// Native-format fallback: no view-compatible surface exists, but a
+        /// rendered sibling still holds real content while the guest memory
+        /// behind the address was never GPU-written and reads back black.
+        /// Prefers GPU-rendered surfaces over CPU uploads, then recency.
+        /// </summary>
+        public bool TryFindNativeAlias(
+            VulkanGuestDrawTexture texture,
+            out GuestImageResource surface)
+        {
+            GuestImageResource? best = null;
+            foreach (var candidate in _surfaces.Values)
+            {
+                if (candidate.Address != texture.Address ||
+                    !IsCompatibleGuestImageAlias(texture, candidate))
+                {
+                    continue;
+                }
+
+                if (best is null ||
+                    (best.IsCpuBacked && !candidate.IsCpuBacked) ||
+                    (best.IsCpuBacked == candidate.IsCpuBacked &&
+                     candidate.LastUseStamp > best.LastUseStamp))
+                {
+                    best = candidate;
+                }
+            }
+
+            surface = best!;
+            return best is not null;
+        }
+
+        /// <summary>
+        /// Present-path selection for an address-only flip: the primary
+        /// (most-recently-rendered) surface, else the largest initialized
+        /// sibling.
+        /// </summary>
+        public bool TryFindPresentable(ulong address, out GuestImageResource surface)
+        {
+            if (_primaries.TryGetValue(address, out surface!) && surface.Initialized)
+            {
+                return true;
+            }
+
+            GuestImageResource? best = null;
+            foreach (var candidate in _surfaces.Values)
+            {
+                if (candidate.Address != address || !candidate.Initialized)
+                {
+                    continue;
+                }
+
+                if (best is null ||
+                    Area(candidate) > Area(best) ||
+                    (Area(candidate) == Area(best) &&
+                     candidate.LastUseStamp > best.LastUseStamp))
+                {
+                    best = candidate;
+                }
+            }
+
+            surface = best!;
+            return best is not null;
+        }
+
+        private GuestImageResource? FindMostRecentlyUsed(ulong address)
+        {
+            GuestImageResource? best = null;
+            foreach (var candidate in _surfaces.Values)
+            {
+                if (candidate.Address == address &&
+                    (best is null || candidate.LastUseStamp > best.LastUseStamp))
+                {
+                    best = candidate;
+                }
+            }
+
+            return best;
+        }
+
+        private static ulong Area(GuestImageResource surface) =>
+            (ulong)surface.Width * surface.Height;
+
+        private static bool IsCompatibleGuestImageAlias(
+            VulkanGuestDrawTexture texture,
+            GuestImageResource guestImage)
+        {
+            if (guestImage.Width == texture.Width &&
+                guestImage.Height == texture.Height)
+            {
+                return true;
+            }
+
+            if (texture.TileMode == 0 ||
+                texture.Width == 0 ||
+                texture.Height == 0)
+            {
+                return false;
+            }
+
+            return texture.Width <= guestImage.Width &&
+                texture.Height <= guestImage.Height;
+        }
+    }
+
     private sealed class Presenter : IDisposable
     {
         private const string FullscreenBarycentricVertexSpirv =
@@ -1565,7 +1810,7 @@ internal static unsafe class VulkanVideoPresenter
         private bool _deviceLost;
         private bool _deviceLostLogged;
         private int _directPresentationCount;
-        private readonly Dictionary<ulong, GuestImageResource> _guestImages = new();
+        private readonly GuestSurfaceCache _guestImages = new();
         private readonly VulkanDeviceMemoryLedger _deviceMemoryLedger = new();
         private PhysicalDeviceMemoryProperties _memoryProperties;
         private int _deviceLocalHeapIndex = -1;
@@ -1696,28 +1941,6 @@ internal static unsafe class VulkanVideoPresenter
             public uint NumberFormat;
             public uint Stride;
             public uint OffsetBytes;
-        }
-
-        private sealed class GuestImageResource
-        {
-            public ulong Address;
-            public uint Width;
-            public uint Height;
-            public uint MipLevels;
-            public Format Format;
-            public Image Image;
-            public DeviceMemory Memory;
-            public ImageView View;
-            public ImageView[] MipViews = [];
-            public Dictionary<(Format Format, uint MipLevel, uint LevelCount, uint DstSelect), ImageView> FormatViews { get; } = new();
-            public RenderPass RenderPass;
-            public Framebuffer Framebuffer;
-            public bool Initialized;
-            public bool InitialUploadPending;
-            public bool IsCpuBacked;
-            public ulong CpuContentFingerprint;
-            public ulong MemorySize;
-            public ulong LastUseStamp;
         }
 
         private sealed record PendingGuestSubmission(
@@ -3931,9 +4154,7 @@ internal static unsafe class VulkanVideoPresenter
 
             var vkFormat = GetTextureFormat(texture.Format, texture.NumberType);
             if (texture.Address != 0 &&
-                _guestImages.TryGetValue(texture.Address, out var guestImage) &&
-                IsCompatibleGuestImageAlias(texture, guestImage) &&
-                IsCompatibleViewFormat(guestImage.Format, vkFormat) &&
+                _guestImages.TryFindSampleAlias(texture, vkFormat, out var guestImage) &&
                 TryGetOrCreateGuestImageView(
                     guestImage,
                     vkFormat,
@@ -3994,8 +4215,7 @@ internal static unsafe class VulkanVideoPresenter
             if (texture.Address != 0 &&
                 !texture.IsFallback &&
                 texture.RgbaPixels.Length == 0 &&
-                _guestImages.TryGetValue(texture.Address, out var renderedImage) &&
-                IsCompatibleGuestImageAlias(texture, renderedImage) &&
+                _guestImages.TryFindNativeAlias(texture, out var renderedImage) &&
                 TryGetOrCreateGuestImageView(
                     renderedImage,
                     renderedImage.Format,
@@ -4094,27 +4314,6 @@ internal static unsafe class VulkanVideoPresenter
                 UpdatesCpuContent = true,
             };
             return true;
-        }
-
-        private static bool IsCompatibleGuestImageAlias(
-            VulkanGuestDrawTexture texture,
-            GuestImageResource guestImage)
-        {
-            if (guestImage.Width == texture.Width &&
-                guestImage.Height == texture.Height)
-            {
-                return true;
-            }
-
-            if (texture.TileMode == 0 ||
-                texture.Width == 0 ||
-                texture.Height == 0)
-            {
-                return false;
-            }
-
-            return texture.Width <= guestImage.Width &&
-                texture.Height <= guestImage.Height;
         }
 
         [MethodImpl(MethodImplOptions.NoInlining)]
@@ -4401,7 +4600,7 @@ internal static unsafe class VulkanVideoPresenter
             };
 
             if (texture.Address != 0 &&
-                !_guestImages.ContainsKey(texture.Address))
+                !_guestImages.ContainsAddress(texture.Address))
             {
                 var guestImage = new GuestImageResource
                 {
@@ -4419,7 +4618,7 @@ internal static unsafe class VulkanVideoPresenter
                     MemorySize = imageRequirements.Size,
                     LastUseStamp = _useStamp,
                 };
-                _guestImages.Add(texture.Address, guestImage);
+                _guestImages.Add(guestImage);
                 resource.OwnsStorage = false;
                 resource.GuestImage = guestImage;
                 lock (_gate)
@@ -5366,9 +5565,9 @@ internal static unsafe class VulkanVideoPresenter
 
                 ulong freed = 0;
                 var evicted = 0;
-                foreach (var (address, image) in _guestImages
-                             .OrderByDescending(entry => entry.Value.IsCpuBacked)
-                             .ThenBy(entry => entry.Value.LastUseStamp)
+                foreach (var surface in _guestImages.Surfaces
+                             .OrderByDescending(entry => entry.IsCpuBacked)
+                             .ThenBy(entry => entry.LastUseStamp)
                              .ToArray())
                 {
                     if (freed >= bytesToFree)
@@ -5376,22 +5575,27 @@ internal static unsafe class VulkanVideoPresenter
                         break;
                     }
 
-                    if (image.LastUseStamp >= _useStamp)
+                    if (surface.LastUseStamp >= _useStamp)
                     {
                         // Referenced by the draw currently being translated.
                         continue;
                     }
 
-                    freed += image.MemorySize;
+                    freed += surface.MemorySize;
                     evicted++;
-                    DestroyGuestImage(image);
-                    _guestImages.Remove(address);
-                    lock (_gate)
+                    DestroyGuestImage(surface);
+                    if (_guestImages.Remove(surface))
                     {
-                        _availableGuestImages.Remove(address);
-                        _gpuGuestImages.Remove(address);
-                        _renderTargetGuestImages.Remove(address);
-                        ForgetRenderedGuestImageLocked(address);
+                        // Last surface at the address: only now may the
+                        // address-level provenance go, or later consumers of a
+                        // surviving sibling would fall back to guest memory.
+                        lock (_gate)
+                        {
+                            _availableGuestImages.Remove(surface.Address);
+                            _gpuGuestImages.Remove(surface.Address);
+                            _renderTargetGuestImages.Remove(surface.Address);
+                            ForgetRenderedGuestImageLocked(surface.Address);
+                        }
                     }
                 }
 
@@ -5962,8 +6166,7 @@ internal static unsafe class VulkanVideoPresenter
                 {
                     foreach (var target in work.Targets)
                     {
-                        if (!_guestImages.TryGetValue(target.Address, out var failedTarget) ||
-                            !failedTarget.Initialized)
+                        if (!_guestImages.HasInitializedSurface(target.Address))
                         {
                             _availableGuestImages.Remove(target.Address);
                             _gpuGuestImages.Remove(target.Address);
@@ -6046,12 +6249,11 @@ internal static unsafe class VulkanVideoPresenter
             Format format)
         {
             var mipLevels = ClampMipLevels(target.Width, target.Height, target.MipLevels);
-            if (_guestImages.TryGetValue(target.Address, out var existing))
+            if (_guestImages.TryGetExact(target.Address, format, out var existing))
             {
                 if (existing.Width == target.Width &&
                     existing.Height == target.Height &&
-                    existing.MipLevels == mipLevels &&
-                    existing.Format == format)
+                    existing.MipLevels == mipLevels)
                 {
                     existing.IsCpuBacked = false;
                     existing.CpuContentFingerprint = 0;
@@ -6073,20 +6275,19 @@ internal static unsafe class VulkanVideoPresenter
                         SetDebugName(ObjectType.Framebuffer, promotedFramebuffer.Handle, $"{promotedName} framebuffer");
                     }
 
+                    _guestImages.Promote(existing);
                     return existing;
                 }
 
+                // Same-format geometry change: a genuine reallocation of this
+                // surface. Different-format siblings at the address stay
+                // alive -- a later pass sampling their format still binds real
+                // rendered content -- and the address-level provenance
+                // survives because the surface is recreated immediately below.
                 CompletePendingPresentation(wait: true);
                 WaitForAllGuestSubmissions();
                 DestroyGuestImage(existing);
-                _guestImages.Remove(target.Address);
-                lock (_gate)
-                {
-                    _availableGuestImages.Remove(target.Address);
-                    _gpuGuestImages.Remove(target.Address);
-                    _renderTargetGuestImages.Remove(target.Address);
-                    ForgetRenderedGuestImageLocked(target.Address);
-                }
+                _guestImages.Remove(existing);
             }
 
             var imageInfo = new ImageCreateInfo
@@ -6190,7 +6391,7 @@ internal static unsafe class VulkanVideoPresenter
             }
             SetDebugName(ObjectType.RenderPass, renderPass.Handle, $"{debugName} renderpass");
             SetDebugName(ObjectType.Framebuffer, framebuffer.Handle, $"{debugName} framebuffer");
-            _guestImages.Add(target.Address, resource);
+            _guestImages.Add(resource);
             return resource;
         }
 
@@ -6729,13 +6930,16 @@ internal static unsafe class VulkanVideoPresenter
 
             TranslatedDrawResources? translatedResources = null;
             GuestImageResource? presentedGuestImage = null;
-            if (presentation.GuestImageAddress != 0 &&
-                (!_guestImages.TryGetValue(
-                    presentation.GuestImageAddress,
-                    out presentedGuestImage) ||
-                 !presentedGuestImage.Initialized))
+            if (presentation.GuestImageAddress != 0)
             {
-                return;
+                if (!_guestImages.TryFindPresentable(
+                        presentation.GuestImageAddress,
+                        out var presentable))
+                {
+                    return;
+                }
+
+                presentedGuestImage = presentable;
             }
             if (presentedGuestImage is not null)
             {
@@ -8255,7 +8459,7 @@ internal static unsafe class VulkanVideoPresenter
             _hostBufferAllocations.Clear();
             _hostBufferPool.Clear();
             _pooledHostBufferBytes = 0;
-            foreach (var guestImage in _guestImages.Values)
+            foreach (var guestImage in _guestImages.Surfaces)
             {
                 DestroyGuestImage(guestImage);
             }
