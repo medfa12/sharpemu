@@ -3654,9 +3654,16 @@ public static class AgcExports
                     return false;
                 }
 
-                return ctx.TryReadUInt32(
-                    state.IndirectArgsAddress + dataOffset,
-                    out drawCount);
+                var argsBase = state.IndirectArgsAddress + dataOffset;
+                var readOk = ctx.TryReadUInt32(argsBase, out drawCount);
+                ctx.TryReadUInt32(argsBase + 4, out var argInstance);
+                ctx.TryReadUInt32(argsBase + 8, out var argFirstIndex);
+                ctx.TryReadUInt32(argsBase + 12, out var argVtxOffset);
+                TraceAgc(
+                    $"agc.draw_indirect_args base=0x{state.IndirectArgsAddress:X16} off=0x{dataOffset:X} " +
+                    $"args=0x{argsBase:X16} ok={readOk} count={drawCount} inst={argInstance} " +
+                    $"firstIdx={argFirstIndex} vtxOff={argVtxOffset}");
+                return readOk;
             default:
                 return false;
         }
