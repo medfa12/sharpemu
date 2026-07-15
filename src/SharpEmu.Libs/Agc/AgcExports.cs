@@ -71,6 +71,7 @@ public static class AgcExports
     private const uint ComputeNumThreadZ = 0x209;
     private const uint SpiPsInputCntl0 = 0x191;
     private const uint VgtPrimitiveType = 0x242;
+    private const uint VgtShaderStagesEn = 0x2D5; // context reg: LS/HS/ES/GS/VS + PRIMGEN_EN (NGG)
     private const uint PaScScreenScissorTl = 0x0C;
     private const uint PaScScreenScissorBr = 0x0D;
     private const uint CbTargetMask = 0x8E;
@@ -160,6 +161,7 @@ public static class AgcExports
     private static readonly HashSet<(int Handle, int Index, ulong Address, string Path)> _tracedDisplayBuffers = new();
     private static readonly HashSet<(ulong, int)> _tracedFlipDecisions = new();
     private static readonly HashSet<ulong> _tracedComputeShaders = new();
+    private static readonly HashSet<ulong> _tracedNggDraws = new();
     private static readonly Dictionary<(ulong Address, uint Width, uint Height), ulong> _tracedTextureHashes = [];
     private static readonly HashSet<uint> _tracedSubmittedDrawOpcodes = new();
     private static readonly Dictionary<(ulong Ps, ulong State, Gen5PixelOutputKind Output), byte[]> _pixelSpirvCache = new();
@@ -3397,7 +3399,7 @@ public static class AgcExports
                     }
                 }
                 else if (state.SawIndexedDraw &&
-                         state.GuestDrawKind != GuestDrawKind.None &&
+                         state.GuestDrawKind == GuestDrawKind.FullscreenBarycentric &&
                          VideoOutExports.TryGetDisplayBufferInfo(
                              handle,
                              displayBufferIndex,
@@ -3747,6 +3749,49 @@ public static class AgcExports
         }
     }
 
+    /// <summary>
+    /// Flags NGG primitive-shader draws (merged ES/GS launched through the
+    /// geometry pipeline). Detection only: the draw still falls through to the
+    /// existing plain-VS translation path unchanged, so non-NGG draws — and,
+    /// for now, NGG draws too — behave exactly as before. The compute
+    /// amplification capture that turns this into real geometry is future work.
+    /// </summary>
+    private static void DetectNggPrimitiveDraw(
+        SubmittedDcbState state,
+        ulong exportShaderAddress,
+        uint vertexCount,
+        bool indexed)
+    {
+        if (!state.CxRegisters.TryGetValue(VgtShaderStagesEn, out var stagesEnRaw))
+        {
+            return;
+        }
+
+        var stages = NggShaderStages.Decode(stagesEnRaw);
+        if (!stages.IsNggPrimitiveDraw)
+        {
+            return;
+        }
+
+        state.GuestDrawKind = GuestDrawKind.NggPrimitive;
+
+        if (_tracedNggDraws.Add(exportShaderAddress))
+        {
+            TraceAgc(
+                $"agc.ngg_draw es=0x{exportShaderAddress:X16} " +
+                $"stages=0x{stages.Raw:X8} primgen=1 " +
+                $"passthru={(stages.PrimgenPassthruEn ? 1 : 0)} " +
+                $"gs_fast_launch={stages.GsFastLaunch} " +
+                $"es_en={(stages.EsEn ? 1 : 0)} gs_en={(stages.GsEn ? 1 : 0)} " +
+                $"indexCount={vertexCount} inst={state.InstanceCount} indexed={(indexed ? 1 : 0)}");
+        }
+
+        VulkanVideoPresenter.NoteNggAmplifyPending(
+            exportShaderAddress,
+            state.InstanceCount,
+            vertexCount);
+    }
+
     private static void TryTranslateGuestDraw(
         CpuContext ctx,
         SubmittedGpuState gpuState,
@@ -3772,6 +3817,11 @@ public static class AgcExports
         var drawSequence = ++gpuState.WorkSequence;
         state.TranslatedDraw = null;
         state.GuestDrawKind = GuestDrawKind.None;
+        DetectNggPrimitiveDraw(
+            state,
+            hasExportShader ? exportShaderAddress : 0,
+            vertexCount,
+            indexed);
         foreach (var target in renderTargets)
         {
             state.RenderTargetWriters[target.Address] = new RenderTargetWriter(

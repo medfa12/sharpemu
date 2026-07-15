@@ -24,6 +24,13 @@ internal enum GuestDrawKind
 {
     None,
     FullscreenBarycentric,
+
+    /// <summary>
+    /// RDNA NGG primitive-shader draw (merged ES/GS launched through the
+    /// geometry pipeline). Detected today; the compute-amplification capture
+    /// that turns it into real geometry is not yet wired.
+    /// </summary>
+    NggPrimitive,
 }
 
 internal sealed record VulkanGuestDrawTexture(
@@ -421,6 +428,35 @@ internal static unsafe class VulkanVideoPresenter
             };
             _thread.Start();
         }
+    }
+
+    private static readonly HashSet<ulong> _tracedNggAmplify = new();
+
+    /// <summary>
+    /// Marks an NGG primitive-shader draw whose compute-amplification capture
+    /// (running the merged ES/GS as a compute dispatch that writes POS/PARAM/
+    /// PRIM exports into vertex/index SSBOs, then feeding them to the existing
+    /// indexed draw path) is not yet implemented. Emitting the trace here lets
+    /// a boot confirm detection reached the presenter seam where the dispatch
+    /// will eventually be issued.
+    /// </summary>
+    public static void NoteNggAmplifyPending(
+        ulong exportShaderAddress,
+        uint instanceCount,
+        uint indexCount)
+    {
+        lock (_gate)
+        {
+            if (!_tracedNggAmplify.Add(exportShaderAddress))
+            {
+                return;
+            }
+        }
+
+        Console.Error.WriteLine(
+            $"[LOADER][TRACE] vk.ngg_amplify es=0x{exportShaderAddress:X16} " +
+            $"subgroups={instanceCount} indexCount={indexCount} dispatched=0 " +
+            "(compute-capture not yet implemented)");
     }
 
     public static void SubmitGuestDraw(GuestDrawKind drawKind, uint width, uint height)
