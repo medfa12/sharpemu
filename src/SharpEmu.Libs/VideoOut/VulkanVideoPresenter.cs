@@ -4386,6 +4386,7 @@ internal static unsafe class VulkanVideoPresenter
             if (texture.Address != 0 &&
                 !texture.IsFallback &&
                 texture.RgbaPixels.Length == 0 &&
+                !IsBlockCompressedFormat(vkFormat) &&
                 _guestImages.TryFindPresentable(texture.Address, out var producer) &&
                 producer.Image.Handle != 0)
             {
@@ -5740,6 +5741,13 @@ internal static unsafe class VulkanVideoPresenter
                 Format.BC1RgbaSrgbBlock or
                 Format.BC7UnormBlock or
                 Format.BC7SrgbBlock;
+
+        private static bool IsIntegerFormat(Format format) =>
+            format is Format.R8Uint or Format.R8Sint or
+                Format.R32Uint or Format.R32Sint or
+                Format.R16G16Uint or Format.R16G16Sint or
+                Format.R8G8B8A8Uint or Format.R8G8B8A8Sint or
+                Format.R16G16B16A16Uint or Format.R16G16B16A16Sint;
 
         private void TraceVkAlloc(ulong size, string tag)
         {
@@ -7957,6 +7965,13 @@ internal static unsafe class VulkanVideoPresenter
                     DstSubresource = subresource,
                     DstOffsets = destinationOffsets,
                 };
+                // Integer (uint/sint) formats do not support linear filtering
+                // (VUID-vkCmdBlitImage-filter-02001); they must blit with
+                // nearest. Only non-integer color formats get linear scaling.
+                var blitFilter =
+                    IsIntegerFormat(copySource.Format) || IsIntegerFormat(texture.Format)
+                        ? Filter.Nearest
+                        : Filter.Linear;
                 _vk.CmdBlitImage(
                     _commandBuffer,
                     copySource.Image,
@@ -7965,7 +7980,7 @@ internal static unsafe class VulkanVideoPresenter
                     ImageLayout.TransferDstOptimal,
                     1,
                     &blitRegion,
-                    Filter.Linear);
+                    blitFilter);
             }
 
             var toShaderRead = new ImageMemoryBarrier
