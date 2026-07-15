@@ -176,6 +176,8 @@ internal static unsafe class VulkanVideoPresenter
     private const uint GuestFormatR8G8B8A8Sint = 0x2000A;
     private const uint GuestFormatR16G16B16A16Uint = 0x1000C;
     private const uint GuestFormatR16G16B16A16Sint = 0x2000C;
+    private const uint MinPresentableGuestImageWidth = 960;
+    private const uint MinPresentableGuestImageHeight = 540;
 
     private static readonly object _gate = new();
     private static readonly Queue<object> _pendingGuestWork = new();
@@ -184,6 +186,10 @@ internal static unsafe class VulkanVideoPresenter
     private static readonly HashSet<(ulong Address, uint Width, uint Height)>
         _tracedGuestImageSubmissions = [];
     private static readonly HashSet<ulong> _dumpedFailedDrawShaders = [];
+    // Most recently GPU-published render target large enough to be the game's
+    // final composite frame. Flips of registered display buffers that never
+    // received a GPU render present this image instead of dropping the frame.
+    private static ulong _latestPresentableGuestImageAddress;
     private static long _grossVkDeviceAlloc;
     private static long _vkAllocCount;
     private static Thread? _thread;
@@ -695,7 +701,22 @@ internal static unsafe class VulkanVideoPresenter
         lock (_gate)
         {
             // VideoOut registration does not imply a rendered Vulkan image.
+            var presentAddress = address;
             var known = _gpuGuestImages.ContainsKey(address);
+            if (!known &&
+                TryResolveDisplayBufferSourceLocked(address, out var sourceAddress))
+            {
+                if (_tracedGuestImageSubmissions.Add((address, width, height)))
+                {
+                    Console.Error.WriteLine(
+                        $"[LOADER][TRACE] vk.flip_redirect display=0x{address:X16} " +
+                        $"source=0x{sourceAddress:X16} {width}x{height}");
+                }
+
+                presentAddress = sourceAddress;
+                known = true;
+            }
+
             if (ShouldTracePresentedGuestImageContentsForDiagnostics())
             {
                 Console.Error.WriteLine(
@@ -717,7 +738,9 @@ internal static unsafe class VulkanVideoPresenter
                 {
                     Console.Error.WriteLine(
                         $"[LOADER][WARN] vk.submit_guest_image_unknown addr=0x{address:X16} " +
-                        $"{width}x{height} - flip target has no completed GPU render output");
+                        $"{width}x{height} - flip target has no completed GPU render output " +
+                        $"(available={_availableGuestImages.ContainsKey(address)} " +
+                        $"gpu_images={_gpuGuestImages.Count} avail_images={_availableGuestImages.Count})");
                 }
 
                 return false;
@@ -735,7 +758,7 @@ internal static unsafe class VulkanVideoPresenter
                 TranslatedDraw: null,
                 RequiredGuestWorkSequence: 0,
                 IsSplash: false,
-                GuestImageAddress: address);
+                GuestImageAddress: presentAddress);
             System.Threading.Monitor.PulseAll(_gate);
             if (_thread is not null)
             {
@@ -775,6 +798,89 @@ internal static unsafe class VulkanVideoPresenter
         lock (_gate)
         {
             _availableGuestImages[address] = guestFormat;
+        }
+    }
+
+    // Games composite the frame into internal render targets and then flip a
+    // display buffer registered through sceVideoOutRegisterBuffers; on hardware
+    // a final GPU pass writes that buffer, but the HLE GPU does not execute it
+    // yet, so no rendered image ever exists at the flipped address. Bridge the
+    // flip to the most recent full-screen render instead of dropping the frame.
+    // Caller must hold _gate.
+    private static bool TryResolveDisplayBufferSourceLocked(
+        ulong flipAddress,
+        out ulong sourceAddress)
+    {
+        sourceAddress = _latestPresentableGuestImageAddress;
+        return sourceAddress != 0 &&
+            _availableGuestImages.ContainsKey(flipAddress) &&
+            _gpuGuestImages.ContainsKey(sourceAddress);
+    }
+
+    // Caller must hold _gate.
+    private static void NoteRenderedGuestImageLocked(
+        ulong address,
+        uint width,
+        uint height)
+    {
+        if (width >= MinPresentableGuestImageWidth &&
+            height >= MinPresentableGuestImageHeight)
+        {
+            _latestPresentableGuestImageAddress = address;
+        }
+    }
+
+    // Caller must hold _gate.
+    private static void ForgetRenderedGuestImageLocked(ulong address)
+    {
+        if (_latestPresentableGuestImageAddress == address)
+        {
+            _latestPresentableGuestImageAddress = 0;
+        }
+    }
+
+    internal static void ResetGuestImageTrackingForTests()
+    {
+        lock (_gate)
+        {
+            _availableGuestImages.Clear();
+            _gpuGuestImages.Clear();
+            _tracedGuestImageSubmissions.Clear();
+            _latestPresentableGuestImageAddress = 0;
+        }
+    }
+
+    internal static void PublishRenderedGuestImageForTests(
+        ulong address,
+        uint guestFormat,
+        uint width,
+        uint height)
+    {
+        lock (_gate)
+        {
+            _availableGuestImages[address] = guestFormat;
+            _gpuGuestImages[address] = guestFormat;
+            NoteRenderedGuestImageLocked(address, width, height);
+        }
+    }
+
+    internal static void RemoveRenderedGuestImageForTests(ulong address)
+    {
+        lock (_gate)
+        {
+            _availableGuestImages.Remove(address);
+            _gpuGuestImages.Remove(address);
+            ForgetRenderedGuestImageLocked(address);
+        }
+    }
+
+    internal static bool TryResolveDisplayBufferSourceForTests(
+        ulong flipAddress,
+        out ulong sourceAddress)
+    {
+        lock (_gate)
+        {
+            return TryResolveDisplayBufferSourceLocked(flipAddress, out sourceAddress);
         }
     }
 
@@ -3981,6 +4087,7 @@ internal static unsafe class VulkanVideoPresenter
                     {
                         _availableGuestImages[texture.Address] = guestFormat;
                         _gpuGuestImages.Remove(texture.Address);
+                        ForgetRenderedGuestImageLocked(texture.Address);
                     }
                 }
             }
@@ -4936,6 +5043,7 @@ internal static unsafe class VulkanVideoPresenter
                     {
                         _availableGuestImages.Remove(address);
                         _gpuGuestImages.Remove(address);
+                        ForgetRenderedGuestImageLocked(address);
                     }
                 }
 
@@ -5450,6 +5558,10 @@ internal static unsafe class VulkanVideoPresenter
                         {
                             _availableGuestImages[targets[index].Address] = guestTextureFormat;
                             _gpuGuestImages[targets[index].Address] = guestTextureFormat;
+                            NoteRenderedGuestImageLocked(
+                                targets[index].Address,
+                                targets[index].Width,
+                                targets[index].Height);
                         }
                     }
                 }
@@ -5499,6 +5611,7 @@ internal static unsafe class VulkanVideoPresenter
                         {
                             _availableGuestImages.Remove(target.Address);
                             _gpuGuestImages.Remove(target.Address);
+                            ForgetRenderedGuestImageLocked(target.Address);
                         }
                     }
                 }
@@ -5614,6 +5727,7 @@ internal static unsafe class VulkanVideoPresenter
                 {
                     _availableGuestImages.Remove(target.Address);
                     _gpuGuestImages.Remove(target.Address);
+                    ForgetRenderedGuestImageLocked(target.Address);
                 }
             }
 
@@ -7000,6 +7114,10 @@ internal static unsafe class VulkanVideoPresenter
                     {
                         _availableGuestImages[texture.Address] = format;
                         _gpuGuestImages[texture.Address] = format;
+                        NoteRenderedGuestImageLocked(
+                            texture.Address,
+                            guestImage.Width,
+                            guestImage.Height);
                     }
 
                     if (traceContents &&
@@ -7795,6 +7913,7 @@ internal static unsafe class VulkanVideoPresenter
             {
                 _availableGuestImages.Clear();
                 _gpuGuestImages.Clear();
+                _latestPresentableGuestImageAddress = 0;
             }
             DestroySwapchainResources();
             if (_device.Handle != 0)

@@ -153,6 +153,7 @@ public static class AgcExports
     private static readonly HashSet<(ulong Es, ulong Ps, ulong Target, ulong Texture, uint VertexCount)> _tracedShaderDraws = new();
     private static readonly HashSet<(ulong Ps, string Error)> _tracedShaderFailures = new();
     private static readonly HashSet<(int Handle, int Index, ulong Address, string Path)> _tracedDisplayBuffers = new();
+    private static readonly HashSet<(ulong, int)> _tracedFlipDecisions = new();
     private static readonly HashSet<ulong> _tracedComputeShaders = new();
     private static readonly Dictionary<(ulong Address, uint Width, uint Height), ulong> _tracedTextureHashes = [];
     private static readonly HashSet<uint> _tracedSubmittedDrawOpcodes = new();
@@ -3257,11 +3258,18 @@ public static class AgcExports
                 }
                 else if (state.SawIndexedDraw && state.PresenterTexture is { } sourceTexture)
                 {
-                    _ = TrySoftwarePresent(
+                    var presented = TrySoftwarePresent(
                         ctx,
                         sourceTexture,
                         unchecked((int)videoOutHandle),
                         displayBufferIndex);
+                    if (_tracedFlipDecisions.Add((sourceTexture.Address, displayBufferIndex)))
+                    {
+                        Console.Error.WriteLine(
+                            $"[LOADER][FLIPDBG] soft_present presented={presented} " +
+                            $"src=0x{sourceTexture.Address:X16} fmt={sourceTexture.Format} tile={sourceTexture.TileMode} " +
+                            $"type={sourceTexture.Type} {sourceTexture.Width}x{sourceTexture.Height} idx={displayBufferIndex}");
+                    }
                 }
                 else if (state.SawIndexedDraw &&
                          state.GuestDrawKind != GuestDrawKind.None &&
@@ -5214,6 +5222,9 @@ public static class AgcExports
                             previous != fingerprint)
                         {
                             _softwareComputeBlitFingerprints[key] = fingerprint;
+                            Console.Error.WriteLine(
+                                $"[LOADER][BLITDST] compute_blit src=0x{sourceTexture.Address:X16} " +
+                                $"dst=0x{texture.Address:X16} {texture.Width}x{texture.Height}");
                             TraceAgcShader(
                                 $"agc.compute_blit cs=0x{shaderAddress:X16} " +
                                 $"src=0x{sourceTexture.Address:X16}:{sourceTexture.Width}x{sourceTexture.Height}:fmt{sourceTexture.Format}/num{sourceTexture.NumberType}/tile{sourceTexture.TileMode} " +
