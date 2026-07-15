@@ -7381,8 +7381,8 @@ internal static unsafe class VulkanVideoPresenter
                         $"center={center} hash=0x{hash:X16}");
                     if (nonblackPixels > 0 && image.Format == Format.R8G8B8A8Unorm)
                     {
-                        const int outWidth = 480;
-                        const int outHeight = 270;
+                        const int outWidth = 960;
+                        const int outHeight = 540;
                         var srcW = (int)image.Width;
                         var srcH = (int)image.Height;
                         var rgb = new byte[outWidth * outHeight * 3];
