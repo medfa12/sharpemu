@@ -1941,6 +1941,7 @@ internal static unsafe class VulkanVideoPresenter
             "1",
             StringComparison.Ordinal);
         private readonly HashSet<(ulong Address, uint Width, uint Height, Format Format)> _tracedTextureUploads = new();
+        private readonly HashSet<ulong> _tracedUploadFallthrough = new();
         private readonly HashSet<(ulong Address, Format Format)> _tracedCopyOnSample = new();
         private readonly HashSet<(ulong Address, uint Width, uint Height, uint Format)> _dumpedTextures = new();
         private readonly HashSet<(ulong Address, int Size)> _tracedGlobalBuffers = new();
@@ -4383,14 +4384,37 @@ internal static unsafe class VulkanVideoPresenter
             // memory would read back black and cascade the whole pass to black.
             // Copy the producer's GPU content into a fresh sampled image so the
             // sampler reads real pixels (Kyty-style copy-on-sample bridge).
+            // A GPU producer (render target / compute ImageStore) at this address
+            // is authoritative even when the enqueue gate already read (empty)
+            // guest memory into RgbaPixels -- for these addresses the guest bytes
+            // are stale/zero and would upload black. Prefer the producer whenever
+            // one is cached, regardless of RgbaPixels (a genuine CPU texture has
+            // no initialized GPU surface at its address, so this does not steal
+            // real uploads).
+            GuestImageResource? producer = null;
+            if (texture.Address != 0)
+            {
+                _guestImages.TryFindPresentable(texture.Address, out producer);
+            }
+
+            if (producer is { } gpuProducer &&
+                gpuProducer.Image.Handle != 0 &&
+                !texture.IsFallback &&
+                !IsBlockCompressedFormat(vkFormat))
+            {
+                return CreateCopyOnSampleTextureResource(texture, gpuProducer);
+            }
+
             if (texture.Address != 0 &&
                 !texture.IsFallback &&
-                texture.RgbaPixels.Length == 0 &&
-                !IsBlockCompressedFormat(vkFormat) &&
-                _guestImages.TryFindPresentable(texture.Address, out var producer) &&
-                producer.Image.Handle != 0)
+                ShouldTracePresentedGuestImageContentsForDiagnostics() &&
+                _tracedUploadFallthrough.Add(texture.Address))
             {
-                return CreateCopyOnSampleTextureResource(texture, producer);
+                Console.Error.WriteLine(
+                    "[LOADER][TRACE] vk.upload_fallthrough addr=0x" + texture.Address.ToString("X16") +
+                    " has_producer=" + (producer is not null) +
+                    " rgba=" + texture.RgbaPixels.Length +
+                    " vk=" + vkFormat);
             }
 
             return CreateTextureResource(texture);
