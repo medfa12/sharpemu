@@ -163,6 +163,7 @@ public static class AgcExports
     private static readonly HashSet<ulong> _tracedComputeShaders = new();
     private static readonly HashSet<ulong> _tracedNggDraws = new();
     private static readonly HashSet<ulong> _tracedNggStagesProbe = new();
+    private static readonly HashSet<ulong> _tracedNggIndirectProbe = new();
     private static readonly Dictionary<(ulong Address, uint Width, uint Height), ulong> _tracedTextureHashes = [];
     private static readonly HashSet<uint> _tracedSubmittedDrawOpcodes = new();
     private static readonly Dictionary<(ulong Ps, ulong State, Gen5PixelOutputKind Output), byte[]> _pixelSpirvCache = new();
@@ -3764,14 +3765,18 @@ public static class AgcExports
         bool indexed)
     {
         var hasStagesEn = state.CxRegisters.TryGetValue(VgtShaderStagesEn, out var stagesEnRaw);
-        if (_tracedNggStagesProbe.Add(exportShaderAddress))
+        // Probe ONLY the indirect/geometry draws (CurrentIndirectArgsAddress set)
+        // so the stage config is the real geometry pipeline, not a stale GS
+        // register left over on a fullscreen pass.
+        var isIndirectGeometry = state.CurrentIndirectArgsAddress != 0;
+        if ((isIndirectGeometry ? _tracedNggIndirectProbe : _tracedNggStagesProbe).Add(exportShaderAddress))
         {
             state.CxRegisters.TryGetValue(0x2D6u, out var geNggSubgrp);
             var hasGs = state.ShRegisters.TryGetValue(SpiShaderPgmLoGs, out var gsLo);
             state.ShRegisters.TryGetValue(SpiShaderPgmHiGs, out var gsHi);
             TraceAgc(
-                $"agc.ngg_probe es=0x{exportShaderAddress:X16} hasStagesEn={hasStagesEn} " +
-                $"stagesEn=0x{stagesEnRaw:X8} geNggSubgrp=0x{geNggSubgrp:X8} " +
+                $"agc.ngg_probe indirect={(isIndirectGeometry ? 1 : 0)} es=0x{exportShaderAddress:X16} " +
+                $"hasStagesEn={hasStagesEn} stagesEn=0x{stagesEnRaw:X8} geNggSubgrp=0x{geNggSubgrp:X8} " +
                 $"hasGs={hasGs} gs=0x{((ulong)gsHi << 32) | gsLo:X16} " +
                 $"vtx={vertexCount} inst={state.InstanceCount} indexed={(indexed ? 1 : 0)}");
         }
