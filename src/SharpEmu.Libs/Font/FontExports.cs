@@ -32,6 +32,8 @@ public static class FontExports
     // Error values from the libSceFont ABI (see shadPS4 font_error.h).
     private const uint FontErrorInvalidParameter = 0x80460002;
     private const uint FontErrorInvalidFontHandle = 0x80460005;
+    private const uint FontErrorInvalidGlyph = 0x80460006;
+    private const uint FontErrorAllocationFailed = 0x80460010;
     private const uint FontErrorNoSupportCode = 0x80460041;
 
     // Pixel scale per font handle, captured from sceFontSetScalePixel /
@@ -210,10 +212,12 @@ public static class FontExports
     private static int FillGlyphMetrics(CpuContext ctx)
     {
         // (OrbisFontHandle handle, u32 code, OrbisFontGlyphMetrics* metrics)
-        var handle = ctx[CpuRegister.Rdi];
-        var code = (uint)ctx[CpuRegister.Rsi];
-        var metrics = ctx[CpuRegister.Rdx];
+        return FillGlyphMetricsAt(
+            ctx, ctx[CpuRegister.Rdi], (uint)ctx[CpuRegister.Rsi], ctx[CpuRegister.Rdx]);
+    }
 
+    private static int FillGlyphMetricsAt(CpuContext ctx, ulong handle, uint code, ulong metrics)
+    {
         if (handle == 0)
         {
             ZeroGuestStruct(ctx, metrics, 0x20);
@@ -279,6 +283,216 @@ public static class FontExports
             && TryWriteFloat(ctx, layout + 0x08, 0f);
         return ok ? Ok(ctx) : Error(ctx, FontErrorInvalidParameter);
     }
+
+    // ----- Glyph objects (sceFontGenerateCharGlyph .. sceFontDeleteGlyph) -----
+    //
+    // The glyph object is opaque to the game but the game's font renderer
+    // module reads fields well past shadPS4's 0x20-byte reconstruction (the
+    // pre-fix crash was a field read at glyph+0x40C), so each glyph is backed
+    // by the same 0x1000-byte zeroed scratch as the other font objects. The
+    // known header (shadPS4 font.h OrbisFontGlyphOpaque) is filled in so any
+    // magic/form checks pass; everything else reads as zero. Deleted glyphs
+    // are recycled so a menu that regenerates its glyph set every frame does
+    // not grow guest memory without bound.
+    private static readonly ConcurrentDictionary<ulong, byte> LiveGlyphs = new();
+    private static readonly ConcurrentQueue<ulong> FreeGlyphs = new();
+    private static readonly byte[] GlyphZeroFill = new byte[ScratchObjectSize];
+
+    [SysAbiExport(Nid = "C-4Qw5Srlyw", ExportName = "sceFontGenerateCharGlyph",
+        Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceFont")]
+    public static int FontGenerateCharGlyph(CpuContext ctx)
+    {
+        // (OrbisFontHandle handle, u32 codepoint,
+        //  const OrbisFontGenerateGlyphParams* params, OrbisFontGlyph* outGlyph)
+        // -> RDI, ESI, RDX (params may be null), RCX (out glyph pointer).
+        var handle = ctx[CpuRegister.Rdi];
+        var code = (uint)ctx[CpuRegister.Rsi];
+        var genParams = ctx[CpuRegister.Rdx];
+        var outGlyph = ctx[CpuRegister.Rcx];
+
+        if (outGlyph == 0 || !ctx.TryWriteUInt64(outGlyph, 0))
+        {
+            // The real library clears the out pointer before any validation.
+            return Error(ctx, FontErrorInvalidParameter);
+        }
+
+        if (handle == 0)
+        {
+            return Error(ctx, FontErrorInvalidFontHandle);
+        }
+
+        if (code == 0)
+        {
+            return Error(ctx, FontErrorNoSupportCode);
+        }
+
+        // OrbisFontGenerateGlyphParams: u16 id; u16 res0; u16 formOptions;
+        // u8 glyphForm; u8 metricsForm; OrbisFontMem* mem (+0x08).
+        uint formsWord = 0;
+        ulong glyphMemory = 0;
+        if (genParams != 0 && ctx.TryReadUInt32(genParams + 0x04, out formsWord))
+        {
+            _ = ctx.TryReadUInt64(genParams + 0x08, out glyphMemory);
+        }
+
+        if (!TryAcquireGlyphObject(ctx, out var glyph))
+        {
+            return Error(ctx, FontErrorAllocationFailed);
+        }
+
+        // OrbisFontGlyphOpaque header: magic 0x0F03 @+0x00, formOptions
+        // @+0x02, glyphForm/metricsForm @+0x04..0x05, emSize @+0x06, baseline
+        // @+0x08, heightPx @+0x0A, originX @+0x0C, originY @+0x0E, scaleX
+        // @+0x10 (f32), baseScale @+0x14 (f32), OrbisFontMem* @+0x18.
+        var (scaleW, scaleH) = GetScalePixel(handle);
+        var emSize = ClampToU16(scaleH);
+        var baseline = ClampToU16(0.72f * scaleH);
+        var ok = ctx.TryWriteUInt32(glyph + 0x00, 0x0F03u | (formsWord << 16))
+            && ctx.TryWriteUInt32(glyph + 0x04, (formsWord >> 16) | ((uint)emSize << 16))
+            && ctx.TryWriteUInt32(glyph + 0x08, baseline | ((uint)baseline << 16))
+            && ctx.TryWriteUInt32(glyph + 0x0C, (uint)baseline << 16)
+            && TryWriteFloat(ctx, glyph + 0x10, scaleW)
+            && TryWriteFloat(ctx, glyph + 0x14, scaleH)
+            && ctx.TryWriteUInt64(glyph + 0x18, glyphMemory)
+            && ctx.TryWriteUInt64(outGlyph, glyph);
+        return ok ? Ok(ctx) : Error(ctx, FontErrorInvalidParameter);
+    }
+
+    [SysAbiExport(Nid = "8-zmgsxkBek", ExportName = "sceFontGlyphDefineAttribute",
+        Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceFont")]
+    public static int FontGlyphDefineAttribute(CpuContext ctx) => Ok(ctx);
+
+    [SysAbiExport(Nid = "kAenWy1Zw5o", ExportName = "sceFontRenderCharGlyphImageHorizontal",
+        Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceFont")]
+    public static int FontRenderCharGlyphImageHorizontal(CpuContext ctx)
+    {
+        // (OrbisFontHandle handle, u32 code, OrbisFontRenderSurface* surf,
+        //  float x, float y, OrbisFontGlyphMetrics* metrics,
+        //  OrbisFontRenderOutput* result). x/y ride XMM0/XMM1, so the
+        // integer-class args land in RDI, ESI, RDX, RCX, R8.
+        var handle = ctx[CpuRegister.Rdi];
+        var code = (uint)ctx[CpuRegister.Rsi];
+        var surf = ctx[CpuRegister.Rdx];
+        var metrics = ctx[CpuRegister.Rcx];
+        var result = ctx[CpuRegister.R8];
+
+        // The real library zeroes both out structs on every failure path so
+        // the caller never consumes stale image pointers.
+        if (handle == 0)
+        {
+            ClearRenderOutputs(ctx, metrics, result);
+            return Error(ctx, FontErrorInvalidFontHandle);
+        }
+
+        if (code == 0)
+        {
+            ClearRenderOutputs(ctx, metrics, result);
+            return Error(ctx, FontErrorNoSupportCode);
+        }
+
+        if (surf == 0 || metrics == 0 || result == 0)
+        {
+            ClearRenderOutputs(ctx, metrics, result);
+            return Error(ctx, FontErrorInvalidParameter);
+        }
+
+        // Same synthetic metrics as the metrics queries so layout and render
+        // agree on advances; no pixels are written yet (blank glyphs).
+        _ = FillGlyphMetricsAt(ctx, handle, code, metrics);
+        if (ctx[CpuRegister.Rax] != 0)
+        {
+            ClearRenderOutputs(ctx, metrics, result);
+            return Error(ctx, (uint)ctx[CpuRegister.Rax]);
+        }
+
+        _ = ctx.TryReadUInt32(metrics + 0x08, out var bearingXBits);
+        _ = ctx.TryReadUInt32(metrics + 0x0C, out var bearingYBits);
+        _ = ctx.TryReadUInt32(metrics + 0x10, out var advanceBits);
+        _ = ctx.TryReadUInt64(surf + 0x00, out var surfBuffer);
+        _ = ctx.TryReadUInt32(surf + 0x08, out var surfWidthByte);
+        _ = ctx.TryReadUInt32(surf + 0x0C, out var surfPixelWord);
+
+        // OrbisFontRenderOutput (0x40 bytes): stage @+0x00, SurfaceImage
+        // { address @+0x08, widthByte @+0x10, pixelSizeByte/pixelFormat/pad
+        // @+0x14 }, UpdateRect { x,y,w,h } @+0x18, ImageMetrics { bearingX,
+        // bearingY, advance, stride @+0x28.., width/height @+0x38 }. An empty
+        // 0x0 UpdateRect and 0x0 image tell the caller "nothing was drawn",
+        // while address still points at the caller's own surface buffer so a
+        // blind copy-out cannot fault.
+        var ok = ctx.TryWriteUInt64(result + 0x00, 0)
+            && ctx.TryWriteUInt64(result + 0x08, surfBuffer)
+            && ctx.TryWriteUInt32(result + 0x10, surfWidthByte)
+            && ctx.TryWriteUInt32(result + 0x14, surfPixelWord & 0xFF)
+            && ctx.TryWriteUInt64(result + 0x18, 0)
+            && ctx.TryWriteUInt64(result + 0x20, 0)
+            && ctx.TryWriteUInt32(result + 0x28, bearingXBits)
+            && ctx.TryWriteUInt32(result + 0x2C, bearingYBits)
+            && ctx.TryWriteUInt32(result + 0x30, advanceBits)
+            && ctx.TryWriteUInt32(result + 0x34, advanceBits)
+            && ctx.TryWriteUInt64(result + 0x38, 0);
+        if (!ok)
+        {
+            ClearRenderOutputs(ctx, metrics, result);
+            return Error(ctx, FontErrorInvalidParameter);
+        }
+
+        return Ok(ctx);
+    }
+
+    [SysAbiExport(Nid = "LHDoRWVFGqk", ExportName = "sceFontDeleteGlyph",
+        Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceFont")]
+    public static int FontDeleteGlyph(CpuContext ctx)
+    {
+        // (const OrbisFontMem* memory, OrbisFontGlyph* glyph) -> RDI, RSI.
+        // The real library validates *glyph, frees it, and nulls the slot.
+        var glyphSlot = ctx[CpuRegister.Rsi];
+        if (glyphSlot == 0)
+        {
+            return Error(ctx, FontErrorInvalidParameter);
+        }
+
+        if (!ctx.TryReadUInt64(glyphSlot, out var glyph) || glyph == 0)
+        {
+            return Error(ctx, FontErrorInvalidGlyph);
+        }
+
+        if (LiveGlyphs.TryRemove(glyph, out _))
+        {
+            FreeGlyphs.Enqueue(glyph);
+        }
+
+        _ = ctx.TryWriteUInt64(glyphSlot, 0);
+        return Ok(ctx);
+    }
+
+    private static bool TryAcquireGlyphObject(CpuContext ctx, out ulong glyph)
+    {
+        if (FreeGlyphs.TryDequeue(out glyph))
+        {
+            // Recycled objects are re-zeroed so no stale state from the
+            // previous glyph leaks into the guest's field reads.
+            _ = ctx.Memory.TryWrite(glyph, GlyphZeroFill);
+        }
+        else if (!KernelMemoryCompatExports.TryAllocateHleData(
+            ctx, ScratchObjectSize, ScratchObjectAlign, out glyph))
+        {
+            return false;
+        }
+
+        LiveGlyphs[glyph] = 1;
+        return true;
+    }
+
+    private static void ClearRenderOutputs(CpuContext ctx, ulong metrics, ulong result)
+    {
+        ZeroGuestStruct(ctx, metrics, 0x20);
+        ZeroGuestStruct(ctx, result, 0x40);
+    }
+
+    private static ushort ClampToU16(float value) =>
+        float.IsFinite(value) && value > 0f
+            ? (ushort)Math.Min(value, ushort.MaxValue)
+            : (ushort)0;
 
     private static (float W, float H) GetScalePixel(ulong handle) =>
         ScalePixels.TryGetValue(handle, out var scale) && scale.W > 0f && scale.H > 0f
@@ -350,4 +564,12 @@ public static class FontExports
     }
 
     internal static void ResetScaleForTests() => ScalePixels.Clear();
+
+    internal static void ResetGlyphStateForTests()
+    {
+        LiveGlyphs.Clear();
+        while (FreeGlyphs.TryDequeue(out _))
+        {
+        }
+    }
 }
