@@ -142,7 +142,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 	private const ulong GuestThreadTlsBaseAddress = 0x7FFE_0000_0000UL;
 
-	private const ulong GuestThreadStackSize = 0x0020_0000UL;
+	private const ulong GuestThreadStackSize = 0x0080_0000UL;
 
 	private const ulong GuestThreadTlsSize = 0x0001_0000UL;
 

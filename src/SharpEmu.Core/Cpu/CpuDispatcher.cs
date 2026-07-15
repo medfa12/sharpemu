@@ -23,7 +23,7 @@ public sealed class CpuDispatcher : ICpuDispatcher, IDisposable
     }
 
     private const ulong StackBaseAddress = 0x7FFF_F000_0000UL;
-    private const ulong StackSize = 0x0020_0000UL;
+    private const ulong StackSize = 0x0080_0000UL;
     private const ulong TlsBaseAddress = 0x7FFE_0000_0000UL;
     private const ulong TlsSize = 0x0001_0000UL;
     private const ulong TlsPrefixSize = 0x0000_1000UL;
