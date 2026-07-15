@@ -4664,10 +4664,35 @@ public static class AgcExports
                 Math.Max(descriptor.Width, descriptor.Pitch),
                 descriptor.Format)
             : descriptor.Width;
-        var sourceByteCount = GetTextureByteCount(
-            descriptor.Format,
-            sourceWidth,
-            descriptor.Height);
+        uint elementWidth = 0;
+        uint elementHeight = 0;
+        uint elementPitch = 0;
+        uint bytesPerElement = 0;
+        var detile = descriptor.TileMode != 0 &&
+            Gfx10Detiler.IsSupportedTileMode(descriptor.TileMode) &&
+            TryGetTextureElementLayout(
+                descriptor.Format,
+                descriptor.Width,
+                descriptor.Height,
+                descriptor.Pitch,
+                out elementWidth,
+                out elementHeight,
+                out elementPitch,
+                out bytesPerElement);
+        // Tiled surfaces occupy the pitch/height padded up to whole swizzle
+        // blocks, so the guest read must cover the padded footprint; the
+        // detiler then emits exactly Width x Height linear elements.
+        var sourceByteCount = detile
+            ? Gfx10Detiler.GetTiledByteCount(
+                descriptor.TileMode,
+                elementWidth,
+                elementHeight,
+                elementPitch,
+                bytesPerElement)
+            : GetTextureByteCount(
+                descriptor.Format,
+                sourceWidth,
+                descriptor.Height);
         if (sourceByteCount == 0 ||
             sourceByteCount > MaxPresentedTextureBytes ||
             sourceByteCount > int.MaxValue)
@@ -4707,10 +4732,18 @@ public static class AgcExports
             if (descriptor.Address != 0)
             {
                 var storageSource = new byte[(int)sourceByteCount];
-                if (ctx.Memory.TryRead(descriptor.Address, storageSource) &&
+                if (TryReadTextureSource(ctx, descriptor, storageSource, detile) &&
                     storageSource.AsSpan().IndexOfAnyExcept((byte)0) >= 0)
                 {
-                    initialPixels = storageSource;
+                    initialPixels = detile
+                        ? Gfx10Detiler.Detile(
+                            storageSource,
+                            descriptor.TileMode,
+                            elementWidth,
+                            elementHeight,
+                            elementPitch,
+                            bytesPerElement)
+                        : storageSource;
                 }
             }
 
@@ -4733,7 +4766,7 @@ public static class AgcExports
         }
 
         var source = new byte[(int)sourceByteCount];
-        if (!ctx.Memory.TryRead(descriptor.Address, source))
+        if (!TryReadTextureSource(ctx, descriptor, source, detile))
         {
             texture = CreateFallbackGuestDrawTexture(isStorage, descriptor.Format, descriptor.NumberType);
             return true;
@@ -4761,7 +4794,15 @@ public static class AgcExports
             $"dst=0x{descriptor.DstSelect:X3} " +
             $"bytes={source.Length} nonzero64={nonZero}");
 
-        var rgba = source;
+        var rgba = detile
+            ? Gfx10Detiler.Detile(
+                source,
+                descriptor.TileMode,
+                elementWidth,
+                elementHeight,
+                elementPitch,
+                bytesPerElement)
+            : source;
         texture = new VulkanGuestDrawTexture(
             descriptor.Address,
             descriptor.Width,
@@ -5455,6 +5496,15 @@ public static class AgcExports
             _ => 0UL,
         };
 
+    private static ulong GetTextureBlockCompressedByteCount(uint format) =>
+        format switch
+        {
+            169 or 170 => 8UL,
+            171 or 172 or 173 or 174 or 175 or 176 or
+            177 or 178 or 179 or 180 or 181 or 182 => 16UL,
+            _ => 0UL,
+        };
+
     private static ulong GetTextureByteCount(uint format, uint width, uint height)
     {
         var bytesPerTexel = GetTextureBytesPerTexel(format);
@@ -5463,16 +5513,84 @@ public static class AgcExports
             return checked((ulong)width * height * bytesPerTexel);
         }
 
-        var blockBytes = format switch
-        {
-            169 or 170 => 8UL,
-            171 or 172 or 173 or 174 or 175 or 176 or
-            177 or 178 or 179 or 180 or 181 or 182 => 16UL,
-            _ => 0UL,
-        };
+        var blockBytes = GetTextureBlockCompressedByteCount(format);
         return blockBytes == 0
             ? 0
             : checked(((ulong)width + 3) / 4 * (((ulong)height + 3) / 4) * blockBytes);
+    }
+
+    /// <summary>
+    /// Dimensions of a texture in detiler elements: texels for plain formats,
+    /// 4x4 blocks for the block-compressed ones. Fails for formats whose
+    /// element size is not a power of two the detiler supports (e.g. the
+    /// 12-byte R32G32B32 format), which then keep the raw-read behavior.
+    /// </summary>
+    private static bool TryGetTextureElementLayout(
+        uint format,
+        uint width,
+        uint height,
+        uint pitch,
+        out uint elementWidth,
+        out uint elementHeight,
+        out uint elementPitch,
+        out uint bytesPerElement)
+    {
+        var bytesPerTexel = GetTextureBytesPerTexel(format);
+        if (bytesPerTexel is 1 or 2 or 4 or 8 or 16)
+        {
+            elementWidth = width;
+            elementHeight = height;
+            elementPitch = Math.Max(width, pitch);
+            bytesPerElement = (uint)bytesPerTexel;
+            return true;
+        }
+
+        var blockBytes = GetTextureBlockCompressedByteCount(format);
+        if (bytesPerTexel == 0 && blockBytes != 0)
+        {
+            elementWidth = (width + 3) / 4;
+            elementHeight = (height + 3) / 4;
+            elementPitch = (Math.Max(width, pitch) + 3) / 4;
+            bytesPerElement = (uint)blockBytes;
+            return true;
+        }
+
+        elementWidth = 0;
+        elementHeight = 0;
+        elementPitch = 0;
+        bytesPerElement = 0;
+        return false;
+    }
+
+    private static bool TryReadTextureSource(
+        CpuContext ctx,
+        TextureDescriptor descriptor,
+        byte[] destination,
+        bool paddedTiledRead)
+    {
+        if (ctx.Memory.TryRead(descriptor.Address, destination))
+        {
+            return true;
+        }
+
+        if (!paddedTiledRead)
+        {
+            return false;
+        }
+
+        // The tiled footprint pads the surface up to whole swizzle blocks, and
+        // the padding rows can run past the end of the guest allocation. Retry
+        // with the unpadded byte count and leave the missing tail zeroed; the
+        // detiler emits zero for elements beyond the bytes that were read.
+        var unpaddedByteCount = GetTextureByteCount(
+            descriptor.Format,
+            descriptor.Width,
+            descriptor.Height);
+        return unpaddedByteCount != 0 &&
+            unpaddedByteCount < (ulong)destination.Length &&
+            ctx.Memory.TryRead(
+                descriptor.Address,
+                destination.AsSpan(0, (int)unpaddedByteCount));
     }
 
     private static uint GetLinearTexturePitch(uint pitch, uint format)
