@@ -3767,9 +3767,12 @@ public static class AgcExports
         if (_tracedNggStagesProbe.Add(exportShaderAddress))
         {
             state.CxRegisters.TryGetValue(0x2D6u, out var geNggSubgrp);
+            var hasGs = state.ShRegisters.TryGetValue(SpiShaderPgmLoGs, out var gsLo);
+            state.ShRegisters.TryGetValue(SpiShaderPgmHiGs, out var gsHi);
             TraceAgc(
                 $"agc.ngg_probe es=0x{exportShaderAddress:X16} hasStagesEn={hasStagesEn} " +
                 $"stagesEn=0x{stagesEnRaw:X8} geNggSubgrp=0x{geNggSubgrp:X8} " +
+                $"hasGs={hasGs} gs=0x{((ulong)gsHi << 32) | gsLo:X16} " +
                 $"vtx={vertexCount} inst={state.InstanceCount} indexed={(indexed ? 1 : 0)}");
         }
 
