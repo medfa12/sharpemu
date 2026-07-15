@@ -166,6 +166,10 @@ public static class AgcExports
     private static readonly HashSet<ulong> _tracedNggStagesProbe = new();
     private static readonly HashSet<ulong> _tracedNggIndirectProbe = new();
     private static readonly HashSet<(uint, uint, uint)> _tracedDepthProbe = new();
+    private static readonly object _frameHistGate = new();
+    private static readonly Dictionary<uint, int> _frameOpHist = new();
+    private static int _frameSuspendCount;
+    private static int _framePacketTotal;
     private static readonly Dictionary<(ulong Address, uint Width, uint Height), ulong> _tracedTextureHashes = [];
     private static readonly HashSet<uint> _tracedSubmittedDrawOpcodes = new();
     private static readonly Dictionary<(ulong Ps, ulong State, Gen5PixelOutputKind Output), byte[]> _pixelSpirvCache = new();
@@ -3015,6 +3019,12 @@ public static class AgcExports
 
             var op = (header >> 8) & 0xFFu;
             var register = (header >> 2) & 0x3Fu;
+            lock (_frameHistGate)
+            {
+                _framePacketTotal++;
+                _frameOpHist.TryGetValue(op, out var c);
+                _frameOpHist[op] = c + 1;
+            }
             if (tracePackets)
             {
                 TraceSubmittedPacket(ctx, currentAddress, offset, header, length, op, register);
@@ -3181,6 +3191,7 @@ public static class AgcExports
                                 $"mask=0x{waitMask:X16} cur=0x{curVal:X16} cmp={cmpFunc}");
                         }
 
+                        lock (_frameHistGate) { _frameSuspendCount++; }
                         return; // suspend parsing of this DCB
                     }
                 }
@@ -3215,6 +3226,7 @@ public static class AgcExports
                                 $"mask=0x{waitMask:X16} cur=0x{curVal:X16} cmp={cmpFunc}");
                         }
 
+                        lock (_frameHistGate) { _frameSuspendCount++; }
                         return;
                     }
                 }
@@ -3315,6 +3327,30 @@ public static class AgcExports
 
             if (op == ItNop && register == RFlip && length >= 6)
             {
+                lock (_frameHistGate)
+                {
+                    var draws = 0;
+                    foreach (var o in new[] { ItDrawIndirect, ItDrawIndexIndirect, ItDrawIndex2,
+                        ItDrawIndexAuto, ItDrawIndexMultiAuto, ItDrawIndexOffset2 })
+                    {
+                        _frameOpHist.TryGetValue(o, out var oc);
+                        draws += oc;
+                    }
+                    _frameOpHist.TryGetValue(ItDispatchDirect, out var dd);
+                    _frameOpHist.TryGetValue(ItDispatchIndirect, out var di);
+                    var top = string.Join(",", _frameOpHist
+                        .OrderByDescending(kv => kv.Value)
+                        .Take(12)
+                        .Select(kv => $"0x{kv.Key:X2}:{kv.Value}"));
+                    TraceAgc(
+                        $"agc.frame_hist packets={_framePacketTotal} draws={draws} " +
+                        $"dispatchDirect={dd} dispatchIndirect={di} suspends={_frameSuspendCount} " +
+                        $"top=[{top}]");
+                    _frameOpHist.Clear();
+                    _framePacketTotal = 0;
+                    _frameSuspendCount = 0;
+                }
+
                 if (!ctx.TryReadUInt32(currentAddress + 4, out var videoOutHandle) ||
                     !ctx.TryReadUInt32(currentAddress + 8, out var displayBufferIndexRaw) ||
                     !ctx.TryReadUInt32(currentAddress + 12, out var flipMode) ||
