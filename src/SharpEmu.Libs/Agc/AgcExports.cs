@@ -3012,11 +3012,16 @@ public static class AgcExports
 
             if (op == ItSetBase &&
                 length >= 4 &&
-                ctx.TryReadUInt32(currentAddress + 4, out var baseSelector) &&
-                baseSelector == 1 &&
-                ctx.TryReadUInt64(currentAddress + 8, out var indirectArgsAddress))
+                ctx.TryReadUInt32(currentAddress + 4, out var baseSelector))
             {
-                state.IndirectArgsAddress = indirectArgsAddress;
+                ctx.TryReadUInt64(currentAddress + 8, out var setBaseAddress);
+                TraceAgc(
+                    $"agc.set_base selector={baseSelector} addr=0x{setBaseAddress:X16} " +
+                    $"header=0x{header:X8} reg=0x{register:X}");
+                if (baseSelector == 1)
+                {
+                    state.IndirectArgsAddress = setBaseAddress;
+                }
             }
 
             if (op == ItEventWrite &&
@@ -3647,22 +3652,15 @@ public static class AgcExports
 
                 drawCount = (control >> 21) & 0x7FFu;
                 return true;
-            case ItDrawIndirect or ItDrawIndexIndirect
-                when packetLength >= 5 && state.IndirectArgsAddress != 0:
-                if (!ctx.TryReadUInt32(packetAddress + 4, out var dataOffset))
-                {
-                    return false;
-                }
-
+            case ItDrawIndirect or ItDrawIndexIndirect when packetLength >= 5:
+                ctx.TryReadUInt32(packetAddress + 4, out var dataOffset);
                 var argsBase = state.IndirectArgsAddress + dataOffset;
-                var readOk = ctx.TryReadUInt32(argsBase, out drawCount);
+                var readOk = state.IndirectArgsAddress != 0 &&
+                    ctx.TryReadUInt32(argsBase, out drawCount);
                 ctx.TryReadUInt32(argsBase + 4, out var argInstance);
-                ctx.TryReadUInt32(argsBase + 8, out var argFirstIndex);
-                ctx.TryReadUInt32(argsBase + 12, out var argVtxOffset);
                 TraceAgc(
-                    $"agc.draw_indirect_args base=0x{state.IndirectArgsAddress:X16} off=0x{dataOffset:X} " +
-                    $"args=0x{argsBase:X16} ok={readOk} count={drawCount} inst={argInstance} " +
-                    $"firstIdx={argFirstIndex} vtxOff={argVtxOffset}");
+                    $"agc.draw_indirect_args indirectBase=0x{state.IndirectArgsAddress:X16} " +
+                    $"off=0x{dataOffset:X} args=0x{argsBase:X16} ok={readOk} count={drawCount} inst={argInstance}");
                 return readOk;
             default:
                 return false;
