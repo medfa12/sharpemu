@@ -1901,6 +1901,37 @@ public static class AgcExports
     }
 
     [SysAbiExport(
+        Nid = "t1vNu082-jM",
+        ExportName = "sceAgcDcbDrawIndexIndirect",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int DcbDrawIndexIndirect(CpuContext ctx)
+    {
+        var commandBufferAddress = ctx[CpuRegister.Rdi];
+        var dataOffset = (uint)ctx[CpuRegister.Rsi];
+        var baseVertexSgpr = (uint)ctx[CpuRegister.Rdx];
+        var startInstanceSgpr = (uint)ctx[CpuRegister.Rcx];
+        var modifier = (uint)ctx[CpuRegister.R8];
+        if (commandBufferAddress == 0)
+        {
+            return ReturnPointer(ctx, 0);
+        }
+
+        if (!TryAllocateCommandDwords(ctx, commandBufferAddress, 5, out var commandAddress) ||
+            !ctx.TryWriteUInt32(commandAddress, Pm4(5, ItDrawIndexIndirect, 0)) ||
+            !ctx.TryWriteUInt32(commandAddress + 4, dataOffset) ||
+            !ctx.TryWriteUInt32(commandAddress + 8, baseVertexSgpr & 0xFFFFu) ||
+            !ctx.TryWriteUInt32(commandAddress + 12, startInstanceSgpr & 0xFFFFu) ||
+            !ctx.TryWriteUInt32(commandAddress + 16, modifier & 0xE000_0001u))
+        {
+            return ReturnPointer(ctx, 0);
+        }
+
+        TraceAgc($"agc.dcb_draw_index_indirect buf=0x{commandBufferAddress:X16} cmd=0x{commandAddress:X16} dataOffset={dataOffset}");
+        return ReturnPointer(ctx, commandAddress);
+    }
+
+    [SysAbiExport(
         Nid = "MWiElSNE8j8",
         ExportName = "sceAgcDcbWaitUntilSafeForRendering",
         Target = Generation.Gen5,
