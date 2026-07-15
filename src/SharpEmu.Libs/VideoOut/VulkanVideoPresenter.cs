@@ -4706,7 +4706,19 @@ internal static unsafe class VulkanVideoPresenter
                 UpdatesCpuContent = texture.Address != 0,
             };
 
+            var uploadIsLiveRenderTarget = false;
+            if (texture.Address != 0)
+            {
+                lock (_gate)
+                {
+                    uploadIsLiveRenderTarget =
+                        _renderTargetGuestImages.ContainsKey(texture.Address) ||
+                        _gpuGuestImages.ContainsKey(texture.Address);
+                }
+            }
+
             if (texture.Address != 0 &&
+                !uploadIsLiveRenderTarget &&
                 !_guestImages.ContainsAddress(texture.Address))
             {
                 var guestImage = new GuestImageResource
