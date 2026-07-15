@@ -8727,32 +8727,10 @@ internal static unsafe class VulkanVideoPresenter
                     resources.Index32Bit ? IndexType.Uint32 : IndexType.Uint16);
                 if (resources.HasIndirectArgs && resources.IndirectArgsBuffer.Handle != 0)
                 {
-                    // Ensure the producing compute's writes to the args buffer
-                    // are visible to the indirect-command read stage. Compute
-                    // and draw are separate in-order queue submits, so this
-                    // barrier expresses the write->indirect-read dependency.
-                    var argsBarrier = new BufferMemoryBarrier
-                    {
-                        SType = StructureType.BufferMemoryBarrier,
-                        SrcAccessMask = AccessFlags.ShaderWriteBit,
-                        DstAccessMask = AccessFlags.IndirectCommandReadBit,
-                        SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
-                        DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
-                        Buffer = resources.IndirectArgsBuffer,
-                        Offset = 0,
-                        Size = Vk.WholeSize,
-                    };
-                    _vk.CmdPipelineBarrier(
-                        _commandBuffer,
-                        PipelineStageFlags.ComputeShaderBit,
-                        PipelineStageFlags.DrawIndirectBit,
-                        0,
-                        0,
-                        null,
-                        1,
-                        &argsBarrier,
-                        0,
-                        null);
+                    // The args buffer is host-visible and CPU-seeded before this
+                    // submit, so the queue submit's implicit host-write barrier
+                    // makes it visible -- no in-pass buffer barrier (which Vulkan
+                    // forbids inside a render pass instance) is needed.
                     _vk.CmdDrawIndexedIndirect(
                         _commandBuffer,
                         resources.IndirectArgsBuffer,
