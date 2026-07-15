@@ -1912,6 +1912,7 @@ internal static unsafe class VulkanVideoPresenter
         private bool _swapchainRecreateDeferred;
         private bool _tracedPresentedSwapchain;
         private int _swapchainCaptureCount;
+        private long _totalPresentCount;
         private int _frameDumpBudget = 6;
         private bool _swapchainReadbackPending;
         private bool _deviceLost;
@@ -4714,6 +4715,18 @@ internal static unsafe class VulkanVideoPresenter
                     uploadIsLiveRenderTarget =
                         _renderTargetGuestImages.ContainsKey(texture.Address) ||
                         _gpuGuestImages.ContainsKey(texture.Address);
+                    if (ShouldTracePresentedGuestImageContentsForDiagnostics() &&
+                        _tracedGateRejects.Add(texture.Address))
+                    {
+                        Console.Error.WriteLine(
+                            "[LOADER][TRACE] vk.upload_miss addr=0x" + texture.Address.ToString("X16") +
+                            " live_rt=" + uploadIsLiveRenderTarget +
+                            " in_rt=" + _renderTargetGuestImages.ContainsKey(texture.Address) +
+                            " in_gpu=" + _gpuGuestImages.ContainsKey(texture.Address) +
+                            " in_avail=" + _availableGuestImages.ContainsKey(texture.Address) +
+                            " has_surface=" + _guestImages.ContainsAddress(texture.Address) +
+                            " view_fmt=" + vkFormat);
+                    }
                 }
             }
 
@@ -7366,6 +7379,33 @@ internal static unsafe class VulkanVideoPresenter
                         $"nonzero_bytes={nonzeroBytes}/{byteCount} " +
                         $"nonblack_pixels={nonblackPixels}/{(ulong)image.Width * image.Height} " +
                         $"center={center} hash=0x{hash:X16}");
+                    if (nonblackPixels > 0 && image.Format == Format.R8G8B8A8Unorm)
+                    {
+                        const int outWidth = 480;
+                        const int outHeight = 270;
+                        var srcW = (int)image.Width;
+                        var srcH = (int)image.Height;
+                        var rgb = new byte[outWidth * outHeight * 3];
+                        for (var oy = 0; oy < outHeight; oy++)
+                        {
+                            var sy = oy * srcH / outHeight;
+                            for (var ox = 0; ox < outWidth; ox++)
+                            {
+                                var sx = ox * srcW / outWidth;
+                                var si = (sy * srcW + sx) * 4;
+                                var di = (oy * outWidth + ox) * 3;
+                                rgb[di] = bytes[si];
+                                rgb[di + 1] = bytes[si + 1];
+                                rgb[di + 2] = bytes[si + 2];
+                            }
+                        }
+
+                        Console.Error.WriteLine(
+                            "[LOADER][GIMGDUMP] addr=0x" + image.Address.ToString("X16") +
+                            " w=" + outWidth + " h=" + outHeight + " fmt=RGB b64=" +
+                            Convert.ToBase64String(rgb));
+                    }
+
                     DumpGuestImageBytes(image, bytes);
                 }
                 finally
@@ -8139,9 +8179,11 @@ internal static unsafe class VulkanVideoPresenter
             uint imageIndex,
             GuestImageResource source)
         {
+            _totalPresentCount++;
             var traceDestination =
                 ShouldTracePresentedGuestImageContentsForDiagnostics() &&
-                _swapchainCaptureCount < 24;
+                _swapchainCaptureCount < 80 &&
+                (_totalPresentCount <= 20 || _totalPresentCount % 40 == 0);
             if (traceDestination)
             {
                 _swapchainCaptureCount++;
