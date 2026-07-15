@@ -184,6 +184,8 @@ internal static unsafe class VulkanVideoPresenter
     private static readonly HashSet<(ulong Address, uint Width, uint Height)>
         _tracedGuestImageSubmissions = [];
     private static readonly HashSet<ulong> _dumpedFailedDrawShaders = [];
+    private static long _grossVkDeviceAlloc;
+    private static long _vkAllocCount;
     private static Thread? _thread;
     private static Presentation? _latestPresentation;
     private static byte[]? _copyFragmentSpirv;
@@ -1160,6 +1162,12 @@ internal static unsafe class VulkanVideoPresenter
         private bool _deviceLostLogged;
         private int _directPresentationCount;
         private readonly Dictionary<ulong, GuestImageResource> _guestImages = new();
+        private readonly VulkanDeviceMemoryLedger _deviceMemoryLedger = new();
+        private PhysicalDeviceMemoryProperties _memoryProperties;
+        private int _deviceLocalHeapIndex = -1;
+        private bool _supportsMemoryBudget;
+        private ulong _useStamp;
+        private bool _reclaimInProgress;
         private readonly HashSet<(ulong Address, uint Width, uint Height, Format Format)> _tracedTextureCacheHits = new();
         private static readonly bool _dumpTextures = string.Equals(
             Environment.GetEnvironmentVariable("SHARPEMU_DUMP_TEXTURES"),
@@ -1296,6 +1304,8 @@ internal static unsafe class VulkanVideoPresenter
             public bool InitialUploadPending;
             public bool IsCpuBacked;
             public ulong CpuContentFingerprint;
+            public ulong MemorySize;
+            public ulong LastUseStamp;
         }
 
         private sealed record PendingGuestSubmission(
@@ -1967,6 +1977,74 @@ internal static unsafe class VulkanVideoPresenter
             {
                 throw new InvalidOperationException("VK_KHR_swapchain is unavailable.");
             }
+
+            QueryDeviceMemoryBudget();
+        }
+
+        private void QueryDeviceMemoryBudget()
+        {
+            _vk.GetPhysicalDeviceMemoryProperties(_physicalDevice, out var properties);
+            _memoryProperties = properties;
+            var heaps = &properties.MemoryHeaps.Element0;
+            ulong heapBytes = 0;
+            for (var index = 0; index < (int)properties.MemoryHeapCount; index++)
+            {
+                if ((heaps[index].Flags & MemoryHeapFlags.DeviceLocalBit) != 0 &&
+                    heaps[index].Size > heapBytes)
+                {
+                    _deviceLocalHeapIndex = index;
+                    heapBytes = heaps[index].Size;
+                }
+            }
+
+            _supportsMemoryBudget = _vk.IsDeviceExtensionPresent(
+                _physicalDevice,
+                "VK_EXT_memory_budget");
+            var budget = heapBytes;
+            ulong driverUsage = 0;
+            if (_supportsMemoryBudget && _deviceLocalHeapIndex >= 0)
+            {
+                var budgetProperties = new PhysicalDeviceMemoryBudgetPropertiesEXT
+                {
+                    SType = StructureType.PhysicalDeviceMemoryBudgetPropertiesExt,
+                };
+                var properties2 = new PhysicalDeviceMemoryProperties2
+                {
+                    SType = StructureType.PhysicalDeviceMemoryProperties2,
+                    PNext = &budgetProperties,
+                };
+                _vk.GetPhysicalDeviceMemoryProperties2(_physicalDevice, &properties2);
+                var driverBudget = budgetProperties.HeapBudget[_deviceLocalHeapIndex];
+                if (driverBudget != 0)
+                {
+                    budget = Math.Min(budget, driverBudget);
+                }
+
+                driverUsage = budgetProperties.HeapUsage[_deviceLocalHeapIndex];
+            }
+
+            // Keep live device-local usage below 80% of the effective budget so
+            // driver-internal and swapchain allocations still fit.
+            _deviceMemoryLedger.BudgetBytes = budget * 8 / 10;
+            Console.Error.WriteLine(
+                $"[LOADER][VKMEM] device-local heap={heapBytes / (1024 * 1024)}MB " +
+                $"driver_budget={budget / (1024 * 1024)}MB " +
+                $"driver_usage={driverUsage / (1024 * 1024)}MB " +
+                $"cap={_deviceMemoryLedger.BudgetBytes / (1024 * 1024)}MB " +
+                $"budget_ext={_supportsMemoryBudget}");
+        }
+
+        private bool IsDeviceLocalMemoryType(uint memoryTypeIndex)
+        {
+            var properties = _memoryProperties;
+            if (memoryTypeIndex >= properties.MemoryTypeCount)
+            {
+                return false;
+            }
+
+            var memoryTypes = &properties.MemoryTypes.Element0;
+            return (memoryTypes[memoryTypeIndex].PropertyFlags &
+                    MemoryPropertyFlags.DeviceLocalBit) != 0;
         }
 
         private void CreatePipelineCache()
@@ -2736,7 +2814,7 @@ internal static unsafe class VulkanVideoPresenter
                 for (var index = 0; index < dispatch.Textures.Count; index++)
                 {
                     var texture = dispatch.Textures[index];
-                    if (texture.IsStorage)
+                    if (texture.IsStorage && texture.Address != 0)
                     {
                         if (traceResources)
                         {
@@ -2747,7 +2825,12 @@ internal static unsafe class VulkanVideoPresenter
                                 $"mips={texture.MipLevels} level={texture.MipLevel}");
                         }
 
-                        _ = ResolveStorageImageResource(texture);
+                        // Warm only the guest-image cache here (like the graphics
+                        // path does). A full ResolveStorageImageResource would
+                        // allocate a scratch image or staging buffer whose result
+                        // is discarded, leaking device memory on every dispatch;
+                        // the resolve loop below creates the tracked resource.
+                        _ = ResolveStorageGuestImage(texture);
                         if (traceResources)
                         {
                             TraceVulkanShader($"vk.compute_resources storage[{index}] ready");
@@ -3388,6 +3471,7 @@ internal static unsafe class VulkanVideoPresenter
                     dstSelect: texture.DstSelect,
                     out var view))
             {
+                guestImage.LastUseStamp = _useStamp;
                 if (ShouldTraceVulkanResources() &&
                     _tracedTextureCacheHits.Add(
                         (texture.Address, texture.Width, texture.Height, vkFormat)))
@@ -3629,9 +3713,7 @@ internal static unsafe class VulkanVideoPresenter
                     requirements.MemoryTypeBits,
                     MemoryPropertyFlags.DeviceLocalBit),
             };
-            Check(
-                _vk.AllocateMemory(_device, &allocationInfo, null, out var memory),
-                "vkAllocateMemory(storage scratch)");
+            var memory = AllocateDeviceMemory(allocationInfo, "storage-scratch");
             Check(
                 _vk.BindImageMemory(_device, image, memory, 0),
                 "vkBindImageMemory(storage scratch)");
@@ -3738,10 +3820,6 @@ internal static unsafe class VulkanVideoPresenter
                 : pixels;
             var contentFingerprint = ComputeTextureContentFingerprint(pixels);
 
-            var (stagingBuffer, stagingMemory) = CreateTextureStagingBuffer(
-                uploadPixels,
-                $"{TextureDebugName(texture, vkFormat)} staging");
-
             var supportsAttachmentUsage = !IsBlockCompressedFormat(vkFormat);
             var imageInfo = new ImageCreateInfo
             {
@@ -3776,20 +3854,37 @@ internal static unsafe class VulkanVideoPresenter
                     imageRequirements.MemoryTypeBits,
                     MemoryPropertyFlags.DeviceLocalBit),
             };
-            Check(_vk.AllocateMemory(_device, &memoryInfo, null, out var imageMemory), "vkAllocateMemory(texture)");
-            Check(_vk.BindImageMemory(_device, image, imageMemory, 0), "vkBindImageMemory(texture)");
-
-            var viewInfo = new ImageViewCreateInfo
+            DeviceMemory imageMemory = default;
+            ImageView view;
+            try
             {
-                SType = StructureType.ImageViewCreateInfo,
-                Image = image,
-                ViewType = ImageViewType.Type2D,
-                Format = vkFormat,
-                Components = ToVkComponentMapping(texture.DstSelect),
-                SubresourceRange = ColorSubresourceRange(),
-            };
-            Check(_vk.CreateImageView(_device, &viewInfo, null, out var view), "vkCreateImageView(texture)");
+                imageMemory = AllocateDeviceMemory(memoryInfo, "texture");
+                Check(_vk.BindImageMemory(_device, image, imageMemory, 0), "vkBindImageMemory(texture)");
+
+                var viewInfo = new ImageViewCreateInfo
+                {
+                    SType = StructureType.ImageViewCreateInfo,
+                    Image = image,
+                    ViewType = ImageViewType.Type2D,
+                    Format = vkFormat,
+                    Components = ToVkComponentMapping(texture.DstSelect),
+                    SubresourceRange = ColorSubresourceRange(),
+                };
+                Check(_vk.CreateImageView(_device, &viewInfo, null, out view), "vkCreateImageView(texture)");
+            }
+            catch
+            {
+                // A partially-created texture never reaches resources.Textures,
+                // so the per-draw cleanup cannot free it. Unwind it here.
+                _vk.DestroyImage(_device, image, null);
+                FreeDeviceMemory(imageMemory);
+                throw;
+            }
+
             var debugName = TextureDebugName(texture, vkFormat);
+            var (stagingBuffer, stagingMemory) = CreateTextureStagingBuffer(
+                uploadPixels,
+                $"{debugName} staging");
             SetDebugName(ObjectType.Image, image.Handle, $"{debugName} image");
             SetDebugName(ObjectType.ImageView, view.Handle, $"{debugName} view");
             var resource = new TextureResource
@@ -3827,6 +3922,8 @@ internal static unsafe class VulkanVideoPresenter
                     InitialUploadPending = true,
                     IsCpuBacked = true,
                     CpuContentFingerprint = contentFingerprint,
+                    MemorySize = imageRequirements.Size,
+                    LastUseStamp = _useStamp,
                 };
                 _guestImages.Add(texture.Address, guestImage);
                 resource.OwnsStorage = false;
@@ -4210,10 +4307,7 @@ internal static unsafe class VulkanVideoPresenter
             }
 
             _vk.DestroyBuffer(_device, buffer, null);
-            if (memory.Handle != 0)
-            {
-                _vk.FreeMemory(_device, memory, null);
-            }
+            FreeDeviceMemory(memory);
         }
 
         private static PrimitiveTopology GetPrimitiveTopology(uint primitiveType) =>
@@ -4651,6 +4745,114 @@ internal static unsafe class VulkanVideoPresenter
                 Format.BC7UnormBlock or
                 Format.BC7SrgbBlock;
 
+        private void TraceVkAlloc(ulong size, string tag)
+        {
+            var gross = Interlocked.Add(ref _grossVkDeviceAlloc, (long)size);
+            var n = Interlocked.Increment(ref _vkAllocCount);
+            if (size >= 64UL * 1024 * 1024 || (n & 31) == 0)
+            {
+                Console.Error.WriteLine(
+                    $"[LOADER][VKMEM] {tag} size={size / (1024 * 1024)}MB gross={gross / (1024 * 1024)}MB " +
+                    $"live={_deviceMemoryLedger.LiveDeviceLocalBytes / (1024 * 1024)}MB alloc#{n} images={_guestImages.Count}");
+            }
+        }
+
+        private DeviceMemory AllocateDeviceMemory(MemoryAllocateInfo allocationInfo, string tag)
+        {
+            var deviceLocal = IsDeviceLocalMemoryType(allocationInfo.MemoryTypeIndex);
+            if (deviceLocal && _deviceMemoryLedger.WouldExceedBudget(allocationInfo.AllocationSize))
+            {
+                EvictLeastRecentlyUsedGuestImages(
+                    _deviceMemoryLedger.BytesOverBudget(allocationInfo.AllocationSize));
+            }
+
+            TraceVkAlloc(allocationInfo.AllocationSize, tag);
+            var result = _vk.AllocateMemory(_device, &allocationInfo, null, out var memory);
+            if (result is Result.ErrorOutOfDeviceMemory or Result.ErrorOutOfHostMemory)
+            {
+                Console.Error.WriteLine(
+                    $"[LOADER][VKMEM] {tag} alloc size={allocationInfo.AllocationSize / (1024 * 1024)}MB " +
+                    $"failed with {result} " +
+                    $"live={_deviceMemoryLedger.LiveDeviceLocalBytes / (1024 * 1024)}MB; " +
+                    "reclaiming and retrying");
+                EvictLeastRecentlyUsedGuestImages(ulong.MaxValue);
+                result = _vk.AllocateMemory(_device, &allocationInfo, null, out memory);
+            }
+
+            Check(result, $"vkAllocateMemory({tag})");
+            _deviceMemoryLedger.Track(memory.Handle, allocationInfo.AllocationSize, deviceLocal);
+            return memory;
+        }
+
+        private void FreeDeviceMemory(DeviceMemory memory)
+        {
+            if (memory.Handle == 0)
+            {
+                return;
+            }
+
+            _deviceMemoryLedger.Untrack(memory.Handle);
+            _vk.FreeMemory(_device, memory, null);
+        }
+
+        private void EvictLeastRecentlyUsedGuestImages(ulong bytesToFree)
+        {
+            if (_reclaimInProgress)
+            {
+                return;
+            }
+
+            _reclaimInProgress = true;
+            try
+            {
+                // In-flight submissions may reference any cached image; drain
+                // them before destroying anything (same pattern as the
+                // replacement path in GetOrCreateGuestImage). This also retires
+                // every pending per-draw resource, freeing transient memory.
+                CompletePendingPresentation(wait: true);
+                WaitForAllGuestSubmissions();
+
+                ulong freed = 0;
+                var evicted = 0;
+                foreach (var (address, image) in _guestImages
+                             .OrderByDescending(entry => entry.Value.IsCpuBacked)
+                             .ThenBy(entry => entry.Value.LastUseStamp)
+                             .ToArray())
+                {
+                    if (freed >= bytesToFree)
+                    {
+                        break;
+                    }
+
+                    if (image.LastUseStamp >= _useStamp)
+                    {
+                        // Referenced by the draw currently being translated.
+                        continue;
+                    }
+
+                    freed += image.MemorySize;
+                    evicted++;
+                    DestroyGuestImage(image);
+                    _guestImages.Remove(address);
+                    lock (_gate)
+                    {
+                        _availableGuestImages.Remove(address);
+                        _gpuGuestImages.Remove(address);
+                    }
+                }
+
+                Console.Error.WriteLine(
+                    $"[LOADER][VKMEM] evicted {evicted} guest images ({freed / (1024 * 1024)}MB) " +
+                    $"live={_deviceMemoryLedger.LiveDeviceLocalBytes / (1024 * 1024)}MB " +
+                    $"cap={_deviceMemoryLedger.BudgetBytes / (1024 * 1024)}MB " +
+                    $"images={_guestImages.Count}");
+            }
+            finally
+            {
+                _reclaimInProgress = false;
+            }
+        }
+
         private VkBuffer CreateBuffer(
             ulong size,
             BufferUsageFlags usage,
@@ -4673,7 +4875,16 @@ internal static unsafe class VulkanVideoPresenter
                 AllocationSize = requirements.Size,
                 MemoryTypeIndex = FindMemoryType(requirements.MemoryTypeBits, memoryFlags),
             };
-            Check(_vk.AllocateMemory(_device, &memoryInfo, null, out memory), "vkAllocateMemory");
+            try
+            {
+                memory = AllocateDeviceMemory(memoryInfo, "buffer");
+            }
+            catch
+            {
+                _vk.DestroyBuffer(_device, buffer, null);
+                throw;
+            }
+
             Check(_vk.BindBufferMemory(_device, buffer, memory, 0), "vkBindBufferMemory");
             return buffer;
         }
@@ -4712,6 +4923,8 @@ internal static unsafe class VulkanVideoPresenter
             {
                 return;
             }
+
+            _useStamp++;
 
             if (AddressListContains("SHARPEMU_SKIP_COMPUTE_CS", work.ShaderAddress))
             {
@@ -4889,6 +5102,8 @@ internal static unsafe class VulkanVideoPresenter
             {
                 return;
             }
+
+            _useStamp++;
 
             if (work.Targets.Count > _maxColorAttachments)
             {
@@ -5166,6 +5381,15 @@ internal static unsafe class VulkanVideoPresenter
                     $"[LOADER][ERROR] Vulkan offscreen draw failed " +
                     $"mrt={work.Targets.Count}: {exception.Message}");
 
+                if (exception.Message.Contains(
+                        nameof(Result.ErrorOutOfDeviceMemory),
+                        StringComparison.Ordinal))
+                {
+                    // Free everything idle so the game's re-submission of this
+                    // draw next frame can succeed instead of staying blank.
+                    EvictLeastRecentlyUsedGuestImages(ulong.MaxValue);
+                }
+
                 // Dump the offending SPIR-V once per distinct shader so a failing
                 // translation can be disassembled/validated offline. Base64 keeps
                 // it inside the (uploaded) stderr log without touching disk.
@@ -5235,6 +5459,7 @@ internal static unsafe class VulkanVideoPresenter
                 {
                     existing.IsCpuBacked = false;
                     existing.CpuContentFingerprint = 0;
+                    existing.LastUseStamp = _useStamp;
                     if (existing.RenderPass.Handle == 0)
                     {
                         var attachmentView = existing.MipViews.Length > 0
@@ -5298,9 +5523,7 @@ internal static unsafe class VulkanVideoPresenter
                     requirements.MemoryTypeBits,
                     MemoryPropertyFlags.DeviceLocalBit),
             };
-            Check(
-                _vk.AllocateMemory(_device, &allocationInfo, null, out var memory),
-                "vkAllocateMemory(offscreen)");
+            var memory = AllocateDeviceMemory(allocationInfo, "offscreen");
             Check(_vk.BindImageMemory(_device, image, memory, 0), "vkBindImageMemory(offscreen)");
 
             var viewInfo = new ImageViewCreateInfo
@@ -5354,6 +5577,8 @@ internal static unsafe class VulkanVideoPresenter
                 MipViews = mipViews,
                 RenderPass = renderPass,
                 Framebuffer = framebuffer,
+                MemorySize = allocationInfo.AllocationSize,
+                LastUseStamp = _useStamp,
             };
             var debugName = GuestImageDebugName(target, format);
             SetDebugName(ObjectType.Image, image.Handle, $"{debugName} image");
@@ -5500,10 +5725,7 @@ internal static unsafe class VulkanVideoPresenter
                 _vk.DestroyImage(_device, resource.Image, null);
             }
 
-            if (resource.Memory.Handle != 0)
-            {
-                _vk.FreeMemory(_device, resource.Memory, null);
-            }
+            FreeDeviceMemory(resource.Memory);
         }
 
         private static uint GetGuestTextureFormat(Format format) =>
@@ -5932,6 +6154,7 @@ internal static unsafe class VulkanVideoPresenter
             }
 
             CompletePendingPresentation(wait: true);
+            _useStamp++;
 
             byte[]? pixels = null;
             if (presentation.Pixels is { } sourcePixels)
@@ -5962,6 +6185,7 @@ internal static unsafe class VulkanVideoPresenter
             }
             if (presentedGuestImage is not null)
             {
+                presentedGuestImage.LastUseStamp = _useStamp;
                 _directPresentationCount++;
                 if (ShouldTracePresentedGuestImageContentsForDiagnostics() &&
                     _directPresentationCount is 1 or 30 or 120)
@@ -6353,7 +6577,7 @@ internal static unsafe class VulkanVideoPresenter
             finally
             {
                 _vk.DestroyBuffer(_device, buffer, null);
-                _vk.FreeMemory(_device, memory, null);
+                FreeDeviceMemory(memory);
             }
         }
 
@@ -6904,9 +7128,9 @@ internal static unsafe class VulkanVideoPresenter
                     _vk.DestroyImage(_device, texture.Image, null);
                 }
 
-                if (texture.OwnsStorage && texture.ImageMemory.Handle != 0)
+                if (texture.OwnsStorage)
                 {
-                    _vk.FreeMemory(_device, texture.ImageMemory, null);
+                    FreeDeviceMemory(texture.ImageMemory);
                 }
 
                 if (texture.StagingBuffer.Handle != 0)
@@ -6914,10 +7138,7 @@ internal static unsafe class VulkanVideoPresenter
                     _vk.DestroyBuffer(_device, texture.StagingBuffer, null);
                 }
 
-                if (texture.StagingMemory.Handle != 0)
-                {
-                    _vk.FreeMemory(_device, texture.StagingMemory, null);
-                }
+                FreeDeviceMemory(texture.StagingMemory);
 
                 if (texture.NeedsUpload &&
                     texture.GuestImage is { Initialized: false } guestImage)
@@ -7437,7 +7658,7 @@ internal static unsafe class VulkanVideoPresenter
             foreach (var allocation in _hostBufferAllocations.Values)
             {
                 _vk.DestroyBuffer(_device, allocation.Buffer, null);
-                _vk.FreeMemory(_device, allocation.Memory, null);
+                FreeDeviceMemory(allocation.Memory);
             }
             _hostBufferAllocations.Clear();
             _hostBufferPool.Clear();
@@ -7527,7 +7748,7 @@ internal static unsafe class VulkanVideoPresenter
             }
             if (_stagingMemory.Handle != 0)
             {
-                _vk.FreeMemory(_device, _stagingMemory, null);
+                FreeDeviceMemory(_stagingMemory);
                 _stagingMemory = default;
                 _stagingSize = 0;
             }
