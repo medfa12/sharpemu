@@ -2955,7 +2955,8 @@ public static class AgcExports
         SubmittedDcbState state,
         ulong commandAddress,
         uint dwordCount,
-        bool tracePackets)
+        bool tracePackets,
+        int depth = 0)
     {
         if (commandAddress == 0 || dwordCount == 0 || dwordCount > 1_000_000)
         {
@@ -3021,6 +3022,27 @@ public static class AgcExports
                 if (baseSelector == 1)
                 {
                     state.IndirectArgsAddress = setBaseAddress;
+                }
+            }
+
+            // Follow chained/secondary command buffers (IB2 / DcbJump). The
+            // geometry DCB is chained from the main one via this packet; without
+            // following it, indirect draws in the chained buffer never execute.
+            if (op == ItIndirectBuffer &&
+                length >= 4 &&
+                depth < 16 &&
+                ctx.TryReadUInt32(currentAddress + 4, out var ibLow) &&
+                ctx.TryReadUInt32(currentAddress + 8, out var ibHigh) &&
+                ctx.TryReadUInt32(currentAddress + 12, out var ibSizeDwords))
+            {
+                var ibAddress = ((ulong)(ibHigh & 0xFFFFu) << 32) | (ibLow & 0xFFFF_FFFCu);
+                var ibDwords = ibSizeDwords & 0xFFFFFu;
+                if (ibAddress != 0 && ibDwords != 0)
+                {
+                    TraceAgc(
+                        $"agc.ib2_follow addr=0x{ibAddress:X16} dwords={ibDwords} depth={depth}");
+                    ParseSubmittedDcb(
+                        ctx, gpuState, state, ibAddress, ibDwords, tracePackets, depth + 1);
                 }
             }
 
