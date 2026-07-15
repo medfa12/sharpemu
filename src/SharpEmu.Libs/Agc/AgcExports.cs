@@ -168,7 +168,10 @@ public static class AgcExports
     private static readonly HashSet<(uint, uint, uint)> _tracedDepthProbe = new();
     private static readonly object _frameHistGate = new();
     private static readonly Dictionary<uint, int> _frameOpHist = new();
+    private static readonly HashSet<ulong> _tracedSuspendTargets = new();
     private static int _frameSuspendCount;
+    private static int _frameResumeCount;
+    private static int _frameAutoDraws;
     private static int _framePacketTotal;
     private static readonly Dictionary<(ulong Address, uint Width, uint Height), ulong> _tracedTextureHashes = [];
     private static readonly HashSet<uint> _tracedSubmittedDrawOpcodes = new();
@@ -2958,6 +2961,7 @@ public static class AgcExports
                         $"resume=0x{waiter.ResumeAddress:X16} dwords={remainingDwords}");
                 }
 
+                lock (_frameHistGate) { _frameResumeCount++; }
                 var state = waiter.State as SubmittedDcbState ?? gpuState.Graphics;
                 ParseSubmittedDcb(
                     ctx,
@@ -3192,6 +3196,12 @@ public static class AgcExports
                         }
 
                         lock (_frameHistGate) { _frameSuspendCount++; }
+                        if (_tracedSuspendTargets.Add(waitAddr))
+                        {
+                            TraceAgc(
+                                $"agc.suspend_target addr=0x{waitAddr:X16} ref=0x{refVal:X16} " +
+                                $"cur=0x{curVal:X16} mask=0x{waitMask:X16} cmp={cmpFunc} kind=nop");
+                        }
                         return; // suspend parsing of this DCB
                     }
                 }
@@ -3227,6 +3237,12 @@ public static class AgcExports
                         }
 
                         lock (_frameHistGate) { _frameSuspendCount++; }
+                        if (_tracedSuspendTargets.Add(waitAddr))
+                        {
+                            TraceAgc(
+                                $"agc.suspend_target addr=0x{waitAddr:X16} ref=0x{refVal:X16} " +
+                                $"cur=0x{curVal:X16} mask=0x{waitMask:X16} cmp={cmpFunc} kind=std");
+                        }
                         return;
                     }
                 }
@@ -3305,6 +3321,7 @@ public static class AgcExports
                 ctx.TryReadUInt32(currentAddress + 4, out var autoIndexCount) &&
                 autoIndexCount != 0)
             {
+                lock (_frameHistGate) { _frameAutoDraws++; }
                 TryTranslateGuestDraw(
                     ctx,
                     gpuState,
@@ -3343,12 +3360,14 @@ public static class AgcExports
                         .Take(12)
                         .Select(kv => $"0x{kv.Key:X2}:{kv.Value}"));
                     TraceAgc(
-                        $"agc.frame_hist packets={_framePacketTotal} draws={draws} " +
-                        $"dispatchDirect={dd} dispatchIndirect={di} suspends={_frameSuspendCount} " +
-                        $"top=[{top}]");
+                        $"agc.frame_hist packets={_framePacketTotal} opDraws={draws} " +
+                        $"autoDraws={_frameAutoDraws} dispatchDirect={dd} dispatchIndirect={di} " +
+                        $"suspends={_frameSuspendCount} resumes={_frameResumeCount} top=[{top}]");
                     _frameOpHist.Clear();
                     _framePacketTotal = 0;
                     _frameSuspendCount = 0;
+                    _frameResumeCount = 0;
+                    _frameAutoDraws = 0;
                 }
 
                 if (!ctx.TryReadUInt32(currentAddress + 4, out var videoOutHandle) ||
