@@ -13,6 +13,7 @@ namespace SharpEmu.Tests;
 /// dropped. Astro Bot's menu flips 0x507410000/0x5093F0000 while its composite
 /// passes render to internal 1080p targets.
 /// </summary>
+[Collection(VulkanPresenterStateCollection.Name)]
 public sealed class VulkanPresenterFlipRedirectTests
 {
     private const ulong DisplayBuffer0 = 0x0000000507410000;

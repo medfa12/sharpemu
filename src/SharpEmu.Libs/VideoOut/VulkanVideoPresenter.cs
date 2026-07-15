@@ -190,6 +190,14 @@ internal static unsafe class VulkanVideoPresenter
     private static readonly Queue<object> _pendingGuestWork = new();
     private static readonly Dictionary<ulong, uint> _availableGuestImages = new();
     private static readonly Dictionary<ulong, uint> _gpuGuestImages = new();
+    // Addresses that are (or are enqueued to become) GPU draw targets, keyed to
+    // their canonical guest format. Unlike _availableGuestImages this never
+    // contains CPU-uploaded asset or registered display-buffer addresses, so
+    // the texture-capture gate can defer resolution for these addresses without
+    // starving the CPU upload/refresh path. Draws execute in submission order
+    // on the render thread, so an address registered here at enqueue time holds
+    // a rendered VkImage by the time any later-enqueued draw samples it.
+    private static readonly Dictionary<ulong, uint> _renderTargetGuestImages = new();
     private static readonly HashSet<(ulong Address, uint Width, uint Height)>
         _tracedGuestImageSubmissions = [];
     private static readonly HashSet<ulong> _dumpedFailedDrawShaders = [];
@@ -607,6 +615,7 @@ internal static unsafe class VulkanVideoPresenter
                 if (guestTextureFormat != 0)
                 {
                     _availableGuestImages[target.Address] = guestTextureFormat;
+                    _renderTargetGuestImages[target.Address] = guestTextureFormat;
                 }
             }
 
@@ -988,6 +997,7 @@ internal static unsafe class VulkanVideoPresenter
         {
             _availableGuestImages.Clear();
             _gpuGuestImages.Clear();
+            _renderTargetGuestImages.Clear();
             _tracedGuestImageSubmissions.Clear();
             _latestPresentableGuestImageAddress = 0;
             _frameCompositeCandidateAddress = 0;
@@ -1011,7 +1021,35 @@ internal static unsafe class VulkanVideoPresenter
         {
             _availableGuestImages[address] = guestFormat;
             _gpuGuestImages[address] = guestFormat;
+            _renderTargetGuestImages[address] = guestFormat;
             NoteRenderedGuestImageLocked(address, width, height, inputTextureCount);
+        }
+    }
+
+    internal static void RegisterPendingRenderTargetForTests(
+        ulong address,
+        uint format,
+        uint numberType)
+    {
+        lock (_gate)
+        {
+            var guestTextureFormat = GetGuestTextureFormat(format, numberType);
+            if (guestTextureFormat != 0)
+            {
+                _availableGuestImages[address] = guestTextureFormat;
+                _renderTargetGuestImages[address] = guestTextureFormat;
+            }
+        }
+    }
+
+    internal static void RegisterCpuGuestImageForTests(ulong address, uint guestFormat)
+    {
+        lock (_gate)
+        {
+            _availableGuestImages[address] = guestFormat;
+            _gpuGuestImages.Remove(address);
+            _renderTargetGuestImages.Remove(address);
+            ForgetRenderedGuestImageLocked(address);
         }
     }
 
@@ -1029,6 +1067,7 @@ internal static unsafe class VulkanVideoPresenter
         {
             _availableGuestImages.Remove(address);
             _gpuGuestImages.Remove(address);
+            _renderTargetGuestImages.Remove(address);
             ForgetRenderedGuestImageLocked(address);
         }
     }
@@ -1059,8 +1098,53 @@ internal static unsafe class VulkanVideoPresenter
 
         lock (_gate)
         {
-            return _gpuGuestImages.TryGetValue(address, out var availableFormat) &&
-                availableFormat == guestFormat;
+            if (_gpuGuestImages.TryGetValue(address, out var availableFormat) &&
+                AreAliasableGuestFormats(availableFormat, guestFormat))
+            {
+                return true;
+            }
+
+            // A target pre-registered at enqueue time holds its rendered
+            // VkImage by the time this draw executes: the work queue is FIFO,
+            // so the producing draw runs first on the render thread.
+            return _renderTargetGuestImages.TryGetValue(address, out var pendingFormat) &&
+                AreAliasableGuestFormats(pendingFormat, guestFormat);
+        }
+    }
+
+    // A rendered target sampled in a different guest format still aliases its
+    // VkImage when both formats share a Vulkan compatibility class; a mutable
+    // image view reinterprets the texels. Cross-class pairs (different texel
+    // size) cannot form a legal view and must keep the guest-memory path.
+    private static bool AreAliasableGuestFormats(uint imageGuestFormat, uint viewGuestFormat)
+    {
+        if (imageGuestFormat == viewGuestFormat)
+        {
+            return true;
+        }
+
+        // Canonical guest codes round-trip through TryDecodeRenderTargetFormat
+        // with numberType 0.
+        return TryDecodeRenderTargetFormat(imageGuestFormat, 0, out var image) &&
+            TryDecodeRenderTargetFormat(viewGuestFormat, 0, out var view) &&
+            IsCompatibleViewFormat(image.Format, view.Format);
+    }
+
+    // A skipped draw never renders its pre-registered targets; drop them from
+    // the render-target registry (unless a previous draw did render them) so
+    // later consumers fall back to guest memory instead of deferring to an
+    // alias that will never exist.
+    private static void AbandonPendingRenderTargets(VulkanOffscreenGuestDraw work)
+    {
+        lock (_gate)
+        {
+            foreach (var target in work.Targets)
+            {
+                if (!_gpuGuestImages.ContainsKey(target.Address))
+                {
+                    _renderTargetGuestImages.Remove(target.Address);
+                }
+            }
         }
     }
 
@@ -1235,6 +1319,56 @@ internal static unsafe class VulkanVideoPresenter
         result = new VulkanRenderTargetFormat(format, outputKind);
         return true;
     }
+
+    private static bool IsCompatibleViewFormat(Format imageFormat, Format viewFormat)
+    {
+        if (imageFormat == viewFormat)
+        {
+            return true;
+        }
+
+        var imageClass = GetFormatCompatibilityClass(imageFormat);
+        return imageClass != 0 && imageClass == GetFormatCompatibilityClass(viewFormat);
+    }
+
+    private static uint GetFormatCompatibilityClass(Format format) =>
+        format switch
+        {
+            Format.R8Unorm or
+            Format.R8Uint or
+            Format.R8Sint => 8,
+            Format.R16Sfloat or
+            Format.R16Unorm or
+            Format.R16Uint or
+            Format.R16Sint or
+            Format.R8G8Unorm or
+            Format.R8G8Uint or
+            Format.R8G8Sint => 16,
+            Format.R32Uint or
+            Format.R32Sint or
+            Format.R32Sfloat or
+            Format.R16G16Unorm or
+            Format.R16G16Uint or
+            Format.R16G16Sint or
+            Format.R16G16Sfloat or
+            Format.R8G8B8A8Unorm or
+            Format.R8G8B8A8Uint or
+            Format.R8G8B8A8Sint or
+            Format.A2R10G10B10UnormPack32 or
+            Format.B10G11R11UfloatPack32 => 32,
+            Format.R32G32Uint or
+            Format.R32G32Sint or
+            Format.R32G32Sfloat or
+            Format.R16G16B16A16Unorm or
+            Format.R16G16B16A16Uint or
+            Format.R16G16B16A16Sint or
+            Format.R16G16B16A16Sfloat => 64,
+            Format.R32G32B32Sfloat => 96,
+            Format.R32G32B32A32Uint or
+            Format.R32G32B32A32Sint or
+            Format.R32G32B32A32Sfloat => 128,
+            _ => 0,
+        };
 
     private static bool IsKnownGuestTextureFormat(uint format) =>
         format is 4 or 5 or 7 or 9 or 13 or 14 or 22 or 29 or 36 or 56 or 62 or 64 or 71;
@@ -4250,7 +4384,10 @@ internal static unsafe class VulkanVideoPresenter
                     if (guestFormat != 0)
                     {
                         _availableGuestImages[texture.Address] = guestFormat;
+                        // A genuine CPU upload owns this address now; it must
+                        // never be captured as an address-referencing texture.
                         _gpuGuestImages.Remove(texture.Address);
+                        _renderTargetGuestImages.Remove(texture.Address);
                         ForgetRenderedGuestImageLocked(texture.Address);
                     }
                 }
@@ -5207,6 +5344,7 @@ internal static unsafe class VulkanVideoPresenter
                     {
                         _availableGuestImages.Remove(address);
                         _gpuGuestImages.Remove(address);
+                        _renderTargetGuestImages.Remove(address);
                         ForgetRenderedGuestImageLocked(address);
                     }
                 }
@@ -5508,6 +5646,7 @@ internal static unsafe class VulkanVideoPresenter
                 Console.Error.WriteLine(
                     $"[LOADER][WARN] Vulkan skipped MRT draw requesting {work.Targets.Count} color attachments; " +
                     $"the selected device supports {_maxColorAttachments}.");
+                AbandonPendingRenderTargets(work);
                 return;
             }
 
@@ -5521,6 +5660,7 @@ internal static unsafe class VulkanVideoPresenter
                     Console.Error.WriteLine(
                         $"[LOADER][WARN] Vulkan skipped MRT draw with unsupported color target " +
                         $"format={target.Format} number_type={target.NumberType}.");
+                    AbandonPendingRenderTargets(work);
                     return;
                 }
             }
@@ -5529,6 +5669,7 @@ internal static unsafe class VulkanVideoPresenter
             {
                 Console.Error.WriteLine(
                     "[LOADER][WARN] Vulkan skipped MRT draw with mismatched attachment/blend counts.");
+                AbandonPendingRenderTargets(work);
                 return;
             }
 
@@ -5538,6 +5679,7 @@ internal static unsafe class VulkanVideoPresenter
             {
                 Console.Error.WriteLine(
                     "[LOADER][WARN] Vulkan skipped MRT draw with blending enabled for an integer attachment.");
+                AbandonPendingRenderTargets(work);
                 return;
             }
 
@@ -5546,6 +5688,7 @@ internal static unsafe class VulkanVideoPresenter
             {
                 Console.Error.WriteLine(
                     "[LOADER][WARN] Vulkan skipped MRT draw requiring unsupported independentBlend.");
+                AbandonPendingRenderTargets(work);
                 return;
             }
 
@@ -5561,6 +5704,7 @@ internal static unsafe class VulkanVideoPresenter
                 Console.Error.WriteLine(
                     $"[LOADER][WARN] Vulkan skipped render-target feedback loop " +
                     $"targets={string.Join(',', targetAddresses.Select(address => $"0x{address:X16}"))}");
+                AbandonPendingRenderTargets(work);
                 return;
             }
 
@@ -5722,6 +5866,7 @@ internal static unsafe class VulkanVideoPresenter
                         {
                             _availableGuestImages[targets[index].Address] = guestTextureFormat;
                             _gpuGuestImages[targets[index].Address] = guestTextureFormat;
+                            _renderTargetGuestImages[targets[index].Address] = guestTextureFormat;
                             NoteRenderedGuestImageLocked(
                                 targets[index].Address,
                                 targets[index].Width,
@@ -5776,6 +5921,7 @@ internal static unsafe class VulkanVideoPresenter
                         {
                             _availableGuestImages.Remove(target.Address);
                             _gpuGuestImages.Remove(target.Address);
+                            _renderTargetGuestImages.Remove(target.Address);
                             ForgetRenderedGuestImageLocked(target.Address);
                         }
                     }
@@ -5892,6 +6038,7 @@ internal static unsafe class VulkanVideoPresenter
                 {
                     _availableGuestImages.Remove(target.Address);
                     _gpuGuestImages.Remove(target.Address);
+                    _renderTargetGuestImages.Remove(target.Address);
                     ForgetRenderedGuestImageLocked(target.Address);
                 }
             }
@@ -6241,50 +6388,6 @@ internal static unsafe class VulkanVideoPresenter
                 $"mip={mipLevel} levels={levelCount} dst=0x{dstSelect:X3}");
             return view;
         }
-
-        private static bool IsCompatibleViewFormat(Format imageFormat, Format viewFormat)
-        {
-            if (imageFormat == viewFormat)
-            {
-                return true;
-            }
-
-            var imageClass = GetFormatCompatibilityClass(imageFormat);
-            return imageClass != 0 && imageClass == GetFormatCompatibilityClass(viewFormat);
-        }
-
-        private static uint GetFormatCompatibilityClass(Format format) =>
-            format switch
-            {
-                Format.R8Unorm or
-                Format.R8Uint or
-                Format.R8Sint => 8,
-                Format.R16Sfloat => 16,
-                Format.R32Uint or
-                Format.R32Sint or
-                Format.R32Sfloat or
-                Format.R16G16Unorm or
-                Format.R16G16Uint or
-                Format.R16G16Sint or
-                Format.R16G16Sfloat or
-                Format.R8G8B8A8Unorm or
-                Format.R8G8B8A8Uint or
-                Format.R8G8B8A8Sint or
-                Format.A2R10G10B10UnormPack32 or
-                Format.B10G11R11UfloatPack32 => 32,
-                Format.R32G32Uint or
-                Format.R32G32Sint or
-                Format.R32G32Sfloat or
-                Format.R16G16B16A16Unorm or
-                Format.R16G16B16A16Uint or
-                Format.R16G16B16A16Sint or
-                Format.R16G16B16A16Sfloat => 64,
-                Format.R32G32B32Sfloat => 96,
-                Format.R32G32B32A32Uint or
-                Format.R32G32B32A32Sint or
-                Format.R32G32B32A32Sfloat => 128,
-                _ => 0,
-            };
 
         private void UpdatePerformanceHud()
         {
@@ -7279,6 +7382,7 @@ internal static unsafe class VulkanVideoPresenter
                     {
                         _availableGuestImages[texture.Address] = format;
                         _gpuGuestImages[texture.Address] = format;
+                        _renderTargetGuestImages[texture.Address] = format;
                         NoteRenderedGuestImageLocked(
                             texture.Address,
                             guestImage.Width,
@@ -8114,6 +8218,7 @@ internal static unsafe class VulkanVideoPresenter
             {
                 _availableGuestImages.Clear();
                 _gpuGuestImages.Clear();
+                _renderTargetGuestImages.Clear();
                 _latestPresentableGuestImageAddress = 0;
                 _frameCompositeCandidateAddress = 0;
                 _frameCompositeCandidateScore = 0;
