@@ -1107,10 +1107,26 @@ internal static unsafe class VulkanVideoPresenter
             // A target pre-registered at enqueue time holds its rendered
             // VkImage by the time this draw executes: the work queue is FIFO,
             // so the producing draw runs first on the render thread.
-            return _renderTargetGuestImages.TryGetValue(address, out var pendingFormat) &&
-                AreAliasableGuestFormats(pendingFormat, guestFormat);
+            var isPending = _renderTargetGuestImages.TryGetValue(address, out var pendingFormat);
+            var result = isPending && AreAliasableGuestFormats(pendingFormat, guestFormat);
+            if (!result &&
+                (isPending || _availableGuestImages.ContainsKey(address)) &&
+                ShouldTracePresentedGuestImageContentsForDiagnostics() &&
+                _tracedGateRejects.Add(address))
+            {
+                Console.Error.WriteLine(
+                    "[LOADER][TRACE] vk.gate_reject addr=0x" + address.ToString("X16") +
+                    " pending=" + isPending + " pending_fmt=" + pendingFormat +
+                    " sampled_fmt=" + guestFormat +
+                    " in_gpu=" + _gpuGuestImages.ContainsKey(address) +
+                    " in_avail=" + _availableGuestImages.ContainsKey(address));
+            }
+
+            return result;
         }
     }
+
+    private static readonly HashSet<ulong> _tracedGateRejects = new();
 
     // A rendered target sampled in a different guest format still aliases its
     // VkImage when both formats share a Vulkan compatibility class; a mutable
@@ -3980,6 +3996,23 @@ internal static unsafe class VulkanVideoPresenter
                     SamplerState = texture.Sampler,
                     GuestImage = guestImage,
                 };
+            }
+
+            if (texture.Address != 0 &&
+                !texture.IsFallback &&
+                texture.RgbaPixels.Length == 0 &&
+                ShouldTracePresentedGuestImageContentsForDiagnostics())
+            {
+                var have = _guestImages.TryGetValue(texture.Address, out var gi);
+                Console.Error.WriteLine(
+                    "[LOADER][TRACE] vk.alias_miss addr=0x" + texture.Address.ToString("X16") +
+                    " in_guestimages=" + have +
+                    (have
+                        ? " img=" + gi.Width + "x" + gi.Height + "/" + gi.Format +
+                          " tex=" + texture.Width + "x" + texture.Height + " view=" + vkFormat +
+                          " sizeok=" + IsCompatibleGuestImageAlias(texture, gi) +
+                          " fmtok=" + IsCompatibleViewFormat(gi.Format, vkFormat)
+                        : " tex=" + texture.Width + "x" + texture.Height + " view=" + vkFormat));
             }
 
             return CreateTextureResource(texture);
