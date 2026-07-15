@@ -178,6 +178,13 @@ internal static unsafe class VulkanVideoPresenter
     private const uint GuestFormatR16G16B16A16Sint = 0x2000C;
     private const uint MinPresentableGuestImageWidth = 960;
     private const uint MinPresentableGuestImageHeight = 540;
+    // Geometry/clear passes sample no textures; a frame's final composite pass
+    // samples many, so a published target only qualifies as the composite
+    // candidate once it reads at least this many inputs.
+    private const int MinCompositeInputTextureCount = 2;
+    // Registered display buffers are 4K surfaces; DMA/copy destinations within
+    // this window past a registered base count as writes to that buffer.
+    private const ulong DisplayBufferCopyWindowBytes = 64UL << 20;
 
     private static readonly object _gate = new();
     private static readonly Queue<object> _pendingGuestWork = new();
@@ -190,6 +197,21 @@ internal static unsafe class VulkanVideoPresenter
     // final composite frame. Flips of registered display buffers that never
     // received a GPU render present this image instead of dropping the frame.
     private static ulong _latestPresentableGuestImageAddress;
+    // Best composite candidate of the current render window: among targets
+    // published since the previous flip, the pass sampling the most input
+    // textures wins (ties broken by area, then recency). Each flip latches the
+    // winner and re-opens the election so the redirect tracks the newest frame.
+    private static ulong _frameCompositeCandidateAddress;
+    private static long _frameCompositeCandidateScore;
+    private static ulong _lastFrameCompositeAddress;
+    // Display buffers registered through sceVideoOutRegisterBuffers and, per
+    // buffer, the source of the last observed DMA/copy into it; a copy source
+    // is the authoritative image to present when that buffer is flipped.
+    private static readonly HashSet<ulong> _registeredDisplayBuffers = [];
+    private static readonly Dictionary<ulong, ulong> _displayBufferCopySources = new();
+    private static readonly HashSet<(ulong Display, ulong Source)>
+        _tracedDisplayBufferCopies = [];
+    private static volatile bool _hasRegisteredDisplayBuffers;
     private static long _grossVkDeviceAlloc;
     private static long _vkAllocCount;
     private static Thread? _thread;
@@ -702,26 +724,36 @@ internal static unsafe class VulkanVideoPresenter
         {
             // VideoOut registration does not imply a rendered Vulkan image.
             var presentAddress = address;
+            var presentReason = "direct";
             var known = _gpuGuestImages.ContainsKey(address);
             if (!known &&
-                TryResolveDisplayBufferSourceLocked(address, out var sourceAddress))
+                TryResolveDisplayBufferSourceLocked(
+                    address,
+                    out var sourceAddress,
+                    out presentReason))
             {
                 if (_tracedGuestImageSubmissions.Add((address, width, height)))
                 {
                     Console.Error.WriteLine(
                         $"[LOADER][TRACE] vk.flip_redirect display=0x{address:X16} " +
-                        $"source=0x{sourceAddress:X16} {width}x{height}");
+                        $"source=0x{sourceAddress:X16} {width}x{height} " +
+                        $"reason={presentReason}");
                 }
 
                 presentAddress = sourceAddress;
                 known = true;
             }
 
+            // The flip closes the frame's render window; latch its composite so
+            // the next window elects a fresh candidate.
+            LatchFrameCompositeLocked();
+
             if (ShouldTracePresentedGuestImageContentsForDiagnostics())
             {
                 Console.Error.WriteLine(
                     $"[LOADER][TRACE] vk.submit_call kind=TrySubmitGuestImage addr=0x{address:X16} " +
-                    $"{width}x{height} known={known}");
+                    $"{width}x{height} known={known} source=0x{presentAddress:X16} " +
+                    $"reason={presentReason} composite=0x{_lastFrameCompositeAddress:X16}");
             }
 
             if (_closed)
@@ -756,7 +788,9 @@ internal static unsafe class VulkanVideoPresenter
                 sequence,
                 GuestDrawKind.None,
                 TranslatedDraw: null,
-                RequiredGuestWorkSequence: 0,
+                // The blit must run after the frame's draws; without this the
+                // flip samples the source image mid-render.
+                RequiredGuestWorkSequence: _enqueuedGuestWorkSequence,
                 IsSplash: false,
                 GuestImageAddress: presentAddress);
             System.Threading.Monitor.PulseAll(_gate);
@@ -798,6 +832,46 @@ internal static unsafe class VulkanVideoPresenter
         lock (_gate)
         {
             _availableGuestImages[address] = guestFormat;
+            _registeredDisplayBuffers.Add(address);
+            _hasRegisteredDisplayBuffers = true;
+        }
+    }
+
+    // Called for GPU DMA/copy packets. A copy whose destination is a registered
+    // display buffer reveals the true present source for that buffer's flips.
+    internal static void NoteGuestMemoryCopy(
+        ulong destinationAddress,
+        ulong sourceAddress,
+        uint byteCount)
+    {
+        if (!_hasRegisteredDisplayBuffers || destinationAddress == 0)
+        {
+            return;
+        }
+
+        lock (_gate)
+        {
+            foreach (var displayBuffer in _registeredDisplayBuffers)
+            {
+                if (destinationAddress < displayBuffer ||
+                    destinationAddress >= displayBuffer + DisplayBufferCopyWindowBytes)
+                {
+                    continue;
+                }
+
+                if (_tracedDisplayBufferCopies.Add((displayBuffer, sourceAddress)))
+                {
+                    Console.Error.WriteLine(
+                        $"[LOADER][TRACE] vk.dma_to_display display=0x{displayBuffer:X16} " +
+                        $"dst=0x{destinationAddress:X16} src=0x{sourceAddress:X16} " +
+                        $"bytes={byteCount}");
+                }
+
+                if (sourceAddress != 0)
+                {
+                    _displayBufferCopySources[displayBuffer] = sourceAddress;
+                }
+            }
         }
     }
 
@@ -805,29 +879,87 @@ internal static unsafe class VulkanVideoPresenter
     // display buffer registered through sceVideoOutRegisterBuffers; on hardware
     // a final GPU pass writes that buffer, but the HLE GPU does not execute it
     // yet, so no rendered image ever exists at the flipped address. Bridge the
-    // flip to the most recent full-screen render instead of dropping the frame.
+    // flip to the best rendered source instead of dropping the frame, in
+    // priority order: an observed copy into the buffer, the frame's composite
+    // pass, then the last published full-screen target.
     // Caller must hold _gate.
     private static bool TryResolveDisplayBufferSourceLocked(
         ulong flipAddress,
-        out ulong sourceAddress)
+        out ulong sourceAddress,
+        out string reason)
     {
+        sourceAddress = 0;
+        reason = "none";
+        if (!_availableGuestImages.ContainsKey(flipAddress))
+        {
+            return false;
+        }
+
+        // A GPU/DMA copy into this display buffer identified its true source.
+        if (_displayBufferCopySources.TryGetValue(flipAddress, out var copySource) &&
+            _gpuGuestImages.ContainsKey(copySource))
+        {
+            sourceAddress = copySource;
+            reason = "copy_source";
+            return true;
+        }
+
+        // The frame's composite pass (most sampled input textures wins).
+        var composite = _frameCompositeCandidateAddress != 0
+            ? _frameCompositeCandidateAddress
+            : _lastFrameCompositeAddress;
+        if (composite != 0 && _gpuGuestImages.ContainsKey(composite))
+        {
+            sourceAddress = composite;
+            reason = "composite";
+            return true;
+        }
+
         sourceAddress = _latestPresentableGuestImageAddress;
-        return sourceAddress != 0 &&
-            _availableGuestImages.ContainsKey(flipAddress) &&
-            _gpuGuestImages.ContainsKey(sourceAddress);
+        reason = "latest_target";
+        return sourceAddress != 0 && _gpuGuestImages.ContainsKey(sourceAddress);
     }
 
     // Caller must hold _gate.
     private static void NoteRenderedGuestImageLocked(
         ulong address,
         uint width,
-        uint height)
+        uint height,
+        int inputTextureCount = 0)
     {
-        if (width >= MinPresentableGuestImageWidth &&
-            height >= MinPresentableGuestImageHeight)
+        if (width < MinPresentableGuestImageWidth ||
+            height < MinPresentableGuestImageHeight)
         {
-            _latestPresentableGuestImageAddress = address;
+            return;
         }
+
+        _latestPresentableGuestImageAddress = address;
+
+        // The final composite pass samples many inputs (Astro Bot's menu
+        // composite reads 15 textures); geometry/clear passes read none.
+        if (inputTextureCount < MinCompositeInputTextureCount)
+        {
+            return;
+        }
+
+        var score = ((long)inputTextureCount << 32) | ((long)width * height);
+        if (score >= _frameCompositeCandidateScore)
+        {
+            _frameCompositeCandidateScore = score;
+            _frameCompositeCandidateAddress = address;
+        }
+    }
+
+    // Caller must hold _gate.
+    private static void LatchFrameCompositeLocked()
+    {
+        if (_frameCompositeCandidateAddress != 0)
+        {
+            _lastFrameCompositeAddress = _frameCompositeCandidateAddress;
+        }
+
+        _frameCompositeCandidateAddress = 0;
+        _frameCompositeCandidateScore = 0;
     }
 
     // Caller must hold _gate.
@@ -836,6 +968,17 @@ internal static unsafe class VulkanVideoPresenter
         if (_latestPresentableGuestImageAddress == address)
         {
             _latestPresentableGuestImageAddress = 0;
+        }
+
+        if (_frameCompositeCandidateAddress == address)
+        {
+            _frameCompositeCandidateAddress = 0;
+            _frameCompositeCandidateScore = 0;
+        }
+
+        if (_lastFrameCompositeAddress == address)
+        {
+            _lastFrameCompositeAddress = 0;
         }
     }
 
@@ -847,6 +990,13 @@ internal static unsafe class VulkanVideoPresenter
             _gpuGuestImages.Clear();
             _tracedGuestImageSubmissions.Clear();
             _latestPresentableGuestImageAddress = 0;
+            _frameCompositeCandidateAddress = 0;
+            _frameCompositeCandidateScore = 0;
+            _lastFrameCompositeAddress = 0;
+            _registeredDisplayBuffers.Clear();
+            _displayBufferCopySources.Clear();
+            _tracedDisplayBufferCopies.Clear();
+            _hasRegisteredDisplayBuffers = false;
         }
     }
 
@@ -854,13 +1004,22 @@ internal static unsafe class VulkanVideoPresenter
         ulong address,
         uint guestFormat,
         uint width,
-        uint height)
+        uint height,
+        int inputTextureCount = 0)
     {
         lock (_gate)
         {
             _availableGuestImages[address] = guestFormat;
             _gpuGuestImages[address] = guestFormat;
-            NoteRenderedGuestImageLocked(address, width, height);
+            NoteRenderedGuestImageLocked(address, width, height, inputTextureCount);
+        }
+    }
+
+    internal static void LatchFrameCompositeForTests()
+    {
+        lock (_gate)
+        {
+            LatchFrameCompositeLocked();
         }
     }
 
@@ -880,7 +1039,10 @@ internal static unsafe class VulkanVideoPresenter
     {
         lock (_gate)
         {
-            return TryResolveDisplayBufferSourceLocked(flipAddress, out sourceAddress);
+            return TryResolveDisplayBufferSourceLocked(
+                flipAddress,
+                out sourceAddress,
+                out _);
         }
     }
 
@@ -5563,7 +5725,8 @@ internal static unsafe class VulkanVideoPresenter
                             NoteRenderedGuestImageLocked(
                                 targets[index].Address,
                                 targets[index].Width,
-                                targets[index].Height);
+                                targets[index].Height,
+                                work.Draw.Textures.Count);
                         }
                     }
                 }
@@ -7952,6 +8115,10 @@ internal static unsafe class VulkanVideoPresenter
                 _availableGuestImages.Clear();
                 _gpuGuestImages.Clear();
                 _latestPresentableGuestImageAddress = 0;
+                _frameCompositeCandidateAddress = 0;
+                _frameCompositeCandidateScore = 0;
+                _lastFrameCompositeAddress = 0;
+                _displayBufferCopySources.Clear();
             }
             DestroySwapchainResources();
             if (_device.Handle != 0)

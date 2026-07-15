@@ -3333,6 +3333,10 @@ public static class AgcExports
             destinationAddress != 0 &&
             sourceAddress != 0 &&
             TryCopyGuestMemory(ctx, sourceAddress, destinationAddress, byteCount);
+        VulkanVideoPresenter.NoteGuestMemoryCopy(
+            destinationAddress,
+            sourceAddress,
+            byteCount);
         if (tracePacket)
         {
             TraceAgc(
@@ -3411,6 +3415,10 @@ public static class AgcExports
             return;
         }
 
+        VulkanVideoPresenter.NoteGuestMemoryCopy(
+            destinationAddress,
+            sourceAddress,
+            byteCount);
         if (ShouldTraceHotPath(ref _standardDmaTraceCount))
         {
             TraceAgcShader(

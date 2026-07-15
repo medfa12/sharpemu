@@ -93,4 +93,106 @@ public sealed class VulkanPresenterFlipRedirectTests
         Assert.False(VulkanVideoPresenter.TryResolveDisplayBufferSourceForTests(
             DisplayBuffer0, out _));
     }
+
+    [Fact]
+    public void CompositePassOutranksLaterIntermediatePass()
+    {
+        VulkanVideoPresenter.ResetGuestImageTrackingForTests();
+        VulkanVideoPresenter.RegisterKnownDisplayBuffer(DisplayBuffer0, Rgba8Format);
+        // Astro Bot's menu: a 15-input-texture composite pass followed by
+        // trailing 0-texture geometry/clear passes that publish last.
+        VulkanVideoPresenter.PublishRenderedGuestImageForTests(
+            CompositeTarget, Rgba8Format, 1920, 1080, inputTextureCount: 15);
+        VulkanVideoPresenter.PublishRenderedGuestImageForTests(
+            0x53B9F0000, Rgba8Format, 2432, 1368, inputTextureCount: 0);
+
+        Assert.True(VulkanVideoPresenter.TryResolveDisplayBufferSourceForTests(
+            DisplayBuffer0, out var source));
+        Assert.Equal(CompositeTarget, source);
+    }
+
+    [Fact]
+    public void HighestInputTextureCountWins()
+    {
+        VulkanVideoPresenter.ResetGuestImageTrackingForTests();
+        VulkanVideoPresenter.RegisterKnownDisplayBuffer(DisplayBuffer0, Rgba8Format);
+        VulkanVideoPresenter.PublishRenderedGuestImageForTests(
+            0x53B9F0000, Rgba8Format, 1920, 1080, inputTextureCount: 7);
+        VulkanVideoPresenter.PublishRenderedGuestImageForTests(
+            CompositeTarget, Rgba8Format, 1920, 1080, inputTextureCount: 15);
+        VulkanVideoPresenter.PublishRenderedGuestImageForTests(
+            0x53D4A0000, Rgba8Format, 2432, 1368, inputTextureCount: 2);
+
+        Assert.True(VulkanVideoPresenter.TryResolveDisplayBufferSourceForTests(
+            DisplayBuffer0, out var source));
+        Assert.Equal(CompositeTarget, source);
+    }
+
+    [Fact]
+    public void LatchedCompositePersistsIntoNextFrameWindow()
+    {
+        VulkanVideoPresenter.ResetGuestImageTrackingForTests();
+        VulkanVideoPresenter.RegisterKnownDisplayBuffer(DisplayBuffer0, Rgba8Format);
+        VulkanVideoPresenter.PublishRenderedGuestImageForTests(
+            CompositeTarget, Rgba8Format, 1920, 1080, inputTextureCount: 15);
+        // Flip closes the window; the composite must keep resolving until the
+        // next window elects a candidate of its own.
+        VulkanVideoPresenter.LatchFrameCompositeForTests();
+        VulkanVideoPresenter.PublishRenderedGuestImageForTests(
+            0x53B9F0000, Rgba8Format, 2432, 1368, inputTextureCount: 0);
+
+        Assert.True(VulkanVideoPresenter.TryResolveDisplayBufferSourceForTests(
+            DisplayBuffer0, out var source));
+        Assert.Equal(CompositeTarget, source);
+    }
+
+    [Fact]
+    public void NewFrameCompositeReplacesLatchedComposite()
+    {
+        VulkanVideoPresenter.ResetGuestImageTrackingForTests();
+        VulkanVideoPresenter.RegisterKnownDisplayBuffer(DisplayBuffer0, Rgba8Format);
+        VulkanVideoPresenter.PublishRenderedGuestImageForTests(
+            0x53B9F0000, Rgba8Format, 1920, 1080, inputTextureCount: 15);
+        VulkanVideoPresenter.LatchFrameCompositeForTests();
+        VulkanVideoPresenter.PublishRenderedGuestImageForTests(
+            CompositeTarget, Rgba8Format, 1920, 1080, inputTextureCount: 15);
+
+        Assert.True(VulkanVideoPresenter.TryResolveDisplayBufferSourceForTests(
+            DisplayBuffer0, out var source));
+        Assert.Equal(CompositeTarget, source);
+    }
+
+    [Fact]
+    public void ObservedCopyIntoDisplayBufferOverridesComposite()
+    {
+        VulkanVideoPresenter.ResetGuestImageTrackingForTests();
+        VulkanVideoPresenter.RegisterKnownDisplayBuffer(DisplayBuffer0, Rgba8Format);
+        VulkanVideoPresenter.PublishRenderedGuestImageForTests(
+            CompositeTarget, Rgba8Format, 1920, 1080, inputTextureCount: 15);
+        VulkanVideoPresenter.PublishRenderedGuestImageForTests(
+            0x53B9F0000, Rgba8Format, 3840, 2160, inputTextureCount: 0);
+        // A DMA copy into the flipped buffer names the authoritative source.
+        VulkanVideoPresenter.NoteGuestMemoryCopy(
+            DisplayBuffer0, 0x53B9F0000UL, 1024 * 1024);
+
+        Assert.True(VulkanVideoPresenter.TryResolveDisplayBufferSourceForTests(
+            DisplayBuffer0, out var source));
+        Assert.Equal(0x53B9F0000UL, source);
+    }
+
+    [Fact]
+    public void EvictedCompositeFallsBackToLatestTarget()
+    {
+        VulkanVideoPresenter.ResetGuestImageTrackingForTests();
+        VulkanVideoPresenter.RegisterKnownDisplayBuffer(DisplayBuffer0, Rgba8Format);
+        VulkanVideoPresenter.PublishRenderedGuestImageForTests(
+            CompositeTarget, Rgba8Format, 1920, 1080, inputTextureCount: 15);
+        VulkanVideoPresenter.PublishRenderedGuestImageForTests(
+            0x53B9F0000, Rgba8Format, 1920, 1080, inputTextureCount: 0);
+        VulkanVideoPresenter.RemoveRenderedGuestImageForTests(CompositeTarget);
+
+        Assert.True(VulkanVideoPresenter.TryResolveDisplayBufferSourceForTests(
+            DisplayBuffer0, out var source));
+        Assert.Equal(0x53B9F0000UL, source);
+    }
 }
