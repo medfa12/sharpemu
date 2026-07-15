@@ -162,6 +162,7 @@ public static class AgcExports
     private static readonly HashSet<(ulong, int)> _tracedFlipDecisions = new();
     private static readonly HashSet<ulong> _tracedComputeShaders = new();
     private static readonly HashSet<ulong> _tracedNggDraws = new();
+    private static readonly HashSet<ulong> _tracedNggStagesProbe = new();
     private static readonly Dictionary<(ulong Address, uint Width, uint Height), ulong> _tracedTextureHashes = [];
     private static readonly HashSet<uint> _tracedSubmittedDrawOpcodes = new();
     private static readonly Dictionary<(ulong Ps, ulong State, Gen5PixelOutputKind Output), byte[]> _pixelSpirvCache = new();
@@ -3762,7 +3763,17 @@ public static class AgcExports
         uint vertexCount,
         bool indexed)
     {
-        if (!state.CxRegisters.TryGetValue(VgtShaderStagesEn, out var stagesEnRaw))
+        var hasStagesEn = state.CxRegisters.TryGetValue(VgtShaderStagesEn, out var stagesEnRaw);
+        if (_tracedNggStagesProbe.Add(exportShaderAddress))
+        {
+            state.CxRegisters.TryGetValue(0x2D6u, out var geNggSubgrp);
+            TraceAgc(
+                $"agc.ngg_probe es=0x{exportShaderAddress:X16} hasStagesEn={hasStagesEn} " +
+                $"stagesEn=0x{stagesEnRaw:X8} geNggSubgrp=0x{geNggSubgrp:X8} " +
+                $"vtx={vertexCount} inst={state.InstanceCount} indexed={(indexed ? 1 : 0)}");
+        }
+
+        if (!hasStagesEn)
         {
             return;
         }
