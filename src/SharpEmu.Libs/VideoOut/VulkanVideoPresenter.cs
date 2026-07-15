@@ -710,6 +710,29 @@ internal static unsafe class VulkanVideoPresenter
                 return;
             }
 
+            // Register the dispatch's storage outputs as render targets at
+            // enqueue time, exactly like graphics targets. A later graphics draw
+            // in the same submit that samples one of these addresses is enqueued
+            // before this dispatch executes; without the pre-registration its
+            // availability gate misses and it snapshots never-written guest
+            // memory (zeros) instead of deferring to the compute-written image.
+            foreach (var texture in textures)
+            {
+                if (!texture.IsStorage || texture.Address == 0)
+                {
+                    continue;
+                }
+
+                var guestTextureFormat = GetGuestTextureFormat(
+                    texture.Format,
+                    texture.NumberType);
+                if (guestTextureFormat != 0)
+                {
+                    _availableGuestImages[texture.Address] = guestTextureFormat;
+                    _renderTargetGuestImages[texture.Address] = guestTextureFormat;
+                }
+            }
+
             EnqueueGuestWorkLocked(
                 new VulkanComputeGuestDispatch(
                     shaderAddress,
