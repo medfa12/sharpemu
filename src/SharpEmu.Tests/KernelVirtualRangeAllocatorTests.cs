@@ -70,6 +70,8 @@ public sealed class KernelVirtualRangeAllocatorTests
             address = 0;
             return false;
         }
+
+        public bool TryFreeGuestMemory(ulong address) => false;
     }
 
     [Fact]

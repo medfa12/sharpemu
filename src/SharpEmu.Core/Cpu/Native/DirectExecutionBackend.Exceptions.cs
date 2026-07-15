@@ -23,6 +23,12 @@ public sealed partial class DirectExecutionBackend
 
 	private unsafe void SetupExceptionHandler()
 	{
+		if (!OperatingSystem.IsWindows())
+		{
+			SetupPosixExceptionHandler();
+			return;
+		}
+
 		if (!string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_DISABLE_RAW_HANDLER"), "1", StringComparison.Ordinal))
 		{
 			_rawExceptionHandlerStub = _faultHandling.CreateHandlerThunk(RawVectoredHandlerPtrManaged, _hostRspSlotTlsIndex, _tlsGetValueAddress);
@@ -232,19 +238,16 @@ public sealed partial class DirectExecutionBackend
 			// bad address is visible without a second disassembly round trip.
 			DumpGuestPointerRegisters(rdi, rsi, rdx, rcx, r8, r9, r12, r13, r14, r15, rax, rbx);
 
-			try
+			Console.Error.WriteLine("[LOADER][INFO]   Stack qwords (RSP..):");
+			for (int i = 0; i < 16; i++)
 			{
-				Console.Error.WriteLine("[LOADER][INFO]   Stack qwords (RSP..):");
-				for (int i = 0; i < 16; i++)
+				ulong stackAddr = rsp + (ulong)(i * 8);
+				if (!TryReadHostQword(stackAddr, out ulong value))
 				{
-					ulong stackAddr = rsp + (ulong)(i * 8);
-					ulong value = (ulong)Marshal.ReadInt64((nint)stackAddr);
-					Console.Error.WriteLine($"[LOADER][INFO]     [rsp+0x{i * 8:X2}] @0x{stackAddr:X16} = 0x{value:X16}");
+					Console.Error.WriteLine("[LOADER][WARNING]   Could not read stack qwords.");
+					break;
 				}
-			}
-			catch
-			{
-				Console.Error.WriteLine("[LOADER][WARNING]   Could not read stack qwords.");
+				Console.Error.WriteLine($"[LOADER][INFO]     [rsp+0x{i * 8:X2}] @0x{stackAddr:X16} = 0x{value:X16}");
 			}
 
 			// The faulting REP MOVSB helper is a leaf (no frame), so the RBP walk
@@ -298,8 +301,11 @@ public sealed partial class DirectExecutionBackend
 					{
 						break;
 					}
-					ulong next = (ulong)Marshal.ReadInt64((nint)frame);
-					ulong ret = (ulong)Marshal.ReadInt64((nint)(frame + 8));
+					if (!TryReadHostQword(frame, out ulong next) || !TryReadHostQword(frame + 8, out ulong ret))
+					{
+						Console.Error.WriteLine("[LOADER][WARNING]   Could not walk RBP frame chain.");
+						break;
+					}
 					string extra = TryFormatNearestRuntimeSymbol(ret, out string retSym) ? $" [{retSym}]" : string.Empty;
 					Console.Error.WriteLine($"[LOADER][INFO]     frame#{i}: rbp=0x{frame:X16} ret=0x{ret:X16}{extra} next=0x{next:X16}");
 					if (i < 3 && ret > 48)
@@ -335,10 +341,9 @@ public sealed partial class DirectExecutionBackend
 					Console.Error.WriteLine("[LOADER][ERROR]     - Guest code called an unmapped import");
 					Console.Error.WriteLine("[LOADER][ERROR]     - Guest code accessed unmapped memory");
 					Console.Error.WriteLine("[LOADER][ERROR]     - Need to implement HLE for this NID");
-					try
+					byte[] code = new byte[16];
+					if (TryReadHostBytes(rip, code))
 					{
-						byte[] code = new byte[16];
-						Marshal.Copy((nint)rip, code, 0, code.Length);
 						Console.Error.WriteLine("[LOADER][INFO]   Code at RIP: " + BitConverter.ToString(code).Replace("-", " "));
 						if (code[0] == 100)
 						{
@@ -354,20 +359,18 @@ public sealed partial class DirectExecutionBackend
 							Console.Error.WriteLine($"[LOADER][INFO]   RBP: 0x{rbp:X16} (mod 16 = {rbp % 16})");
 							Console.Error.WriteLine($"[LOADER][INFO]   RSP: 0x{rsp:X16} (mod 16 = {rsp % 16})");
 						}
-						if (rip > 16)
+						byte[] before = new byte[16];
+						if (rip > 16 && TryReadHostBytes(rip - 16, before))
 						{
-							byte[] before = new byte[16];
-							Marshal.Copy((nint)(rip - 16), before, 0, before.Length);
 							Console.Error.WriteLine("[LOADER][INFO]   Code before RIP: " + BitConverter.ToString(before).Replace("-", " "));
 						}
-						if (rip > 32)
+						byte[] window = new byte[64];
+						if (rip > 32 && TryReadHostBytes(rip - 32, window))
 						{
-							byte[] window = new byte[64];
-							Marshal.Copy((nint)(rip - 32), window, 0, window.Length);
 							Console.Error.WriteLine("[LOADER][INFO]   Code window [RIP-0x20..]: " + BitConverter.ToString(window).Replace("-", " "));
 						}
 					}
-					catch
+					else
 					{
 						Console.Error.WriteLine("[LOADER][ERROR]   Could not read code at RIP");
 					}
@@ -981,6 +984,61 @@ public sealed partial class DirectExecutionBackend
 		catch
 		{
 			value = 0;
+			return false;
+		}
+	}
+
+	private static bool TryReadHostQword(ulong address, out ulong value)
+	{
+		if (!OperatingSystem.IsWindows())
+		{
+			// A stray read inside the signal handler would raise a nested
+			// SIGSEGV and kill the process before diagnostics finish, so
+			// probe the region table instead of relying on try/catch.
+			return TryReadStackU64(address, out value);
+		}
+
+		value = 0;
+		try
+		{
+			value = (ulong)Marshal.ReadInt64((nint)address);
+			return true;
+		}
+		catch
+		{
+			return false;
+		}
+	}
+
+	private unsafe bool TryReadHostBytes(ulong address, byte[] buffer)
+	{
+		if (address < 65536)
+		{
+			return false;
+		}
+
+		if (!OperatingSystem.IsWindows())
+		{
+			// See TryReadHostQword: probe every touched page before reading.
+			ulong end = address + (ulong)buffer.Length;
+			for (ulong page = address & 0xFFFFFFFFFFFFF000uL; page < end; page += 4096)
+			{
+				if (!_hostMemory.Query(page, out var mbi) ||
+					mbi.State != HostRegionState.Committed ||
+					!IsReadableProtection(mbi.RawProtection))
+				{
+					return false;
+				}
+			}
+		}
+
+		try
+		{
+			Marshal.Copy((nint)address, buffer, 0, buffer.Length);
+			return true;
+		}
+		catch
+		{
 			return false;
 		}
 	}

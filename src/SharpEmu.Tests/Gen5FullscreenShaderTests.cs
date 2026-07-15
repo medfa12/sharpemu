@@ -4,6 +4,7 @@
 using SharpEmu.HLE;
 using SharpEmu.Libs.Agc;
 using SharpEmu.Libs.VideoOut;
+using SharpEmu.ShaderCompiler;
 using Xunit;
 
 namespace SharpEmu.Tests;

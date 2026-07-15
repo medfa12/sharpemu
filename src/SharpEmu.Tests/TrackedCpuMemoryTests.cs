@@ -27,6 +27,8 @@ public sealed class TrackedCpuMemoryTests
             address = 0xABCD_0000;
             return true;
         }
+
+        public bool TryFreeGuestMemory(ulong address) => true;
     }
 
     [Fact]

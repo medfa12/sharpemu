@@ -55,4 +55,7 @@ internal sealed class FakeGuestMemory : ICpuMemory, IGuestAddressSpace
 
     public bool TryAllocateGuestMemory(ulong size, ulong alignment, out ulong address) =>
         TryAllocateAtOrAbove(0, size, executable: false, alignment, out address);
+
+    // Bump allocator: individual frees are not tracked or reclaimed.
+    public bool TryFreeGuestMemory(ulong address) => false;
 }

@@ -41,15 +41,14 @@ public sealed class VirtualMemory : IVirtualMemory
 
         lock (_gate)
         {
-            foreach (var existing in _regions)
+            var insertionIndex = FindInsertionIndex(virtualAddress);
+            if ((insertionIndex > 0 && virtualAddress < _regions[insertionIndex - 1].EndAddress) ||
+                (insertionIndex < _regions.Count && endAddress > _regions[insertionIndex].Region.VirtualAddress))
             {
-                if (virtualAddress < existing.EndAddress && endAddress > existing.Region.VirtualAddress)
-                {
-                    throw new InvalidOperationException("Attempted to map an overlapping virtual memory region.");
-                }
+                throw new InvalidOperationException("Attempted to map an overlapping virtual memory region.");
             }
 
-            _regions.Add(new MappedRegion(
+            _regions.Insert(insertionIndex, new MappedRegion(
                 new VirtualMemoryRegion(virtualAddress, memorySize, fileOffset, (ulong)fileData.Length, protection),
                 endAddress,
                 backingMemory));
@@ -74,24 +73,12 @@ public sealed class VirtualMemory : IVirtualMemory
     {
         lock (_gate)
         {
-            if (destination.IsEmpty)
+            if (!TryValidateRange(virtualAddress, destination.Length, ProgramHeaderFlags.Read, out var regionIndex))
             {
-                return TryResolveRegion(virtualAddress, out _, out _);
+                return false;
             }
 
-            var completed = 0;
-            while (completed < destination.Length)
-            {
-                if (!TryResolveRegion(virtualAddress + (ulong)completed, out var region, out var offset))
-                {
-                    return false;
-                }
-
-                var available = Math.Min(destination.Length - completed, region.BackingMemory.Length - offset);
-                region.BackingMemory.AsSpan(offset, available).CopyTo(destination[completed..]);
-                completed += available;
-            }
-
+            CopyFromRegions(virtualAddress, destination, regionIndex);
             return true;
         }
     }
@@ -100,53 +87,127 @@ public sealed class VirtualMemory : IVirtualMemory
     {
         lock (_gate)
         {
-            if (source.IsEmpty)
+            if (!TryValidateRange(virtualAddress, source.Length, ProgramHeaderFlags.Write, out var regionIndex))
             {
-                return TryResolveRegion(virtualAddress, out _, out _);
+                return false;
             }
 
-            // Validate the whole range first so partially applied writes never happen.
-            var validated = 0;
-            while (validated < source.Length)
-            {
-                if (!TryResolveRegion(virtualAddress + (ulong)validated, out var region, out var offset))
-                {
-                    return false;
-                }
-
-                validated += Math.Min(source.Length - validated, region.BackingMemory.Length - offset);
-            }
-
-            var completed = 0;
-            while (completed < source.Length)
-            {
-                TryResolveRegion(virtualAddress + (ulong)completed, out var region, out var offset);
-                var available = Math.Min(source.Length - completed, region.BackingMemory.Length - offset);
-                source.Slice(completed, available).CopyTo(region.BackingMemory.AsSpan(offset, available));
-                completed += available;
-            }
-
+            CopyToRegions(virtualAddress, source, regionIndex);
             return true;
         }
     }
 
-    private bool TryResolveRegion(ulong virtualAddress, out MappedRegion region, out int offset)
+    private bool TryValidateRange(
+        ulong virtualAddress,
+        int length,
+        ProgramHeaderFlags requiredProtection,
+        out int regionIndex)
     {
-        foreach (var candidate in _regions)
+        regionIndex = FindContainingRegionIndex(virtualAddress);
+        if (regionIndex < 0)
         {
-            if (virtualAddress < candidate.Region.VirtualAddress || virtualAddress >= candidate.EndAddress)
-            {
-                continue;
-            }
-
-            region = candidate;
-            offset = checked((int)(virtualAddress - candidate.Region.VirtualAddress));
-            return true;
+            return false;
         }
 
-        region = default;
-        offset = 0;
-        return false;
+        var currentAddress = virtualAddress;
+        var remaining = length;
+        var currentIndex = regionIndex;
+        while (true)
+        {
+            if (currentIndex >= _regions.Count)
+            {
+                return false;
+            }
+
+            var region = _regions[currentIndex];
+            if (currentAddress < region.Region.VirtualAddress ||
+                currentAddress >= region.EndAddress ||
+                (region.Region.Protection & requiredProtection) == 0)
+            {
+                return false;
+            }
+
+            if (remaining == 0)
+            {
+                return true;
+            }
+
+            var available = region.EndAddress - currentAddress;
+            var chunkLength = (int)Math.Min((ulong)remaining, available);
+            remaining -= chunkLength;
+            if (remaining == 0)
+            {
+                return true;
+            }
+
+            currentAddress += (ulong)chunkLength;
+            currentIndex++;
+        }
+    }
+
+    private int FindContainingRegionIndex(ulong virtualAddress)
+    {
+        var insertionIndex = FindInsertionIndex(virtualAddress);
+        if (insertionIndex < _regions.Count &&
+            _regions[insertionIndex].Region.VirtualAddress == virtualAddress)
+        {
+            return insertionIndex;
+        }
+
+        var candidateIndex = insertionIndex - 1;
+        return candidateIndex >= 0 && virtualAddress < _regions[candidateIndex].EndAddress
+            ? candidateIndex
+            : -1;
+    }
+
+    private void CopyFromRegions(ulong virtualAddress, Span<byte> destination, int regionIndex)
+    {
+        var copied = 0;
+        var currentAddress = virtualAddress;
+        while (copied < destination.Length)
+        {
+            var region = _regions[regionIndex++];
+            var regionOffset = checked((int)(currentAddress - region.Region.VirtualAddress));
+            var chunkLength = Math.Min(destination.Length - copied, region.BackingMemory.Length - regionOffset);
+            region.BackingMemory.AsSpan(regionOffset, chunkLength).CopyTo(destination[copied..]);
+            copied += chunkLength;
+            currentAddress += (ulong)chunkLength;
+        }
+    }
+
+    private void CopyToRegions(ulong virtualAddress, ReadOnlySpan<byte> source, int regionIndex)
+    {
+        var copied = 0;
+        var currentAddress = virtualAddress;
+        while (copied < source.Length)
+        {
+            var region = _regions[regionIndex++];
+            var regionOffset = checked((int)(currentAddress - region.Region.VirtualAddress));
+            var chunkLength = Math.Min(source.Length - copied, region.BackingMemory.Length - regionOffset);
+            source.Slice(copied, chunkLength).CopyTo(region.BackingMemory.AsSpan(regionOffset, chunkLength));
+            copied += chunkLength;
+            currentAddress += (ulong)chunkLength;
+        }
+    }
+
+    private int FindInsertionIndex(ulong virtualAddress)
+    {
+        var lower = 0;
+        var upper = _regions.Count;
+        while (lower < upper)
+        {
+            var middle = lower + ((upper - lower) / 2);
+            if (_regions[middle].Region.VirtualAddress < virtualAddress)
+            {
+                lower = middle + 1;
+            }
+            else
+            {
+                upper = middle;
+            }
+        }
+
+        return lower;
     }
 
     private readonly record struct MappedRegion(VirtualMemoryRegion Region, ulong EndAddress, byte[] BackingMemory);

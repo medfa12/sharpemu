@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using System.Reflection;
+using System.Runtime.InteropServices;
 using SharpEmu.Core.Cpu.Native;
 using SharpEmu.Core.Loader;
 using SharpEmu.Core.Memory;
@@ -22,9 +23,22 @@ public sealed class GuestThreadRegionAllocationTests
     private const ulong StackBaseAddress = 0x7FFF_E000_0000UL;
     private const ulong StackSize = 0x0020_0000UL;
 
+    // DirectExecutionBackend's static initializer resolves the native import
+    // gateway through HostPlatform.Current, which requires an x86-64 process
+    // (see HostPlatform.Create). The region-allocation logic under test is
+    // arch-independent, but it cannot be reached on a non-x86-64 host, so skip
+    // there instead of tripping the platform gate.
+    private static bool NativeExecutionSupported =>
+        RuntimeInformation.ProcessArchitecture is Architecture.X64 or Architecture.X86;
+
     [Fact]
     public void ConcurrentStackRegionMapsReceiveDistinctBases()
     {
+        if (!NativeExecutionSupported)
+        {
+            return;
+        }
+
         var memory = new RacyVirtualMemory();
         var bases = new ulong[2];
         var results = new bool[2];
@@ -39,6 +53,11 @@ public sealed class GuestThreadRegionAllocationTests
     [Fact]
     public void ConcurrentTlsRegionMapsReceiveDistinctBases()
     {
+        if (!NativeExecutionSupported)
+        {
+            return;
+        }
+
         var memory = new RacyVirtualMemory();
         var bases = new ulong[2];
         var results = new bool[2];

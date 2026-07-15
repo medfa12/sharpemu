@@ -1,6 +1,7 @@
 // Copyright (C) 2026 SharpEmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+using SharpEmu.Libs.Gpu;
 using SharpEmu.Libs.VideoOut;
 using Silk.NET.Vulkan;
 using Xunit;
@@ -171,7 +172,7 @@ public sealed class VulkanPresenterGuestSurfaceCacheTests
         LastUseStamp = stamp,
     };
 
-    private static VulkanGuestDrawTexture Texture(ulong address, uint width, uint height) =>
+    private static GuestDrawTexture Texture(ulong address, uint width, uint height) =>
         new(address, width, height, Format: 0, NumberType: 0, [], IsFallback: false, IsStorage: false);
 
     [Fact]

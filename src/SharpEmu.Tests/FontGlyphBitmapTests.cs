@@ -239,5 +239,7 @@ public sealed class FontGlyphBitmapTests
             address = 0;
             return false;
         }
+
+        public bool TryFreeGuestMemory(ulong address) => false;
     }
 }

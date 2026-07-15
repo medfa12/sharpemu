@@ -42,7 +42,8 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
 
     private readonly IHostMemory _hostMemory;
     private ulong _guestAllocationArenaBase;
-    private ulong _guestAllocationOffset;
+    private readonly SortedDictionary<ulong, ulong> _guestAllocationFreeRanges = new();
+    private readonly Dictionary<ulong, (ulong Offset, ulong Size)> _guestAllocations = new();
     private static readonly ulong LazyReservePrimeBytes = ResolveLazyReservePrimeBytes();
 
     public PhysicalVirtualMemory(IHostMemory? hostMemory = null)
@@ -248,6 +249,71 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
         var requestedCursor = AlignUp(desiredAddress, effectiveAlignment);
         var cursor = GetAllocationSearchCursor(desiredAddress, requestedCursor, effectiveAlignment, executable);
 
+        // Under Rosetta 2 the kernel can ignore placement hints for whole
+        // windows, so page-stepped exact probes are pathological on macOS.
+        // Linux must keep using the exact-address search below: PS5 resource
+        // descriptors cannot represent ordinary 0x7F... host mappings. Linux
+        // HostMemory uses MAP_FIXED_NOREPLACE, making those low-address probes
+        // safe without clobbering existing host mappings.
+        if (OperatingSystem.IsMacOS())
+        {
+            // Prefer the requested low address.  Besides matching the guest
+            // address model, this keeps the allocation representable by every
+            // PS5 GPU descriptor (the strictest ones carry 40 address bits).
+            try
+            {
+                var exactAddress = AllocateAt(
+                    cursor,
+                    alignedSize,
+                    executable,
+                    allowAlternative: false);
+                if (exactAddress == cursor)
+                {
+                    actualAddress = exactAddress;
+                    UpdateAllocationSearchCursor(
+                        desiredAddress,
+                        effectiveAlignment,
+                        executable,
+                        exactAddress + alignedSize);
+                    return true;
+                }
+            }
+            catch
+            {
+            }
+
+            // Over-allocate by the alignment so a kernel-chosen placement
+            // always contains an aligned start; the unused head/tail stays
+            // part of the tracked region and is simply never handed out.
+            var reserveSize = effectiveAlignment > PageSize
+                ? alignedSize + effectiveAlignment
+                : alignedSize;
+            try
+            {
+                var posixAddress = AllocateAt(cursor, reserveSize, executable, allowAlternative: true);
+                if (posixAddress != 0)
+                {
+                    var alignedBase = AlignUp(posixAddress, effectiveAlignment);
+                    const ulong gpuAddressLimit = 1UL << 40;
+                    if (alignedBase < gpuAddressLimit &&
+                        alignedSize <= gpuAddressLimit - alignedBase &&
+                        alignedBase + alignedSize <= posixAddress + reserveSize)
+                    {
+                        actualAddress = alignedBase;
+                        UpdateAllocationSearchCursor(desiredAddress, effectiveAlignment, executable, alignedBase + alignedSize);
+                        return true;
+                    }
+
+                    ReleaseUntrackedAllocation(posixAddress);
+                }
+            }
+            catch
+            {
+            }
+
+            return false;
+        }
+
         for (var attempt = 0; attempt < 0x10000; attempt++)
         {
             if (cursor == 0 || ulong.MaxValue - cursor < alignedSize)
@@ -282,6 +348,28 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
         return false;
     }
 
+    private void ReleaseUntrackedAllocation(ulong address)
+    {
+        _gate.EnterWriteLock();
+        try
+        {
+            for (var i = 0; i < _regions.Count; i++)
+            {
+                if (_regions[i].VirtualAddress == address)
+                {
+                    _regions.RemoveAt(i);
+                    break;
+                }
+            }
+        }
+        finally
+        {
+            _gate.ExitWriteLock();
+        }
+
+        _hostMemory.Free(address);
+    }
+
     public bool TryAllocateGuestMemory(ulong size, ulong alignment, out ulong address)
     {
         address = 0;
@@ -301,7 +389,9 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
                         GuestAllocationArenaSize,
                         executable: false,
                         allowAlternative: true);
-                    _guestAllocationOffset = GuestAllocationArenaStartOffset;
+                    _guestAllocationFreeRanges.Add(
+                        GuestAllocationArenaStartOffset,
+                        GuestAllocationArenaSize - GuestAllocationArenaStartOffset);
                 }
                 catch (Exception)
                 {
@@ -309,14 +399,89 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
                 }
             }
 
-            var alignedOffset = AlignUp(_guestAllocationOffset, alignment);
-            if (alignedOffset > GuestAllocationArenaSize || size > GuestAllocationArenaSize - alignedOffset)
+            ulong rangeOffset = 0;
+            ulong rangeSize = 0;
+            ulong alignedOffset = 0;
+            var found = false;
+            foreach (var range in _guestAllocationFreeRanges)
+            {
+                alignedOffset = AlignUp(range.Key, alignment);
+                if (alignedOffset >= range.Key &&
+                    alignedOffset - range.Key <= range.Value &&
+                    size <= range.Value - (alignedOffset - range.Key))
+                {
+                    rangeOffset = range.Key;
+                    rangeSize = range.Value;
+                    found = true;
+                    break;
+                }
+            }
+
+            if (!found)
             {
                 return false;
             }
 
+            _guestAllocationFreeRanges.Remove(rangeOffset);
+            if (alignedOffset > rangeOffset)
+            {
+                _guestAllocationFreeRanges.Add(rangeOffset, alignedOffset - rangeOffset);
+            }
+
+            var allocationEnd = alignedOffset + size;
+            var rangeEnd = rangeOffset + rangeSize;
+            if (allocationEnd < rangeEnd)
+            {
+                _guestAllocationFreeRanges.Add(allocationEnd, rangeEnd - allocationEnd);
+            }
+
             address = _guestAllocationArenaBase + alignedOffset;
-            _guestAllocationOffset = alignedOffset + size;
+            _guestAllocations.Add(address, (alignedOffset, size));
+            return true;
+        }
+    }
+
+    public bool TryFreeGuestMemory(ulong address)
+    {
+        lock (_guestAllocationGate)
+        {
+            if (!_guestAllocations.Remove(address, out var allocation))
+            {
+                return false;
+            }
+
+            var freeOffset = allocation.Offset;
+            var freeSize = allocation.Size;
+            ulong? previousOffset = null;
+            ulong? nextOffset = null;
+
+            foreach (var range in _guestAllocationFreeRanges)
+            {
+                if (range.Key < freeOffset)
+                {
+                    previousOffset = range.Key;
+                    continue;
+                }
+
+                nextOffset = range.Key;
+                break;
+            }
+
+            if (previousOffset is { } previous &&
+                previous + _guestAllocationFreeRanges[previous] == freeOffset)
+            {
+                freeOffset = previous;
+                freeSize += _guestAllocationFreeRanges[previous];
+                _guestAllocationFreeRanges.Remove(previous);
+            }
+
+            if (nextOffset is { } next && freeOffset + freeSize == next)
+            {
+                freeSize += _guestAllocationFreeRanges[next];
+                _guestAllocationFreeRanges.Remove(next);
+            }
+
+            _guestAllocationFreeRanges.Add(freeOffset, freeSize);
             return true;
         }
     }
@@ -380,7 +545,8 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
             }
 
             _guestAllocationArenaBase = 0;
-            _guestAllocationOffset = 0;
+            _guestAllocationFreeRanges.Clear();
+            _guestAllocations.Clear();
         }
     }
 
@@ -439,12 +605,33 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
 
     private void ApplySegmentProtection(ulong mapStart, ulong mapEnd, ProgramHeaderFlags flags)
     {
+        var runStart = mapStart;
+        var runFlags = ProgramHeaderFlags.None;
+        var hasRun = false;
+
         for (var pageAddress = mapStart; pageAddress < mapEnd; pageAddress += PageSize)
         {
             _pageProtections.TryGetValue(pageAddress, out var existingFlags);
             var mergedFlags = existingFlags | flags;
             _pageProtections[pageAddress] = mergedFlags;
-            SetProtection(pageAddress, PageSize, mergedFlags);
+
+            if (!hasRun)
+            {
+                runStart = pageAddress;
+                runFlags = mergedFlags;
+                hasRun = true;
+            }
+            else if (mergedFlags != runFlags)
+            {
+                SetProtection(runStart, pageAddress - runStart, runFlags);
+                runStart = pageAddress;
+                runFlags = mergedFlags;
+            }
+        }
+
+        if (hasRun)
+        {
+            SetProtection(runStart, mapEnd - runStart, runFlags);
         }
     }
 
@@ -789,9 +976,14 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
         _gate.EnterReadLock();
         try
         {
-            return FindRegion(virtualAddress, 1) is not null
-                ? (void*)virtualAddress
-                : null;
+            var region = FindRegion(virtualAddress, 1);
+            if (region is null ||
+                (region.IsReservedOnly && !EnsureRangeCommitted(virtualAddress, 1, region)))
+            {
+                return null;
+            }
+
+            return (void*)virtualAddress;
         }
         finally
         {

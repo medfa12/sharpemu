@@ -30,10 +30,20 @@ public static class KernelPosixSemExports
         public object Gate { get; } = new();
     }
 
-    private sealed class PosixSemaphoreWaiter
+    private sealed class PosixSemaphoreWaiter : IGuestThreadBlockWaiter
     {
+        public required PosixSemaphoreState State { get; init; }
+
         // Written and read only under the owning semaphore's Gate.
         public int? Result { get; set; }
+
+        // Resume handler: runs on the woken guest thread; its return value
+        // becomes the guest's RAX for the resumed sem_wait.
+        public int Resume() => CompleteBlockedWait(State, this);
+
+        // Wake handler: runs under the scheduler's guest-thread gate. Returns
+        // true iff the waiter has a final result and should be re-readied.
+        public bool TryWake() => TryConsumeBlockedWait(State, this);
     }
 
     private static readonly ConcurrentDictionary<ulong, PosixSemaphoreState> _sems = new();
@@ -224,13 +234,12 @@ public static class KernelPosixSemExports
                 return ctx.SetReturn(0);
             }
 
-            var waiter = new PosixSemaphoreWaiter();
+            var waiter = new PosixSemaphoreWaiter { State = state };
             if (!GuestThreadExecution.RequestCurrentThreadBlock(
                     ctx,
                     "sem_wait",
                     GetWakeKey(sem),
-                    resumeHandler: () => CompleteBlockedWait(state, waiter),
-                    wakeHandler: () => TryConsumeBlockedWait(state, waiter)))
+                    waiter))
             {
                 // Host-owned thread: it cannot park in the guest scheduler, so block
                 // the host thread on the gate until a sem_post pulses it.
