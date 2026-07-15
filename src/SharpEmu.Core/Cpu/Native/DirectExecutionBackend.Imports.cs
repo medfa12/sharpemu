@@ -8,8 +8,10 @@ using System.Linq;
 using System.Runtime.InteropServices;
 using System.Threading;
 using SharpEmu.Core.Cpu;
+using SharpEmu.Core.Cpu.Native.Windows;
 using SharpEmu.Core.Loader;
 using SharpEmu.HLE;
+using SharpEmu.HLE.Host;
 
 namespace SharpEmu.Core.Cpu.Native;
 
@@ -69,23 +71,23 @@ public sealed partial class DirectExecutionBackend
 	private unsafe static int TryRecoverUnresolvedSentinel(void* exceptionInfo)
 	{
 		EXCEPTION_RECORD* exceptionRecord = ((EXCEPTION_POINTERS*)exceptionInfo)->ExceptionRecord;
-		if (exceptionRecord->ExceptionCode != 3221225477u)
+		if (exceptionRecord->ExceptionCode != WindowsFaultCodes.AccessViolation)
 		{
 			return 0;
 		}
 		void* contextRecord = ((EXCEPTION_POINTERS*)exceptionInfo)->ContextRecord;
-		ulong value = ReadCtxU64(contextRecord, 248);
+		ulong value = ReadCtxU64(contextRecord, CTX_RIP);
 		ulong value2 = (ulong)exceptionRecord->ExceptionAddress;
 		if (!IsUnresolvedSentinel(value) && !IsUnresolvedSentinel(value2))
 		{
 			return 0;
 		}
-		ulong rsp = ReadCtxU64(contextRecord, 152);
-		WriteCtxU64(contextRecord, 120, 0uL);
+		ulong rsp = ReadCtxU64(contextRecord, CTX_RSP);
+		WriteCtxU64(contextRecord, CTX_RAX, 0uL);
 		if (TryGetPlausibleReturnFromStack(rsp, out var returnRip, out var nextRsp))
 		{
-			WriteCtxU64(contextRecord, 152, nextRsp);
-			WriteCtxU64(contextRecord, 248, returnRip);
+			WriteCtxU64(contextRecord, CTX_RSP, nextRsp);
+			WriteCtxU64(contextRecord, CTX_RIP, returnRip);
 			Interlocked.Increment(ref _rawSentinelRecoveries);
 			if (LogThreadMode)
 			{
@@ -161,7 +163,7 @@ public sealed partial class DirectExecutionBackend
 				*(ulong*)(xmmSlot + 8));
 		}
 		cpuContext[CpuRegister.Rsp] = (ulong)argPackPtr + 96uL;
-		if (string.Equals(importStubEntry.Nid, RuntimeStubNids.BootstrapBridge, StringComparison.Ordinal))
+		if (importStubEntry.Kind == ImportStubKind.BootstrapBridge)
 		{
 			NormalizeKernelDynlibDlsymArguments(cpuContext, out _, out _);
 			*(ulong*)argPackPtr = cpuContext[CpuRegister.Rdi];
@@ -238,6 +240,22 @@ public sealed partial class DirectExecutionBackend
 			cpuContext[CpuRegister.Rax] = 0uL;
 			return 0uL;
 		}
+		if (_hostShutdownRequested)
+		{
+			if (isGuestWorker &&
+				TryYieldGuestThreadToHostStub(argPackPtr, num, num7, importStubEntry.Nid, "host shutdown"))
+			{
+				cpuContext[CpuRegister.Rax] = 0uL;
+				return 0uL;
+			}
+
+			if (!isGuestWorker &&
+				TryAbortGuestForHostShutdown(argPackPtr, num, num7))
+			{
+				cpuContext[CpuRegister.Rax] = 1uL;
+				return 1uL;
+			}
+		}
 		bool flag0 = ShouldSuppressStrlenTrace(importStubEntry.Nid);
 		bool flag = num7 >= 2156221920u && num7 <= 2156225024u;
 		bool flag2 = num7 >= 2156351360u && num7 <= 2156352080u;
@@ -245,12 +263,13 @@ public sealed partial class DirectExecutionBackend
 		bool flag4 = !string.IsNullOrWhiteSpace(_importFilter);
 		bool flag5 = false;
 		ExportedFunction? matchedExport = importStubEntry.Export;
+		var traceFlags = importStubEntry.TraceFlags;
 		bool periodicTrace = num <= 128 ||
 			(num >= 240 && num <= 400) ||
 			(num >= 900 && num <= 1300) ||
 			num % 100000 == 0L ||
-			(importStubEntry.Nid == "tsvEmnenz48" && (num <= 256 || num % 1000 == 0L)) ||
-			(importStubEntry.Nid == "rTXw65xmLIA" && (num <= 256 || num % 128 == 0)) ||
+			((traceFlags & ImportStubTraceFlags.PeriodicEvery1000) != 0 && (num <= 256 || num % 1000 == 0L)) ||
+			((traceFlags & ImportStubTraceFlags.PeriodicEvery128) != 0 && (num <= 256 || num % 128 == 0)) ||
 			flag ||
 			flag2 ||
 			flag3;
@@ -311,15 +330,15 @@ public sealed partial class DirectExecutionBackend
 				cpuContext[CpuRegister.Rsi],
 				cpuContext[CpuRegister.Rdx]);
 		}
-		if (importStubEntry.Nid == "8zTFvBIAIN8" && num <= 256)
+		if ((traceFlags & ImportStubTraceFlags.Memset) != 0 && num <= 256)
 		{
 			Console.Error.WriteLine($"[LOADER][TRACE] memset#{num}: dst=0x{cpuContext[CpuRegister.Rdi]:X16} val=0x{cpuContext[CpuRegister.Rsi] & 0xFF:X2} len=0x{cpuContext[CpuRegister.Rdx]:X16} ret=0x{num7:X16}");
 		}
-		if (importStubEntry.Nid == "tsvEmnenz48" && num <= 64)
+		if ((traceFlags & ImportStubTraceFlags.CxaAtexit) != 0 && num <= 64)
 		{
 			Console.Error.WriteLine($"[LOADER][TRACE] __cxa_atexit#{num}: func=0x{cpuContext[CpuRegister.Rdi]:X16} arg=0x{cpuContext[CpuRegister.Rsi]:X16} dso=0x{cpuContext[CpuRegister.Rdx]:X16} ret=0x{num7:X16}");
 		}
-		if (importStubEntry.Nid == "bzQExy189ZI" || importStubEntry.Nid == "8G2LB+A3rzg")
+		if ((traceFlags & ImportStubTraceFlags.RawArgs) != 0)
 		{
 			Console.Error.WriteLine($"[LOADER][TRACE] {importStubEntry.Nid}#{num}: rdi=0x{cpuContext[CpuRegister.Rdi]:X16} rsi=0x{cpuContext[CpuRegister.Rsi]:X16} rdx=0x{cpuContext[CpuRegister.Rdx]:X16} ret=0x{num7:X16}");
 		}
@@ -349,7 +368,7 @@ public sealed partial class DirectExecutionBackend
 				Console.Error.Flush();
 			}
 		}
-		if (importStubEntry.Nid == "Ou3iL1abvng")
+		if ((traceFlags & ImportStubTraceFlags.StackChkFail) != 0)
 		{
 			if (_logStackCheck)
 			{
@@ -381,7 +400,7 @@ public sealed partial class DirectExecutionBackend
 				ActiveGuestReturnSlotAddress);
 			try
 			{
-				if (string.Equals(importStubEntry.Nid, RuntimeStubNids.BootstrapBridge, StringComparison.Ordinal))
+				if (importStubEntry.Kind == ImportStubKind.BootstrapBridge)
 				{
 					if (_logBootstrap)
 					{
@@ -390,12 +409,11 @@ public sealed partial class DirectExecutionBackend
 
 					orbisGen2Result = DispatchBootstrapBridge();
 				}
-				else if (string.Equals(importStubEntry.Nid, RuntimeStubNids.KernelDynlibDlsym, StringComparison.Ordinal) ||
-					string.Equals(importStubEntry.Nid, "LwG8g3niqwA", StringComparison.Ordinal))
+				else if (importStubEntry.Kind == ImportStubKind.KernelDynlibDlsym)
 				{
 					orbisGen2Result = DispatchKernelDynlibDlsym();
 				}
-				else if (string.Equals(importStubEntry.Nid, "r8mvOaWdi28", StringComparison.Ordinal))
+				else if (importStubEntry.Kind == ImportStubKind.Il2CppApiLookupSymbol)
 				{
 					orbisGen2Result = DispatchIl2CppApiLookupSymbol();
 				}
@@ -736,6 +754,9 @@ public sealed partial class DirectExecutionBackend
 		var expectedEqueueTimeout =
 			string.Equals(nid, "fzyMKs9kim0", StringComparison.Ordinal) &&
 			result == OrbisGen2Result.ORBIS_GEN2_ERROR_TIMED_OUT;
+		var expectedEventFlagTimeout =
+			string.Equals(nid, "JTvBflhYazQ", StringComparison.Ordinal) &&
+			result == OrbisGen2Result.ORBIS_GEN2_ERROR_TIMED_OUT;
 		var expectedMutexTrylockBusy =
 			string.Equals(nid, "K-jXhbt2gn4", StringComparison.Ordinal) &&
 			result == OrbisGen2Result.ORBIS_GEN2_ERROR_BUSY;
@@ -748,6 +769,7 @@ public sealed partial class DirectExecutionBackend
 		if (!expectedFileProbeMiss &&
 			!expectedTimedWaitTimeout &&
 			!expectedEqueueTimeout &&
+			!expectedEventFlagTimeout &&
 			!expectedMutexTrylockBusy &&
 			!expectedUserServiceNoEvent &&
 			!expectedPrivacyInvalidParameter)
@@ -810,14 +832,15 @@ public sealed partial class DirectExecutionBackend
 			return !_logUsleep;
 		}
 
-		// Only mutex/rwlock *lock* is excluded: it may block a contended acquire, which the
-		// leaf path can't. unlock never blocks and stays here — routing it off the fast path
-		// slows guest spinlocks enough to livelock (Demon's Souls).
+		// Mutex lock uses this block-capable leaf path. Keep it out of the no-block subset.
 		return nid is
+			"9UK1vLZQft4" or // scePthreadMutexLock
+			"7H0iTOciTLo" or // pthread_mutex_lock
 			"tn3VlD0hG60" or // scePthreadMutexUnlock
 			"2Z+PpY6CaJg" or // pthread_mutex_unlock
 			"EgmLo6EWgso" or // pthread_rwlock_unlock
 			"+L98PIbGttk" or // scePthreadRwlockUnlock
+			"q1cHNfGycLI" or // scePadRead
 			"8aI7R7WaOlc" or // sceAmprCommandBufferConstructor
 			"zgXifHT9ErY" or // sceVideoOutIsFlipPending
 			"V++UgBtQhn0" or // sceAgcGetDataPacketPayloadAddress
@@ -876,7 +899,7 @@ public sealed partial class DirectExecutionBackend
 			"Q2V+iqvjgC0" or // vsnprintf
 			"j4ViWNHEgww" or // strlen
 			"5jNubw4vlAA" or // strnlen
-			"LHMrG7e8G78" or // wcslen
+			"LHMrG7e8G78" or // wcsmisc
 			"WkkeywLJcgU" or // wcslen
 			"Ovb2dSJOAuE" or // strcmp
 			"aesyjrHVWy4" or // strncmp
@@ -967,6 +990,31 @@ public sealed partial class DirectExecutionBackend
 		LastError = $"Detected repeating import loop at import#{dispatchIndex} ({nid}) and forced guest exit.";
 		Console.Error.WriteLine($"[LOADER][ERROR] Import-loop guard fired at import#{dispatchIndex}: nid={nid} ret=0x{returnRip:X16} -> host_exit=0x{num:X16}");
 		DumpRecentImportTrace();
+		return true;
+	}
+
+	private unsafe bool TryAbortGuestForHostShutdown(nint argPackPtr, long dispatchIndex, ulong returnRip)
+	{
+		ulong hostExit = ActiveEntryReturnSentinelRip;
+		if (hostExit < 65536 || !TryPatchActiveGuestReturnSlot(hostExit))
+		{
+			return false;
+		}
+		try
+		{
+			*(ulong*)(argPackPtr + 96) = hostExit;
+		}
+		catch
+		{
+			return false;
+		}
+		ActiveForcedGuestExit = true;
+		if (string.IsNullOrWhiteSpace(LastError))
+		{
+			LastError = "Host shutdown requested.";
+		}
+		Console.Error.WriteLine(
+			$"[LOADER][INFO] Guest unwind for host shutdown at import#{dispatchIndex} ret=0x{returnRip:X16} -> host_exit=0x{hostExit:X16}");
 		return true;
 	}
 
@@ -1076,9 +1124,15 @@ public sealed partial class DirectExecutionBackend
 	}
 
 	private static bool IsImportLoopGuardBoundary(string nid) =>
-		string.Equals(nid, "1jfXLRVzisc", StringComparison.Ordinal) ||
-		string.Equals(nid, "Zxa0VhQVTsk", StringComparison.Ordinal) ||
-		string.Equals(nid, "T72hz6ffq08", StringComparison.Ordinal);
+    nid switch
+    {
+        "1jfXLRVzisc" => true, // sceKernelUsleep
+        "QcteRwbsnV0" => true, // usleep
+        "n88vx3C5nW8" => true, // gettimeofday
+        "Zxa0VhQVTsk" => true, // sceKernelWaitSema
+        "T72hz6ffq08" => true, // scePthreadYield
+        _ => false
+    };
 
 	private void ResetImportLoopPattern()
 	{
@@ -1673,9 +1727,9 @@ public sealed partial class DirectExecutionBackend
 		{
 			var candidateBase = ImportStubRegionCanonicalBase -
 				(ulong)candidateIndex * ImportStubRegionAddressStride;
-			if (VirtualQuery((void*)candidateBase, out var memoryInfo, (nuint)sizeof(MEMORY_BASIC_INFORMATION64)) == 0 ||
+			if (!_hostMemory.Query(candidateBase, out var memoryInfo) ||
 				memoryInfo.RegionSize == 0 ||
-				memoryInfo.State != 4096)
+				memoryInfo.State != HostRegionState.Committed)
 			{
 				continue;
 			}
@@ -2014,7 +2068,7 @@ public sealed partial class DirectExecutionBackend
 		uint flNewProtect = default(uint);
 		try
 		{
-			if (Marshal.ReadByte(num2) != 232 || !VirtualProtect((void*)num, 5u, 64u, &flNewProtect))
+			if (Marshal.ReadByte(num2) != 232 || !_hostMemory.Protect((ulong)(void*)num, 5u, HostPageProtection.ReadWriteExecute, out flNewProtect))
 			{
 				return;
 			}
@@ -2022,7 +2076,7 @@ public sealed partial class DirectExecutionBackend
 			{
 				Marshal.WriteByte(num2 + i, 144);
 			}
-			FlushInstructionCache(GetCurrentProcess(), (void*)num, 5u);
+			_hostMemory.FlushInstructionCache((ulong)(void*)num, 5u);
 			_patchedEa020eLookupCall = true;
 			Console.Error.WriteLine($"[LOADER][WARNING] Import#{dispatchIndex}: patched hash-lookup call at 0x{num:X16} -> NOP*5");
 		}
@@ -2033,7 +2087,7 @@ public sealed partial class DirectExecutionBackend
 		{
 			if (flNewProtect != 0)
 			{
-				VirtualProtect((void*)num, 5u, flNewProtect, &flNewProtect);
+				_hostMemory.ProtectRaw((ulong)(void*)num, 5u, flNewProtect, out flNewProtect);
 			}
 		}
 	}

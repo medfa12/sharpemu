@@ -682,7 +682,18 @@ public static class PlayGoExports
         // says nothing about the title. Treat the title as playgo-enabled and
         // fully installed; an empty chunk table answers every chunk id as
         // present at local-fast locus.
+        var playGoDat = Path.Combine(app0Root, "sce_sys", "playgo-chunk.dat");
+        var scenarioJson = Path.Combine(app0Root, "sce_sys", "playgo-scenario.json");
         var chunkDefsXml = Path.Combine(app0Root, "playgo-chunkdefs.xml");
+
+        var hasMetadata = File.Exists(playGoDat) || File.Exists(scenarioJson) || File.Exists(chunkDefsXml);
+        if (!hasMetadata)
+        {
+            // Full installs may omit PlayGo sidecar metadata.
+            TracePlayGo("metadata_missing; using fully-installed default chunk");
+            return new PlayGoMetadata(true, [(ushort)0]);
+        }
+
         var chunkIds = LoadChunkIds(chunkDefsXml);
         return new PlayGoMetadata(true, chunkIds);
     }

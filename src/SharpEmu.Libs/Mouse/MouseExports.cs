@@ -29,6 +29,7 @@ public static class MouseExports
     private static int _initialized;
     private static int _openPorts;
 
+    // This NID was previously misbound as an sceNgs2VoiceGetState alias.
     [SysAbiExport(
         Nid = "Qs0wWulgl7U",
         ExportName = "sceMouseInit",

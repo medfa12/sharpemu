@@ -8,9 +8,10 @@ using Xunit;
 namespace SharpEmu.Tests;
 
 /// <summary>
-/// Tests for the reflection-based allocation dispatch in
-/// <see cref="KernelVirtualRangeAllocator"/>. Each scenario uses a distinct
-/// fake memory type because discovered accessors are cached per Type.
+/// Tests for the typed allocation dispatch in
+/// <see cref="KernelVirtualRangeAllocator"/>: search-vs-direct ordering, the
+/// allowAlternative passthrough, and wrapper unwrapping via
+/// <see cref="ICpuMemoryWrapper"/>.
 /// </summary>
 public sealed class KernelVirtualRangeAllocatorTests
 {
@@ -42,70 +43,69 @@ public sealed class KernelVirtualRangeAllocatorTests
         public bool TryWrite(ulong virtualAddress, ReadOnlySpan<byte> source) => false;
     }
 
-    private sealed class MemoryWithThreeArgAllocate : FakeMemoryBase
+    private class FakeAddressSpace : FakeMemoryBase, IGuestAddressSpace
     {
-        public (ulong Address, ulong Size, bool Executable)? LastCall;
-
-        public ulong AllocateAt(ulong desiredAddress, ulong size, bool executable)
-        {
-            LastCall = (desiredAddress, size, executable);
-            return desiredAddress;
-        }
-    }
-
-    [Fact]
-    public void TryReserve_UsesThreeArgAllocateAt()
-    {
-        var memory = new MemoryWithThreeArgAllocate();
-
-        Assert.True(Reserve(memory, out var mapped, length: 0x2000));
-        Assert.Equal(Desired, mapped);
-        Assert.Equal((Desired, 0x2000UL, false), memory.LastCall);
-    }
-
-    private sealed class MemoryWithFourArgAllocate : FakeMemoryBase
-    {
-        public bool? ObservedAllowAlternative;
-
-        public ulong AllocateAt(ulong desiredAddress, ulong size, bool executable, bool allowAlternative)
-        {
-            ObservedAllowAlternative = allowAlternative;
-            return desiredAddress;
-        }
-    }
-
-    [Fact]
-    public void TryReserve_PassesAllowAlternativeToFourArgOverload()
-    {
-        var memory = new MemoryWithFourArgAllocate();
-
-        Assert.True(Reserve(memory, out _, allowAlternative: true));
-        Assert.True(memory.ObservedAllowAlternative);
-    }
-
-    private sealed class MemoryWithSearch : FakeMemoryBase
-    {
+        public (ulong Address, ulong Size, bool Executable, bool AllowAlternative)? LastAllocateAt;
         public int SearchCalls;
         public int DirectCalls;
 
-        public bool TryAllocateAtOrAbove(ulong desiredAddress, ulong size, bool executable, ulong alignment, out ulong address)
-        {
-            SearchCalls++;
-            address = desiredAddress + 0x1000;
-            return true;
-        }
-
-        public ulong AllocateAt(ulong desiredAddress, ulong size, bool executable)
+        public virtual ulong AllocateAt(ulong desiredAddress, ulong size, bool executable = true, bool allowAlternative = true)
         {
             DirectCalls++;
+            LastAllocateAt = (desiredAddress, size, executable, allowAlternative);
             return desiredAddress;
+        }
+
+        public virtual bool TryAllocateAtOrAbove(ulong desiredAddress, ulong size, bool executable, ulong alignment, out ulong actualAddress)
+        {
+            SearchCalls++;
+            actualAddress = 0;
+            return false;
+        }
+
+        public bool TryProtect(ulong address, ulong size, GuestPageProtection protection) => true;
+
+        public bool TryAllocateGuestMemory(ulong size, ulong alignment, out ulong address)
+        {
+            address = 0;
+            return false;
+        }
+    }
+
+    [Fact]
+    public void TryReserve_UsesAllocateAt()
+    {
+        var memory = new FakeAddressSpace();
+
+        Assert.True(Reserve(memory, out var mapped, length: 0x2000));
+        Assert.Equal(Desired, mapped);
+        Assert.Equal((Desired, 0x2000UL, false, false), memory.LastAllocateAt);
+    }
+
+    [Fact]
+    public void TryReserve_PassesAllowAlternativeThrough()
+    {
+        var memory = new FakeAddressSpace();
+
+        Assert.True(Reserve(memory, out _, allowAlternative: true));
+        Assert.NotNull(memory.LastAllocateAt);
+        Assert.True(memory.LastAllocateAt!.Value.AllowAlternative);
+    }
+
+    private sealed class MemoryWithSucceedingSearch : FakeAddressSpace
+    {
+        public override bool TryAllocateAtOrAbove(ulong desiredAddress, ulong size, bool executable, ulong alignment, out ulong actualAddress)
+        {
+            SearchCalls++;
+            actualAddress = desiredAddress + 0x1000;
+            return true;
         }
     }
 
     [Fact]
     public void TryReserve_PrefersSearchWhenAllowed()
     {
-        var memory = new MemoryWithSearch();
+        var memory = new MemoryWithSucceedingSearch();
 
         Assert.True(Reserve(memory, out var mapped, allowSearch: true));
         Assert.Equal(Desired + 0x1000, mapped);
@@ -113,67 +113,43 @@ public sealed class KernelVirtualRangeAllocatorTests
         Assert.Equal(0, memory.DirectCalls);
     }
 
-    private sealed class MemoryWithSearchNotAllowed : FakeMemoryBase
-    {
-        public int SearchCalls;
-
-        public bool TryAllocateAtOrAbove(ulong desiredAddress, ulong size, bool executable, ulong alignment, out ulong address)
-        {
-            SearchCalls++;
-            address = desiredAddress;
-            return true;
-        }
-
-        public ulong AllocateAt(ulong desiredAddress, ulong size, bool executable) => desiredAddress;
-    }
-
     [Fact]
     public void TryReserve_SkipsSearchWhenNotAllowed()
     {
-        var memory = new MemoryWithSearchNotAllowed();
+        var memory = new MemoryWithSucceedingSearch();
 
         Assert.True(Reserve(memory, out var mapped, allowSearch: false));
         Assert.Equal(Desired, mapped);
         Assert.Equal(0, memory.SearchCalls);
-    }
-
-    private sealed class MemoryWithFailingSearch : FakeMemoryBase
-    {
-        public bool TryAllocateAtOrAbove(ulong desiredAddress, ulong size, bool executable, ulong alignment, out ulong address)
-        {
-            address = 0;
-            return false;
-        }
-
-        public ulong AllocateAt(ulong desiredAddress, ulong size, bool executable) => desiredAddress;
+        Assert.Equal(1, memory.DirectCalls);
     }
 
     [Fact]
     public void TryReserve_FallsBackToAllocateAtWhenSearchFails()
     {
-        var memory = new MemoryWithFailingSearch();
+        var memory = new FakeAddressSpace();
 
         Assert.True(Reserve(memory, out var mapped, allowSearch: true));
         Assert.Equal(Desired, mapped);
+        Assert.Equal(1, memory.SearchCalls);
+        Assert.Equal(1, memory.DirectCalls);
     }
 
-    private sealed class InnerMemoryTarget
+    private sealed class MemoryWrappingAddressSpace : FakeMemoryBase, ICpuMemoryWrapper
     {
-        public ulong AllocateAt(ulong desiredAddress, ulong size, bool executable) => desiredAddress;
-    }
+        public FakeAddressSpace InnerAddressSpace { get; } = new();
 
-    private sealed class MemoryWithInner : FakeMemoryBase
-    {
-        public InnerMemoryTarget Inner { get; } = new();
+        public ICpuMemory Inner => InnerAddressSpace;
     }
 
     [Fact]
-    public void TryReserve_TraversesInnerPropertyChain()
+    public void TryReserve_UnwrapsCpuMemoryWrapperChain()
     {
-        var memory = new MemoryWithInner();
+        var memory = new MemoryWrappingAddressSpace();
 
         Assert.True(Reserve(memory, out var mapped));
         Assert.Equal(Desired, mapped);
+        Assert.Equal(1, memory.InnerAddressSpace.DirectCalls);
     }
 
     private sealed class MemoryWithoutAllocation : FakeMemoryBase
@@ -187,9 +163,9 @@ public sealed class KernelVirtualRangeAllocatorTests
         Assert.Equal(0UL, mapped);
     }
 
-    private sealed class MemoryReturningZero : FakeMemoryBase
+    private sealed class MemoryReturningZero : FakeAddressSpace
     {
-        public ulong AllocateAt(ulong desiredAddress, ulong size, bool executable) => 0;
+        public override ulong AllocateAt(ulong desiredAddress, ulong size, bool executable = true, bool allowAlternative = true) => 0;
     }
 
     [Fact]
@@ -198,9 +174,9 @@ public sealed class KernelVirtualRangeAllocatorTests
         Assert.False(Reserve(new MemoryReturningZero(), out _));
     }
 
-    private sealed class MemoryThatThrows : FakeMemoryBase
+    private sealed class MemoryThatThrows : FakeAddressSpace
     {
-        public ulong AllocateAt(ulong desiredAddress, ulong size, bool executable)
+        public override ulong AllocateAt(ulong desiredAddress, ulong size, bool executable = true, bool allowAlternative = true)
             => throw new InvalidOperationException("boom");
     }
 
@@ -213,6 +189,6 @@ public sealed class KernelVirtualRangeAllocatorTests
     [Fact]
     public void TryReserve_ZeroLength_ReturnsFalse()
     {
-        Assert.False(Reserve(new MemoryWithThreeArgAllocate(), out _, length: 0));
+        Assert.False(Reserve(new FakeAddressSpace(), out _, length: 0));
     }
 }

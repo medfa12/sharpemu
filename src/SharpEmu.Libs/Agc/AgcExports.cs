@@ -29,6 +29,7 @@ public static class AgcExports
     private const uint ItDispatchDirect = 0x15;
     private const uint ItDispatchIndirect = 0x16;
     private const uint ItWaitRegMem = 0x3C;
+    private const uint ItIndirectBuffer = 0x3F;
     private const uint ItEventWrite = 0x46;
     private const uint ItDmaData = 0x50;
     private const uint ItSetContextReg = 0x69;
@@ -120,6 +121,9 @@ public static class AgcExports
     private const uint RegisterDefaultsVersion13 = 13;
     private const int RegisterDefaultsSize = 0x40;
     private const int RegisterDefaultBlockSize = 16 * 8;
+    private const ulong ResourceRegistrationBytesPerResource = 0x118;
+    private const ulong ResourceRegistrationBytesPerOwner = 0x1E0;
+    private const int ResourceRegistrationMaxNameLength = 256;
 
     private const ulong ShaderUserDataOffset = 0x08;
     private const ulong ShaderCodeOffset = 0x10;
@@ -154,7 +158,7 @@ public static class AgcExports
     private static readonly HashSet<uint> _tracedSubmittedDrawOpcodes = new();
     private static readonly Dictionary<(ulong Ps, ulong State, Gen5PixelOutputKind Output), byte[]> _pixelSpirvCache = new();
     private static readonly Dictionary<
-        (ulong Es, ulong EsState, ulong Ps, ulong PsState, Gen5PixelOutputKind Output),
+        (ulong Es, ulong EsState, ulong Ps, ulong PsState, string OutputLayout, uint Attributes),
         (byte[] Vertex, byte[] Pixel)> _graphicsSpirvCache = new();
     private static readonly Dictionary<
         (ulong Cs, ulong State, uint LocalX, uint LocalY, uint LocalZ),
@@ -388,8 +392,25 @@ public static class AgcExports
         public SubmittedDcbState Graphics { get; } = new();
         public Dictionary<uint, SubmittedDcbState> ComputeQueues { get; } = new();
         public Dictionary<ulong, ComputeImageWriter> ComputeImageWriters { get; } = new();
+        public Dictionary<uint, string> ResourceOwners { get; } = new();
+        public Dictionary<uint, RegisteredAgcResource> RegisteredResources { get; } = new();
+        public bool ResourceRegistrationInitialized { get; set; }
+        public ulong ResourceRegistrationMemory { get; set; }
+        public ulong ResourceRegistrationMemorySize { get; set; }
+        public uint ResourceRegistrationMaxOwners { get; set; }
+        public uint DefaultOwner { get; set; } = DefaultAgcOwner;
+        public uint NextOwner { get; set; } = 1;
+        public uint NextResource { get; set; } = 1;
         public ulong WorkSequence { get; set; }
     }
+
+    private readonly record struct RegisteredAgcResource(
+        uint Owner,
+        ulong Address,
+        ulong Size,
+        string Name,
+        uint Type,
+        uint Flags);
 
     private readonly record struct RegisterDefaultValue(uint Offset, uint Value);
 
@@ -1926,6 +1947,72 @@ public static class AgcExports
         return ReturnPointer(ctx, commandAddress);
     }
 
+    // Guest draw-command builders: emit valid (skippable) packets and return a live
+    // command pointer so the guest's command-buffer build succeeds; full draw processing is TODO.
+    [SysAbiExport(
+        Nid = "xSAR0LTcRKM",
+        ExportName = "sceAgcDcbJump",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int DcbJump(CpuContext ctx)
+    {
+        var dcb = ctx[CpuRegister.Rdi];
+        var target = ctx[CpuRegister.Rsi];
+        var sizeDwords = (uint)ctx[CpuRegister.Rdx];
+        if (dcb == 0)
+        {
+            return ReturnPointer(ctx, 0);
+        }
+
+        if (!TryAllocateCommandDwords(ctx, dcb, 4, out var cmd) ||
+            !ctx.TryWriteUInt32(cmd, Pm4(4, ItIndirectBuffer, RZero)) ||
+            !ctx.TryWriteUInt32(cmd + 4, (uint)(target & 0xFFFF_FFFFUL)) ||
+            !ctx.TryWriteUInt32(cmd + 8, (uint)((target >> 32) & 0xFFFFUL)) ||
+            !ctx.TryWriteUInt32(cmd + 12, sizeDwords & 0xFFFFF))
+        {
+            return ReturnPointer(ctx, 0);
+        }
+
+        return ReturnPointer(ctx, cmd);
+    }
+
+    [SysAbiExport(
+        Nid = "bbFueFP+J4k",
+        ExportName = "sceAgcDcbSetPredication",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int DcbSetPredication(CpuContext ctx)
+    {
+        var dcb = ctx[CpuRegister.Rdi];
+        var address = ctx[CpuRegister.Rsi];
+        if (dcb == 0)
+        {
+            return ReturnPointer(ctx, 0);
+        }
+
+        if (!TryAllocateCommandDwords(ctx, dcb, 3, out var cmd) ||
+            !ctx.TryWriteUInt32(cmd, Pm4(3, ItNop, RZero)) ||
+            !ctx.TryWriteUInt32(cmd + 4, (uint)(address & 0xFFFF_FFFFUL)) ||
+            !ctx.TryWriteUInt32(cmd + 8, (uint)(address >> 32)))
+        {
+            return ReturnPointer(ctx, 0);
+        }
+
+        return ReturnPointer(ctx, cmd);
+    }
+
+    [SysAbiExport(
+        Nid = "w6Dj1VJt5qY",
+        ExportName = "sceAgcSetPacketPredication",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int SetPacketPredication(CpuContext ctx)
+    {
+        // Global predication toggle on a packet; a no-op is safe for rendering.
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
     [SysAbiExport(
         Nid = "w2rJhmD+dsE",
         ExportName = "sceAgcDriverAddEqEvent",
@@ -2002,8 +2089,16 @@ public static class AgcExports
         var gpuState = _submittedGpuStates.GetValue(ctx.Memory, static _ => new SubmittedGpuState());
         lock (gpuState.Gate)
         {
-            ParseSubmittedDcb(ctx, gpuState, gpuState.Graphics, commandAddress, dwordCount, tracePackets);
-            DrainResumableDcbs(ctx, gpuState, tracePackets);
+            Gen5ShaderScalarEvaluator.BeginGlobalMemoryReadScope();
+            try
+            {
+                ParseSubmittedDcb(ctx, gpuState, gpuState.Graphics, commandAddress, dwordCount, tracePackets);
+                DrainResumableDcbs(ctx, gpuState, tracePackets);
+            }
+            finally
+            {
+                Gen5ShaderScalarEvaluator.EndGlobalMemoryReadScope();
+            }
         }
 
         ctx[CpuRegister.Rax] = 0;
@@ -2033,27 +2128,35 @@ public static class AgcExports
         var gpuState = _submittedGpuStates.GetValue(ctx.Memory, static _ => new SubmittedGpuState());
         lock (gpuState.Gate)
         {
-            for (uint i = 0; i < bufferCount; i++)
+            Gen5ShaderScalarEvaluator.BeginGlobalMemoryReadScope();
+            try
             {
-                if (!ctx.TryReadUInt64(addressArray + i * 8, out var commandAddress) ||
-                    commandAddress == 0 ||
-                    !ctx.TryReadUInt32(sizeArray + i * 4, out var dwordCount) ||
-                    dwordCount == 0)
+                for (uint i = 0; i < bufferCount; i++)
                 {
-                    continue;
+                    if (!ctx.TryReadUInt64(addressArray + i * 8, out var commandAddress) ||
+                        commandAddress == 0 ||
+                        !ctx.TryReadUInt32(sizeArray + i * 4, out var dwordCount) ||
+                        dwordCount == 0)
+                    {
+                        continue;
+                    }
+
+                    if (tracePackets)
+                    {
+                        TraceAgc(
+                            $"agc.driver_submit_multi_dcbs index={i}/{bufferCount} " +
+                            $"addr=0x{commandAddress:X16} dwords={dwordCount}");
+                    }
+
+                    ParseSubmittedDcb(ctx, gpuState, gpuState.Graphics, commandAddress, dwordCount, tracePackets);
                 }
 
-                if (tracePackets)
-                {
-                    TraceAgc(
-                        $"agc.driver_submit_multi_dcbs index={i}/{bufferCount} " +
-                        $"addr=0x{commandAddress:X16} dwords={dwordCount}");
-                }
-
-                ParseSubmittedDcb(ctx, gpuState, gpuState.Graphics, commandAddress, dwordCount, tracePackets);
+                DrainResumableDcbs(ctx, gpuState, tracePackets);
             }
-
-            DrainResumableDcbs(ctx, gpuState, tracePackets);
+            finally
+            {
+                Gen5ShaderScalarEvaluator.EndGlobalMemoryReadScope();
+            }
         }
 
         ctx[CpuRegister.Rax] = 0;
@@ -2101,39 +2204,20 @@ public static class AgcExports
                 gpuState.ComputeQueues.Add(ownerHandle, queueState);
             }
 
-            ParseSubmittedDcb(ctx, gpuState, queueState, commandAddress, dwordCount, tracePackets);
-            DrainResumableDcbs(ctx, gpuState, tracePackets);
+            Gen5ShaderScalarEvaluator.BeginGlobalMemoryReadScope();
+            try
+            {
+                ParseSubmittedDcb(ctx, gpuState, queueState, commandAddress, dwordCount, tracePackets);
+                DrainResumableDcbs(ctx, gpuState, tracePackets);
+            }
+            finally
+            {
+                Gen5ShaderScalarEvaluator.EndGlobalMemoryReadScope();
+            }
         }
 
         ctx[CpuRegister.Rax] = 0;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
-    }
-
-    // X-Nm5KLREeg — sceAgcDriverRegisterOwner. rdi=uint32* handleOut, rsi=const char* name.
-    // Hand out incrementing handles starting at 2 (owner 1 is DefaultAgcOwner). Must exist
-    // because the per-frame submit pair fires right after this call.
-    [SysAbiExport(
-        Nid = "X-Nm5KLREeg",
-        ExportName = "sceAgcDriverRegisterOwner",
-        Target = Generation.Gen5,
-        LibraryName = "libSceAgcDriver")]
-    public static int DriverRegisterOwner(CpuContext ctx)
-    {
-        var handleAddress = ctx[CpuRegister.Rdi];
-        var nameAddress = ctx[CpuRegister.Rsi];
-        if (handleAddress == 0)
-        {
-            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
-        }
-
-        var handle = (uint)Interlocked.Increment(ref _nextAgcOwner); // 2, 3, 4, ...
-        if (!ctx.TryWriteUInt32(handleAddress, handle))
-        {
-            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
-        }
-
-        TraceAgc($"agc.driver_register_owner out=0x{handleAddress:X16} name=0x{nameAddress:X16} owner={handle}");
-        return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
     }
 
     // dolOmWH+huQ — per-frame VALIDATE/REGISTER of a DCB command range (called first).
@@ -2426,16 +2510,90 @@ public static class AgcExports
             return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
         }
 
-        if (!ctx.TryWriteUInt32(outAddress, 256))
+        if (!ctx.TryWriteUInt32(outAddress, ResourceRegistrationMaxNameLength))
         {
             return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
         }
 
-        TraceAgc($"agc.driver_get_resource_registration_max_name_length out=0x{outAddress:X16} value=256");
+        TraceAgc(
+            $"agc.driver_get_resource_registration_max_name_length " +
+            $"out=0x{outAddress:X16} value={ResourceRegistrationMaxNameLength}");
         return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
     }
 
-    private static int _nextAgcOwner = 1;
+    [SysAbiExport(
+        Nid = "AOLcoIkQDgM",
+        ExportName = "sceAgcDriverQueryResourceRegistrationUserMemoryRequirements",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int DriverQueryResourceRegistrationUserMemoryRequirements(CpuContext ctx)
+    {
+        var sizeAddress = ctx[CpuRegister.Rdi];
+        var resourceCount = ctx[CpuRegister.Rsi];
+        var ownerCount = ctx[CpuRegister.Rdx];
+        if (sizeAddress == 0 || resourceCount == 0 || ownerCount == 0)
+        {
+            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        ulong requiredSize;
+        try
+        {
+            requiredSize = checked(
+                resourceCount * ResourceRegistrationBytesPerResource +
+                ownerCount * ResourceRegistrationBytesPerOwner);
+        }
+        catch (OverflowException)
+        {
+            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        if (!ctx.TryWriteUInt64(sizeAddress, requiredSize))
+        {
+            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        TraceAgc(
+            $"agc.driver_query_resource_registration_memory resources={resourceCount} " +
+            $"owners={ownerCount} bytes=0x{requiredSize:X}");
+        return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
+    }
+
+    [SysAbiExport(
+        Nid = "F0Y42t-3e18",
+        ExportName = "sceAgcDriverInitResourceRegistration",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int DriverInitResourceRegistration(CpuContext ctx)
+    {
+        var memoryAddress = ctx[CpuRegister.Rdi];
+        var memorySize = ctx[CpuRegister.Rsi];
+        var ownerCount = ctx[CpuRegister.Rdx];
+        if (memoryAddress == 0 || memorySize == 0 || ownerCount == 0 || ownerCount > uint.MaxValue)
+        {
+            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        var state = _submittedGpuStates.GetValue(ctx.Memory, static _ => new SubmittedGpuState());
+        lock (state.Gate)
+        {
+            state.ResourceRegistrationInitialized = true;
+            state.ResourceRegistrationMemory = memoryAddress;
+            state.ResourceRegistrationMemorySize = memorySize;
+            state.ResourceRegistrationMaxOwners = (uint)ownerCount;
+            state.ResourceOwners.Clear();
+            state.RegisteredResources.Clear();
+            state.DefaultOwner = DefaultAgcOwner;
+            state.NextOwner = 1;
+            state.NextResource = 1;
+        }
+
+        TraceAgc(
+            $"agc.driver_init_resource_registration memory=0x{memoryAddress:X16} " +
+            $"bytes=0x{memorySize:X} owners={ownerCount}");
+        return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
+    }
+
     private const uint DefaultAgcOwner = 1;
     [SysAbiExport(
         Nid = "F0ZXt5q0ZTA",
@@ -2451,12 +2609,100 @@ public static class AgcExports
             return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
         }
 
-        if (!ctx.TryWriteUInt32(ownerAddress, DefaultAgcOwner))
+        var state = _submittedGpuStates.GetValue(ctx.Memory, static _ => new SubmittedGpuState());
+        uint owner;
+        lock (state.Gate)
+        {
+            owner = state.DefaultOwner;
+        }
+
+        if (!ctx.TryWriteUInt32(ownerAddress, owner))
         {
             return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
         }
 
-        TraceAgc($"agc.driver_get_default_owner out=0x{ownerAddress:X16} owner={DefaultAgcOwner}");
+        TraceAgc($"agc.driver_get_default_owner out=0x{ownerAddress:X16} owner={owner}");
+        return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
+    }
+
+    [SysAbiExport(
+        Nid = "U9ueyEhSkF4",
+        ExportName = "sceAgcDriverRegisterDefaultOwner",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int DriverRegisterDefaultOwner(CpuContext ctx)
+    {
+        var owner = (uint)ctx[CpuRegister.Rdi];
+        var state = _submittedGpuStates.GetValue(ctx.Memory, static _ => new SubmittedGpuState());
+        lock (state.Gate)
+        {
+            state.DefaultOwner = owner;
+        }
+
+        TraceAgc($"agc.driver_register_default_owner owner={owner}");
+        return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
+    }
+
+    [SysAbiExport(
+        Nid = "X-Nm5KLREeg",
+        ExportName = "sceAgcDriverRegisterOwner",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int DriverRegisterOwner(CpuContext ctx)
+    {
+        var ownerAddress = ctx[CpuRegister.Rdi];
+        var nameAddress = ctx[CpuRegister.Rsi];
+        if (ownerAddress == 0 || nameAddress == 0 ||
+            !TryReadGuestCString(
+                ctx,
+                nameAddress,
+                ResourceRegistrationMaxNameLength,
+                out var nameBytes))
+        {
+            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        var state = _submittedGpuStates.GetValue(ctx.Memory, static _ => new SubmittedGpuState());
+        uint owner;
+        lock (state.Gate)
+        {
+            // Games can register owners before (or without) initializing resource
+            // registration -- the per-frame submit pair fires right after this call,
+            // so hand out a handle either way and only enforce the cap once set up.
+            if (state.ResourceRegistrationInitialized &&
+                state.ResourceRegistrationMaxOwners != 0 &&
+                state.ResourceOwners.Count >= state.ResourceRegistrationMaxOwners)
+            {
+                return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+            }
+
+            owner = state.NextOwner;
+            while (owner == state.DefaultOwner || state.ResourceOwners.ContainsKey(owner))
+            {
+                owner++;
+                if (owner == 0)
+                {
+                    return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+                }
+            }
+
+            state.NextOwner = owner + 1;
+            state.ResourceOwners.Add(owner, System.Text.Encoding.UTF8.GetString(nameBytes));
+        }
+
+        if (!ctx.TryWriteUInt32(ownerAddress, owner))
+        {
+            lock (state.Gate)
+            {
+                state.ResourceOwners.Remove(owner);
+            }
+
+            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        TraceAgc(
+            $"agc.driver_register_owner out=0x{ownerAddress:X16} owner={owner} " +
+            $"name={System.Text.Encoding.UTF8.GetString(nameBytes)}");
         return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
     }
 
@@ -2467,16 +2713,87 @@ public static class AgcExports
     LibraryName = "libSceAgc")]
     public static int DriverRegisterResource(CpuContext ctx)
     {
-        var resourceAddress = ctx[CpuRegister.Rdi];
+        var resourceHandleAddress = ctx[CpuRegister.Rdi];
         var owner = (uint)ctx[CpuRegister.Rsi];
-        var nameAddress = ctx[CpuRegister.Rdx];
-        var type = (uint)ctx[CpuRegister.R8];
-        var flags = (uint)ctx[CpuRegister.R9];
+        var resourceAddress = ctx[CpuRegister.Rdx];
+        var resourceSize = ctx[CpuRegister.Rcx];
+        var nameAddress = ctx[CpuRegister.R8];
+        var type = (uint)ctx[CpuRegister.R9];
+        if (resourceHandleAddress == 0 || resourceAddress == 0 || resourceSize == 0 ||
+            !ctx.TryReadUInt32(ctx[CpuRegister.Rsp] + sizeof(ulong), out var flags) ||
+            !TryReadGuestCString(
+                ctx,
+                nameAddress,
+                ResourceRegistrationMaxNameLength,
+                out var nameBytes))
+        {
+            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        var state = _submittedGpuStates.GetValue(ctx.Memory, static _ => new SubmittedGpuState());
+        uint resourceHandle;
+        lock (state.Gate)
+        {
+            if (!state.ResourceRegistrationInitialized ||
+                owner != state.DefaultOwner &&
+                !state.ResourceOwners.ContainsKey(owner))
+            {
+                return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+            }
+
+            resourceHandle = state.NextResource++;
+            if (resourceHandle == 0)
+            {
+                return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+            }
+
+            state.RegisteredResources.Add(
+                resourceHandle,
+                new RegisteredAgcResource(
+                    owner,
+                    resourceAddress,
+                    resourceSize,
+                    System.Text.Encoding.UTF8.GetString(nameBytes),
+                    type,
+                    flags));
+        }
+
+        if (!ctx.TryWriteUInt32(resourceHandleAddress, resourceHandle))
+        {
+            lock (state.Gate)
+            {
+                state.RegisteredResources.Remove(resourceHandle);
+            }
+
+            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
 
         TraceAgc(
-            $"agc.driver_register_resource resource=0x{resourceAddress:X16} owner={owner} " +
-            $"name=0x{nameAddress:X16} type={type} flags={flags}");
+            $"agc.driver_register_resource handle={resourceHandle} owner={owner} " +
+            $"resource=0x{resourceAddress:X16} bytes=0x{resourceSize:X} " +
+            $"name={System.Text.Encoding.UTF8.GetString(nameBytes)} type={type} flags={flags}");
 
+        return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
+    }
+
+    [SysAbiExport(
+        Nid = "pWLG7WOpVcw",
+        ExportName = "sceAgcDriverUnregisterResource",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int DriverUnregisterResource(CpuContext ctx)
+    {
+        var resourceHandle = (uint)ctx[CpuRegister.Rdi];
+        var state = _submittedGpuStates.GetValue(ctx.Memory, static _ => new SubmittedGpuState());
+        lock (state.Gate)
+        {
+            if (!state.RegisteredResources.Remove(resourceHandle))
+            {
+                return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+            }
+        }
+
+        TraceAgc($"agc.driver_unregister_resource handle={resourceHandle}");
         return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
     }
 
@@ -3361,12 +3678,13 @@ public static class AgcExports
                     textures,
                     globalMemoryBuffers,
                     translatedDraw.AttributeCount,
-                    new VulkanGuestRenderTarget(
-                        firstTarget.Address,
-                        firstTarget.Width,
-                            firstTarget.Height,
-                            firstTarget.Format,
-                            firstTarget.NumberType),
+                    translatedDraw.RenderTargets.Select(target =>
+                        new VulkanGuestRenderTarget(
+                            target.Address,
+                            target.Width,
+                            target.Height,
+                            target.Format,
+                            target.NumberType)).ToArray(),
                         translatedDraw.VertexSpirv,
                         translatedDraw.VertexCount,
                         translatedDraw.InstanceCount,
@@ -3474,7 +3792,8 @@ public static class AgcExports
                 exportState,
                 out var exportEvaluation,
                 out error,
-                resolveVertexInputs: true) ||
+                resolveVertexInputs: true,
+                vertexRecordLimit: indexed ? null : vertexCount) ||
             !Gen5ShaderTranslator.TryCreateState(
                 ctx,
                 pixelShaderAddress,
@@ -3493,19 +3812,47 @@ public static class AgcExports
         }
 
         var renderTargets = GetRenderTargets(state.CxRegisters)
-            .Where(target =>
-                target.Slot == 0 &&
-                HasPixelColorExport(pixelState, target.Slot))
+            .Where(target => HasPixelColorExport(pixelState, target.Slot))
+            .OrderBy(target => target.Slot)
             .ToArray();
-        var outputKind = GetPixelOutputKind(renderTargets.FirstOrDefault().NumberType);
-        var exportStateFingerprint = ComputeShaderStateFingerprint(exportEvaluation);
-        var pixelStateFingerprint = ComputeShaderStateFingerprint(pixelEvaluation);
+        var renderTargetFormats = new VulkanRenderTargetFormat[renderTargets.Length];
+        for (var index = 0; index < renderTargets.Length; index++)
+        {
+            var target = renderTargets[index];
+            if (!VulkanVideoPresenter.TryDecodeRenderTargetFormat(
+                    target.Format,
+                    target.NumberType,
+                    out renderTargetFormats[index]))
+            {
+                error =
+                    $"unsupported color target format={target.Format} number_type={target.NumberType}";
+                return false;
+            }
+        }
+
+        var pixelOutputs = renderTargets
+            .Select((target, location) => new Gen5PixelOutputBinding(
+                target.Slot,
+                (uint)location,
+                renderTargetFormats[location].OutputKind))
+            .ToArray();
+        var outputLayout = string.Join(
+            ';',
+            pixelOutputs.Select(output =>
+                $"{output.GuestSlot}:{output.HostLocation}:{(int)output.Kind}"));
+        var attributeCount = GetInterpolatedAttributeCount(pixelState);
+        var exportStateFingerprint = ComputeShaderStructureFingerprint(exportEvaluation);
+        var pixelStateFingerprint = ComputeShaderStructureFingerprint(pixelEvaluation);
         var shaderKey = (
             exportShaderAddress,
             exportStateFingerprint,
             pixelShaderAddress,
             pixelStateFingerprint,
-            outputKind);
+            outputLayout,
+            attributeCount);
+        var totalGlobalBuffers =
+            pixelEvaluation.GlobalMemoryBindings.Count +
+            exportEvaluation.GlobalMemoryBindings.Count;
         (byte[] Vertex, byte[] Pixel) compiled;
         lock (_submitTraceGate)
         {
@@ -3514,26 +3861,25 @@ public static class AgcExports
 
         if (compiled.Vertex is null || compiled.Pixel is null)
         {
-            var totalGlobalBuffers =
-                pixelEvaluation.GlobalMemoryBindings.Count +
-                exportEvaluation.GlobalMemoryBindings.Count;
             if (!Gen5SpirvTranslator.TryCompilePixelShader(
                     pixelState,
                     pixelEvaluation,
-                    outputKind,
+                    pixelOutputs,
                     out var pixelShader,
                     out error,
                     globalBufferBase: 0,
-                    totalGlobalBufferCount: totalGlobalBuffers,
-                    imageBindingBase: 0) ||
+                    totalGlobalBufferCount: totalGlobalBuffers + 2,
+                    imageBindingBase: 0,
+                    scalarRegisterBufferIndex: totalGlobalBuffers) ||
                 !Gen5SpirvTranslator.TryCompileVertexShader(
                     exportState,
                     exportEvaluation,
                     out var vertexShader,
                     out error,
                     globalBufferBase: pixelEvaluation.GlobalMemoryBindings.Count,
-                    totalGlobalBufferCount: totalGlobalBuffers,
-                    imageBindingBase: pixelEvaluation.ImageBindings.Count))
+                    totalGlobalBufferCount: totalGlobalBuffers + 2,
+                    imageBindingBase: pixelEvaluation.ImageBindings.Count,
+                    scalarRegisterBufferIndex: totalGlobalBuffers + 1))
             {
                 return false;
             }
@@ -3585,6 +3931,8 @@ public static class AgcExports
 
         var globalMemoryBindings = pixelEvaluation.GlobalMemoryBindings
             .Concat(exportEvaluation.GlobalMemoryBindings)
+            .Append(CreateScalarRegisterBinding(pixelEvaluation))
+            .Append(CreateScalarRegisterBinding(exportEvaluation))
             .ToArray();
         IReadOnlyList<Gen5VertexInputBinding> vertexInputs =
             exportEvaluation.VertexInputs ?? [];
@@ -3595,7 +3943,7 @@ public static class AgcExports
             primitiveType,
             compiled.Vertex,
             compiled.Pixel,
-            GetInterpolatedAttributeCount(pixelState),
+            attributeCount,
             vertexCount,
             state.InstanceCount,
             indexed ? CreateVulkanIndexBuffer(ctx, state, vertexCount) : null,
@@ -3604,7 +3952,7 @@ public static class AgcExports
             vertexInputs,
             renderTargets,
             ApplyTransparentPremultipliedFillClear(
-                CreateRenderState(state.CxRegisters, renderTargets.FirstOrDefault()),
+                CreateRenderState(state.CxRegisters, renderTargets, pixelState),
                 textures,
                 vertexInputs,
                 pixelEvaluation.InitialScalarRegisters));
@@ -3620,7 +3968,8 @@ public static class AgcExports
     /// Chowdren resets its effect layers with an untextured transparent-black
     /// fill using premultiplied blending. With One/OneMinusSrcAlpha that draw
     /// is otherwise a no-op, causing fog and vignette layers to accumulate.
-    /// Treat precisely that draw shape as an overwrite.
+    /// Treat precisely that draw shape as an overwrite only when every MRT
+    /// attachment uses the same premultiplied blend pattern.
     /// </summary>
     private static VulkanGuestRenderState ApplyTransparentPremultipliedFillClear(
         VulkanGuestRenderState renderState,
@@ -3632,13 +3981,7 @@ public static class AgcExports
             textures.Count != 0 ||
             vertexInputs.Count != 0 ||
             pixelUserData.Count < 4 ||
-            renderState.Blend is not
-            {
-                Enable: true,
-                ColorSrcFactor: 1,
-                ColorDstFactor: 5,
-                ColorFunc: 0,
-            })
+            !renderState.Blends.All(IsTransparentPremultipliedFillBlend))
         {
             return renderState;
         }
@@ -3653,9 +3996,20 @@ public static class AgcExports
 
         return renderState with
         {
-            Blend = renderState.Blend with { Enable = false },
+            Blends = renderState.Blends
+                .Select(blend => blend with { Enable = false })
+                .ToArray(),
         };
     }
+
+    private static bool IsTransparentPremultipliedFillBlend(VulkanGuestBlendState blend) =>
+        blend is
+        {
+            Enable: true,
+            ColorSrcFactor: 1,
+            ColorDstFactor: 5,
+            ColorFunc: 0,
+        };
 
     private static VulkanGuestIndexBuffer? CreateVulkanIndexBuffer(
         CpuContext ctx,
@@ -3679,19 +4033,15 @@ public static class AgcExports
             : null;
     }
 
-    private static Gen5PixelOutputKind GetPixelOutputKind(uint numberType) =>
-        numberType switch
-        {
-            4 => Gen5PixelOutputKind.Uint,
-            5 => Gen5PixelOutputKind.Sint,
-            _ => Gen5PixelOutputKind.Float,
-        };
-
     private static bool HasPixelColorExport(Gen5ShaderState state, uint target) =>
-        state.Program.Instructions.Any(instruction =>
-            instruction.Control is Gen5ExportControl export &&
-            export.Target == target &&
-            export.EnableMask != 0);
+        GetPixelColorExportMask(state, target) != 0;
+
+    private static uint GetPixelColorExportMask(Gen5ShaderState state, uint target) =>
+        state.Program.Instructions
+            .Select(instruction => instruction.Control)
+            .OfType<Gen5ExportControl>()
+            .Where(export => export.Target == target)
+            .Aggregate(0u, (mask, export) => mask | (export.EnableMask & 0xFu));
 
     private static uint GetInterpolatedAttributeCount(Gen5ShaderState state)
     {
@@ -3705,6 +4055,88 @@ public static class AgcExports
         }
 
         return (uint)(maxAttribute + 1);
+    }
+
+    private const int ShaderScalarRegisterCount = 256;
+
+    private static Gen5GlobalMemoryBinding CreateScalarRegisterBinding(
+        Gen5ShaderEvaluation evaluation)
+    {
+        var data = new byte[ShaderScalarRegisterCount * sizeof(uint)];
+        var registers = evaluation.InitialScalarRegisters;
+        var count = Math.Min(registers.Count, ShaderScalarRegisterCount);
+        for (var index = 0; index < count; index++)
+        {
+            var value = registers[index];
+            var offset = index * sizeof(uint);
+            data[offset] = (byte)value;
+            data[offset + 1] = (byte)(value >> 8);
+            data[offset + 2] = (byte)(value >> 16);
+            data[offset + 3] = (byte)(value >> 24);
+        }
+
+        return new Gen5GlobalMemoryBinding(0, 0, [], data);
+    }
+
+    private static ulong ComputeShaderStructureFingerprint(Gen5ShaderEvaluation evaluation)
+    {
+        const ulong offsetBasis = 14695981039346656037UL;
+        const ulong prime = 1099511628211UL;
+        var hash = offsetBasis;
+        void Mix(ulong value) => hash = (hash ^ value) * prime;
+
+        Mix((ulong)evaluation.GlobalMemoryBindings.Count);
+        foreach (var binding in evaluation.GlobalMemoryBindings)
+        {
+            Mix(binding.ScalarAddress);
+            Mix((ulong)binding.InstructionPcs.Count);
+            foreach (var pc in binding.InstructionPcs)
+            {
+                Mix(pc);
+            }
+        }
+
+        Mix((ulong)evaluation.ImageBindings.Count);
+        foreach (var image in evaluation.ImageBindings)
+        {
+            Mix(image.Pc);
+            Mix((ulong)(uint)image.Opcode.GetHashCode());
+            foreach (var word in image.ResourceDescriptor)
+            {
+                Mix(word);
+            }
+
+            foreach (var word in image.SamplerDescriptor)
+            {
+                Mix(word);
+            }
+
+            Mix(image.MipLevel ?? uint.MaxValue);
+        }
+
+        if (evaluation.VertexInputs is { } vertexInputs)
+        {
+            Mix((ulong)vertexInputs.Count);
+            foreach (var input in vertexInputs)
+            {
+                Mix(input.Pc);
+                Mix(input.Location);
+                Mix(input.ComponentCount);
+                Mix(input.DataFormat);
+                Mix(input.NumberFormat);
+                Mix(input.Stride);
+            }
+        }
+
+        if (evaluation.ComputeSystemRegisters is { } computeSystemRegisters)
+        {
+            Mix(computeSystemRegisters.WorkGroupXRegister ?? uint.MaxValue);
+            Mix(computeSystemRegisters.WorkGroupYRegister ?? uint.MaxValue);
+            Mix(computeSystemRegisters.WorkGroupZRegister ?? uint.MaxValue);
+            Mix(computeSystemRegisters.ThreadGroupSizeRegister ?? uint.MaxValue);
+        }
+
+        return hash;
     }
 
     private static ulong ComputeShaderStateFingerprint(Gen5ShaderEvaluation evaluation)
@@ -3767,11 +4199,25 @@ public static class AgcExports
 
     private static VulkanGuestRenderState CreateRenderState(
         IReadOnlyDictionary<uint, uint> registers,
-        RenderTargetDescriptor target)
+        IReadOnlyList<RenderTargetDescriptor> targets,
+        Gen5ShaderState pixelState)
     {
+        if (targets.Count == 0)
+        {
+            return VulkanGuestRenderState.Default;
+        }
+
+        var target = targets[0];
         var scissor = DecodeScissor(registers, target.Width, target.Height);
         return new VulkanGuestRenderState(
-            DecodeBlendState(registers, target.Slot),
+            targets.Select(target =>
+            {
+                var blend = DecodeBlendState(registers, target.Slot);
+                return blend with
+                {
+                    WriteMask = blend.WriteMask & GetPixelColorExportMask(pixelState, target.Slot),
+                };
+            }).ToArray(),
             scissor,
             DecodeViewport(registers, target.Width, target.Height, scissor));
     }
@@ -3796,7 +4242,7 @@ public static class AgcExports
             (control >> 24) & 0x1Fu,
             (control >> 21) & 0x7u,
             ((control >> 29) & 1u) != 0,
-            writeMask == 0 ? 0xFu : writeMask);
+            writeMask);
     }
 
     private static VulkanGuestRect? DecodeScissor(
@@ -4557,7 +5003,7 @@ public static class AgcExports
         var localSizeZ = GetComputeLocalSize(state.ShRegisters, ComputeNumThreadZ);
         var gpuDispatch = false;
         var computeError = string.Empty;
-        if (hasStorageBinding &&
+        if ((hasStorageBinding || evaluation.GlobalMemoryBindings.Count != 0) &&
             (ulong)localSizeX * localSizeY * localSizeZ <= 1024)
         {
             var shaderKey = (
@@ -4627,7 +5073,8 @@ public static class AgcExports
                     $"groups={dispatch.GroupCountX}x{dispatch.GroupCountY}x{dispatch.GroupCountZ} " +
                     $"local={localSizeX}x{localSizeY}x{localSizeZ} " +
                     $"sys={DescribeComputeSystemRegisters(computeSystemRegisters)} " +
-                    $"gpu={gpuDispatch} blits={blitCount}" +
+                    $"gpu={gpuDispatch} blits={blitCount} " +
+                    $"globals={evaluation.GlobalMemoryBindings.Count}" +
                     (computeError.Length == 0 ? string.Empty : $" error={computeError}") +
                     $" bindings=[{string.Join(',', descriptions)}]");
             }
@@ -5133,7 +5580,7 @@ public static class AgcExports
                         if (Gen5SpirvTranslator.TryCompilePixelShader(
                                  pixelState,
                                  evaluation,
-                                 Gen5PixelOutputKind.Float,
+                                 [new(0, 0, Gen5PixelOutputKind.Float)],
                                  out var compiledPixel,
                                  out var compileError))
                         {

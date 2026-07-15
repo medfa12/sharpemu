@@ -30,13 +30,19 @@ public static class SaveDataExports
     private const uint MountModeCreate2 = 1u << 5;
     private const int MountResultSize = 0x40;
     private static readonly object _stateGate = new();
+    private static readonly HashSet<int> _transactionResources = [];
+    private static readonly HashSet<int> _preparedTransactionResources = [];
     private static string? _titleId;
+    private static int _nextTransactionResource;
 
     public static void ConfigureApplicationInfo(string? titleId)
     {
         lock (_stateGate)
         {
             _titleId = string.IsNullOrWhiteSpace(titleId) ? null : SanitizePathSegment(titleId.Trim());
+            _transactionResources.Clear();
+            _preparedTransactionResources.Clear();
+            _nextTransactionResource = 0;
         }
     }
 
@@ -568,7 +574,6 @@ public static class SaveDataExports
 
     private readonly record struct MemoryData(ulong BufAddress, ulong BufSize, long Offset);
 
-    private static int _nextTransactionResource;
     [SysAbiExport(
         Nid = "gjRZNnw0JPE",
         ExportName = "sceSaveDataCreateTransactionResource",
@@ -576,25 +581,124 @@ public static class SaveDataExports
         LibraryName = "libSceSaveData")]
     public static int SaveDataCreateTransactionResource(CpuContext ctx)
     {
-        var userId = unchecked((int)ctx[CpuRegister.Rdi]);
-        var reserved = ctx[CpuRegister.Rsi];
-        var resourceAddress = ctx[CpuRegister.Rdx];
+        var memorySize = ctx[CpuRegister.Rdi];
+        int resource;
+        lock (_stateGate)
+        {
+            resource = ++_nextTransactionResource;
+            _transactionResources.Add(resource);
+        }
 
-        if (resourceAddress == 0)
+        TraceSaveData($"create_transaction_resource memory_size=0x{memorySize:X} resource={resource}");
+        return ctx.SetReturn(resource);
+    }
+
+    [SysAbiExport(
+        Nid = "lJUQuaKqoKY",
+        ExportName = "sceSaveDataDeleteTransactionResource",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceSaveData")]
+    public static int SaveDataDeleteTransactionResource(CpuContext ctx)
+    {
+        var resource = unchecked((int)ctx[CpuRegister.Rdi]);
+        lock (_stateGate)
+        {
+            _transactionResources.Remove(resource);
+            _preparedTransactionResources.Remove(resource);
+        }
+
+        TraceSaveData($"delete_transaction_resource resource={resource}");
+        return ctx.SetReturn(0);
+    }
+
+    [SysAbiExport(
+        Nid = "sDCBrmc61XU",
+        ExportName = "sceSaveDataPrepare",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceSaveData")]
+    public static int SaveDataPrepare(CpuContext ctx)
+    {
+        var mountPointAddress = ctx[CpuRegister.Rdi];
+        var resource = unchecked((int)ctx[CpuRegister.Rdx]);
+        if (mountPointAddress == 0)
         {
             return ctx.SetReturn(OrbisSaveDataErrorParameter);
         }
 
-        var id = (uint)Interlocked.Increment(ref _nextTransactionResource);
-
-        if (!ctx.TryWriteUInt32(resourceAddress, id))
+        if (!TryReadFixedAscii(ctx, mountPointAddress, 16, out var mountPoint))
         {
             return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
         }
 
-        TraceSaveData(
-            $"create_transaction_resource user={userId} reserved=0x{reserved:X} resource_addr=0x{resourceAddress:X} id={id}");
+        if (string.IsNullOrWhiteSpace(mountPoint))
+        {
+            return ctx.SetReturn(OrbisSaveDataErrorParameter);
+        }
 
+        lock (_stateGate)
+        {
+            if (resource != 0)
+            {
+                _preparedTransactionResources.Add(resource);
+            }
+        }
+
+        TraceSaveData($"prepare mount_point={mountPoint} resource={resource}");
+        return ctx.SetReturn(0);
+    }
+
+    [SysAbiExport(
+        Nid = "ie7qhZ4X0Cc",
+        ExportName = "sceSaveDataCommit",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceSaveData")]
+    public static int SaveDataCommit(CpuContext ctx)
+    {
+        var commitAddress = ctx[CpuRegister.Rdi];
+        if (commitAddress == 0)
+        {
+            return ctx.SetReturn(OrbisSaveDataErrorParameter);
+        }
+
+        lock (_stateGate)
+        {
+            _preparedTransactionResources.Clear();
+        }
+
+        TraceSaveData($"commit commit=0x{commitAddress:X16}");
+        return ctx.SetReturn(0);
+    }
+
+    [SysAbiExport(
+        Nid = "uW4vfTwMQVo",
+        ExportName = "sceSaveDataUmount2",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceSaveData")]
+    public static int SaveDataUmount2(CpuContext ctx)
+    {
+        var mountPointAddress = ctx[CpuRegister.Rdi];
+        if (mountPointAddress == 0)
+        {
+            mountPointAddress = ctx[CpuRegister.Rsi];
+        }
+
+        if (mountPointAddress == 0)
+        {
+            return ctx.SetReturn(OrbisSaveDataErrorParameter);
+        }
+
+        if (!TryReadFixedAscii(ctx, mountPointAddress, 16, out var mountPoint))
+        {
+            return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        if (string.IsNullOrWhiteSpace(mountPoint))
+        {
+            return ctx.SetReturn(OrbisSaveDataErrorParameter);
+        }
+
+        var unmounted = KernelMemoryCompatExports.TryUnregisterGuestPathMount(mountPoint);
+        TraceSaveData($"umount2 mount_point={mountPoint} unregistered={unmounted}");
         return ctx.SetReturn(0);
     }
 

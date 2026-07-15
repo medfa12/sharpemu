@@ -10,7 +10,9 @@ using System.Runtime.InteropServices;
 using System.Threading;
 using SharpEmu.Core.Cpu;
 using SharpEmu.Core.Cpu.Disasm;
+using SharpEmu.Core.Cpu.Native.Windows;
 using SharpEmu.HLE;
+using SharpEmu.HLE.Host;
 
 namespace SharpEmu.Core.Cpu.Native;
 
@@ -23,12 +25,12 @@ public sealed partial class DirectExecutionBackend
 	{
 		if (!string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_DISABLE_RAW_HANDLER"), "1", StringComparison.Ordinal))
 		{
-			_rawExceptionHandlerStub = CreateExceptionHandlerTrampoline(RawVectoredHandlerPtrManaged);
+			_rawExceptionHandlerStub = _faultHandling.CreateHandlerThunk(RawVectoredHandlerPtrManaged, _hostRspSlotTlsIndex, _tlsGetValueAddress);
 			if (_rawExceptionHandlerStub == 0)
 			{
 				throw new InvalidOperationException("Failed to create raw exception handler trampoline");
 			}
-			_rawExceptionHandler = (nint)AddVectoredExceptionHandler(1u, _rawExceptionHandlerStub);
+			_rawExceptionHandler = _faultHandling.AddFirstChanceHandler(_rawExceptionHandlerStub);
 			Console.Error.WriteLine($"[LOADER][INFO] Raw exception handler installed: 0x{_rawExceptionHandler:X16}");
 		}
 		else
@@ -38,22 +40,22 @@ public sealed partial class DirectExecutionBackend
 
 		_handlerDelegate = VectoredHandler;
 		_handlerHandle = GCHandle.Alloc(_handlerDelegate);
-		_exceptionHandlerStub = CreateExceptionHandlerTrampoline(Marshal.GetFunctionPointerForDelegate(_handlerDelegate));
+		_exceptionHandlerStub = _faultHandling.CreateHandlerThunk(Marshal.GetFunctionPointerForDelegate(_handlerDelegate), _hostRspSlotTlsIndex, _tlsGetValueAddress);
 		if (_exceptionHandlerStub == 0)
 		{
 			throw new InvalidOperationException("Failed to create exception handler trampoline");
 		}
-		_exceptionHandler = (nint)AddVectoredExceptionHandler(1u, _exceptionHandlerStub);
+		_exceptionHandler = _faultHandling.AddFirstChanceHandler(_exceptionHandlerStub);
 		Console.Error.WriteLine($"[LOADER][INFO] Exception handler installed: 0x{_exceptionHandler:X16}");
 
 		_unhandledFilterDelegate = UnhandledExceptionFilter;
 		_unhandledFilterHandle = GCHandle.Alloc(_unhandledFilterDelegate);
-		_unhandledFilterStub = CreateExceptionHandlerTrampoline(Marshal.GetFunctionPointerForDelegate(_unhandledFilterDelegate));
+		_unhandledFilterStub = _faultHandling.CreateHandlerThunk(Marshal.GetFunctionPointerForDelegate(_unhandledFilterDelegate), _hostRspSlotTlsIndex, _tlsGetValueAddress);
 		if (_unhandledFilterStub == 0)
 		{
 			throw new InvalidOperationException("Failed to create unhandled exception filter trampoline");
 		}
-		SetUnhandledExceptionFilter(_unhandledFilterStub);
+		_faultHandling.SetUnhandledFilter(_unhandledFilterStub);
 	}
 
 	private unsafe int UnhandledExceptionFilter(void* exceptionInfo)
@@ -61,8 +63,8 @@ public sealed partial class DirectExecutionBackend
 		try
 		{
 			EXCEPTION_RECORD* exceptionRecord = ((EXCEPTION_POINTERS*)exceptionInfo)->ExceptionRecord;
-			ulong rip = ReadCtxU64(((EXCEPTION_POINTERS*)exceptionInfo)->ContextRecord, 248);
-			ulong rsp = ReadCtxU64(((EXCEPTION_POINTERS*)exceptionInfo)->ContextRecord, 152);
+			ulong rip = ReadCtxU64(((EXCEPTION_POINTERS*)exceptionInfo)->ContextRecord, CTX_RIP);
+			ulong rsp = ReadCtxU64(((EXCEPTION_POINTERS*)exceptionInfo)->ContextRecord, CTX_RSP);
 			Console.Error.WriteLine("[LOADER][FATAL] Unhandled exception filter fired.");
 			Console.Error.WriteLine($"[LOADER][FATAL]   Code: 0x{exceptionRecord->ExceptionCode:X8}");
 			Console.Error.WriteLine($"[LOADER][FATAL]   Exception Address: 0x{(ulong)(nint)exceptionRecord->ExceptionAddress:X16}");
@@ -101,8 +103,8 @@ public sealed partial class DirectExecutionBackend
 				return 0;
 			}
 
-			ulong rip = ReadCtxU64(contextRecord, 248);
-			ulong rsp = ReadCtxU64(contextRecord, 152);
+			ulong rip = ReadCtxU64(contextRecord, CTX_RIP);
+			ulong rsp = ReadCtxU64(contextRecord, CTX_RSP);
 
 			// Thread-mode probe: a hardware exception raised while this thread is inside
 			// the managed import gateway means the VEH->managed reentry happened from
@@ -113,7 +115,7 @@ public sealed partial class DirectExecutionBackend
 					$"veh_in_gateway code=0x{exceptionCode:X8} rip=0x{rip:X16} gateway_depth={_threadModeGatewayDepth}");
 			}
 
-			if (exceptionCode == 3221225477u && TryHandleLazyCommittedPage(exceptionRecord, rip, rsp))
+			if (exceptionCode == WindowsFaultCodes.AccessViolation && TryHandleLazyCommittedPage(exceptionRecord, rip, rsp))
 			{
 				return -1;
 			}
@@ -144,10 +146,10 @@ public sealed partial class DirectExecutionBackend
 
 			switch (exceptionCode)
 			{
-				case 3221225477u:
+				case WindowsFaultCodes.AccessViolation:
 					LogAccessViolationTrace(exceptionAddress, exceptionRecord);
 					break;
-				case 3221226505u:
+				case WindowsFaultCodes.FastFail:
 					{
 						ulong p0 = exceptionRecord->NumberParameters >= 1 ? (*exceptionRecord->ExceptionInformation) : 0;
 						ulong p1 = exceptionRecord->NumberParameters >= 2 ? exceptionRecord->ExceptionInformation[1] : 0;
@@ -157,21 +159,21 @@ public sealed partial class DirectExecutionBackend
 					}
 			}
 
-			ulong rax = ReadCtxU64(contextRecord, 120);
-			ulong rbx = ReadCtxU64(contextRecord, 144);
-			ulong rcx = ReadCtxU64(contextRecord, 128);
-			ulong rdx = ReadCtxU64(contextRecord, 136);
-			ulong rsi = ReadCtxU64(contextRecord, 168);
-			ulong rdi = ReadCtxU64(contextRecord, 176);
-			ulong rbp = ReadCtxU64(contextRecord, 160);
-			ulong r8 = ReadCtxU64(contextRecord, 184);
-			ulong r9 = ReadCtxU64(contextRecord, 192);
-			ulong r10 = ReadCtxU64(contextRecord, 200);
-			ulong r11 = ReadCtxU64(contextRecord, 208);
-			ulong r12 = ReadCtxU64(contextRecord, 216);
-			ulong r13 = ReadCtxU64(contextRecord, 224);
-			ulong r14 = ReadCtxU64(contextRecord, 232);
-			ulong r15 = ReadCtxU64(contextRecord, 240);
+			ulong rax = ReadCtxU64(contextRecord, CTX_RAX);
+			ulong rbx = ReadCtxU64(contextRecord, CTX_RBX);
+			ulong rcx = ReadCtxU64(contextRecord, CTX_RCX);
+			ulong rdx = ReadCtxU64(contextRecord, CTX_RDX);
+			ulong rsi = ReadCtxU64(contextRecord, CTX_RSI);
+			ulong rdi = ReadCtxU64(contextRecord, CTX_RDI);
+			ulong rbp = ReadCtxU64(contextRecord, CTX_RBP);
+			ulong r8 = ReadCtxU64(contextRecord, CTX_R8);
+			ulong r9 = ReadCtxU64(contextRecord, CTX_R9);
+			ulong r10 = ReadCtxU64(contextRecord, CTX_R10);
+			ulong r11 = ReadCtxU64(contextRecord, CTX_R11);
+			ulong r12 = ReadCtxU64(contextRecord, CTX_R12);
+			ulong r13 = ReadCtxU64(contextRecord, CTX_R13);
+			ulong r14 = ReadCtxU64(contextRecord, CTX_R14);
+			ulong r15 = ReadCtxU64(contextRecord, CTX_R15);
 
 			Console.Error.WriteLine("[LOADER][INFO] =========================================");
 			Console.Error.WriteLine("[LOADER][INFO] NATIVE EXCEPTION CAUGHT!");
@@ -202,7 +204,7 @@ public sealed partial class DirectExecutionBackend
 
 			ulong accessType = 0;
 			ulong target = 0;
-			if (exceptionCode == 3221225477u && exceptionRecord->NumberParameters >= 2)
+			if (exceptionCode == WindowsFaultCodes.AccessViolation && exceptionRecord->NumberParameters >= 2)
 			{
 				accessType = *exceptionRecord->ExceptionInformation;
 				target = exceptionRecord->ExceptionInformation[1];
@@ -215,9 +217,9 @@ public sealed partial class DirectExecutionBackend
 				};
 				Console.Error.WriteLine("[LOADER][INFO]   AV access: " + accessText);
 				Console.Error.WriteLine($"[LOADER][INFO]   AV target: 0x{target:X16}");
-				if (VirtualQuery((void*)target, out var mbi, (nuint)sizeof(MEMORY_BASIC_INFORMATION64)) != 0)
+				if (_hostMemory.Query(target, out var mbi))
 				{
-					Console.Error.WriteLine($"[LOADER][INFO]   AV target region: base=0x{mbi.BaseAddress:X16} size=0x{mbi.RegionSize:X16} state=0x{mbi.State:X08} protect=0x{mbi.Protect:X08}");
+					Console.Error.WriteLine($"[LOADER][INFO]   AV target region: base=0x{mbi.BaseAddress:X16} size=0x{mbi.RegionSize:X16} state=0x{mbi.RawState:X08} protect=0x{mbi.RawProtection:X08}");
 				}
 
 			}
@@ -273,7 +275,7 @@ public sealed partial class DirectExecutionBackend
 
 			switch (exceptionCode)
 			{
-				case 3221225477u:
+				case WindowsFaultCodes.AccessViolation:
 					Console.Error.WriteLine("[LOADER][ERROR]   Type: Access Violation");
 					Console.Error.WriteLine("[LOADER][ERROR]   This usually means:");
 					Console.Error.WriteLine("[LOADER][ERROR]     - Guest code called an unmapped import");
@@ -320,11 +322,11 @@ public sealed partial class DirectExecutionBackend
 					DumpGuestReferenceDiagnostics();
 					DumpGuestPointerWindowDiagnostics();
 					break;
-				case 2147483651u:
+				case WindowsFaultCodes.Breakpoint:
 					Console.Error.WriteLine("[LOADER][WARNING]   Type: Breakpoint (int3)");
 					Console.Error.WriteLine("[LOADER][WARNING]   Unexpected breakpoint in direct-bridge mode");
 					break;
-				case 3221225501u:
+				case WindowsFaultCodes.IllegalInstruction:
 					Console.Error.WriteLine("[LOADER][INFO]   Type: Illegal Instruction");
 					break;
 			}
@@ -400,16 +402,17 @@ public sealed partial class DirectExecutionBackend
 
 	private static unsafe bool IsHostRangeReadable(ulong address, ulong length)
 	{
+		var hostMemory = ResolveDiagnosticsHostMemory();
 		var cursor = address;
 		var end = address + length;
 		while (cursor < end)
 		{
-			if (VirtualQuery((void*)cursor, out var mbi, (nuint)sizeof(MEMORY_BASIC_INFORMATION64)) == 0)
+			if (!hostMemory.Query(cursor, out var mbi))
 			{
 				return false;
 			}
 
-			if (mbi.State != MEM_COMMIT || !IsReadableProtection(mbi.Protect) || (mbi.Protect & PAGE_GUARD) != 0)
+			if (mbi.State != HostRegionState.Committed || !IsReadableProtection(mbi.RawProtection) || (mbi.RawProtection & PAGE_GUARD) != 0)
 			{
 				return false;
 			}
@@ -439,8 +442,8 @@ public sealed partial class DirectExecutionBackend
 			EXCEPTION_POINTERS* pointers = (EXCEPTION_POINTERS*)exceptionInfo;
 			EXCEPTION_RECORD* record = pointers->ExceptionRecord;
 			void* contextRecord = pointers->ContextRecord;
-			ulong rip = contextRecord != null ? ReadCtxU64(contextRecord, 248) : 0;
-			ulong rsp = contextRecord != null ? ReadCtxU64(contextRecord, 152) : 0;
+			ulong rip = contextRecord != null ? ReadCtxU64(contextRecord, CTX_RIP) : 0;
+			ulong rsp = contextRecord != null ? ReadCtxU64(contextRecord, CTX_RSP) : 0;
 			ulong accessType = record->NumberParameters >= 1 ? *record->ExceptionInformation : 0;
 			ulong target = record->NumberParameters >= 2 ? record->ExceptionInformation[1] : 0;
 			Console.Error.WriteLine(
@@ -586,7 +589,7 @@ public sealed partial class DirectExecutionBackend
 		ulong address = scanBase;
 		while (address < scanEnd)
 		{
-			if (VirtualQuery((void*)address, out var mbi, (nuint)sizeof(MEMORY_BASIC_INFORMATION64)) == 0)
+			if (!_hostMemory.Query(address, out var mbi))
 			{
 				break;
 			}
@@ -598,9 +601,9 @@ public sealed partial class DirectExecutionBackend
 				break;
 			}
 
-			if (mbi.State == MEM_COMMIT &&
-				IsReadableProtection(mbi.Protect) &&
-				IsExecutableProtection(mbi.Protect))
+			if (mbi.State == HostRegionState.Committed &&
+				IsReadableProtection(mbi.RawProtection) &&
+				IsExecutableProtection(mbi.RawProtection))
 			{
 				ScanExecutableRegionForTargetReferences(regionBase, regionEnd, targetList, hitCounts, maxHitsPerTarget);
 			}
@@ -905,13 +908,13 @@ public sealed partial class DirectExecutionBackend
 			return false;
 		}
 
-		if (VirtualQuery((void*)address, out var mbi, (nuint)sizeof(MEMORY_BASIC_INFORMATION64)) == 0)
+		if (!_hostMemory.Query(address, out var mbi))
 		{
 			return false;
 		}
 
 		ulong regionEnd = mbi.BaseAddress + mbi.RegionSize;
-		if (mbi.State != MEM_COMMIT || !IsReadableProtection(mbi.Protect) || regionEnd <= address || address > regionEnd - 8)
+		if (mbi.State != HostRegionState.Committed || !IsReadableProtection(mbi.RawProtection) || regionEnd <= address || address > regionEnd - 8)
 		{
 			return false;
 		}
@@ -1583,25 +1586,25 @@ public sealed partial class DirectExecutionBackend
 		{
 			return false;
 		}
-		if (VirtualQuery((void*)faultAddress, out var mbi, (nuint)sizeof(MEMORY_BASIC_INFORMATION64)) == 0)
+		if (!_hostMemory.Query(faultAddress, out var mbi))
 		{
 			return false;
 		}
 
 		ulong pageBase = faultAddress & 0xFFFFFFFFFFFFF000uL;
-		uint commitProtect = ResolveLazyCommitProtection(accessType, mbi.AllocationProtect);
+		uint commitProtect = ResolveLazyCommitProtection(accessType, mbi.RawAllocationProtection);
 		int traceIndex = Interlocked.Increment(ref _lazyCommitTraceCount);
 		bool traceLazyCommit = ShouldTraceLazyCommit(traceIndex);
 		if (traceLazyCommit)
 		{
-			Console.Error.WriteLine($"[LOADER][TRACE] lazy-query#{traceIndex}: fault=0x{faultAddress:X16} owner={owner} rip=0x{rip:X16} rsp=0x{rsp:X16} state=0x{mbi.State:X08} base=0x{mbi.BaseAddress:X16} size=0x{mbi.RegionSize:X16} alloc=0x{mbi.AllocationProtect:X08} prot=0x{mbi.Protect:X08}");
+			Console.Error.WriteLine($"[LOADER][TRACE] lazy-query#{traceIndex}: fault=0x{faultAddress:X16} owner={owner} rip=0x{rip:X16} rsp=0x{rsp:X16} state=0x{mbi.RawState:X08} base=0x{mbi.BaseAddress:X16} size=0x{mbi.RegionSize:X16} alloc=0x{mbi.RawAllocationProtection:X08} prot=0x{mbi.RawProtection:X08}");
 		}
 
-		if (mbi.State == 4096 && IsAccessCompatible(accessType, mbi.Protect))
+		if (mbi.State == HostRegionState.Committed && IsAccessCompatible(accessType, mbi.RawProtection))
 		{
 			if (traceLazyCommit)
 			{
-				Console.Error.WriteLine($"[LOADER][TRACE] lazy-commit-race#{traceIndex}: fault=0x{faultAddress:X16} protect=0x{mbi.Protect:X08}");
+				Console.Error.WriteLine($"[LOADER][TRACE] lazy-commit-race#{traceIndex}: fault=0x{faultAddress:X16} protect=0x{mbi.RawProtection:X08}");
 			}
 			return true;
 		}
@@ -1610,10 +1613,10 @@ public sealed partial class DirectExecutionBackend
 		ulong committedBase = 0;
 		ulong committedSize = 0;
 
-		if (mbi.State == 65536)
+		if (mbi.State == HostRegionState.Free)
 		{
 			if (TryGetLazyCommitWindow(faultAddress, mbi.BaseAddress, mbi.RegionSize, out var windowBase, out var windowSize) &&
-				TryReserveThenCommit(windowBase, windowSize, windowBase, windowSize, commitProtect))
+				TryReserveThenCommit(_hostMemory, windowBase, windowSize, windowBase, windowSize, commitProtect))
 			{
 				committed = true;
 				committedBase = windowBase;
@@ -1622,7 +1625,7 @@ public sealed partial class DirectExecutionBackend
 			else
 			{
 				ulong largeBase = faultAddress & 0xFFFFFFFFFFE00000uL;
-				if (TryReserveThenCommit(largeBase, 2097152uL, largeBase, 2097152uL, commitProtect))
+				if (TryReserveThenCommit(_hostMemory, largeBase, 2097152uL, largeBase, 2097152uL, commitProtect))
 				{
 					committed = true;
 					committedBase = largeBase;
@@ -1633,13 +1636,13 @@ public sealed partial class DirectExecutionBackend
 			if (!committed)
 			{
 				ulong region64kBase = faultAddress & 0xFFFFFFFFFFFF0000uL;
-				if (TryReserveThenCommit(region64kBase, 65536uL, region64kBase, 65536uL, commitProtect))
+				if (TryReserveThenCommit(_hostMemory, region64kBase, 65536uL, region64kBase, 65536uL, commitProtect))
 				{
 					committed = true;
 					committedBase = region64kBase;
 					committedSize = 65536uL;
 				}
-				else if (TryReserveThenCommit(pageBase, 4096uL, pageBase, 4096uL, commitProtect))
+				else if (TryReserveThenCommit(_hostMemory, pageBase, 4096uL, pageBase, 4096uL, commitProtect))
 				{
 					committed = true;
 					committedBase = pageBase;
@@ -1652,7 +1655,7 @@ public sealed partial class DirectExecutionBackend
 				return false;
 			}
 
-			TryCommitRange(pageBase + 4096, 4096uL, commitProtect);
+			TryCommitRange(_hostMemory, pageBase + 4096, 4096uL, commitProtect);
 			BackStackPointerIfNeeded(rsp);
 			if (traceLazyCommit)
 			{
@@ -1661,13 +1664,13 @@ public sealed partial class DirectExecutionBackend
 			return true;
 		}
 
-		if (mbi.State != 8192)
+		if (mbi.State != HostRegionState.Reserved)
 		{
 			return false;
 		}
 
 		if (TryGetLazyCommitWindow(faultAddress, mbi.BaseAddress, mbi.RegionSize, out var commitWindowBase, out var commitWindowSize) &&
-			TryCommitRange(commitWindowBase, commitWindowSize, commitProtect))
+			TryCommitRange(_hostMemory, commitWindowBase, commitWindowSize, commitProtect))
 		{
 			committed = true;
 			committedBase = commitWindowBase;
@@ -1676,7 +1679,7 @@ public sealed partial class DirectExecutionBackend
 		else
 		{
 			ulong largeCommitBase = faultAddress & 0xFFFFFFFFFFE00000uL;
-			if (TryCommitRange(largeCommitBase, 2097152uL, commitProtect))
+			if (TryCommitRange(_hostMemory, largeCommitBase, 2097152uL, commitProtect))
 			{
 				committed = true;
 				committedBase = largeCommitBase;
@@ -1687,19 +1690,19 @@ public sealed partial class DirectExecutionBackend
 		if (!committed)
 		{
 			ulong region64kBase = faultAddress & 0xFFFFFFFFFFFF0000uL;
-			if (TryCommitRange(region64kBase, 65536uL, commitProtect))
+			if (TryCommitRange(_hostMemory, region64kBase, 65536uL, commitProtect))
 			{
 				committed = true;
 				committedBase = region64kBase;
 				committedSize = 65536uL;
 			}
-			else if (TryCommitRange(pageBase, 8192uL, commitProtect))
+			else if (TryCommitRange(_hostMemory, pageBase, 8192uL, commitProtect))
 			{
 				committed = true;
 				committedBase = pageBase;
 				committedSize = 8192uL;
 			}
-			else if (TryCommitRange(pageBase, 4096uL, commitProtect))
+			else if (TryCommitRange(_hostMemory, pageBase, 4096uL, commitProtect))
 			{
 				committed = true;
 				committedBase = pageBase;
@@ -1712,7 +1715,7 @@ public sealed partial class DirectExecutionBackend
 			return false;
 		}
 
-		TryCommitRange(pageBase + 4096, 4096uL, commitProtect);
+		TryCommitRange(_hostMemory, pageBase + 4096, 4096uL, commitProtect);
 		BackStackPointerIfNeeded(rsp);
 		if (traceLazyCommit)
 		{
@@ -1739,27 +1742,27 @@ public sealed partial class DirectExecutionBackend
 			{
 				return;
 			}
-			if (VirtualQuery((void*)stackPointer, out var spMbi, (nuint)sizeof(MEMORY_BASIC_INFORMATION64)) == 0 ||
-				spMbi.State == 4096)
+			if (!_hostMemory.Query(stackPointer, out var spMbi) ||
+				spMbi.State == HostRegionState.Committed)
 			{
 				return;
 			}
 
 			ulong spPageBase = stackPointer & 0xFFFFFFFFFFFFF000uL;
-			if (spMbi.State == 65536)
+			if (spMbi.State == HostRegionState.Free)
 			{
 				if (!TryGetLazyCommitWindow(stackPointer, spMbi.BaseAddress, spMbi.RegionSize, out var spWindowBase, out var spWindowSize) ||
-					!TryReserveThenCommit(spWindowBase, spWindowSize, spWindowBase, spWindowSize, commitProtect))
+					!TryReserveThenCommit(_hostMemory, spWindowBase, spWindowSize, spWindowBase, spWindowSize, commitProtect))
 				{
-					TryReserveThenCommit(spPageBase, 65536uL, spPageBase, 65536uL, commitProtect);
+					TryReserveThenCommit(_hostMemory, spPageBase, 65536uL, spPageBase, 65536uL, commitProtect);
 				}
 			}
-			else if (spMbi.State == 8192)
+			else if (spMbi.State == HostRegionState.Reserved)
 			{
 				if (!TryGetLazyCommitWindow(stackPointer, spMbi.BaseAddress, spMbi.RegionSize, out var spCommitBase, out var spCommitSize) ||
-					!TryCommitRange(spCommitBase, spCommitSize, commitProtect))
+					!TryCommitRange(_hostMemory, spCommitBase, spCommitSize, commitProtect))
 				{
-					TryCommitRange(spPageBase, 65536uL, commitProtect);
+					TryCommitRange(_hostMemory, spPageBase, 65536uL, commitProtect);
 				}
 			}
 		}
@@ -1798,31 +1801,33 @@ public sealed partial class DirectExecutionBackend
 			return true;
 		}
 
-		static unsafe bool TryCommitRange(ulong baseAddress, ulong length, uint protection)
+		// The commit protection is one of the two raw values ResolveLazyCommitProtection
+		// produces (0x40 RWX / 0x04 RW); the enum mapping reproduces those exactly.
+		static bool TryCommitRange(IHostMemory hostMemory, ulong baseAddress, ulong length, uint protection)
 		{
 			if (length == 0)
 			{
 				return false;
 			}
-			return VirtualAlloc((void*)baseAddress, (nuint)length, 4096u, protection) != null;
+			return hostMemory.Commit(baseAddress, length, protection == 64u ? HostPageProtection.ReadWriteExecute : HostPageProtection.ReadWrite);
 		}
 
-		static unsafe bool TryReserveRange(ulong baseAddress, ulong length)
+		static bool TryReserveRange(IHostMemory hostMemory, ulong baseAddress, ulong length)
 		{
 			if (length == 0)
 			{
 				return false;
 			}
-			return VirtualAlloc((void*)baseAddress, (nuint)length, 8192u, 4u) != null;
+			return hostMemory.Reserve(baseAddress, length, HostPageProtection.ReadWrite) != 0;
 		}
 
-		static bool TryReserveThenCommit(ulong reserveAddress, ulong reserveSize, ulong commitAddress, ulong commitSize, uint protection)
+		static bool TryReserveThenCommit(IHostMemory hostMemory, ulong reserveAddress, ulong reserveSize, ulong commitAddress, ulong commitSize, uint protection)
 		{
-			if (!TryReserveRange(reserveAddress, reserveSize))
+			if (!TryReserveRange(hostMemory, reserveAddress, reserveSize))
 			{
 				return false;
 			}
-			return TryCommitRange(commitAddress, commitSize, protection);
+			return TryCommitRange(hostMemory, commitAddress, commitSize, protection);
 		}
 
 		static bool IsAccessCompatible(ulong accessType, uint protection)
