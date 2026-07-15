@@ -520,6 +520,12 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 	private readonly object _guestThreadGate = new object();
 
+	// Serializes the free-scan + Map of guest thread stack/TLS regions. Without it,
+	// two concurrent thread creations can probe the same candidate slot before either
+	// maps it; PhysicalVirtualMemory.Map silently reuses an existing region, so both
+	// threads end up running on one stack and corrupt each other's trampoline frames.
+	private static readonly object _guestThreadRegionMapGate = new object();
+
 	private readonly Queue<GuestThreadState> _readyGuestThreads = new Queue<GuestThreadState>();
 
 	// Once set, guest worker threads are unwound to the host at their next import
@@ -3534,27 +3540,30 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		out ulong mappedBase,
 		out string? error)
 	{
-		for (int i = 0; i < 64; i++)
+		lock (_guestThreadRegionMapGate)
 		{
-			var candidateBase = baseAddress - ((ulong)i * GuestThreadRegionStride);
-			if (!IsGuestThreadRegionFree(virtualMemory, candidateBase, size))
+			for (int i = 0; i < 64; i++)
 			{
-				continue;
-			}
-			try
-			{
-				virtualMemory.Map(
-					candidateBase,
-					size,
-					fileOffset: 0,
-					fileData: ReadOnlySpan<byte>.Empty,
-					protection: protection);
-				mappedBase = candidateBase;
-				error = null;
-				return true;
-			}
-			catch (InvalidOperationException)
-			{
+				var candidateBase = baseAddress - ((ulong)i * GuestThreadRegionStride);
+				if (!IsGuestThreadRegionFree(virtualMemory, candidateBase, size))
+				{
+					continue;
+				}
+				try
+				{
+					virtualMemory.Map(
+						candidateBase,
+						size,
+						fileOffset: 0,
+						fileData: ReadOnlySpan<byte>.Empty,
+						protection: protection);
+					mappedBase = candidateBase;
+					error = null;
+					return true;
+				}
+				catch (InvalidOperationException)
+				{
+				}
 			}
 		}
 
@@ -3568,29 +3577,32 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		out ulong tlsBase,
 		out string? error)
 	{
-		for (int i = 0; i < 64; i++)
+		lock (_guestThreadRegionMapGate)
 		{
-			var candidateBase = GuestThreadTlsBaseAddress - ((ulong)i * GuestThreadRegionStride);
-			var mappedBase = candidateBase - GuestThreadTlsPrefixSize;
-			var mappedSize = GuestThreadTlsSize + GuestThreadTlsPrefixSize;
-			if (!IsGuestThreadRegionFree(virtualMemory, mappedBase, mappedSize))
+			for (int i = 0; i < 64; i++)
 			{
-				continue;
-			}
-			try
-			{
-				virtualMemory.Map(
-					mappedBase,
-					mappedSize,
-					fileOffset: 0,
-					fileData: ReadOnlySpan<byte>.Empty,
-					protection: ProgramHeaderFlags.Read | ProgramHeaderFlags.Write);
-				tlsBase = candidateBase;
-				error = null;
-				return true;
-			}
-			catch (InvalidOperationException)
-			{
+				var candidateBase = GuestThreadTlsBaseAddress - ((ulong)i * GuestThreadRegionStride);
+				var mappedBase = candidateBase - GuestThreadTlsPrefixSize;
+				var mappedSize = GuestThreadTlsSize + GuestThreadTlsPrefixSize;
+				if (!IsGuestThreadRegionFree(virtualMemory, mappedBase, mappedSize))
+				{
+					continue;
+				}
+				try
+				{
+					virtualMemory.Map(
+						mappedBase,
+						mappedSize,
+						fileOffset: 0,
+						fileData: ReadOnlySpan<byte>.Empty,
+						protection: ProgramHeaderFlags.Read | ProgramHeaderFlags.Write);
+					tlsBase = candidateBase;
+					error = null;
+					return true;
+				}
+				catch (InvalidOperationException)
+				{
+				}
 			}
 		}
 
