@@ -4407,12 +4407,14 @@ internal static unsafe class VulkanVideoPresenter
 
             if (texture.Address != 0 &&
                 !texture.IsFallback &&
-                ShouldTracePresentedGuestImageContentsForDiagnostics() &&
                 _tracedUploadFallthrough.Add(texture.Address))
             {
                 Console.Error.WriteLine(
                     "[LOADER][TRACE] vk.upload_fallthrough addr=0x" + texture.Address.ToString("X16") +
                     " has_producer=" + (producer is not null) +
+                    " producer_init=" + (producer?.Initialized) +
+                    " producer_fmt=" + (producer?.Format) +
+                    " has_surface=" + _guestImages.ContainsAddress(texture.Address) +
                     " rgba=" + texture.RgbaPixels.Length +
                     " vk=" + vkFormat);
             }
