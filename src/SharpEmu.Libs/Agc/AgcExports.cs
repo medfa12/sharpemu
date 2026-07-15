@@ -5395,6 +5395,7 @@ public static class AgcExports
                     $"sys={DescribeComputeSystemRegisters(computeSystemRegisters)} " +
                     $"gpu={gpuDispatch} blits={blitCount} " +
                     $"globals={evaluation.GlobalMemoryBindings.Count}" +
+                    $" globalAddrs=[{string.Join(',', evaluation.GlobalMemoryBindings.Select(b => $"0x{b.BaseAddress:X}"))}]" +
                     (computeError.Length == 0 ? string.Empty : $" error={computeError}") +
                     $" bindings=[{string.Join(',', descriptions)}]");
             }
