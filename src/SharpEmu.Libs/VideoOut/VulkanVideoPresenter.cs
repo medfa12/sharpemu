@@ -1941,6 +1941,7 @@ internal static unsafe class VulkanVideoPresenter
             "1",
             StringComparison.Ordinal);
         private readonly HashSet<(ulong Address, uint Width, uint Height, Format Format)> _tracedTextureUploads = new();
+        private readonly HashSet<(ulong Address, Format Format)> _tracedCopyOnSample = new();
         private readonly HashSet<(ulong Address, uint Width, uint Height, uint Format)> _dumpedTextures = new();
         private readonly HashSet<(ulong Address, int Size)> _tracedGlobalBuffers = new();
         private readonly HashSet<ulong> _tracedGuestImageContents = new();
@@ -2045,6 +2046,10 @@ internal static unsafe class VulkanVideoPresenter
             // blits/copies from this producer image into our own image, so the
             // sampler reads real GPU content (Kyty-style copy-on-sample bridge).
             public GuestImageResource? CopySource;
+            // The Vulkan format of Image; only populated for copy-on-sample
+            // resources, where the recorder chooses vkCmdCopyImage vs
+            // vkCmdBlitImage by comparing it against the producer's format.
+            public Format Format;
         }
 
         private sealed class GlobalBufferResource
@@ -4372,7 +4377,121 @@ internal static unsafe class VulkanVideoPresenter
                 };
             }
 
+            // The producer at this address rendered/compute-wrote real content
+            // into a VkImage, but no compatible sampled view could be aliased
+            // and the guest memory carries no CPU pixels. Uploading empty guest
+            // memory would read back black and cascade the whole pass to black.
+            // Copy the producer's GPU content into a fresh sampled image so the
+            // sampler reads real pixels (Kyty-style copy-on-sample bridge).
+            if (texture.Address != 0 &&
+                !texture.IsFallback &&
+                texture.RgbaPixels.Length == 0 &&
+                _guestImages.TryFindPresentable(texture.Address, out var producer) &&
+                producer.Image.Handle != 0)
+            {
+                return CreateCopyOnSampleTextureResource(texture, producer);
+            }
+
             return CreateTextureResource(texture);
+        }
+
+        private TextureResource CreateCopyOnSampleTextureResource(
+            VulkanGuestDrawTexture texture,
+            GuestImageResource producer)
+        {
+            var width = Math.Max(texture.Width, 1);
+            var height = Math.Max(texture.Height, 1);
+            var vkFormat = GetTextureFormat(texture.Format, texture.NumberType);
+
+            if (_tracedCopyOnSample.Add((texture.Address, vkFormat)))
+            {
+                Console.Error.WriteLine(
+                    "[LOADER][TRACE] vk.copy_on_sample addr=0x" + texture.Address.ToString("X16") +
+                    " producer_fmt=" + producer.Format +
+                    " producer=" + producer.Width + "x" + producer.Height +
+                    " sampled_fmt=" + vkFormat +
+                    " dst=" + width + "x" + height);
+            }
+
+            var supportsAttachmentUsage = !IsBlockCompressedFormat(vkFormat);
+            var imageInfo = new ImageCreateInfo
+            {
+                SType = StructureType.ImageCreateInfo,
+                Flags = supportsAttachmentUsage
+                    ? ImageCreateFlags.CreateMutableFormatBit | ImageCreateFlags.CreateExtendedUsageBit
+                    : 0,
+                ImageType = ImageType.Type2D,
+                Format = vkFormat,
+                Extent = new Extent3D(width, height, 1),
+                MipLevels = 1,
+                ArrayLayers = 1,
+                Samples = SampleCountFlags.Count1Bit,
+                Tiling = ImageTiling.Optimal,
+                Usage = supportsAttachmentUsage
+                    ? ImageUsageFlags.TransferDstBit |
+                      ImageUsageFlags.SampledBit |
+                      ImageUsageFlags.ColorAttachmentBit |
+                      ImageUsageFlags.StorageBit |
+                      ImageUsageFlags.TransferSrcBit
+                    : ImageUsageFlags.TransferDstBit | ImageUsageFlags.SampledBit,
+                SharingMode = SharingMode.Exclusive,
+                InitialLayout = ImageLayout.Undefined,
+            };
+            Check(_vk.CreateImage(_device, &imageInfo, null, out var image), "vkCreateImage(copy_on_sample)");
+            _vk.GetImageMemoryRequirements(_device, image, out var imageRequirements);
+            var memoryInfo = new MemoryAllocateInfo
+            {
+                SType = StructureType.MemoryAllocateInfo,
+                AllocationSize = imageRequirements.Size,
+                MemoryTypeIndex = FindMemoryType(
+                    imageRequirements.MemoryTypeBits,
+                    MemoryPropertyFlags.DeviceLocalBit),
+            };
+            DeviceMemory imageMemory = default;
+            ImageView view;
+            try
+            {
+                imageMemory = AllocateDeviceMemory(memoryInfo, "copy_on_sample");
+                Check(_vk.BindImageMemory(_device, image, imageMemory, 0), "vkBindImageMemory(copy_on_sample)");
+
+                var viewInfo = new ImageViewCreateInfo
+                {
+                    SType = StructureType.ImageViewCreateInfo,
+                    Image = image,
+                    ViewType = ImageViewType.Type2D,
+                    Format = vkFormat,
+                    Components = ToVkComponentMapping(texture.DstSelect),
+                    SubresourceRange = ColorSubresourceRange(),
+                };
+                Check(_vk.CreateImageView(_device, &viewInfo, null, out view), "vkCreateImageView(copy_on_sample)");
+            }
+            catch
+            {
+                _vk.DestroyImage(_device, image, null);
+                FreeDeviceMemory(imageMemory);
+                throw;
+            }
+
+            var debugName = TextureDebugName(texture, vkFormat);
+            SetDebugName(ObjectType.Image, image.Handle, $"{debugName} copy_on_sample image");
+            SetDebugName(ObjectType.ImageView, view.Handle, $"{debugName} copy_on_sample view");
+
+            return new TextureResource
+            {
+                Address = texture.Address,
+                Image = image,
+                ImageMemory = imageMemory,
+                View = view,
+                Width = width,
+                Height = height,
+                RowLength = width,
+                DstSelect = texture.DstSelect,
+                SamplerState = texture.Sampler,
+                NeedsUpload = true,
+                OwnsStorage = true,
+                CopySource = producer,
+                Format = vkFormat,
+            };
         }
 
         private bool TryCreateCpuTextureRefreshResource(
@@ -7652,6 +7771,12 @@ internal static unsafe class VulkanVideoPresenter
                     continue;
                 }
 
+                if (texture.CopySource is { } copySource)
+                {
+                    RecordCopyOnSample(texture, copySource, shaderStage);
+                    continue;
+                }
+
                 if (texture.GuestImage is { } guestImage)
                 {
                     TransitionGuestImage(
@@ -7743,6 +7868,129 @@ internal static unsafe class VulkanVideoPresenter
                         &toShaderRead);
                 }
             }
+        }
+
+        private void RecordCopyOnSample(
+            TextureResource texture,
+            GuestImageResource copySource,
+            PipelineStageFlags shaderStage)
+        {
+            // Bring the producer image into TransferSrc scope.
+            TransitionGuestImage(
+                copySource,
+                ImageLayout.TransferSrcOptimal,
+                PipelineStageFlags.TransferBit,
+                AccessFlags.TransferReadBit);
+
+            // Our freshly-created destination image is in Undefined.
+            var toTransfer = new ImageMemoryBarrier
+            {
+                SType = StructureType.ImageMemoryBarrier,
+                SrcAccessMask = 0,
+                DstAccessMask = AccessFlags.TransferWriteBit,
+                OldLayout = ImageLayout.Undefined,
+                NewLayout = ImageLayout.TransferDstOptimal,
+                SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                Image = texture.Image,
+                SubresourceRange = ColorSubresourceRange(),
+            };
+            _vk.CmdPipelineBarrier(
+                _commandBuffer,
+                PipelineStageFlags.TopOfPipeBit,
+                PipelineStageFlags.TransferBit,
+                0,
+                0,
+                null,
+                0,
+                null,
+                1,
+                &toTransfer);
+
+            var sameSize =
+                copySource.Width == texture.Width &&
+                copySource.Height == texture.Height;
+            var subresource = new ImageSubresourceLayers(
+                ImageAspectFlags.ColorBit,
+                0,
+                0,
+                1);
+            if (copySource.Format == texture.Format && sameSize)
+            {
+                var copyRegion = new ImageCopy
+                {
+                    SrcSubresource = subresource,
+                    DstSubresource = subresource,
+                    Extent = new Extent3D(texture.Width, texture.Height, 1),
+                };
+                _vk.CmdCopyImage(
+                    _commandBuffer,
+                    copySource.Image,
+                    ImageLayout.TransferSrcOptimal,
+                    texture.Image,
+                    ImageLayout.TransferDstOptimal,
+                    1,
+                    &copyRegion);
+            }
+            else
+            {
+                var sourceOffsets = new ImageBlit.SrcOffsetsBuffer
+                {
+                    Element0 = new Offset3D(0, 0, 0),
+                    Element1 = new Offset3D(
+                        checked((int)copySource.Width),
+                        checked((int)copySource.Height),
+                        1),
+                };
+                var destinationOffsets = new ImageBlit.DstOffsetsBuffer
+                {
+                    Element0 = new Offset3D(0, 0, 0),
+                    Element1 = new Offset3D(
+                        checked((int)texture.Width),
+                        checked((int)texture.Height),
+                        1),
+                };
+                var blitRegion = new ImageBlit
+                {
+                    SrcSubresource = subresource,
+                    SrcOffsets = sourceOffsets,
+                    DstSubresource = subresource,
+                    DstOffsets = destinationOffsets,
+                };
+                _vk.CmdBlitImage(
+                    _commandBuffer,
+                    copySource.Image,
+                    ImageLayout.TransferSrcOptimal,
+                    texture.Image,
+                    ImageLayout.TransferDstOptimal,
+                    1,
+                    &blitRegion,
+                    Filter.Linear);
+            }
+
+            var toShaderRead = new ImageMemoryBarrier
+            {
+                SType = StructureType.ImageMemoryBarrier,
+                SrcAccessMask = AccessFlags.TransferWriteBit,
+                DstAccessMask = AccessFlags.ShaderReadBit,
+                OldLayout = ImageLayout.TransferDstOptimal,
+                NewLayout = ImageLayout.ShaderReadOnlyOptimal,
+                SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                Image = texture.Image,
+                SubresourceRange = ColorSubresourceRange(),
+            };
+            _vk.CmdPipelineBarrier(
+                _commandBuffer,
+                PipelineStageFlags.TransferBit,
+                shaderStage,
+                0,
+                0,
+                null,
+                0,
+                null,
+                1,
+                &toShaderRead);
         }
 
         private void RecordStorageImagesForWrite(
