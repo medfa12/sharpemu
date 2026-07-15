@@ -100,6 +100,11 @@ public static class AgcExports
     private const uint CbColor0Attrib3 = 0x3B8;
     private const uint CbBlend0Control = 0x1E0;
     private const uint PaScModeCntl0 = 0x292;
+    private const uint DbDepthControl = 0x200; // Z_ENABLE / Z_WRITE_ENABLE / ZFUNC
+    private const uint DbZInfo = 0x010; // FORMAT / SW_MODE
+    private const uint DbZWriteBase = 0x016; // depth address >> 8
+    private const uint DbZWriteBaseHi = 0x017; // depth address [47:40]
+    private const uint DbDepthSizeXy = 0x01A; // X_MAX / Y_MAX
     private const int ColorTargetCount = 8;
     private const uint PsTextureUserDataRegister = 0xC;
     private const uint VsUserDataRegister = 0x4C;
@@ -329,6 +334,16 @@ public static class AgcExports
         uint Format,
         uint NumberType,
         uint TileMode);
+
+    private readonly record struct DepthTargetDescriptor(
+        ulong Address,
+        uint Width,
+        uint Height,
+        uint Format,      // DB_Z_INFO.FORMAT: 1=Z16, 3=Z32_FLOAT
+        uint TileMode,    // DB_Z_INFO.SW_MODE
+        bool TestEnable,  // DB_DEPTH_CONTROL.Z_ENABLE
+        bool WriteEnable, // DB_DEPTH_CONTROL.Z_WRITE_ENABLE
+        uint CompareOp);  // DB_DEPTH_CONTROL.ZFUNC (0=NEVER..7=ALWAYS)
 
     private sealed record TranslatedGuestDraw(
         ulong ExportShaderAddress,
@@ -3637,6 +3652,7 @@ public static class AgcExports
         var hasPsInputAddr = state.CxRegisters.TryGetValue(SpiPsInputAddr, out var psInputAddr);
         state.UcRegisters.TryGetValue(VgtPrimitiveType, out var primitiveType);
         var renderTargets = GetRenderTargets(state.CxRegisters);
+        var depthTarget = GetDepthTarget(state.CxRegisters);
         var drawSequence = ++gpuState.WorkSequence;
         state.TranslatedDraw = null;
         state.GuestDrawKind = GuestDrawKind.None;
@@ -3707,7 +3723,18 @@ public static class AgcExports
                         translatedDraw.PrimitiveType,
                         translatedDraw.IndexBuffer,
                         vertexBuffers,
-                        translatedDraw.RenderState);
+                        translatedDraw.RenderState,
+                        depthTarget is { } depth
+                            ? new VulkanGuestDepthTarget(
+                                depth.Address,
+                                depth.Width,
+                                depth.Height,
+                                depth.Format,
+                                depth.TileMode,
+                                depth.TestEnable,
+                                depth.WriteEnable,
+                                depth.CompareOp)
+                            : null);
             }
             else
             {
@@ -4211,6 +4238,56 @@ public static class AgcExports
         }
 
         return targets;
+    }
+
+    private static DepthTargetDescriptor? GetDepthTarget(
+        IReadOnlyDictionary<uint, uint> registers)
+    {
+        if (!registers.TryGetValue(DbZWriteBase, out var zWriteBase) ||
+            !registers.TryGetValue(DbZInfo, out var zInfo))
+        {
+            return null;
+        }
+
+        registers.TryGetValue(DbZWriteBaseHi, out var zWriteHi);
+        var address = ((ulong)(zWriteHi & 0xFFu) << 40) | ((ulong)zWriteBase << 8);
+
+        var format = zInfo & 0x3u; // FORMAT [1:0]; 0 == Z_INVALID -> no depth bound
+        if (address == 0 || format == 0)
+        {
+            return null;
+        }
+
+        var tileMode = (zInfo >> 11) & 0x1Fu; // SW_MODE [15:11]
+
+        uint width = 0, height = 0;
+        if (registers.TryGetValue(DbDepthSizeXy, out var sizeXy))
+        {
+            width = (sizeXy & 0x3FFFu) + 1;         // X_MAX [13:0]
+            height = ((sizeXy >> 16) & 0x3FFFu) + 1; // Y_MAX [29:16]
+        }
+
+        registers.TryGetValue(DbDepthControl, out var depthControl);
+        var testEnable = ((depthControl >> 1) & 1u) != 0;  // Z_ENABLE [1]
+        var writeEnable = ((depthControl >> 2) & 1u) != 0; // Z_WRITE_ENABLE [2]
+        var compareOp = (depthControl >> 4) & 0x7u;        // ZFUNC [6:4]
+
+        // Only report a depth target the game actually reads from or writes to;
+        // an address with neither test nor write is not a live depth surface.
+        if (!testEnable && !writeEnable)
+        {
+            return null;
+        }
+
+        var descriptor = new DepthTargetDescriptor(
+            address, width, height, format, tileMode,
+            testEnable, writeEnable, compareOp);
+
+        TraceAgc(
+            $"agc.depth_target addr=0x{address:X16} fmt={format} tile={tileMode} " +
+            $"size={width}x{height} test={testEnable} write={writeEnable} zfunc={compareOp}");
+
+        return descriptor;
     }
 
     private static VulkanGuestRenderState CreateRenderState(
