@@ -103,6 +103,7 @@ public static class AgcExports
     private const uint PaScModeCntl0 = 0x292;
     private const uint DbDepthControl = 0x200; // Z_ENABLE / Z_WRITE_ENABLE / ZFUNC
     private const uint DbZInfo = 0x010; // FORMAT / SW_MODE
+    private const uint DbZReadBase = 0x012; // depth read address >> 8
     private const uint DbZWriteBase = 0x016; // depth address >> 8
     private const uint DbZWriteBaseHi = 0x017; // depth address [47:40]
     private const uint DbDepthSizeXy = 0x01A; // X_MAX / Y_MAX
@@ -164,6 +165,7 @@ public static class AgcExports
     private static readonly HashSet<ulong> _tracedNggDraws = new();
     private static readonly HashSet<ulong> _tracedNggStagesProbe = new();
     private static readonly HashSet<ulong> _tracedNggIndirectProbe = new();
+    private static readonly HashSet<(uint, uint, uint)> _tracedDepthProbe = new();
     private static readonly Dictionary<(ulong Address, uint Width, uint Height), ulong> _tracedTextureHashes = [];
     private static readonly HashSet<uint> _tracedSubmittedDrawOpcodes = new();
     private static readonly Dictionary<(ulong Ps, ulong State, Gen5PixelOutputKind Output), byte[]> _pixelSpirvCache = new();
@@ -4429,8 +4431,21 @@ public static class AgcExports
     private static DepthTargetDescriptor? GetDepthTarget(
         IReadOnlyDictionary<uint, uint> registers)
     {
-        if (!registers.TryGetValue(DbZWriteBase, out var zWriteBase) ||
-            !registers.TryGetValue(DbZInfo, out var zInfo))
+        var hasZWrite = registers.TryGetValue(DbZWriteBase, out var zWriteBase);
+        var hasZInfo = registers.TryGetValue(DbZInfo, out var zInfo);
+        registers.TryGetValue(DbZReadBase, out var zReadBaseProbe);
+        registers.TryGetValue(DbDepthControl, out var depthControlProbe);
+        var zAddrProbe = ((ulong)zWriteBase << 8);
+        if (_tracedDepthProbe.Add((zWriteBase, zInfo, depthControlProbe)))
+        {
+            TraceAgc(
+                $"agc.depth_probe hasZWrite={hasZWrite} hasZInfo={hasZInfo} " +
+                $"zWriteBase=0x{zWriteBase:X8}(->0x{zAddrProbe:X}) zReadBase=0x{zReadBaseProbe:X8} " +
+                $"zInfo=0x{zInfo:X8} fmt={zInfo & 0x3u} depthControl=0x{depthControlProbe:X8} " +
+                $"zEn={(depthControlProbe >> 1) & 1u} zWrEn={(depthControlProbe >> 2) & 1u}");
+        }
+
+        if (!hasZWrite || !hasZInfo)
         {
             return null;
         }
