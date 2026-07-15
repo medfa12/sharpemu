@@ -400,6 +400,17 @@ public static class AgcExports
         public uint IndexSize { get; set; }
         public uint InstanceCount { get; set; } = 1;
         public uint DrawIndexOffset { get; set; }
+
+        // Guest address of the VkDrawIndexedIndirectCommand for the draw being
+        // parsed (0 when the current packet is not an indirect draw). Set by
+        // TryReadSubmittedDrawCount and consumed by the draw dispatch to build
+        // the indirect args threaded to the presenter.
+        public ulong CurrentIndirectArgsAddress { get; set; }
+
+        // Indirect args seeded for the current draw and forwarded to the
+        // presenter so it records a native vkCmdDrawIndexedIndirect. Null for
+        // every non-indirect draw, keeping those paths byte-for-byte unchanged.
+        public VulkanGuestIndirectArgs? PendingIndirectArgs { get; set; }
     }
 
     private sealed class SubmittedGpuState
@@ -3226,7 +3237,48 @@ public static class AgcExports
                     ItDrawIndexOffset2 or
                     ItDrawIndexIndirect;
                 state.SawIndexedDraw |= indexed;
-                TryTranslateGuestDraw(ctx, gpuState, state, indexCount, indexed);
+
+                var effectiveCount = indexCount;
+                state.PendingIndirectArgs = null;
+                if (op == ItDrawIndexIndirect && state.CurrentIndirectArgsAddress != 0)
+                {
+                    var argsBase = state.CurrentIndirectArgsAddress;
+                    ctx.TryReadUInt32(argsBase, out var argIndexCount);
+                    ctx.TryReadUInt32(argsBase + 4, out var argInstanceCount);
+
+                    // The indirect count is CPU-read at DCB-parse time, before
+                    // the producing compute has run on the GPU, so a degenerate
+                    // <=1 count means "not yet computed". Seed the whole
+                    // index-buffer element count so the native indirect draw
+                    // renders the full (unculled) mesh instead of one vertex.
+                    var seedIndexCount = argIndexCount;
+                    if (seedIndexCount <= 1 &&
+                        state.IndexBufferCount > seedIndexCount &&
+                        state.IndexBufferCount <= 1_048_576)
+                    {
+                        seedIndexCount = state.IndexBufferCount;
+                    }
+
+                    if (seedIndexCount != 0 && seedIndexCount <= 1_048_576)
+                    {
+                        var argsData = new byte[20];
+                        BinaryPrimitives.WriteUInt32LittleEndian(
+                            argsData.AsSpan(0), seedIndexCount);
+                        BinaryPrimitives.WriteUInt32LittleEndian(
+                            argsData.AsSpan(4), Math.Max(argInstanceCount, 1u));
+                        // firstIndex, vertexOffset, firstInstance stay zero.
+                        state.PendingIndirectArgs =
+                            new VulkanGuestIndirectArgs(argsData, 0, 20);
+                        effectiveCount = seedIndexCount;
+                        TraceAgc(
+                            $"agc.draw_indirect_native args=0x{argsBase:X16} " +
+                            $"cpuCount={argIndexCount} seedCount={seedIndexCount} " +
+                            $"indexBufCount={state.IndexBufferCount} inst={Math.Max(argInstanceCount, 1u)}");
+                    }
+                }
+
+                TryTranslateGuestDraw(ctx, gpuState, state, effectiveCount, indexed);
+                state.PendingIndirectArgs = null;
             }
 
             if (op == ItNop &&
@@ -3646,6 +3698,7 @@ public static class AgcExports
         out uint drawCount)
     {
         drawCount = 0;
+        state.CurrentIndirectArgsAddress = 0;
         switch (op)
         {
             case ItDrawIndexAuto when packetLength >= 3:
@@ -3679,6 +3732,11 @@ public static class AgcExports
                 var argsBase = state.IndirectArgsAddress + dataOffset;
                 var readOk = state.IndirectArgsAddress != 0 &&
                     ctx.TryReadUInt32(argsBase, out drawCount);
+                if (readOk)
+                {
+                    state.CurrentIndirectArgsAddress = argsBase;
+                }
+
                 ctx.TryReadUInt32(argsBase + 4, out var argInstance);
                 TraceAgc(
                     $"agc.draw_indirect_args indirectBase=0x{state.IndirectArgsAddress:X16} " +
@@ -3792,7 +3850,8 @@ public static class AgcExports
                                 depth.TestEnable,
                                 depth.WriteEnable,
                                 depth.CompareOp)
-                            : null);
+                            : null,
+                        state.PendingIndirectArgs);
             }
             else
             {

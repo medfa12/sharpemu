@@ -66,6 +66,17 @@ internal sealed record VulkanGuestIndexBuffer(
     byte[] Data,
     bool Is32Bit);
 
+// GPU-driven indexed indirect draw arguments. Data holds the raw
+// VkDrawIndexedIndirectCommand block(s) (5 dwords each: indexCount,
+// instanceCount, firstIndex, vertexOffset, firstInstance); Offset selects the
+// command within Data and Stride is its byte size (20). When present on a
+// translated draw the presenter records vkCmdDrawIndexedIndirect against a
+// dedicated indirect VkBuffer instead of vkCmdDrawIndexed with a CPU count.
+internal sealed record VulkanGuestIndirectArgs(
+    byte[] Data,
+    uint Offset,
+    uint Stride);
+
 internal readonly record struct VulkanGuestRect(
     int X,
     int Y,
@@ -153,7 +164,8 @@ internal sealed record VulkanTranslatedGuestDraw(
     uint InstanceCount,
     uint PrimitiveType,
     VulkanGuestIndexBuffer? IndexBuffer,
-    VulkanGuestRenderState RenderState);
+    VulkanGuestRenderState RenderState,
+    VulkanGuestIndirectArgs? IndirectArgs = null);
 
 internal sealed record VulkanOffscreenGuestDraw(
     VulkanTranslatedGuestDraw Draw,
@@ -545,7 +557,8 @@ internal static unsafe class VulkanVideoPresenter
         VulkanGuestIndexBuffer? indexBuffer = null,
         IReadOnlyList<VulkanGuestVertexBuffer>? vertexBuffers = null,
         VulkanGuestRenderState? renderState = null,
-        VulkanGuestDepthTarget? depthTarget = null)
+        VulkanGuestDepthTarget? depthTarget = null,
+        VulkanGuestIndirectArgs? indirectArgs = null)
     {
         SubmitOffscreenTranslatedDraw(
             pixelSpirv,
@@ -560,7 +573,8 @@ internal static unsafe class VulkanVideoPresenter
             indexBuffer,
             vertexBuffers,
             renderState,
-            depthTarget);
+            depthTarget,
+            indirectArgs);
     }
 
     public static void SubmitOffscreenTranslatedDraw(
@@ -576,7 +590,8 @@ internal static unsafe class VulkanVideoPresenter
         VulkanGuestIndexBuffer? indexBuffer = null,
         IReadOnlyList<VulkanGuestVertexBuffer>? vertexBuffers = null,
         VulkanGuestRenderState? renderState = null,
-        VulkanGuestDepthTarget? depthTarget = null)
+        VulkanGuestDepthTarget? depthTarget = null,
+        VulkanGuestIndirectArgs? indirectArgs = null)
     {
         if (pixelSpirv.Length == 0 ||
             targets.Count == 0 ||
@@ -646,7 +661,8 @@ internal static unsafe class VulkanVideoPresenter
                         instanceCount,
                         primitiveType,
                         indexBuffer,
-                        effectiveRenderState),
+                        effectiveRenderState,
+                        indexBuffer is not null ? indirectArgs : null),
                     targets.ToArray(),
                     PublishTarget: true,
                     Depth: depthTarget));
@@ -1959,6 +1975,7 @@ internal static unsafe class VulkanVideoPresenter
         private bool _splashPresented;
         private bool _swapchainRecreateDeferred;
         private bool _tracedPresentedSwapchain;
+        private bool _tracedNativeIndirectDraw;
         private int _swapchainCaptureCount;
         private long _totalPresentCount;
         // Fire a RenderDoc capture at the first present after this many seconds.
@@ -2058,6 +2075,11 @@ internal static unsafe class VulkanVideoPresenter
             public VkBuffer IndexBuffer;
             public DeviceMemory IndexMemory;
             public bool Index32Bit;
+            public VkBuffer IndirectArgsBuffer;
+            public DeviceMemory IndirectArgsMemory;
+            public ulong IndirectArgsOffset;
+            public uint IndirectArgsStride;
+            public bool HasIndirectArgs;
             public uint VertexCount = 3;
             public uint InstanceCount = 1;
             public PrimitiveTopology Topology = PrimitiveTopology.TriangleList;
@@ -3641,6 +3663,23 @@ internal static unsafe class VulkanVideoPresenter
                         BufferUsageFlags.IndexBufferBit,
                         out resources.IndexMemory);
                     resources.Index32Bit = indexBuffer.Is32Bit;
+
+                    // GPU-driven indexed indirect: back the draw with a real
+                    // vkCmdDrawIndexedIndirect reading a dedicated indirect
+                    // VkBuffer. Only taken for indexed draws that carried
+                    // indirect args; every other draw path is untouched.
+                    if (draw.IndirectArgs is { } args &&
+                        args.Data.Length >= (int)(args.Offset + args.Stride) &&
+                        args.Stride >= 20)
+                    {
+                        resources.IndirectArgsBuffer = CreateHostBuffer(
+                            args.Data,
+                            BufferUsageFlags.IndirectBufferBit,
+                            out resources.IndirectArgsMemory);
+                        resources.IndirectArgsOffset = args.Offset;
+                        resources.IndirectArgsStride = args.Stride;
+                        resources.HasIndirectArgs = true;
+                    }
                 }
 
                 CreateTranslatedDescriptorResources(
@@ -8686,13 +8725,60 @@ internal static unsafe class VulkanVideoPresenter
                     resources.IndexBuffer,
                     0,
                     resources.Index32Bit ? IndexType.Uint32 : IndexType.Uint16);
-                _vk.CmdDrawIndexed(
-                    _commandBuffer,
-                    resources.VertexCount,
-                    resources.InstanceCount,
-                    0,
-                    0,
-                    0);
+                if (resources.HasIndirectArgs && resources.IndirectArgsBuffer.Handle != 0)
+                {
+                    // Ensure the producing compute's writes to the args buffer
+                    // are visible to the indirect-command read stage. Compute
+                    // and draw are separate in-order queue submits, so this
+                    // barrier expresses the write->indirect-read dependency.
+                    var argsBarrier = new BufferMemoryBarrier
+                    {
+                        SType = StructureType.BufferMemoryBarrier,
+                        SrcAccessMask = AccessFlags.ShaderWriteBit,
+                        DstAccessMask = AccessFlags.IndirectCommandReadBit,
+                        SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                        DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                        Buffer = resources.IndirectArgsBuffer,
+                        Offset = 0,
+                        Size = Vk.WholeSize,
+                    };
+                    _vk.CmdPipelineBarrier(
+                        _commandBuffer,
+                        PipelineStageFlags.ComputeShaderBit,
+                        PipelineStageFlags.DrawIndirectBit,
+                        0,
+                        0,
+                        null,
+                        1,
+                        &argsBarrier,
+                        0,
+                        null);
+                    _vk.CmdDrawIndexedIndirect(
+                        _commandBuffer,
+                        resources.IndirectArgsBuffer,
+                        resources.IndirectArgsOffset,
+                        1,
+                        resources.IndirectArgsStride);
+                    if (!_tracedNativeIndirectDraw)
+                    {
+                        _tracedNativeIndirectDraw = true;
+                        Console.Error.WriteLine(
+                            "[LOADER][TRACE] vk.draw_indexed_indirect_native recorded " +
+                            $"argsOffset=0x{resources.IndirectArgsOffset:X} " +
+                            $"stride={resources.IndirectArgsStride} " +
+                            $"index32={(resources.Index32Bit ? 1 : 0)}");
+                    }
+                }
+                else
+                {
+                    _vk.CmdDrawIndexed(
+                        _commandBuffer,
+                        resources.VertexCount,
+                        resources.InstanceCount,
+                        0,
+                        0,
+                        0);
+                }
             }
             else
             {
@@ -8772,6 +8858,7 @@ internal static unsafe class VulkanVideoPresenter
             }
 
             RecycleHostBuffer(resources.IndexBuffer, resources.IndexMemory);
+            RecycleHostBuffer(resources.IndirectArgsBuffer, resources.IndirectArgsMemory);
 
             if (!resources.PipelineCached && resources.Pipeline.Handle != 0)
             {
