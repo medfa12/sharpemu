@@ -7977,7 +7977,8 @@ internal static unsafe class VulkanVideoPresenter
                         $"center={center} hash=0x{hash:X16}");
                     var isRgba8 = image.Format == Format.R8G8B8A8Unorm;
                     var isHdr16 = image.Format == Format.R16G16B16A16Sfloat;
-                    if (nonblackPixels > 0 && (isRgba8 || isHdr16))
+                    var isHdr32 = image.Format == Format.R32G32B32A32Sfloat;
+                    if (nonblackPixels > 0 && (isRgba8 || isHdr16 || isHdr32))
                     {
                         const int outWidth = 960;
                         const int outHeight = 540;
@@ -7998,7 +7999,7 @@ internal static unsafe class VulkanVideoPresenter
                                     rgb[di + 1] = bytes[si + 1];
                                     rgb[di + 2] = bytes[si + 2];
                                 }
-                                else
+                                else if (isHdr16)
                                 {
                                     var si = (sy * srcW + sx) * 8;
                                     for (var c = 0; c < 3; c++)
@@ -8006,6 +8007,16 @@ internal static unsafe class VulkanVideoPresenter
                                         var h = BitConverter.UInt16BitsToHalf(
                                             BitConverter.ToUInt16(bytes.Slice(si + c * 2, 2)));
                                         var v = (float)h;
+                                        v = v <= 0f ? 0f : v >= 1f ? 1f : v;
+                                        rgb[di + c] = (byte)(v * 255f + 0.5f);
+                                    }
+                                }
+                                else
+                                {
+                                    var si = (sy * srcW + sx) * 16;
+                                    for (var c = 0; c < 3; c++)
+                                    {
+                                        var v = BitConverter.ToSingle(bytes.Slice(si + c * 4, 4));
                                         v = v <= 0f ? 0f : v >= 1f ? 1f : v;
                                         rgb[di + c] = (byte)(v * 255f + 0.5f);
                                     }
