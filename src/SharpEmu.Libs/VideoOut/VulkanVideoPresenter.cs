@@ -5882,6 +5882,21 @@ internal static unsafe class VulkanVideoPresenter
                         continue;
                     }
 
+                    if (surface.Initialized && !surface.IsCpuBacked)
+                    {
+                        // A GPU-produced surface (render target / compute store)
+                        // is being reclaimed. If a still-needed producer is
+                        // evicted before a later pass samples it, that pass
+                        // falls through to a zeroed guest upload and renders
+                        // black -- the second candidate mechanism behind the
+                        // black menu. Log the address so the loss is provable.
+                        Console.Error.WriteLine(
+                            "[LOADER][TRACE] vk.producer_evicted " +
+                            "addr=0x" + surface.Address.ToString("X16") +
+                            " last_use=" + surface.LastUseStamp +
+                            " use_stamp=" + _useStamp);
+                    }
+
                     freed += surface.MemorySize;
                     evicted++;
                     DestroyGuestImage(surface);
@@ -6431,13 +6446,28 @@ internal static unsafe class VulkanVideoPresenter
                             _gpuGuestImages.Remove(target.Address);
                             _renderTargetGuestImages.Remove(target.Address);
                             ForgetRenderedGuestImageLocked(target.Address);
+
+                            // This target never produced content and its
+                            // provenance is now gone: any later pass that
+                            // samples this address falls through to a zeroed
+                            // guest upload and renders black. Surfacing the
+                            // exact dropped producer address is what pins the
+                            // black-menu root cause (missing producer) to a
+                            // specific G-buffer.
+                            Console.Error.WriteLine(
+                                "[LOADER][TRACE] vk.producer_dropped_on_throw " +
+                                "addr=0x" + target.Address.ToString("X16"));
                         }
                     }
                 }
 
+                var failedTargetAddresses = string.Join(
+                    ",",
+                    work.Targets.Select(t => "0x" + t.Address.ToString("X16")));
                 Console.Error.WriteLine(
                     $"[LOADER][ERROR] Vulkan offscreen draw failed " +
-                    $"mrt={work.Targets.Count}: {exception.Message}");
+                    $"mrt={work.Targets.Count} targets=[{failedTargetAddresses}]: " +
+                    $"{exception.Message}");
 
                 if (exception.Message.Contains(
                         nameof(Result.ErrorOutOfDeviceMemory),
