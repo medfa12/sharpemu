@@ -247,6 +247,47 @@ public sealed partial class DirectExecutionBackend
 				Console.Error.WriteLine("[LOADER][WARNING]   Could not read stack qwords.");
 			}
 
+			// The faulting REP MOVSB helper is a leaf (no frame), so the RBP walk
+			// skips its caller. The real memcpy call site is the return address at
+			// [rsp]. Dump code windows around every plausible code pointer in the
+			// first 48 stack slots so the argument set-up (how the bad source
+			// pointer was computed) can be disassembled offline.
+			try
+			{
+				Console.Error.WriteLine("[LOADER][INFO]   Stack return-address call-site windows:");
+				var seenRet = new HashSet<ulong>();
+				int dumped = 0;
+				for (int i = 0; i < 48 && dumped < 10; i++)
+				{
+					ulong slotAddr = rsp + (ulong)(i * 8);
+					ulong candidate;
+					try { candidate = (ulong)Marshal.ReadInt64((nint)slotAddr); }
+					catch { continue; }
+					if (candidate <= 0x1000 || !seenRet.Add(candidate))
+					{
+						continue;
+					}
+					if (!_hostMemory.Query(candidate, out var q) || (q.RawProtection & 0xF0) == 0)
+					{
+						continue;
+					}
+					try
+					{
+						byte[] w = new byte[64];
+						Marshal.Copy((nint)(candidate - 56), w, 0, w.Length);
+						Console.Error.WriteLine($"[LOADER][INFO]     ret@[rsp+0x{i * 8:X2}]=0x{candidate:X16} [ret-0x38..ret+0x08]: " + BitConverter.ToString(w).Replace("-", " "));
+						dumped++;
+					}
+					catch
+					{
+					}
+				}
+			}
+			catch
+			{
+				Console.Error.WriteLine("[LOADER][WARNING]   Could not dump stack call-site windows.");
+			}
+
 			try
 			{
 				Console.Error.WriteLine("[LOADER][INFO]   Frame chain (RBP walk):");
@@ -261,6 +302,19 @@ public sealed partial class DirectExecutionBackend
 					ulong ret = (ulong)Marshal.ReadInt64((nint)(frame + 8));
 					string extra = TryFormatNearestRuntimeSymbol(ret, out string retSym) ? $" [{retSym}]" : string.Empty;
 					Console.Error.WriteLine($"[LOADER][INFO]     frame#{i}: rbp=0x{frame:X16} ret=0x{ret:X16}{extra} next=0x{next:X16}");
+					if (i < 3 && ret > 48)
+					{
+						try
+						{
+							byte[] callSite = new byte[48];
+							Marshal.Copy((nint)(ret - 40), callSite, 0, callSite.Length);
+							Console.Error.WriteLine($"[LOADER][INFO]       call-site frame#{i} [ret-0x28..ret+0x08]: " + BitConverter.ToString(callSite).Replace("-", " "));
+						}
+						catch
+						{
+							Console.Error.WriteLine($"[LOADER][INFO]       call-site frame#{i}: unreadable");
+						}
+					}
 					if (next <= frame)
 					{
 						break;

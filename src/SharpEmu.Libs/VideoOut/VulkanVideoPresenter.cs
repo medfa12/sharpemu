@@ -1263,6 +1263,8 @@ internal static unsafe class VulkanVideoPresenter
         private bool _splashPresented;
         private bool _swapchainRecreateDeferred;
         private bool _tracedPresentedSwapchain;
+        private int _swapchainCaptureCount;
+        private int _frameDumpBudget = 6;
         private bool _swapchainReadbackPending;
         private bool _deviceLost;
         private bool _deviceLostLogged;
@@ -7512,7 +7514,12 @@ internal static unsafe class VulkanVideoPresenter
         {
             var traceDestination =
                 ShouldTracePresentedGuestImageContentsForDiagnostics() &&
-                !_tracedPresentedSwapchain;
+                _swapchainCaptureCount < 24;
+            if (traceDestination)
+            {
+                _swapchainCaptureCount++;
+            }
+
             _tracedPresentedSwapchain |= traceDestination;
             BeginDebugLabel(
                 _commandBuffer,
@@ -7727,6 +7734,37 @@ internal static unsafe class VulkanVideoPresenter
                     $"format={_swapchainFormat} nonzero_bytes={nonzeroBytes}/{byteCount} " +
                     $"nonblack_pixels={nonblackPixels}/{(ulong)_extent.Width * _extent.Height} " +
                     $"hash=0x{hash:X16}");
+
+                var contentThreshold = (long)_extent.Width * _extent.Height / 50;
+                if (_frameDumpBudget > 0 && nonblackPixels > contentThreshold)
+                {
+                    _frameDumpBudget--;
+                    const int outWidth = 384;
+                    const int outHeight = 216;
+                    var srcWidth = (int)_extent.Width;
+                    var srcHeight = (int)_extent.Height;
+                    var isBgra =
+                        _swapchainFormat == Format.B8G8R8A8Unorm ||
+                        _swapchainFormat == Format.B8G8R8A8Srgb;
+                    var rgb = new byte[outWidth * outHeight * 3];
+                    for (var oy = 0; oy < outHeight; oy++)
+                    {
+                        var sy = oy * srcHeight / outHeight;
+                        for (var ox = 0; ox < outWidth; ox++)
+                        {
+                            var sx = ox * srcWidth / outWidth;
+                            var si = (sy * srcWidth + sx) * 4;
+                            var di = (oy * outWidth + ox) * 3;
+                            rgb[di] = isBgra ? bytes[si + 2] : bytes[si];
+                            rgb[di + 1] = bytes[si + 1];
+                            rgb[di + 2] = isBgra ? bytes[si] : bytes[si + 2];
+                        }
+                    }
+
+                    Console.Error.WriteLine(
+                        $"[LOADER][FRAMEDUMP] frame={_swapchainCaptureCount} w={outWidth} h={outHeight} " +
+                        $"fmt=RGB nonblack={nonblackPixels} b64={Convert.ToBase64String(rgb)}");
+                }
             }
             finally
             {
