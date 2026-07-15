@@ -3959,7 +3959,7 @@ internal static unsafe class VulkanVideoPresenter
             VulkanGuestDepthTarget? depth = null)
         {
             var depthKey = depth is { } depthState
-                ? $"{(depthState.TestEnable ? 1 : 0)}:{(depthState.WriteEnable ? 1 : 0)}:{depthState.CompareOp}"
+                ? $"{depthState.Format}:{(depthState.TestEnable ? 1 : 0)}:{(depthState.WriteEnable ? 1 : 0)}:{depthState.CompareOp}"
                 : "none";
             var pipelineKey = new GraphicsPipelineKey(
                 GetShaderDigest(vertexSpirv),
