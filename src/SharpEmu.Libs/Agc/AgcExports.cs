@@ -410,6 +410,10 @@ public static class AgcExports
         // plain-VS path; the flag lets downstream logic refuse to force a
         // pass-through vertex count that would draw garbage.
         public bool NggEsAmplifying { get; set; }
+        // Set when the current indirect draw's ES program is a classified
+        // pass-through NGG primitive shader: it can run 1:1 as a plain vertex
+        // shader, so a bare instanced draw is really N pass-through vertices.
+        public bool NggEsPassthroughGeometry { get; set; }
         public TranslatedGuestDraw? TranslatedDraw { get; set; }
         public Dictionary<ulong, RenderTargetWriter> RenderTargetWriters { get; } = new();
         public ulong IndirectArgsAddress { get; set; }
@@ -3887,6 +3891,8 @@ public static class AgcExports
         var classified = cached.HasValue;
         var classification = cached ?? default;
         state.NggEsAmplifying = classified && classification.IsAmplifying;
+        state.NggEsPassthroughGeometry =
+            classified && !classification.IsAmplifying && isIndirectGeometry;
 
         if (_tracedNggDraws.Add(exportShaderAddress))
         {
@@ -3949,12 +3955,34 @@ public static class AgcExports
         var drawSequence = ++gpuState.WorkSequence;
         state.TranslatedDraw = null;
         state.GuestDrawKind = GuestDrawKind.None;
+        state.NggEsAmplifying = false;
+        state.NggEsPassthroughGeometry = false;
         DetectNggPrimitiveDraw(
             ctx,
             state,
             hasExportShader ? exportShaderAddress : 0,
             vertexCount,
             indexed);
+
+        // A bare pass-through NGG geometry draw arrives as an instanced indirect
+        // draw with a degenerate index count and no index buffer (indexCount<=1 x
+        // N instances). Each instance is one pass-through vertex, so run it
+        // non-indexed over N vertices instead of a degenerate 1-vertex draw that
+        // leaves the G-buffer empty.
+        if (state.NggEsPassthroughGeometry &&
+            vertexCount <= 1 &&
+            state.InstanceCount > 1 &&
+            state.IndexBufferCount == 0)
+        {
+            var passthroughVertexCount = state.InstanceCount;
+            TraceAgc(
+                $"agc.ngg_passthrough_expand es=0x{(hasExportShader ? exportShaderAddress : 0):X16} " +
+                $"verts={vertexCount}->{passthroughVertexCount} prim=0x{primitiveType:X}");
+            vertexCount = passthroughVertexCount;
+            indexed = false;
+            state.InstanceCount = 1;
+            state.PendingIndirectArgs = null;
+        }
         foreach (var target in renderTargets)
         {
             state.RenderTargetWriters[target.Address] = new RenderTargetWriter(
