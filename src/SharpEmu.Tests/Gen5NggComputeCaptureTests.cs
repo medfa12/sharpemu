@@ -91,7 +91,7 @@ public sealed class Gen5NggComputeCaptureTests
     public void CaptureVariant_ProducesDifferentSpirvThanNoCapture()
     {
         var plain = Compile(capture: null);
-        var captured = Compile(new NggComputeCapture(0, 4, 0));
+        var captured = Compile(new NggComputeCapture(0, 4, 0, 0));
 
         // The capture route adds an input built-in, a VGPR seed, and a buffer
         // store, so it must diverge from the drop-every-export compute path.
@@ -101,7 +101,7 @@ public sealed class Gen5NggComputeCaptureTests
     [Fact]
     public void CaptureVariant_IsStructurallyValidComputeModule()
     {
-        var module = SpirvModuleAssert.Parse(Compile(new NggComputeCapture(0, 4, 0)));
+        var module = SpirvModuleAssert.Parse(Compile(new NggComputeCapture(0, 4, 0, 0)));
         SpirvModuleAssert.AssertShaderModule(module, ExecutionModelGLCompute);
     }
 
@@ -110,7 +110,7 @@ public sealed class Gen5NggComputeCaptureTests
     {
         // The output vertex index is gl_GlobalInvocationID.x; the no-capture
         // path never declares that built-in.
-        var captured = SpirvModuleAssert.Parse(Compile(new NggComputeCapture(0, 4, 0)));
+        var captured = SpirvModuleAssert.Parse(Compile(new NggComputeCapture(0, 4, 0, 0)));
         var plain = SpirvModuleAssert.Parse(Compile(capture: null));
 
         Assert.True(
@@ -128,7 +128,7 @@ public sealed class Gen5NggComputeCaptureTests
         // land anywhere), so that module declares no descriptor-bound buffer.
         // The capture variant appends the output storage buffer at binding 0 and
         // stores into it.
-        var captured = SpirvModuleAssert.Parse(Compile(new NggComputeCapture(0, 4, 0)));
+        var captured = SpirvModuleAssert.Parse(Compile(new NggComputeCapture(0, 4, 0, 0)));
         var plain = SpirvModuleAssert.Parse(Compile(capture: null));
 
         Assert.True(

@@ -72,7 +72,8 @@ internal enum Gen5SpirvStage
 internal readonly record struct NggComputeCapture(
     int PositionBufferBindingIndex,
     uint PositionDwordStride,
-    uint VertexIndexVgpr);
+    uint VertexIndexVgpr,
+    uint ParamCount);
 
 internal sealed record Gen5SpirvShader(
     byte[] Spirv,

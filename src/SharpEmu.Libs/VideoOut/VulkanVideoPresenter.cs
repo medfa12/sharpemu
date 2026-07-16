@@ -3749,7 +3749,9 @@ internal static unsafe class VulkanVideoPresenter
                     "1",
                     StringComparison.Ordinal)
                     ? SpirvFixedShaders.CreateFullscreenVertex(draw.AttributeCount)
-                    : SpirvFixedShaders.CreatePositionPassthroughVertex(draw.AttributeCount);
+                    : SpirvFixedShaders.CreatePositionPassthroughVertex(
+                        draw.AttributeCount,
+                        captureLayout.ParamCount);
             }
             else if (vertexSpirv.Length == 0 &&
                 !TryCompileFullscreenVertexShader(
@@ -3972,24 +3974,30 @@ internal static unsafe class VulkanVideoPresenter
                 resources.CaptureReadbackSize = outputSize;
             }
 
-            // Draw the captured clip-space positions as a single location-0 vec4
-            // stream (14/7 -> R32G32B32A32_SFLOAT). External: owned by the child.
-            resources.VertexBuffers =
-            [
-                new VertexBufferResource
+            // Draw the captured clip-space positions as a location-0 vec4 stream
+            // (14/7 -> R32G32B32A32_SFLOAT), followed by one location-(1+i) vec4
+            // stream per captured parameter export laid out after the position in
+            // the same interleaved buffer. External: owned by the child.
+            const uint captureVec4Bytes = 4u * sizeof(float);
+            var vertexBuffers = new VertexBufferResource[1 + captureLayout.ParamCount];
+            for (var slot = 0u; slot < vertexBuffers.Length; slot++)
+            {
+                vertexBuffers[slot] = new VertexBufferResource
                 {
                     Buffer = outputBuffer,
                     Memory = default,
                     Size = outputSize,
-                    Location = 0,
+                    Location = slot,
                     ComponentCount = 4,
                     DataFormat = 14,
                     NumberFormat = 7,
                     Stride = vertexStride,
-                    OffsetBytes = 0,
+                    OffsetBytes = slot * captureVec4Bytes,
                     External = true,
-                },
-            ];
+                };
+            }
+
+            resources.VertexBuffers = vertexBuffers;
 
             // One 32-bit index per captured vertex, in dispatch order, so the
             // ordinary CmdBindIndexBuffer + CmdDrawIndexed branch is taken.

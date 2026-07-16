@@ -97,12 +97,17 @@ internal static class SpirvFixedShaders
     /// vec4 the capture-compute prepass wrote for this vertex (vertex-input
     /// location 0) and passes it straight to gl_Position. The pass-through NGG
     /// export has already applied the full transform in the compute prepass, so
-    /// the rasterizer just consumes those positions. Interpolated attributes the
-    /// pixel shader declares (0..attributeCount-1) are emitted as zero, mirroring
-    /// how <see cref="CreateFullscreenVertex"/> keeps the fragment inputs
-    /// satisfied without carrying real varyings.
+    /// the rasterizer just consumes those positions. The capture prepass also
+    /// writes the export shader's parameter exports (<paramref
+    /// name="capturedParamCount"/> vec4s at vertex-input locations 1..N); those
+    /// are forwarded to the pixel shader's varyings so it shades with real
+    /// values. Any attribute the pixel shader declares beyond the captured set
+    /// (up to <paramref name="attributeCount"/>) is emitted as zero so the
+    /// fragment inputs stay satisfied.
     /// </summary>
-    public static byte[] CreatePositionPassthroughVertex(uint attributeCount)
+    public static byte[] CreatePositionPassthroughVertex(
+        uint attributeCount,
+        uint capturedParamCount)
     {
         var module = new SpirvModuleBuilder();
         module.AddCapability(SpirvCapability.Shader);
@@ -121,14 +126,25 @@ internal static class SpirvFixedShaders
         module.AddName(position, "position");
         module.AddDecoration(position, SpirvDecoration.BuiltIn, (uint)SpirvBuiltIn.Position);
 
-        var attributes = new uint[attributeCount];
-        for (uint index = 0; index < attributeCount; index++)
+        // Captured parameter exports are bound at vertex-input locations 1..N
+        // (location 0 is the position). One vec4 each, in export order.
+        var paramInputs = new uint[capturedParamCount];
+        for (uint index = 0; index < capturedParamCount; index++)
+        {
+            paramInputs[index] =
+                module.AddGlobalVariable(inputVec4Pointer, SpirvStorageClass.Input);
+            module.AddName(paramInputs[index], $"paramInput{index}");
+            module.AddDecoration(paramInputs[index], SpirvDecoration.Location, index + 1u);
+        }
+
+        var outputCount = Math.Max(attributeCount, capturedParamCount);
+        var attributes = new uint[outputCount];
+        for (uint index = 0; index < outputCount; index++)
         {
             attributes[index] =
                 module.AddGlobalVariable(outputVec4Pointer, SpirvStorageClass.Output);
             module.AddName(attributes[index], $"attr{index}");
             module.AddDecoration(attributes[index], SpirvDecoration.Location, index);
-            module.AddDecoration(attributes[index], SpirvDecoration.NoPerspective);
         }
 
         var functionType = module.TypeFunction(voidType);
@@ -139,29 +155,43 @@ internal static class SpirvFixedShaders
         var positionValue = module.AddInstruction(SpirvOp.Load, vec4Type, positionInput);
         module.AddStatement(SpirvOp.Store, position, positionValue);
 
-        if (attributes.Length != 0)
+        uint zeroVec = 0;
+        if (outputCount > capturedParamCount)
         {
             var zeroFloat = module.ConstantFloat(floatType, 0f);
-            var zeroVec = module.AddInstruction(
+            zeroVec = module.AddInstruction(
                 SpirvOp.CompositeConstruct,
                 vec4Type,
                 zeroFloat,
                 zeroFloat,
                 zeroFloat,
                 zeroFloat);
-            foreach (var attribute in attributes)
+        }
+
+        for (uint index = 0; index < outputCount; index++)
+        {
+            if (index < capturedParamCount)
             {
-                module.AddStatement(SpirvOp.Store, attribute, zeroVec);
+                var paramValue = module.AddInstruction(
+                    SpirvOp.Load,
+                    vec4Type,
+                    paramInputs[index]);
+                module.AddStatement(SpirvOp.Store, attributes[index], paramValue);
+            }
+            else
+            {
+                module.AddStatement(SpirvOp.Store, attributes[index], zeroVec);
             }
         }
 
         module.AddStatement(SpirvOp.Return);
         module.EndFunction();
 
-        var interfaces = new uint[2 + attributes.Length];
+        var interfaces = new uint[2 + paramInputs.Length + attributes.Length];
         interfaces[0] = positionInput;
         interfaces[1] = position;
-        attributes.CopyTo(interfaces, 2);
+        paramInputs.CopyTo(interfaces, 2);
+        attributes.CopyTo(interfaces, 2 + paramInputs.Length);
         module.AddEntryPoint(SpirvExecutionModel.Vertex, main, "main", interfaces);
         return module.Build();
     }

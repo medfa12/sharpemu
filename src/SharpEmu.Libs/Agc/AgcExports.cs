@@ -4450,10 +4450,17 @@ public static class AgcExports
         invocationCount = effectiveCount;
 
         var vertexIndexVgpr = RecoverNggVertexIndexVgpr(exportState, vertexInputs);
+        // The game pixel shader reads the ES parameter exports (exp param,
+        // targets 32+) as varyings; capture them alongside POS0 so the
+        // pass-through raster VS can forward real values instead of zero. Each
+        // captured attribute is one vec4, laid out after the position vec4, so
+        // the per-vertex stride grows to 4 * (1 + paramCount) dwords.
+        var paramCount = CountNggParamExports(exportState);
         var capture = new NggComputeCapture(
             computeEvaluation.GlobalMemoryBindings.Count,
-            4,
-            vertexIndexVgpr);
+            4u * (1u + paramCount),
+            vertexIndexVgpr,
+            paramCount);
         if (!Gen5SpirvTranslator.TryCompileComputeShader(
                 exportState,
                 computeEvaluation,
@@ -4598,6 +4605,25 @@ public static class AgcExports
                 KernelMemoryCompatExports.TryReadTrackedLibcHeap(address, data))
             ? new VulkanGuestIndexBuffer(data, is32Bit)
             : null;
+    }
+
+    // Counts the export shader's parameter exports (exp param, hardware targets
+    // 32..63). The result is (highest param slot + 1) so a sparse set still
+    // reserves every intermediate slot; capped so a malformed program cannot
+    // blow up the per-vertex capture stride.
+    private static uint CountNggParamExports(Gen5ShaderState state)
+    {
+        const uint maxParamSlots = 16;
+        var maxParam = -1;
+        foreach (var instruction in state.Program.Instructions)
+        {
+            if (instruction.Control is Gen5ExportControl { Target: >= 32 and < 64 } export)
+            {
+                maxParam = Math.Max(maxParam, (int)(export.Target - 32u));
+            }
+        }
+
+        return Math.Min((uint)(maxParam + 1), maxParamSlots);
     }
 
     private static bool HasPixelColorExport(Gen5ShaderState state, uint target) =>

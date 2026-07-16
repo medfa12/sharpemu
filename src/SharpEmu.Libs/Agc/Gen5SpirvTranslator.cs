@@ -2364,17 +2364,30 @@ internal static partial class Gen5SpirvTranslator
             return true;
         }
 
-        // Position-capture route: redirect the POS0 (exp target 12) export to a
-        // device-local storage buffer indexed by gl_GlobalInvocationID.x, so a
-        // pass-through NGG export shader run as compute writes one clip-space
-        // vec4 per invocation. Every other export target is dropped in this
-        // first cut (params, PRIM target 20, POS0 targets 13-15).
+        // Position-capture route: redirect the POS0 (exp target 12) export and
+        // the parameter exports (targets 32..) to a device-local storage buffer
+        // indexed by gl_GlobalInvocationID.x, so a pass-through NGG export shader
+        // run as compute writes one clip-space vec4 plus each captured varyings
+        // vec4 per invocation. PRIM target 20 and POS0 targets 13-15 are dropped.
         private bool TryEmitComputeCaptureExport(
             Gen5ShaderInstruction instruction,
             Gen5ExportControl export,
             NggComputeCapture capture)
         {
-            if (export.Target != 12)
+            // POS0 (target 12) lands in the first vec4 slot; parameter exports
+            // (targets 32..) follow, one vec4 slot each, so the raster VS can
+            // forward them to the game pixel shader as varyings. Every other
+            // export target (PRIM target 20, POS0 targets 13-15) is dropped.
+            uint slotDword;
+            if (export.Target == 12)
+            {
+                slotDword = 0;
+            }
+            else if (export.Target >= 32 && export.Target - 32u < capture.ParamCount)
+            {
+                slotDword = 4u * (export.Target - 32u + 1u);
+            }
+            else
             {
                 return true;
             }
@@ -2401,9 +2414,10 @@ internal static partial class Gen5SpirvTranslator
             {
                 for (uint component = 0; component < 4; component++)
                 {
-                    var address = component == 0
+                    var offset = slotDword + component;
+                    var address = offset == 0
                         ? baseDword
-                        : IAdd(baseDword, UInt(component));
+                        : IAdd(baseDword, UInt(offset));
                     StoreBufferWord(
                         capture.PositionBufferBindingIndex,
                         address,
