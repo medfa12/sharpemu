@@ -178,7 +178,7 @@ public static class AgcExports
     private static readonly HashSet<uint> _tracedSubmittedDrawOpcodes = new();
     private static readonly Dictionary<(ulong Ps, ulong State, Gen5PixelOutputKind Output), byte[]> _pixelSpirvCache = new();
     private static readonly Dictionary<
-        (ulong Es, ulong EsState, ulong Ps, ulong PsState, string OutputLayout, uint Attributes),
+        (ulong Es, ulong EsState, ulong Ps, ulong PsState, string OutputLayout, uint Attributes, bool Flatten),
         (byte[] Vertex, byte[] Pixel)> _graphicsSpirvCache = new();
     private static readonly Dictionary<
         (ulong Cs, ulong State, uint LocalX, uint LocalY, uint LocalZ),
@@ -3975,12 +3975,14 @@ public static class AgcExports
         // N instances). Each instance is one pass-through vertex, so run it
         // non-indexed over N vertices instead of a degenerate 1-vertex draw that
         // leaves the G-buffer empty.
+        var flattenInstanceToVertex = false;
         if (state.NggEsPassthroughGeometry &&
             vertexCount <= 1 &&
             state.IndirectInstanceCount > 1 &&
             state.IndexBufferCount == 0)
         {
             var passthroughVertexCount = state.IndirectInstanceCount;
+            flattenInstanceToVertex = true;
             TraceAgc(
                 $"agc.ngg_passthrough_expand es=0x{(hasExportShader ? exportShaderAddress : 0):X16} " +
                 $"verts={vertexCount}->{passthroughVertexCount} inst={state.InstanceCount} " +
@@ -4026,6 +4028,7 @@ public static class AgcExports
                 pixelShaderAddress,
                 vertexCount,
                 indexed,
+                flattenInstanceToVertex,
                 out var translatedDraw,
                 out translationError))
         {
@@ -4145,6 +4148,7 @@ public static class AgcExports
         ulong pixelShaderAddress,
         uint vertexCount,
         bool indexed,
+        bool flattenInstanceToVertex,
         out TranslatedGuestDraw draw,
         out string error)
     {
@@ -4229,7 +4233,8 @@ public static class AgcExports
             pixelShaderAddress,
             pixelStateFingerprint,
             outputLayout,
-            attributeCount);
+            attributeCount,
+            flattenInstanceToVertex);
         var totalGlobalBuffers =
             pixelEvaluation.GlobalMemoryBindings.Count +
             exportEvaluation.GlobalMemoryBindings.Count;
@@ -4259,14 +4264,15 @@ public static class AgcExports
                     globalBufferBase: pixelEvaluation.GlobalMemoryBindings.Count,
                     totalGlobalBufferCount: totalGlobalBuffers + 2,
                     imageBindingBase: pixelEvaluation.ImageBindings.Count,
-                    scalarRegisterBufferIndex: totalGlobalBuffers + 1))
+                    scalarRegisterBufferIndex: totalGlobalBuffers + 1,
+                    instanceIdFromVertexIndex: flattenInstanceToVertex))
             {
                 return false;
             }
 
             compiled = (vertexShader.Spirv, pixelShader.Spirv);
             DumpSpirv(
-                "vs",
+                flattenInstanceToVertex ? "vs.flat" : "vs",
                 exportShaderAddress,
                 exportStateFingerprint,
                 compiled.Vertex,

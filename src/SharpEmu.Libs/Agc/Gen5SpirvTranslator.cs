@@ -90,7 +90,8 @@ internal static partial class Gen5SpirvTranslator
         int globalBufferBase = 0,
         int totalGlobalBufferCount = -1,
         int imageBindingBase = 0,
-        int scalarRegisterBufferIndex = -1)
+        int scalarRegisterBufferIndex = -1,
+        bool instanceIdFromVertexIndex = false)
     {
         var context = new CompilationContext(
             Gen5SpirvStage.Vertex,
@@ -103,7 +104,8 @@ internal static partial class Gen5SpirvTranslator
             globalBufferBase,
             totalGlobalBufferCount,
             imageBindingBase,
-            scalarRegisterBufferIndex);
+            scalarRegisterBufferIndex,
+            instanceIdFromVertexIndex);
         return context.TryCompile(out shader, out error);
     }
 
@@ -145,6 +147,7 @@ internal static partial class Gen5SpirvTranslator
         private readonly int _totalGlobalBufferCount;
         private readonly int _imageBindingBase;
         private readonly int _scalarRegisterBufferIndex;
+        private readonly bool _instanceIdFromVertexIndex;
         private readonly List<uint> _interfaces = [];
         private readonly Dictionary<uint, uint> _pixelInputs = [];
         private readonly Dictionary<uint, SpirvPixelOutput> _pixelOutputs = [];
@@ -225,7 +228,8 @@ internal static partial class Gen5SpirvTranslator
             int globalBufferBase,
             int totalGlobalBufferCount,
             int imageBindingBase,
-            int scalarRegisterBufferIndex)
+            int scalarRegisterBufferIndex,
+            bool instanceIdFromVertexIndex = false)
         {
             _stage = stage;
             _state = state;
@@ -240,6 +244,7 @@ internal static partial class Gen5SpirvTranslator
                 : totalGlobalBufferCount;
             _imageBindingBase = imageBindingBase;
             _scalarRegisterBufferIndex = scalarRegisterBufferIndex;
+            _instanceIdFromVertexIndex = instanceIdFromVertexIndex;
         }
 
         public bool TryCompile(out Gen5SpirvShader shader, out string error)
@@ -870,7 +875,12 @@ internal static partial class Gen5SpirvTranslator
             if (_stage == Gen5SpirvStage.Vertex)
             {
                 StoreV(5, Load(_uintType, _vertexIndexInput), guardWithExec: false);
-                StoreV(8, Load(_uintType, _instanceIndexInput), guardWithExec: false);
+                StoreV(
+                    8,
+                    Load(
+                        _uintType,
+                        _instanceIdFromVertexIndex ? _vertexIndexInput : _instanceIndexInput),
+                    guardWithExec: false);
             }
             else if (_stage == Gen5SpirvStage.Pixel)
             {
