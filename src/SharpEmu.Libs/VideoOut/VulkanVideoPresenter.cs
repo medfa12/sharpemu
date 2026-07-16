@@ -783,6 +783,9 @@ internal static unsafe class VulkanVideoPresenter
             // before this dispatch executes; without the pre-registration its
             // availability gate misses and it snapshots never-written guest
             // memory (zeros) instead of deferring to the compute-written image.
+            // The address is registered even when its guest render-target format
+            // is unmapped, because the execution path creates the VkImage via the
+            // sampled-format decoder regardless; the stored value is presence-only.
             foreach (var texture in textures)
             {
                 if (!texture.IsStorage || texture.Address == 0)
@@ -793,11 +796,8 @@ internal static unsafe class VulkanVideoPresenter
                 var guestTextureFormat = GetGuestTextureFormat(
                     texture.Format,
                     texture.NumberType);
-                if (guestTextureFormat != 0)
-                {
-                    _availableGuestImages[texture.Address] = guestTextureFormat;
-                    _renderTargetGuestImages[texture.Address] = guestTextureFormat;
-                }
+                _availableGuestImages[texture.Address] = guestTextureFormat;
+                _renderTargetGuestImages[texture.Address] = guestTextureFormat;
             }
 
             EnqueueGuestWorkLocked(
@@ -1180,21 +1180,22 @@ internal static unsafe class VulkanVideoPresenter
         uint format,
         uint numberType)
     {
-        var guestFormat = GetGuestTextureFormat(format, numberType);
-        if (address == 0 || guestFormat == 0)
+        if (address == 0)
         {
             return false;
         }
 
         lock (_gate)
         {
-            // Any address the GPU has rendered (this frame or a prior one) holds
-            // real content in its VkImage; guest memory for it was never written
-            // and reads back black. Prefer the rendered image even when the
-            // sampled format differs from the rendered format -- resolution binds
-            // a native-format view rather than uploading never-written memory.
-            // Genuine CPU-asset textures live only in _availableGuestImages and
-            // are deliberately not deferred here.
+            // Whether a GPU producer exists at an address is independent of the
+            // format the consumer samples it in, so deferral is decided purely by
+            // address presence in the GPU-produced sets. Any address the GPU has
+            // rendered (this frame or a prior one) holds real content in its
+            // VkImage; guest memory for it was never written and reads back black.
+            // Prefer the rendered image even when the sampled format differs from
+            // the rendered format -- resolution binds a native-format view rather
+            // than uploading never-written memory. Genuine CPU-asset textures live
+            // only in _availableGuestImages and are deliberately not deferred here.
             return _gpuGuestImages.ContainsKey(address) ||
                 _renderTargetGuestImages.ContainsKey(address);
         }

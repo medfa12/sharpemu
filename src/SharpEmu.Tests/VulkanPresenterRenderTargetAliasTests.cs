@@ -139,6 +139,59 @@ public sealed class VulkanPresenterRenderTargetAliasTests
         Assert.False(VulkanVideoPresenter.IsGpuGuestImageAvailable(
             RenderTarget, Rgba8SampleFormat, numberType: 0));
     }
+
+    // A guest data format / numberType pair that has no render-target mapping
+    // (GetGuestTextureFormat returns 0). Whether a producer exists at an address
+    // is independent of the format the consumer samples it in, so an unmapped
+    // sample format must not stop the deferral to the rendered image.
+    private const uint UnmappedSampleFormat = 35;
+    private const uint UnmappedSampleNumberType = 9;
+
+    [Fact]
+    public void UnmappedSampleFormatStillDefersToRenderTarget()
+    {
+        VulkanVideoPresenter.ResetGuestImageTrackingForTests();
+        VulkanVideoPresenter.RegisterPendingRenderTargetForTests(
+            RenderTarget, Rgba8RenderFormat, numberType: 0);
+
+        // The sampled format has no guest-format mapping, but a GPU producer is
+        // registered at the address, so the sample defers to the rendered image
+        // instead of snapshotting never-written guest memory.
+        Assert.True(VulkanVideoPresenter.IsGpuGuestImageAvailable(
+            RenderTarget, UnmappedSampleFormat, UnmappedSampleNumberType));
+    }
+
+    [Fact]
+    public void ComputeStorageOutputWithUnmappedFormatIsPreRegistered()
+    {
+        VulkanVideoPresenter.ResetGuestImageTrackingForTests();
+
+        // A compute dispatch writes a storage image whose guest render-target
+        // format is unmapped. The address must still be pre-registered so a
+        // same-submit graphics draw enqueued before the dispatch executes defers
+        // to the compute-written image rather than snapshotting guest zeros.
+        var storage = new VulkanGuestDrawTexture(
+            RenderTarget,
+            Width: 64,
+            Height: 64,
+            Format: UnmappedSampleFormat,
+            NumberType: UnmappedSampleNumberType,
+            RgbaPixels: [],
+            IsFallback: false,
+            IsStorage: true);
+
+        VulkanVideoPresenter.SubmitComputeDispatch(
+            shaderAddress: 0x1000,
+            computeSpirv: [0x1],
+            textures: [storage],
+            globalMemoryBuffers: [],
+            groupCountX: 1,
+            groupCountY: 1,
+            groupCountZ: 1);
+
+        Assert.True(VulkanVideoPresenter.IsGpuGuestImageAvailable(
+            RenderTarget, UnmappedSampleFormat, UnmappedSampleNumberType));
+    }
 }
 
 /// <summary>
