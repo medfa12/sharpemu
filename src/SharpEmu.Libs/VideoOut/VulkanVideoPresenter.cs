@@ -2070,7 +2070,7 @@ internal static unsafe class VulkanVideoPresenter
         private readonly HashSet<(ulong Address, Format Format)> _tracedCopyOnSample = new();
         private readonly HashSet<(ulong Address, uint Width, uint Height, uint Format)> _dumpedTextures = new();
         private readonly HashSet<(ulong Address, int Size)> _tracedGlobalBuffers = new();
-        private readonly HashSet<ulong> _tracedGuestImageContents = new();
+        private readonly HashSet<(ulong Address, Format Format)> _tracedGuestImageContents = new();
         private readonly Dictionary<ulong, int> _tracedGuestWriteCounts = new();
         private int _tracedVertexBufferCount;
         private readonly Dictionary<byte[], Pipeline> _computePipelines =
@@ -7684,7 +7684,7 @@ internal static unsafe class VulkanVideoPresenter
                         foreach (var boundTexture in translatedResources.Textures)
                         {
                             if (boundTexture.GuestImage is { } guestImage &&
-                                _tracedGuestImageContents.Add(guestImage.Address))
+                                _tracedGuestImageContents.Add((guestImage.Address, guestImage.Format)))
                             {
                                 TraceGuestImageContents(guestImage);
                             }
@@ -8631,7 +8631,7 @@ internal static unsafe class VulkanVideoPresenter
                 image.Width >= 1280 &&
                 image.Height >= 720;
             return (addressMatched || broadTrace) &&
-                   _tracedGuestImageContents.Add(image.Address);
+                   _tracedGuestImageContents.Add((image.Address, image.Format));
         }
 
         private static bool ShouldTraceGuestImageContentsForDiagnostics() =>
