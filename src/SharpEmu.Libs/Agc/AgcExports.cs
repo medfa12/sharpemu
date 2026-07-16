@@ -414,6 +414,10 @@ public static class AgcExports
         // pass-through NGG primitive shader: it can run 1:1 as a plain vertex
         // shader, so a bare instanced draw is really N pass-through vertices.
         public bool NggEsPassthroughGeometry { get; set; }
+        // Instance count read from the indirect args buffer (distinct from
+        // InstanceCount, which comes from ItNumInstances). For a bare NGG
+        // pass-through draw this is the pass-through vertex count.
+        public uint IndirectInstanceCount { get; set; }
         public TranslatedGuestDraw? TranslatedDraw { get; set; }
         public Dictionary<ulong, RenderTargetWriter> RenderTargetWriters { get; } = new();
         public ulong IndirectArgsAddress { get; set; }
@@ -3284,11 +3288,13 @@ public static class AgcExports
 
                 var effectiveCount = indexCount;
                 state.PendingIndirectArgs = null;
+                state.IndirectInstanceCount = 0;
                 if (op == ItDrawIndexIndirect && state.CurrentIndirectArgsAddress != 0)
                 {
                     var argsBase = state.CurrentIndirectArgsAddress;
                     ctx.TryReadUInt32(argsBase, out var argIndexCount);
                     ctx.TryReadUInt32(argsBase + 4, out var argInstanceCount);
+                    state.IndirectInstanceCount = Math.Max(argInstanceCount, 1u);
 
                     // The indirect count is CPU-read at DCB-parse time, before
                     // the producing compute has run on the GPU, so a degenerate
@@ -3971,16 +3977,16 @@ public static class AgcExports
         // leaves the G-buffer empty.
         if (state.NggEsPassthroughGeometry &&
             vertexCount <= 1 &&
-            state.InstanceCount > 1 &&
+            state.IndirectInstanceCount > 1 &&
             state.IndexBufferCount == 0)
         {
-            var passthroughVertexCount = state.InstanceCount;
+            var passthroughVertexCount = state.IndirectInstanceCount;
             TraceAgc(
                 $"agc.ngg_passthrough_expand es=0x{(hasExportShader ? exportShaderAddress : 0):X16} " +
-                $"verts={vertexCount}->{passthroughVertexCount} prim=0x{primitiveType:X}");
+                $"verts={vertexCount}->{passthroughVertexCount} inst={state.InstanceCount} " +
+                $"prim=0x{primitiveType:X}");
             vertexCount = passthroughVertexCount;
             indexed = false;
-            state.InstanceCount = 1;
             state.PendingIndirectArgs = null;
         }
         foreach (var target in renderTargets)
