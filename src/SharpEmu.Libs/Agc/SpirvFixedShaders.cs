@@ -238,4 +238,48 @@ internal static class SpirvFixedShaders
         module.AddExecutionMode(main, SpirvExecutionMode.OriginUpperLeft);
         return module.Build();
     }
+
+    // Diagnostic: writes a fixed opaque magenta to every color attachment, with
+    // no inputs. Used to prove a draw's geometry rasterizes into its target
+    // independent of the guest pixel shader's varyings/samplers.
+    public static byte[] CreateSolidColorFragment(uint targetCount)
+    {
+        var module = new SpirvModuleBuilder();
+        module.AddCapability(SpirvCapability.Shader);
+
+        var voidType = module.TypeVoid();
+        var floatType = module.TypeFloat(32);
+        var vec4Type = module.TypeVector(floatType, 4);
+        var outputVec4Pointer = module.TypePointer(SpirvStorageClass.Output, vec4Type);
+
+        var count = Math.Max(targetCount, 1u);
+        var outputs = new uint[count];
+        for (uint index = 0; index < count; index++)
+        {
+            outputs[index] =
+                module.AddGlobalVariable(outputVec4Pointer, SpirvStorageClass.Output);
+            module.AddName(outputs[index], $"outColor{index}");
+            module.AddDecoration(outputs[index], SpirvDecoration.Location, index);
+        }
+
+        var functionType = module.TypeFunction(voidType);
+        var main = module.BeginFunction(voidType, functionType);
+        module.AddName(main, "main");
+        module.AddLabel();
+
+        var one = module.ConstantFloat(floatType, 1f);
+        var zero = module.ConstantFloat(floatType, 0f);
+        var magenta = module.ConstantComposite(vec4Type, one, zero, one, one);
+        foreach (var output in outputs)
+        {
+            module.AddStatement(SpirvOp.Store, output, magenta);
+        }
+
+        module.AddStatement(SpirvOp.Return);
+        module.EndFunction();
+
+        module.AddEntryPoint(SpirvExecutionModel.Fragment, main, "main", outputs);
+        module.AddExecutionMode(main, SpirvExecutionMode.OriginUpperLeft);
+        return module.Build();
+    }
 }

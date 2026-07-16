@@ -3795,10 +3795,20 @@ internal static unsafe class VulkanVideoPresenter
                     CreateTranslatedDescriptorResources(
                         resources,
                         ShaderStageFlags.VertexBit | ShaderStageFlags.FragmentBit);
+                    // Diagnostic: replace the guest pixel shader with a solid-color
+                    // one to prove the captured geometry rasterizes into the target
+                    // independent of the guest PS's (currently unfed) varyings.
+                    var capturePixelSpirv = string.Equals(
+                        Environment.GetEnvironmentVariable("SHARPEMU_NGG_DEBUG"),
+                        "1",
+                        StringComparison.Ordinal)
+                        ? SpirvFixedShaders.CreateSolidColorFragment(
+                            (uint)renderTargetFormats.Count)
+                        : draw.PixelSpirv;
                     CreateTranslatedPipeline(
                         resources,
                         vertexSpirv,
-                        draw.PixelSpirv,
+                        capturePixelSpirv,
                         renderPass,
                         renderTargetFormats,
                         extent,
