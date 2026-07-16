@@ -8953,6 +8953,17 @@ internal static unsafe class VulkanVideoPresenter
                 ShouldTraceGuestImageContentsForDiagnostics() &&
                 image.Width >= 1280 &&
                 image.Height >= 720;
+            // NGG debug: re-read every frame (skip the per-(addr,format) dedup) so
+            // a target filled by a late NGG draw is not masked by an earlier empty
+            // read of the same surface.
+            if (string.Equals(
+                    Environment.GetEnvironmentVariable("SHARPEMU_NGG_DEBUG"),
+                    "1",
+                    StringComparison.Ordinal))
+            {
+                return addressMatched || broadTrace;
+            }
+
             return (addressMatched || broadTrace) &&
                    _tracedGuestImageContents.Add((image.Address, image.Format));
         }
