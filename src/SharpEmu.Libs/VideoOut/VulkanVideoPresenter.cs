@@ -4008,6 +4008,11 @@ internal static unsafe class VulkanVideoPresenter
             resources.VertexCount = invocationCount;
             resources.InstanceCount = 1;
             resources.HasIndirectArgs = false;
+            // The NGG pass-through geometry is a triangle list; the original
+            // indirect draw's VGT primitive type is the NGG *input* topology
+            // (points), which would rasterize the mesh as 3 points and produce
+            // no coverage. Force triangle-list for the reconstructed draw.
+            resources.Topology = PrimitiveTopology.TriangleList;
         }
 
         // Records the NGG position-capture compute prepass into the offscreen
