@@ -3984,9 +3984,12 @@ public static class AgcExports
             TraceAgc(
                 $"agc.ngg_passthrough_expand es=0x{(hasExportShader ? exportShaderAddress : 0):X16} " +
                 $"verts={vertexCount}->{passthroughVertexCount} inst={state.InstanceCount} " +
-                $"prim=0x{primitiveType:X}");
+                $"prim=0x{primitiveType:X}->0x4");
             vertexCount = passthroughVertexCount;
             indexed = false;
+            // VgtPrimitiveType is the NGG input topology (points); the emitted
+            // geometry is a triangle list.
+            primitiveType = 4;
             state.PendingIndirectArgs = null;
         }
         foreach (var target in renderTargets)
