@@ -3733,7 +3733,15 @@ internal static unsafe class VulkanVideoPresenter
                 // The pass-through export already applies the full transform in
                 // the compute prepass, so the raster VS just forwards the captured
                 // clip-space position bound at vertex-input location 0.
-                vertexSpirv = SpirvFixedShaders.CreatePositionPassthroughVertex(draw.AttributeCount);
+                // Diagnostic: a hardcoded fullscreen-triangle VS (ignores the
+                // vertex input) isolates the render pass/target/depth from the
+                // captured-vertex binding.
+                vertexSpirv = string.Equals(
+                    Environment.GetEnvironmentVariable("SHARPEMU_NGG_DEBUG"),
+                    "1",
+                    StringComparison.Ordinal)
+                    ? SpirvFixedShaders.CreateFullscreenVertex(draw.AttributeCount)
+                    : SpirvFixedShaders.CreatePositionPassthroughVertex(draw.AttributeCount);
             }
             else if (vertexSpirv.Length == 0 &&
                 !TryCompileFullscreenVertexShader(
