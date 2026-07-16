@@ -9102,6 +9102,19 @@ internal static unsafe class VulkanVideoPresenter
             }
 
             var drawScissor = ClampScissor(resources.Scissor, extent);
+            if (resources.CaptureInvocationCount > 0)
+            {
+                var vp = ClampViewport(resources.Viewport, extent);
+                AgcExports.TraceNgg(
+                    $"vk.ngg_raster extent={extent.Width}x{extent.Height} " +
+                    $"scissor={drawScissor.X},{drawScissor.Y},{drawScissor.Width}x{drawScissor.Height} " +
+                    $"rawScissor={(resources.Scissor.HasValue ? $"{resources.Scissor.Value.Width}x{resources.Scissor.Value.Height}" : "null")} " +
+                    $"viewport={vp.X},{vp.Y},{vp.Width}x{vp.Height} " +
+                    $"vtxCount={resources.VertexCount} idx32={resources.Index32Bit} " +
+                    $"vbufs={resources.VertexBuffers.Length} blends={resources.Blends.Length} " +
+                    $"skip={(drawScissor.Width == 0 || drawScissor.Height == 0)}");
+            }
+
             if (drawScissor.Width == 0 || drawScissor.Height == 0)
             {
                 _vk.CmdEndRenderPass(_commandBuffer);
