@@ -2184,6 +2184,14 @@ internal static unsafe class VulkanVideoPresenter
             public VkBuffer CaptureReadbackBuffer;
             public DeviceMemory CaptureReadbackMemory;
             public ulong CaptureReadbackSize;
+            // Diagnostic (NGG debug): host-visible copy of the render TARGET taken
+            // in the same command buffer immediately after the capture draw, so a
+            // later pass overwriting the target can't mask whether the geometry
+            // actually rasterized this frame.
+            public VkBuffer CaptureTargetReadbackBuffer;
+            public DeviceMemory CaptureTargetReadbackMemory;
+            public ulong CaptureTargetReadbackSize;
+            public uint CaptureTargetBpp;
         }
 
         private sealed class TextureResource
@@ -6907,6 +6915,53 @@ internal static unsafe class VulkanVideoPresenter
                     depthImage is not null);
                 RecordStorageImagesForRead(resources, PipelineStageFlags.FragmentShaderBit);
 
+                // NGG debug: copy the just-drawn target into a host buffer in THIS
+                // command buffer, so a later pass overwriting it can't hide whether
+                // the capture geometry rasterized.
+                if (resources.CaptureInvocationCount > 0 &&
+                    string.Equals(
+                        Environment.GetEnvironmentVariable("SHARPEMU_NGG_DEBUG"),
+                        "1",
+                        StringComparison.Ordinal))
+                {
+                    var t = targets[0];
+                    var bpp = GetReadbackBytesPerPixel(t.Format);
+                    if (bpp != 0)
+                    {
+                        var size = (ulong)t.Width * t.Height * bpp;
+                        resources.CaptureTargetReadbackBuffer = CreateBuffer(
+                            size,
+                            BufferUsageFlags.TransferDstBit,
+                            MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit,
+                            out resources.CaptureTargetReadbackMemory);
+                        resources.CaptureTargetReadbackSize = size;
+                        resources.CaptureTargetBpp = bpp;
+                        TransitionGuestImage(
+                            t,
+                            ImageLayout.TransferSrcOptimal,
+                            PipelineStageFlags.TransferBit,
+                            AccessFlags.TransferReadBit);
+                        var region = new BufferImageCopy
+                        {
+                            ImageSubresource = new ImageSubresourceLayers
+                            {
+                                AspectMask = ImageAspectFlags.ColorBit,
+                                MipLevel = 0,
+                                BaseArrayLayer = 0,
+                                LayerCount = 1,
+                            },
+                            ImageExtent = new Extent3D(t.Width, t.Height, 1),
+                        };
+                        _vk.CmdCopyImageToBuffer(
+                            _commandBuffer,
+                            t.Image,
+                            ImageLayout.TransferSrcOptimal,
+                            resources.CaptureTargetReadbackBuffer,
+                            1,
+                            &region);
+                    }
+                }
+
                 foreach (var target in targets)
                 {
                     TransitionGuestImage(
@@ -9226,6 +9281,40 @@ internal static unsafe class VulkanVideoPresenter
 
                 _vk.DestroyBuffer(_device, resources.CaptureReadbackBuffer, null);
                 FreeDeviceMemory(resources.CaptureReadbackMemory);
+            }
+
+            if (resources.CaptureTargetReadbackBuffer.Handle != 0)
+            {
+                void* mapped = null;
+                if (_vk.MapMemory(
+                        _device, resources.CaptureTargetReadbackMemory, 0,
+                        resources.CaptureTargetReadbackSize, 0, &mapped) == Result.Success)
+                {
+                    var bytes = new ReadOnlySpan<byte>(
+                        mapped, checked((int)resources.CaptureTargetReadbackSize));
+                    long nonzero = 0;
+                    foreach (var b in bytes)
+                    {
+                        if (b != 0)
+                        {
+                            nonzero++;
+                        }
+                    }
+
+                    var bpp = (int)resources.CaptureTargetBpp;
+                    var center = resources.CaptureTargetReadbackSize >= (ulong)bpp
+                        ? Convert.ToHexString(
+                            bytes.Slice((bytes.Length / 2) & ~(bpp - 1), bpp))
+                        : "";
+                    Console.Error.WriteLine(
+                        "[LOADER][TRACE] vk.ngg_target_readback " +
+                        $"nonzero_bytes={nonzero}/{resources.CaptureTargetReadbackSize} " +
+                        $"center={center}");
+                    _vk.UnmapMemory(_device, resources.CaptureTargetReadbackMemory);
+                }
+
+                _vk.DestroyBuffer(_device, resources.CaptureTargetReadbackBuffer, null);
+                FreeDeviceMemory(resources.CaptureTargetReadbackMemory);
             }
 
             if (resources.TransientFramebuffer.Handle != 0)
