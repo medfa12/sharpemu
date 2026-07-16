@@ -1631,12 +1631,39 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		return false;
 	}
 
+	private static readonly bool _traceTlsIdentity = string.Equals(
+		Environment.GetEnvironmentVariable("SHARPEMU_TRACE_TLS"),
+		"1",
+		StringComparison.Ordinal);
+	private readonly HashSet<ulong> _tracedTlsFallbackHandles = new HashSet<ulong>();
+
 	private unsafe void BindTlsBase(CpuContext context)
 	{
 		nint num = (nint)((context.FsBase != 0L) ? context.FsBase : context.GsBase);
 		if (num == 0)
 		{
 			num = _tlsBaseAddress;
+			// A guest thread binding with no per-thread FsBase collapses onto the
+			// shared TLS base, so its fs:[0] self-pointer collides with every other
+			// such thread -- the suspected cause of Havok's m_threadIDToContext
+			// lookup miss. Log once per guest handle to catch which threads lack a
+			// unique TLS identity.
+			if (_traceTlsIdentity)
+			{
+				var handle = SharpEmu.HLE.GuestThreadExecution.CurrentGuestThreadHandle;
+				bool firstForHandle;
+				lock (_tracedTlsFallbackHandles)
+				{
+					firstForHandle = _tracedTlsFallbackHandles.Add(handle);
+				}
+
+				if (firstForHandle)
+				{
+					Console.Error.WriteLine(
+						$"[LOADER][WARN] tls.identity_fallback guest_handle=0x{handle:X16} " +
+						$"shared_tls=0x{(ulong)_tlsBaseAddress:X16} (no per-thread FsBase)");
+				}
+			}
 		}
 		if (!HasActiveExecutionThread && num != _tlsBaseAddress)
 		{

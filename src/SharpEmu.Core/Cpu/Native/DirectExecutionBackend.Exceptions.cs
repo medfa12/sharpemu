@@ -184,6 +184,11 @@ public sealed partial class DirectExecutionBackend
 			{
 				Console.Error.WriteLine("[LOADER][INFO]   RIP symbol: " + symbol);
 			}
+			// The guest thread the fault happened on; cross-reference with
+			// tls.identity_fallback traces to tell whether a thread-identity
+			// (fs-based TLS) collision drove a Havok-style map-miss crash.
+			Console.Error.WriteLine(
+				$"[LOADER][INFO]   Guest thread handle: 0x{SharpEmu.HLE.GuestThreadExecution.CurrentGuestThreadHandle:X16}");
 			Console.Error.WriteLine($"[LOADER][INFO]   RAX: 0x{rax:X16}");
 			Console.Error.WriteLine($"[LOADER][INFO]   RBX: 0x{rbx:X16}");
 			Console.Error.WriteLine($"[LOADER][INFO]   RCX: 0x{rcx:X16}");
