@@ -311,7 +311,10 @@ internal static class Gen5ShaderTranslator
 
         lines = program.Instructions
             .Select(instruction =>
-                $"0x{instruction.Pc:X4} {instruction.Encoding} {instruction.Opcode}")
+                $"0x{instruction.Pc:X4} {instruction.Encoding} {instruction.Opcode} " +
+                $"w=[{string.Join(",", instruction.Words.Select(word => $"{word:X8}"))}] " +
+                $"dst=[{string.Join(",", instruction.Destinations)}] " +
+                $"src=[{string.Join(",", instruction.Sources)}]")
             .ToList();
         return true;
     }
