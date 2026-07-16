@@ -298,6 +298,24 @@ internal static class Gen5ShaderTranslator
         return true;
     }
 
+    internal static bool TryGetProgramInstructionSummary(
+        CpuContext ctx,
+        ulong address,
+        out IReadOnlyList<string> lines)
+    {
+        lines = Array.Empty<string>();
+        if (!TryDecodeProgram(ctx, address, out var program, out _))
+        {
+            return false;
+        }
+
+        lines = program.Instructions
+            .Select(instruction =>
+                $"0x{instruction.Pc:X4} {instruction.Encoding} {instruction.Opcode}")
+            .ToList();
+        return true;
+    }
+
     private static NggEsGeometryClassification ClassifyNggSendMessages(
         IReadOnlyList<Gen5ShaderInstruction> instructions)
     {

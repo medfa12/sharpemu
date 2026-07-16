@@ -163,6 +163,7 @@ public static class AgcExports
     private static readonly HashSet<(ulong, int)> _tracedFlipDecisions = new();
     private static readonly HashSet<ulong> _tracedComputeShaders = new();
     private static readonly HashSet<ulong> _tracedNggDraws = new();
+    private static readonly HashSet<ulong> _dumpedNggIr = new();
     private static readonly Dictionary<ulong, NggEsGeometryClassification?> _nggEsClassifications = new();
     private static readonly HashSet<ulong> _tracedNggStagesProbe = new();
     private static readonly HashSet<ulong> _tracedNggIndirectProbe = new();
@@ -3899,6 +3900,25 @@ public static class AgcExports
         state.NggEsAmplifying = classified && classification.IsAmplifying;
         state.NggEsPassthroughGeometry =
             classified && !classification.IsAmplifying && isIndirectGeometry;
+
+        if (state.NggEsPassthroughGeometry &&
+            exportShaderAddress != 0 &&
+            _dumpedNggIr.Add(exportShaderAddress) &&
+            string.Equals(
+                Environment.GetEnvironmentVariable("SHARPEMU_DUMP_NGG_IR"),
+                "1",
+                StringComparison.Ordinal) &&
+            Gen5ShaderTranslator.TryGetProgramInstructionSummary(
+                ctx,
+                exportShaderAddress,
+                out var nggIrLines))
+        {
+            TraceAgc($"agc.ngg_ir es=0x{exportShaderAddress:X16} count={nggIrLines.Count}");
+            foreach (var line in nggIrLines)
+            {
+                TraceAgc($"agc.ngg_ir es=0x{exportShaderAddress:X16} {line}");
+            }
+        }
 
         if (_tracedNggDraws.Add(exportShaderAddress))
         {
