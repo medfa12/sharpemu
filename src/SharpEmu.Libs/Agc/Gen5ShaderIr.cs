@@ -299,7 +299,8 @@ internal sealed record Gen5VertexInputBinding(
     ulong BaseAddress,
     uint Stride,
     uint OffsetBytes,
-    byte[] Data);
+    byte[] Data,
+    uint NumRecords = 0);
 
 internal sealed record Gen5ShaderEvaluation(
     IReadOnlyList<uint> InitialScalarRegisters,

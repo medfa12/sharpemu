@@ -654,7 +654,8 @@ internal static class Gen5ShaderScalarEvaluator
             descriptor.BaseAddress,
             bindingStride,
             bindingOffset,
-            bindingData);
+            bindingData,
+            descriptor.NumRecords);
         return true;
     }
 

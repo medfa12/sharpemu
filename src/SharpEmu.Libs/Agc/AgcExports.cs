@@ -4438,6 +4438,17 @@ public static class AgcExports
             return;
         }
 
+        // The indirect instance count (invocationCount) is NOT the vertex count:
+        // NGG produces the mesh described by the vertex buffer, whose real length
+        // is the fetch descriptor's record count. Drawing more than that emits
+        // degenerate w=0 triangles that kill the whole draw, so cap the dispatch
+        // and draw to the actual vertex count when it is known.
+        var recordCount = vertexInputs.Count > 0 ? vertexInputs[0].NumRecords : 0;
+        var effectiveCount = recordCount is > 0 and <= 1_048_576
+            ? Math.Min(recordCount, invocationCount)
+            : invocationCount;
+        invocationCount = effectiveCount;
+
         var vertexIndexVgpr = RecoverNggVertexIndexVgpr(exportState, vertexInputs);
         var capture = new NggComputeCapture(
             computeEvaluation.GlobalMemoryBindings.Count,
@@ -4486,8 +4497,8 @@ public static class AgcExports
             $"agc.ngg_compute_compile es=0x{exportShaderAddress:X16} " +
             $"vgpr={vertexIndexVgpr} out_binding={capture.PositionBufferBindingIndex} " +
             $"stride={capture.PositionDwordStride} bytes={computeShader.Spirv.Length} " +
-            $"invocations={invocationCount} inputs=[{inputAddrs}] vtxInputs=[{vtxAddrs}] " +
-            $"vtx0=[{vtxHead}]");
+            $"invocations={invocationCount} records={recordCount} inputs=[{inputAddrs}] " +
+            $"vtxInputs=[{vtxAddrs}] vtx0=[{vtxHead}]");
     }
 
     /// <summary>
