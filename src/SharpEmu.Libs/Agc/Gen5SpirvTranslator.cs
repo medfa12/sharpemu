@@ -983,16 +983,18 @@ internal static partial class Gen5SpirvTranslator
                     }
                 }
 
-                // Position-capture route only: seed the ES's vertex-index VGPR
-                // from gl_GlobalInvocationID.x, mirroring the vertex-stage
-                // v5<-VertexIndex seed above. One invocation produces one output
-                // vertex, so the global invocation id is the vertex index.
-                if (_computeCapture is { } capture)
+                // Position-capture route only: seed the vertex-id and instance-id
+                // VGPRs (v5/v8) from gl_GlobalInvocationID.x, mirroring the
+                // vertex-stage v5<-VertexIndex/v8<-InstanceIndex seed above. The
+                // ES recomputes its fetch index from these (e.g. v_cndmask v0,
+                // v8, v5), so seeding v0 directly is overwritten; seeding the id
+                // registers the shader reads makes that computation yield the
+                // invocation index. One invocation produces one output vertex.
+                if (_computeCapture is not null)
                 {
-                    StoreV(
-                        capture.VertexIndexVgpr,
-                        LoadGlobalInvocationIdX(),
-                        guardWithExec: false);
+                    var invocationIndex = LoadGlobalInvocationIdX();
+                    StoreV(5, invocationIndex, guardWithExec: false);
+                    StoreV(8, invocationIndex, guardWithExec: false);
                 }
             }
         }
