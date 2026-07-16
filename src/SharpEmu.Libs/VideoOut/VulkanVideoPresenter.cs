@@ -654,6 +654,29 @@ internal static unsafe class VulkanVideoPresenter
                 $"[LOADER][TRACE] vk.submit_call kind=SubmitOffscreenTranslatedDraw " +
                 $"targets={targets.Count} first=0x{firstTarget.Address:X16} " +
                 $"{firstTarget.Width}x{firstTarget.Height} textures={textures.Count}");
+
+            // For the final display composite (the fullscreen pass that writes a
+            // registered flip buffer), list each sampled input so we can tell
+            // whether it binds a GPU-produced image (RgbaPixels empty -> resolved
+            // to the rendered VkImage) or falls back to a CPU upload of
+            // never-written guest memory (RgbaPixels populated -> reads black).
+            bool isDisplayComposite;
+            lock (_gate)
+            {
+                isDisplayComposite = _registeredDisplayBuffers.Contains(firstTarget.Address);
+            }
+            if (isDisplayComposite)
+            {
+                for (var i = 0; i < textures.Count; i++)
+                {
+                    var t = textures[i];
+                    Console.Error.WriteLine(
+                        $"[LOADER][TRACE] vk.composite_input target=0x{firstTarget.Address:X16} " +
+                        $"idx={i} addr=0x{t.Address:X16} fmt={t.Format} num={t.NumberType} " +
+                        $"deferred={(t.RgbaPixels.Length == 0)} fallback={t.IsFallback} " +
+                        $"storage={t.IsStorage}");
+                }
+            }
         }
 
         var effectiveRenderState = renderState ?? VulkanGuestRenderState.Default;
