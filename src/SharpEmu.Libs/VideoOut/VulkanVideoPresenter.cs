@@ -6892,7 +6892,7 @@ internal static unsafe class VulkanVideoPresenter
                 if (resources.CaptureInvocationCount > 0)
                 {
                     RecordNggCaptureDispatch(resources);
-                    TraceVulkanShader(
+                    AgcExports.TraceNgg(
                         $"vk.ngg_compute_draw invocations={resources.CaptureInvocationCount} " +
                         $"outBytes={(ulong)resources.CaptureInvocationCount * 16} " +
                         $"target=0x{work.Targets[0].Address:X16} " +

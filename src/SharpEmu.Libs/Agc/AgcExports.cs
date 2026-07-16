@@ -4024,7 +4024,7 @@ public static class AgcExports
             // above) so no other draw is affected; the graphics fallback below
             // is unchanged for safety while the compute prepass is wired up.
             passthroughCompute = true;
-            TraceAgc(
+            TraceNgg(
                 $"agc.ngg_passthrough_expand es=0x{(hasExportShader ? exportShaderAddress : 0):X16} " +
                 $"verts={vertexCount}->{passthroughVertexCount} inst={state.InstanceCount} " +
                 $"prim=0x{primitiveType:X}->0x4");
@@ -4493,7 +4493,7 @@ public static class AgcExports
         var vtxHead = vtxBinding is { Data.Length: > 0 }
             ? Convert.ToHexString(vtxBinding.Data.AsSpan(0, Math.Min(24, vtxBinding.Data.Length)))
             : "none";
-        TraceAgc(
+        TraceNgg(
             $"agc.ngg_compute_compile es=0x{exportShaderAddress:X16} " +
             $"vgpr={vertexIndexVgpr} out_binding={capture.PositionBufferBindingIndex} " +
             $"stride={capture.PositionDwordStride} bytes={computeShader.Spirv.Length} " +
@@ -7205,6 +7205,21 @@ public static class AgcExports
         }
 
         Console.Error.WriteLine($"[LOADER][TRACE] {message}");
+    }
+
+    private static readonly bool _nggDebug = string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_NGG_DEBUG"),
+        "1",
+        StringComparison.Ordinal);
+
+    // Always logs NGG-lifecycle diagnostics under SHARPEMU_NGG_DEBUG, independent
+    // of the LOG_AGC gate, so a single boot shows the full capture path.
+    internal static void TraceNgg(string message)
+    {
+        if (_nggDebug)
+        {
+            Console.Error.WriteLine($"[LOADER][TRACE] {message}");
+        }
     }
 
     private static void TraceAgcShader(string message)
