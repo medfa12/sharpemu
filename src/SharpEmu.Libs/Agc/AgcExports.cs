@@ -4473,11 +4473,21 @@ public static class AgcExports
         var vtxAddrs = string.Join(
             ",",
             vertexInputs.Select(v => $"0x{v.BaseAddress:X}(stride{v.Stride})"));
+        // Dump the first vertex (24 bytes) of the snapshot bound for the MUBUF
+        // fetch address, to tell whether the fetched positions are real floats or
+        // a zero/GPU-generated buffer that was empty at parse time.
+        var vtxAddr = vertexInputs.Count > 0 ? vertexInputs[0].BaseAddress : 0;
+        var vtxBinding = computeEvaluation.GlobalMemoryBindings
+            .FirstOrDefault(b => b.BaseAddress == vtxAddr);
+        var vtxHead = vtxBinding is { Data.Length: > 0 }
+            ? Convert.ToHexString(vtxBinding.Data.AsSpan(0, Math.Min(24, vtxBinding.Data.Length)))
+            : "none";
         TraceAgc(
             $"agc.ngg_compute_compile es=0x{exportShaderAddress:X16} " +
             $"vgpr={vertexIndexVgpr} out_binding={capture.PositionBufferBindingIndex} " +
             $"stride={capture.PositionDwordStride} bytes={computeShader.Spirv.Length} " +
-            $"invocations={invocationCount} inputs=[{inputAddrs}] vtxInputs=[{vtxAddrs}]");
+            $"invocations={invocationCount} inputs=[{inputAddrs}] vtxInputs=[{vtxAddrs}] " +
+            $"vtx0=[{vtxHead}]");
     }
 
     /// <summary>
