@@ -8316,12 +8316,24 @@ internal static unsafe class VulkanVideoPresenter
                         (int)bytesPerPixel);
                     var center = Convert.ToHexString(
                         bytes.Slice(centerOffset, (int)bytesPerPixel));
-                    TraceVulkanShader(
+                    var imageLine =
                         $"vk.guest_image addr=0x{image.Address:X16} " +
                         $"size={image.Width}x{image.Height} format={image.Format} " +
                         $"nonzero_bytes={nonzeroBytes}/{byteCount} " +
                         $"nonblack_pixels={nonblackPixels}/{(ulong)image.Width * image.Height} " +
-                        $"center={center} hash=0x{hash:X16}");
+                        $"center={center} hash=0x{hash:X16}";
+                    // An explicitly targeted address (SHARPEMU_TRACE_GUEST_IMAGE_ADDRS)
+                    // always logs, independent of the broader vk-shader trace gate,
+                    // so a single address can be watched every frame without the
+                    // full guest-image trace flooding the log.
+                    if (ShouldTraceGuestImageAddressForDiagnostics(image.Address))
+                    {
+                        Console.Error.WriteLine("[LOADER][TRACE] " + imageLine);
+                    }
+                    else
+                    {
+                        TraceVulkanShader(imageLine);
+                    }
                     var isRgba8 = image.Format == Format.R8G8B8A8Unorm;
                     var isHdr16 = image.Format == Format.R16G16B16A16Sfloat;
                     var isHdr32 = image.Format == Format.R32G32B32A32Sfloat;
