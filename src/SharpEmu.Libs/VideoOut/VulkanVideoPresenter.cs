@@ -9167,6 +9167,8 @@ internal static unsafe class VulkanVideoPresenter
                     $"viewport={vp.X},{vp.Y},{vp.Width}x{vp.Height} " +
                     $"vtxCount={resources.VertexCount} idx32={resources.Index32Bit} " +
                     $"vbufs={resources.VertexBuffers.Length} blends={resources.Blends.Length} " +
+                    $"hasDepth={hasDepth} idxHandle={(resources.IndexBuffer.Handle != 0)} " +
+                    $"pipeline={(resources.Pipeline.Handle != 0)} inst={resources.InstanceCount} " +
                     $"skip={(drawScissor.Width == 0 || drawScissor.Height == 0)}");
             }
 
