@@ -992,6 +992,12 @@ internal static partial class Gen5SpirvTranslator
                 // invocation index. One invocation produces one output vertex.
                 if (_computeCapture is not null)
                 {
+                    // Force the execution mask on. NGG shaders use subgroup ops,
+                    // so the prologue above set the wave masks but left _exec
+                    // unset; the position-capture export (and any exec-guarded
+                    // body store) is gated on _exec, so without this every
+                    // invocation writes nothing. One invocation = one live vertex.
+                    Store(_exec, _module.ConstantBool(true));
                     var invocationIndex = LoadGlobalInvocationIdX();
                     StoreV(5, invocationIndex, guardWithExec: false);
                     StoreV(8, invocationIndex, guardWithExec: false);
