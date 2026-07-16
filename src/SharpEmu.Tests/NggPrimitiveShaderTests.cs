@@ -98,4 +98,96 @@ public sealed class NggPrimitiveShaderTests
 
         Assert.Equal(NggMessageId.Unknown, message.Message);
     }
+
+    [Fact]
+    public void SendMessage_GsAllocReq_IsNotAmplification()
+    {
+        var message = NggSendMessage.Decode(0xBF90_0000u | 9u);
+
+        Assert.False(message.IsGeometryAmplification);
+    }
+
+    [Fact]
+    public void SendMessage_GsEmit_IsAmplification()
+    {
+        var simm16 = 2u | (2u << 4); // GS message, EMIT operation
+        var message = NggSendMessage.Decode(0xBF90_0000u | simm16);
+
+        Assert.True(message.IsGeometryAmplification);
+    }
+
+    [Fact]
+    public void Classification_GsAllocReqOnly_IsPassThrough()
+    {
+        var messages = new[]
+        {
+            NggSendMessage.Decode(0xBF90_0000u | 9u), // GS_ALLOC_REQ
+        };
+
+        var result = NggEsGeometryClassification.FromSendMessages(messages);
+
+        Assert.Equal(NggEsGeometryMode.PassThrough, result.Mode);
+        Assert.False(result.IsAmplifying);
+        Assert.Equal(1, result.AllocReqCount);
+        Assert.Equal(0, result.EmitCount);
+        Assert.Equal(0, result.CutCount);
+    }
+
+    [Fact]
+    public void Classification_NoMessages_IsPassThrough()
+    {
+        var result = NggEsGeometryClassification.FromSendMessages(
+            System.Array.Empty<NggSendMessage>());
+
+        Assert.Equal(NggEsGeometryMode.PassThrough, result.Mode);
+        Assert.False(result.IsAmplifying);
+    }
+
+    [Fact]
+    public void Classification_WithEmit_IsAmplifying()
+    {
+        var messages = new[]
+        {
+            NggSendMessage.Decode(0xBF90_0000u | 9u),             // GS_ALLOC_REQ
+            NggSendMessage.Decode(0xBF90_0000u | 2u | (2u << 4)), // GS EMIT
+        };
+
+        var result = NggEsGeometryClassification.FromSendMessages(messages);
+
+        Assert.Equal(NggEsGeometryMode.Amplifying, result.Mode);
+        Assert.True(result.IsAmplifying);
+        Assert.Equal(1, result.AllocReqCount);
+        Assert.Equal(1, result.EmitCount);
+        Assert.Equal(0, result.CutCount);
+    }
+
+    [Fact]
+    public void Classification_WithCut_IsAmplifying()
+    {
+        var messages = new[]
+        {
+            NggSendMessage.Decode(0xBF90_0000u | 2u | (1u << 4)), // GS CUT
+        };
+
+        var result = NggEsGeometryClassification.FromSendMessages(messages);
+
+        Assert.Equal(NggEsGeometryMode.Amplifying, result.Mode);
+        Assert.Equal(0, result.EmitCount);
+        Assert.Equal(1, result.CutCount);
+    }
+
+    [Fact]
+    public void Classification_EmitCut_CountsBoth()
+    {
+        var messages = new[]
+        {
+            NggSendMessage.Decode(0xBF90_0000u | 2u | (3u << 4)), // GS EMIT_CUT
+        };
+
+        var result = NggEsGeometryClassification.FromSendMessages(messages);
+
+        Assert.Equal(NggEsGeometryMode.Amplifying, result.Mode);
+        Assert.Equal(1, result.EmitCount);
+        Assert.Equal(1, result.CutCount);
+    }
 }

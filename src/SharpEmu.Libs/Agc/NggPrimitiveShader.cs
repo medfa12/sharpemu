@@ -119,4 +119,89 @@ internal readonly record struct NggSendMessage(
     }
 
     public bool IsGsAllocReq => Message == NggMessageId.GsAllocReq;
+
+    /// <summary>
+    /// True when the message advances or terminates a primitive stream
+    /// (<c>GS_EMIT</c>/<c>GS_CUT</c>), i.e. the shader is amplifying geometry
+    /// rather than passing vertices through 1:1.
+    /// </summary>
+    public bool IsGeometryAmplification =>
+        (Message == NggMessageId.Gs || Message == NggMessageId.GsDone) &&
+        GsOperation != NggGsOperation.Nop;
+}
+
+/// <summary>
+/// How an NGG ES (merged ES/GS) primitive shader produces its output stream.
+/// </summary>
+internal enum NggEsGeometryMode
+{
+    /// <summary>
+    /// The shader only requests its per-subgroup allocation
+    /// (<c>GS_ALLOC_REQ</c>) — or issues no geometry message at all — and
+    /// exports one output vertex per invocation. It can be run as a plain
+    /// vertex shader (one thread == one output vertex).
+    /// </summary>
+    PassThrough,
+
+    /// <summary>
+    /// The shader issues <c>GS_EMIT</c>/<c>GS_CUT</c>: it amplifies geometry.
+    /// Running it as a plain vertex shader drops the amplification and renders
+    /// garbage; a real geometry backend is required.
+    /// </summary>
+    Amplifying,
+}
+
+/// <summary>
+/// Result of scanning a decoded ES primitive-shader program for the
+/// <c>s_sendmsg</c> messages that distinguish a pass-through NGG draw (safe to
+/// run as a plain vertex shader) from an amplifying one (not).
+/// </summary>
+internal readonly record struct NggEsGeometryClassification(
+    NggEsGeometryMode Mode,
+    int AllocReqCount,
+    int EmitCount,
+    int CutCount)
+{
+    public bool IsAmplifying => Mode == NggEsGeometryMode.Amplifying;
+
+    /// <summary>
+    /// Classifies an ES program from its decoded <c>s_sendmsg</c> payloads.
+    /// Presence of any <c>GS_EMIT</c>/<c>GS_CUT</c> marks the shader
+    /// amplifying; otherwise it is treated as pass-through.
+    /// </summary>
+    public static NggEsGeometryClassification FromSendMessages(
+        IEnumerable<NggSendMessage> messages)
+    {
+        var allocReq = 0;
+        var emit = 0;
+        var cut = 0;
+        foreach (var message in messages)
+        {
+            if (message.IsGsAllocReq)
+            {
+                allocReq++;
+                continue;
+            }
+
+            if (!message.IsGeometryAmplification)
+            {
+                continue;
+            }
+
+            if (message.GsOperation is NggGsOperation.Emit or NggGsOperation.EmitCut)
+            {
+                emit++;
+            }
+
+            if (message.GsOperation is NggGsOperation.Cut or NggGsOperation.EmitCut)
+            {
+                cut++;
+            }
+        }
+
+        var mode = emit + cut > 0
+            ? NggEsGeometryMode.Amplifying
+            : NggEsGeometryMode.PassThrough;
+        return new NggEsGeometryClassification(mode, allocReq, emit, cut);
+    }
 }

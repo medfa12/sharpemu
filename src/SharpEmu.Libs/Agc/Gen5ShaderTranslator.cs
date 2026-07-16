@@ -276,6 +276,45 @@ internal static class Gen5ShaderTranslator
         return true;
     }
 
+    /// <summary>
+    /// Decodes an ES primitive-shader program and classifies its
+    /// <c>s_sendmsg</c> usage so callers can tell a pass-through NGG draw
+    /// (safe to run as a plain vertex shader) from an amplifying one. This is a
+    /// telemetry/guard helper; it does not affect translation.
+    /// </summary>
+    internal static bool TryClassifyNggExportShader(
+        CpuContext ctx,
+        ulong address,
+        out NggEsGeometryClassification classification,
+        out string error)
+    {
+        classification = default;
+        if (!TryDecodeProgram(ctx, address, out var program, out error))
+        {
+            return false;
+        }
+
+        classification = ClassifyNggSendMessages(program.Instructions);
+        return true;
+    }
+
+    private static NggEsGeometryClassification ClassifyNggSendMessages(
+        IReadOnlyList<Gen5ShaderInstruction> instructions)
+    {
+        var messages = new List<NggSendMessage>();
+        foreach (var instruction in instructions)
+        {
+            if (instruction.Encoding == Gen5ShaderEncoding.Sopp &&
+                string.Equals(instruction.Opcode, "SSendmsg", StringComparison.Ordinal) &&
+                instruction.Words.Count >= 1)
+            {
+                messages.Add(NggSendMessage.Decode(instruction.Words[0]));
+            }
+        }
+
+        return NggEsGeometryClassification.FromSendMessages(messages);
+    }
+
     private static bool TryDecodeProgram(
         CpuContext ctx,
         ulong address,

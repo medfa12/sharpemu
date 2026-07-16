@@ -163,6 +163,7 @@ public static class AgcExports
     private static readonly HashSet<(ulong, int)> _tracedFlipDecisions = new();
     private static readonly HashSet<ulong> _tracedComputeShaders = new();
     private static readonly HashSet<ulong> _tracedNggDraws = new();
+    private static readonly Dictionary<ulong, NggEsGeometryClassification?> _nggEsClassifications = new();
     private static readonly HashSet<ulong> _tracedNggStagesProbe = new();
     private static readonly HashSet<ulong> _tracedNggIndirectProbe = new();
     private static readonly HashSet<(uint, uint, uint)> _tracedDepthProbe = new();
@@ -404,6 +405,11 @@ public static class AgcExports
         public Dictionary<uint, uint> UcRegisters { get; } = new();
         public TextureDescriptor? PresenterTexture { get; set; }
         public GuestDrawKind GuestDrawKind { get; set; }
+        // Set when an NGG primitive draw's ES program was found to amplify
+        // geometry (GS_EMIT/GS_CUT). Such a draw cannot be rendered by the
+        // plain-VS path; the flag lets downstream logic refuse to force a
+        // pass-through vertex count that would draw garbage.
+        public bool NggEsAmplifying { get; set; }
         public TranslatedGuestDraw? TranslatedDraw { get; set; }
         public Dictionary<ulong, RenderTargetWriter> RenderTargetWriters { get; } = new();
         public ulong IndirectArgsAddress { get; set; }
@@ -3816,6 +3822,7 @@ public static class AgcExports
     /// amplification capture that turns this into real geometry is future work.
     /// </summary>
     private static void DetectNggPrimitiveDraw(
+        CpuContext ctx,
         SubmittedDcbState state,
         ulong exportShaderAddress,
         uint vertexCount,
@@ -3844,22 +3851,71 @@ public static class AgcExports
         }
 
         var stages = NggShaderStages.Decode(stagesEnRaw);
-        if (!stages.IsNggPrimitiveDraw)
+        // The PRIMGEN_EN bit position varies across GFX10 revisions and reads
+        // clear on this title's geometry draws, so also classify any indirect
+        // geometry draw: its ES program is the real geometry front-end whether
+        // or not that particular register bit is set.
+        if (!stages.IsNggPrimitiveDraw && !isIndirectGeometry)
         {
             return;
         }
 
-        state.GuestDrawKind = GuestDrawKind.NggPrimitive;
+        if (stages.IsNggPrimitiveDraw)
+        {
+            state.GuestDrawKind = GuestDrawKind.NggPrimitive;
+        }
+
+        // Classify the ES program's s_sendmsg usage: a pass-through NGG shader
+        // (GS_ALLOC_REQ only) can run 1:1 as a plain vertex shader, whereas an
+        // amplifying one (GS_EMIT/GS_CUT) cannot. This turns the manual
+        // boot-trace check into an automatic runtime guard: the register bits
+        // (PRIMGEN_PASSTHRU_EN/GS_EN) are only a hint; the instruction scan is
+        // authoritative.
+        if (!_nggEsClassifications.TryGetValue(exportShaderAddress, out var cached))
+        {
+            cached = exportShaderAddress != 0 &&
+                Gen5ShaderTranslator.TryClassifyNggExportShader(
+                    ctx,
+                    exportShaderAddress,
+                    out var decoded,
+                    out _)
+                ? decoded
+                : null;
+            _nggEsClassifications[exportShaderAddress] = cached;
+        }
+
+        var classified = cached.HasValue;
+        var classification = cached ?? default;
+        state.NggEsAmplifying = classified && classification.IsAmplifying;
 
         if (_tracedNggDraws.Add(exportShaderAddress))
         {
+            var esGeom = !classified
+                ? "unknown"
+                : (classification.IsAmplifying ? "amplifying" : "passthrough");
             TraceAgc(
                 $"agc.ngg_draw es=0x{exportShaderAddress:X16} " +
-                $"stages=0x{stages.Raw:X8} primgen=1 " +
+                $"stages=0x{stages.Raw:X8} primgen={(stages.PrimgenEn ? 1 : 0)} " +
+                $"indirect={(isIndirectGeometry ? 1 : 0)} " +
                 $"passthru={(stages.PrimgenPassthruEn ? 1 : 0)} " +
                 $"gs_fast_launch={stages.GsFastLaunch} " +
                 $"es_en={(stages.EsEn ? 1 : 0)} gs_en={(stages.GsEn ? 1 : 0)} " +
+                $"es_geom={esGeom} " +
+                $"allocReq={(classified ? classification.AllocReqCount : 0)} " +
+                $"emit={(classified ? classification.EmitCount : 0)} " +
+                $"cut={(classified ? classification.CutCount : 0)} " +
                 $"indexCount={vertexCount} inst={state.InstanceCount} indexed={(indexed ? 1 : 0)}");
+
+            if (classified && classification.IsAmplifying)
+            {
+                // Loud, deduplicated warning: running this as a plain VS drops
+                // the amplification. Real geometry needs the amplify backend.
+                TraceAgc(
+                    $"agc.ngg_warn es=0x{exportShaderAddress:X16} AMPLIFYING " +
+                    $"(emit={classification.EmitCount} cut={classification.CutCount}) " +
+                    "— plain-VS path will not reproduce this geometry; " +
+                    "pass-through count-forcing suppressed.");
+            }
         }
 
         VulkanVideoPresenter.NoteNggAmplifyPending(
@@ -3894,6 +3950,7 @@ public static class AgcExports
         state.TranslatedDraw = null;
         state.GuestDrawKind = GuestDrawKind.None;
         DetectNggPrimitiveDraw(
+            ctx,
             state,
             hasExportShader ? exportShaderAddress : 0,
             vertexCount,
