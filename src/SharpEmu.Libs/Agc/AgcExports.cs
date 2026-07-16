@@ -4312,7 +4312,9 @@ public static class AgcExports
                     totalGlobalBufferCount: totalGlobalBuffers + 2,
                     imageBindingBase: pixelEvaluation.ImageBindings.Count,
                     scalarRegisterBufferIndex: totalGlobalBuffers + 1,
-                    instanceIdFromVertexIndex: flattenInstanceToVertex))
+                    instanceIdFromVertexIndex: flattenInstanceToVertex,
+                    requiredVertexOutputLocations:
+                        Gen5SpirvTranslator.GetPixelInterpolantLocations(pixelState)))
             {
                 return false;
             }

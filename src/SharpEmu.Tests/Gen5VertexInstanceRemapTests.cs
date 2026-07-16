@@ -21,6 +21,7 @@ public sealed class Gen5VertexInstanceRemapTests
     private const uint ExecutionModelVertex = 0;
     private const ushort OpDecorate = 71;
     private const uint DecorationBuiltIn = 11;
+    private const uint DecorationLocation = 30;
     private const uint BuiltInVertexIndex = 42;
     private const uint BuiltInInstanceIndex = 43;
 
@@ -53,6 +54,38 @@ public sealed class Gen5VertexInstanceRemapTests
             instanceIdFromVertexIndex: instanceIdFromVertexIndex);
         Assert.True(ok, $"TryCompileVertexShader failed: {error}");
         return shader.Spirv;
+    }
+
+    private static uint[] LocationDecorations(SpirvModuleAssert.ParsedModule module) =>
+        module.Instructions
+            .Where(i => i.Opcode == OpDecorate && i.Words.Length >= 4 &&
+                i.Words[2] == DecorationLocation)
+            .Select(i => i.Words[3])
+            .ToArray();
+
+    [Fact]
+    public void RequiredOutputLocations_PadMissingVertexOutputs()
+    {
+        // The minimal vertex program exports no parameters, so on its own it
+        // declares no location-decorated outputs.
+        var (state, evaluation) = DecodeAndEvaluate();
+        Assert.True(Gen5SpirvTranslator.TryCompileVertexShader(
+            state, evaluation, out var bare, out var bareError), bareError);
+        Assert.Empty(LocationDecorations(SpirvModuleAssert.Parse(bare.Spirv)));
+
+        // Pairing it with a pixel shader that interpolates Locations 0 and 2
+        // must pad the vertex output interface with exactly those locations so
+        // vkCreateGraphicsPipelines accepts the pair.
+        Assert.True(Gen5SpirvTranslator.TryCompileVertexShader(
+            state,
+            evaluation,
+            out var padded,
+            out var paddedError,
+            requiredVertexOutputLocations: new uint[] { 0, 2 }), paddedError);
+
+        var module = SpirvModuleAssert.Parse(padded.Spirv);
+        SpirvModuleAssert.AssertShaderModule(module, ExecutionModelVertex);
+        Assert.Equal(new uint[] { 0, 2 }, LocationDecorations(module).Order().ToArray());
     }
 
     private static bool HasBuiltIn(SpirvModuleAssert.ParsedModule module, uint builtIn) =>

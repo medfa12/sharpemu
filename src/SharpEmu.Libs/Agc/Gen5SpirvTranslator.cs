@@ -91,7 +91,8 @@ internal static partial class Gen5SpirvTranslator
         int totalGlobalBufferCount = -1,
         int imageBindingBase = 0,
         int scalarRegisterBufferIndex = -1,
-        bool instanceIdFromVertexIndex = false)
+        bool instanceIdFromVertexIndex = false,
+        IReadOnlyCollection<uint>? requiredVertexOutputLocations = null)
     {
         var context = new CompilationContext(
             Gen5SpirvStage.Vertex,
@@ -105,9 +106,25 @@ internal static partial class Gen5SpirvTranslator
             totalGlobalBufferCount,
             imageBindingBase,
             scalarRegisterBufferIndex,
-            instanceIdFromVertexIndex);
+            instanceIdFromVertexIndex,
+            computeCapture: null,
+            requiredVertexOutputLocations: requiredVertexOutputLocations);
         return context.TryCompile(out shader, out error);
     }
+
+    /// <summary>
+    /// The vertex-output Locations a pixel shader interpolates (one per distinct
+    /// interpolation attribute). Paired with a vertex shader so its output
+    /// interface can be padded to cover every fragment input.
+    /// </summary>
+    public static IReadOnlyCollection<uint> GetPixelInterpolantLocations(
+        Gen5ShaderState pixelState) =>
+        pixelState.Program.Instructions
+            .Select(instruction => instruction.Control)
+            .OfType<Gen5InterpolationControl>()
+            .Select(control => control.Attribute)
+            .Distinct()
+            .ToArray();
 
     public static bool TryCompileComputeShader(
         Gen5ShaderState state,
@@ -174,6 +191,12 @@ internal static partial class Gen5SpirvTranslator
         private readonly Dictionary<uint, uint> _pixelInputs = [];
         private readonly Dictionary<uint, SpirvPixelOutput> _pixelOutputs = [];
         private readonly Dictionary<uint, uint> _vertexOutputs = [];
+        // Vertex Output variables declared only to satisfy the paired pixel
+        // shader's input interface (Locations it interpolates that this vertex
+        // program never exports); zero-initialised at entry so the fragment
+        // varyings are defined rather than undefined.
+        private readonly List<uint> _paddedVertexOutputs = [];
+        private readonly IReadOnlyCollection<uint> _requiredVertexOutputLocations;
         private readonly Dictionary<uint, SpirvVertexInput> _vertexInputsByPc = [];
         private readonly List<SpirvImageResource> _imageResources = [];
         private readonly Dictionary<uint, int> _imageBindingByPc = [];
@@ -253,10 +276,12 @@ internal static partial class Gen5SpirvTranslator
             int imageBindingBase,
             int scalarRegisterBufferIndex,
             bool instanceIdFromVertexIndex = false,
-            NggComputeCapture? computeCapture = null)
+            NggComputeCapture? computeCapture = null,
+            IReadOnlyCollection<uint>? requiredVertexOutputLocations = null)
         {
             _stage = stage;
             _state = state;
+            _requiredVertexOutputLocations = requiredVertexOutputLocations ?? [];
             _evaluation = evaluation;
             _pixelOutputBindings = pixelOutputBindings;
             _localSizeX = localSizeX;
@@ -297,6 +322,7 @@ internal static partial class Gen5SpirvTranslator
                 _module.AddName(main, "main");
                 _module.AddLabel();
                 EmitInitialState();
+                EmitPaddedVertexOutputStores();
 
                 var loopHeader = _module.AllocateId();
                 var switchHeader = _module.AllocateId();
@@ -754,6 +780,26 @@ internal static partial class Gen5SpirvTranslator
                         SpirvStorageClass.Output);
                     _module.AddDecoration(variable, SpirvDecoration.Location, parameter);
                     _vertexOutputs.Add(parameter, variable);
+                    _interfaces.Add(variable);
+                }
+
+                // Pad the interface with any Location the paired pixel shader
+                // interpolates but this vertex program does not export. Without
+                // it vkCreateGraphicsPipelines rejects the pipeline (fragment
+                // Input with no matching vertex Output) and the draw renders
+                // nothing -- which black-holed the fullscreen composite pass.
+                foreach (var location in _requiredVertexOutputLocations)
+                {
+                    if (_vertexOutputs.ContainsKey(location))
+                    {
+                        continue;
+                    }
+
+                    var variable = _module.AddGlobalVariable(
+                        outputPointer,
+                        SpirvStorageClass.Output);
+                    _module.AddDecoration(variable, SpirvDecoration.Location, location);
+                    _paddedVertexOutputs.Add(variable);
                     _interfaces.Add(variable);
                 }
             }
@@ -2523,6 +2569,30 @@ internal static partial class Gen5SpirvTranslator
 
         private void Store(uint pointer, uint value) =>
             _module.AddStatement(SpirvOp.Store, pointer, value);
+
+        // Zero-initialise the interface-padding vertex outputs (Locations the
+        // paired pixel shader reads but this program never exports) so the
+        // fragment stage sees defined varyings. No-op for non-vertex stages.
+        private void EmitPaddedVertexOutputStores()
+        {
+            if (_paddedVertexOutputs.Count == 0)
+            {
+                return;
+            }
+
+            var zero = Float(0f);
+            var zeroVec = _module.AddInstruction(
+                SpirvOp.CompositeConstruct,
+                _vec4Type,
+                zero,
+                zero,
+                zero,
+                zero);
+            foreach (var output in _paddedVertexOutputs)
+            {
+                Store(output, zeroVec);
+            }
+        }
 
         private uint UInt(uint value) => _module.Constant(_uintType, value);
 
