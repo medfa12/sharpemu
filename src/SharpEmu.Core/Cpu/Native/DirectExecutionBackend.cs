@@ -1707,14 +1707,27 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 	private unsafe static void SeedTlsLayout(nint tlsBase)
 	{
+		// Seed the standard TLS self-pointer, but NEVER overwrite a slot the
+		// guest may have populated after thread creation -- this runs on every
+		// thread bind/resume, and clobbering guest-owned TLS here corrupts
+		// per-thread state (e.g. Havok's thread->context slot), which surfaced
+		// as a resume-triggered m_threadIDToContext lookup miss / crash. Only
+		// the self-pointer at offset 0 is an emulator invariant; every other
+		// slot is written only while still zero, matching the offset-16 guard.
 		ulong num = (ulong)tlsBase;
 		*(ulong*)tlsBase = num;
 		if (*(ulong*)(tlsBase + 16) == 0)
 		{
 			*(ulong*)(tlsBase + 16) = num;
 		}
-		*(long*)(tlsBase + 40) = -4548986510476657986L;
-		*(ulong*)(tlsBase + 96) = num;
+		if (*(long*)(tlsBase + 40) == 0)
+		{
+			*(long*)(tlsBase + 40) = -4548986510476657986L;
+		}
+		if (*(ulong*)(tlsBase + 96) == 0)
+		{
+			*(ulong*)(tlsBase + 96) = num;
+		}
 	}
 
 	private unsafe void UpdateTlsHandlerBase(nint tlsBase)
