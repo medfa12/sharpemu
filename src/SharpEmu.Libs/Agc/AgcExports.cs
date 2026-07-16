@@ -374,7 +374,15 @@ public static class AgcExports
         IReadOnlyList<Gen5GlobalMemoryBinding> GlobalMemoryBindings,
         IReadOnlyList<Gen5VertexInputBinding> VertexInputs,
         IReadOnlyList<RenderTargetDescriptor> RenderTargets,
-        VulkanGuestRenderState RenderState);
+        VulkanGuestRenderState RenderState,
+        // Position-capture compute prepass for a pass-through NGG draw. Null for
+        // every ordinary draw. When present, ComputeCaptureSpirv is the ES
+        // compiled as a compute kernel that writes one clip-space vec4 per
+        // invocation into the storage buffer named by ComputeCapture, and
+        // ComputeInvocationCount is N (one invocation per output vertex).
+        byte[]? ComputeCaptureSpirv = null,
+        NggComputeCapture? ComputeCapture = null,
+        uint ComputeInvocationCount = 0);
 
     private sealed record TranslatedImageBinding(
         TextureDescriptor Descriptor,
@@ -3996,6 +4004,7 @@ public static class AgcExports
         // non-indexed over N vertices instead of a degenerate 1-vertex draw that
         // leaves the G-buffer empty.
         var flattenInstanceToVertex = false;
+        var passthroughCompute = false;
         if (state.NggEsPassthroughGeometry &&
             vertexCount <= 1 &&
             state.IndirectInstanceCount > 1 &&
@@ -4003,6 +4012,11 @@ public static class AgcExports
         {
             var passthroughVertexCount = state.IndirectInstanceCount;
             flattenInstanceToVertex = true;
+            // Additionally compile the pass-through ES as a position-capture
+            // compute kernel. This is gated to exactly this draw (see the guard
+            // above) so no other draw is affected; the graphics fallback below
+            // is unchanged for safety while the compute prepass is wired up.
+            passthroughCompute = true;
             TraceAgc(
                 $"agc.ngg_passthrough_expand es=0x{(hasExportShader ? exportShaderAddress : 0):X16} " +
                 $"verts={vertexCount}->{passthroughVertexCount} inst={state.InstanceCount} " +
@@ -4049,6 +4063,7 @@ public static class AgcExports
                 vertexCount,
                 indexed,
                 flattenInstanceToVertex,
+                passthroughCompute,
                 out var translatedDraw,
                 out translationError))
         {
@@ -4169,6 +4184,7 @@ public static class AgcExports
         uint vertexCount,
         bool indexed,
         bool flattenInstanceToVertex,
+        bool passthroughCompute,
         out TranslatedGuestDraw draw,
         out string error)
     {
@@ -4362,7 +4378,112 @@ public static class AgcExports
                 textures,
                 vertexInputs,
                 pixelEvaluation.InitialScalarRegisters));
+
+        if (passthroughCompute)
+        {
+            TryAttachNggComputeCapture(
+                ctx,
+                exportState,
+                exportShaderAddress,
+                vertexInputs,
+                vertexCount,
+                ref draw);
+        }
+
         return true;
+    }
+
+    // Local workgroup width for the position-capture compute prepass: one thread
+    // per output vertex, so the caller dispatches ceil(N / this) groups.
+    private const uint NggCaptureLocalSizeX = 64;
+
+    /// <summary>
+    /// Compiles the pass-through NGG export shader a second time as a
+    /// position-capture compute kernel and, on success, records the resulting
+    /// SPIR-V + capture layout on the draw. The kernel is re-evaluated with
+    /// vertex-input resolution disabled so the MUBUF vertex fetch is treated as a
+    /// raw storage-buffer read (the generic buffer path), and its per-vertex
+    /// index VGPR is seeded from gl_GlobalInvocationID.x. Any failure is traced
+    /// and left non-fatal: the graphics fallback still renders the draw.
+    /// </summary>
+    private static void TryAttachNggComputeCapture(
+        CpuContext ctx,
+        Gen5ShaderState exportState,
+        ulong exportShaderAddress,
+        IReadOnlyList<Gen5VertexInputBinding> vertexInputs,
+        uint invocationCount,
+        ref TranslatedGuestDraw draw)
+    {
+        if (!Gen5ShaderScalarEvaluator.TryEvaluate(
+                ctx,
+                exportState,
+                out var computeEvaluation,
+                out var evalError,
+                resolveVertexInputs: false))
+        {
+            TraceAgc(
+                $"agc.ngg_compute_compile es=0x{exportShaderAddress:X16} " +
+                $"FAILED evaluate: {evalError}");
+            return;
+        }
+
+        var vertexIndexVgpr = RecoverNggVertexIndexVgpr(exportState, vertexInputs);
+        var capture = new NggComputeCapture(
+            computeEvaluation.GlobalMemoryBindings.Count,
+            4,
+            vertexIndexVgpr);
+        if (!Gen5SpirvTranslator.TryCompileComputeShader(
+                exportState,
+                computeEvaluation,
+                NggCaptureLocalSizeX,
+                1,
+                1,
+                capture,
+                out var computeShader,
+                out var compileError))
+        {
+            TraceAgc(
+                $"agc.ngg_compute_compile es=0x{exportShaderAddress:X16} " +
+                $"FAILED compile: {compileError}");
+            return;
+        }
+
+        draw = draw with
+        {
+            ComputeCaptureSpirv = computeShader.Spirv,
+            ComputeCapture = capture,
+            ComputeInvocationCount = invocationCount,
+        };
+        TraceAgc(
+            $"agc.ngg_compute_compile es=0x{exportShaderAddress:X16} " +
+            $"vgpr={vertexIndexVgpr} out_binding={capture.PositionBufferBindingIndex} " +
+            $"stride={capture.PositionDwordStride} bytes={computeShader.Spirv.Length} " +
+            $"invocations={invocationCount}");
+    }
+
+    /// <summary>
+    /// Recovers the VGPR the export shader reads as its per-vertex fetch index:
+    /// the <c>VectorAddress</c> of the index-enabled MUBUF that the scalar
+    /// evaluator classified as a vertex input. Falls back to v0 when no such
+    /// fetch is present.
+    /// </summary>
+    private static uint RecoverNggVertexIndexVgpr(
+        Gen5ShaderState exportState,
+        IReadOnlyList<Gen5VertexInputBinding> vertexInputs)
+    {
+        foreach (var input in vertexInputs)
+        {
+            foreach (var instruction in exportState.Program.Instructions)
+            {
+                if (instruction.Pc == input.Pc &&
+                    instruction.Control is Gen5BufferMemoryControl { IndexEnabled: true } control)
+                {
+                    return control.VectorAddress;
+                }
+            }
+        }
+
+        return 0;
     }
 
     private static readonly bool _transparentFillClearEnabled = !string.Equals(

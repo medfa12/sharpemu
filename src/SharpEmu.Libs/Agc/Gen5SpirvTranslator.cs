@@ -117,6 +117,25 @@ internal static partial class Gen5SpirvTranslator
         uint localSizeZ,
         out Gen5SpirvShader shader,
         out string error)
+        => TryCompileComputeShader(
+            state,
+            evaluation,
+            localSizeX,
+            localSizeY,
+            localSizeZ,
+            null,
+            out shader,
+            out error);
+
+    public static bool TryCompileComputeShader(
+        Gen5ShaderState state,
+        Gen5ShaderEvaluation evaluation,
+        uint localSizeX,
+        uint localSizeY,
+        uint localSizeZ,
+        NggComputeCapture? capture,
+        out Gen5SpirvShader shader,
+        out string error)
     {
         var context = new CompilationContext(
             Gen5SpirvStage.Compute,
@@ -129,7 +148,9 @@ internal static partial class Gen5SpirvTranslator
             0,
             -1,
             0,
-            -1);
+            -1,
+            false,
+            capture);
         return context.TryCompile(out shader, out error);
     }
 
@@ -148,6 +169,7 @@ internal static partial class Gen5SpirvTranslator
         private readonly int _imageBindingBase;
         private readonly int _scalarRegisterBufferIndex;
         private readonly bool _instanceIdFromVertexIndex;
+        private readonly NggComputeCapture? _computeCapture;
         private readonly List<uint> _interfaces = [];
         private readonly Dictionary<uint, uint> _pixelInputs = [];
         private readonly Dictionary<uint, SpirvPixelOutput> _pixelOutputs = [];
@@ -188,6 +210,7 @@ internal static partial class Gen5SpirvTranslator
         private uint _fragCoordInput;
         private uint _localInvocationIdInput;
         private uint _workGroupIdInput;
+        private uint _globalInvocationIdInput;
         private uint _subgroupInvocationIdInput;
         private uint _glsl;
 
@@ -229,7 +252,8 @@ internal static partial class Gen5SpirvTranslator
             int totalGlobalBufferCount,
             int imageBindingBase,
             int scalarRegisterBufferIndex,
-            bool instanceIdFromVertexIndex = false)
+            bool instanceIdFromVertexIndex = false,
+            NggComputeCapture? computeCapture = null)
         {
             _stage = stage;
             _state = state;
@@ -242,6 +266,13 @@ internal static partial class Gen5SpirvTranslator
             _totalGlobalBufferCount = totalGlobalBufferCount < 0
                 ? evaluation.GlobalMemoryBindings.Count
                 : totalGlobalBufferCount;
+            _computeCapture = computeCapture;
+            // The capture output buffer is appended after the ES's own global
+            // buffers, so the guestBuffers descriptor array needs one extra slot.
+            if (_computeCapture is not null)
+            {
+                _totalGlobalBufferCount += 1;
+            }
             _imageBindingBase = imageBindingBase;
             _scalarRegisterBufferIndex = scalarRegisterBufferIndex;
             _instanceIdFromVertexIndex = instanceIdFromVertexIndex;
@@ -795,6 +826,20 @@ internal static partial class Gen5SpirvTranslator
                     (uint)SpirvBuiltIn.WorkgroupId);
                 _interfaces.Add(_localInvocationIdInput);
                 _interfaces.Add(_workGroupIdInput);
+
+                // Position-capture route only: the flattened output vertex index
+                // is gl_GlobalInvocationID.x (one invocation == one vertex).
+                if (_computeCapture is not null)
+                {
+                    _globalInvocationIdInput = _module.AddGlobalVariable(
+                        inputPointer,
+                        SpirvStorageClass.Input);
+                    _module.AddDecoration(
+                        _globalInvocationIdInput,
+                        SpirvDecoration.BuiltIn,
+                        (uint)SpirvBuiltIn.GlobalInvocationId);
+                    _interfaces.Add(_globalInvocationIdInput);
+                }
             }
         }
 
@@ -937,7 +982,29 @@ internal static partial class Gen5SpirvTranslator
                             UInt(checked(_localSizeX * _localSizeY * _localSizeZ)));
                     }
                 }
+
+                // Position-capture route only: seed the ES's vertex-index VGPR
+                // from gl_GlobalInvocationID.x, mirroring the vertex-stage
+                // v5<-VertexIndex seed above. One invocation produces one output
+                // vertex, so the global invocation id is the vertex index.
+                if (_computeCapture is { } capture)
+                {
+                    StoreV(
+                        capture.VertexIndexVgpr,
+                        LoadGlobalInvocationIdX(),
+                        guardWithExec: false);
+                }
             }
+        }
+
+        private uint LoadGlobalInvocationIdX()
+        {
+            var globalId = Load(_uvec3Type, _globalInvocationIdInput);
+            return _module.AddInstruction(
+                SpirvOp.CompositeExtract,
+                _uintType,
+                globalId,
+                0);
         }
 
         private void StoreComputeSystemRegister(
@@ -2235,6 +2302,11 @@ internal static partial class Gen5SpirvTranslator
 
             if (_stage != Gen5SpirvStage.Vertex)
             {
+                if (_stage == Gen5SpirvStage.Compute && _computeCapture is { } capture)
+                {
+                    return TryEmitComputeCaptureExport(instruction, export, capture);
+                }
+
                 return true;
             }
 
@@ -2281,6 +2353,56 @@ internal static partial class Gen5SpirvTranslator
                 outputValue,
                 Load(_vec4Type, outputVariable));
             Store(outputVariable, outputValue);
+            return true;
+        }
+
+        // Position-capture route: redirect the POS0 (exp target 12) export to a
+        // device-local storage buffer indexed by gl_GlobalInvocationID.x, so a
+        // pass-through NGG export shader run as compute writes one clip-space
+        // vec4 per invocation. Every other export target is dropped in this
+        // first cut (params, PRIM target 20, POS0 targets 13-15).
+        private bool TryEmitComputeCaptureExport(
+            Gen5ShaderInstruction instruction,
+            Gen5ExportControl export,
+            NggComputeCapture capture)
+        {
+            if (export.Target != 12)
+            {
+                return true;
+            }
+
+            var components = new uint[4];
+            for (var component = 0; component < 4; component++)
+            {
+                components[component] = (export.EnableMask & (1u << component)) != 0
+                    ? export.Compressed
+                        ? LoadCompressedExportComponent(instruction, component)
+                        : Bitcast(
+                            _floatType,
+                            LoadV(instruction.Sources[component].Value))
+                    : Float(component == 3 ? 1f : 0f);
+            }
+
+            var baseDword = _module.AddInstruction(
+                SpirvOp.IMul,
+                _uintType,
+                LoadGlobalInvocationIdX(),
+                UInt(capture.PositionDwordStride));
+
+            EmitExecConditional(() =>
+            {
+                for (uint component = 0; component < 4; component++)
+                {
+                    var address = component == 0
+                        ? baseDword
+                        : IAdd(baseDword, UInt(component));
+                    StoreBufferWord(
+                        capture.PositionBufferBindingIndex,
+                        address,
+                        Bitcast(_uintType, components[component]));
+                }
+            });
+
             return true;
         }
 

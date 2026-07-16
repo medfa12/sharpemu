@@ -61,6 +61,19 @@ internal enum Gen5SpirvStage
     Compute,
 }
 
+/// <summary>
+/// Optional configuration that turns a pass-through NGG export shader compiled
+/// as a compute shader into a position-capture kernel: gl_GlobalInvocationID.x
+/// seeds the vertex-index VGPR and the POS0 (exp target 12) export is redirected
+/// to a device-local storage buffer instead of a graphics Output variable. When
+/// null, the compute translation is byte-for-byte identical to a plain compute
+/// dispatch.
+/// </summary>
+internal readonly record struct NggComputeCapture(
+    int PositionBufferBindingIndex,
+    uint PositionDwordStride,
+    uint VertexIndexVgpr);
+
 internal sealed record Gen5SpirvShader(
     byte[] Spirv,
     IReadOnlyList<Gen5GlobalMemoryBinding> GlobalMemoryBindings,
