@@ -92,6 +92,80 @@ internal static class SpirvFixedShaders
         return module.Build();
     }
 
+    /// <summary>
+    /// Vertex shader for the NGG position-capture path: reads the clip-space
+    /// vec4 the capture-compute prepass wrote for this vertex (vertex-input
+    /// location 0) and passes it straight to gl_Position. The pass-through NGG
+    /// export has already applied the full transform in the compute prepass, so
+    /// the rasterizer just consumes those positions. Interpolated attributes the
+    /// pixel shader declares (0..attributeCount-1) are emitted as zero, mirroring
+    /// how <see cref="CreateFullscreenVertex"/> keeps the fragment inputs
+    /// satisfied without carrying real varyings.
+    /// </summary>
+    public static byte[] CreatePositionPassthroughVertex(uint attributeCount)
+    {
+        var module = new SpirvModuleBuilder();
+        module.AddCapability(SpirvCapability.Shader);
+
+        var voidType = module.TypeVoid();
+        var floatType = module.TypeFloat(32);
+        var vec4Type = module.TypeVector(floatType, 4);
+        var inputVec4Pointer = module.TypePointer(SpirvStorageClass.Input, vec4Type);
+        var outputVec4Pointer = module.TypePointer(SpirvStorageClass.Output, vec4Type);
+
+        var positionInput = module.AddGlobalVariable(inputVec4Pointer, SpirvStorageClass.Input);
+        module.AddName(positionInput, "positionInput");
+        module.AddDecoration(positionInput, SpirvDecoration.Location, 0u);
+
+        var position = module.AddGlobalVariable(outputVec4Pointer, SpirvStorageClass.Output);
+        module.AddName(position, "position");
+        module.AddDecoration(position, SpirvDecoration.BuiltIn, (uint)SpirvBuiltIn.Position);
+
+        var attributes = new uint[attributeCount];
+        for (uint index = 0; index < attributeCount; index++)
+        {
+            attributes[index] =
+                module.AddGlobalVariable(outputVec4Pointer, SpirvStorageClass.Output);
+            module.AddName(attributes[index], $"attr{index}");
+            module.AddDecoration(attributes[index], SpirvDecoration.Location, index);
+            module.AddDecoration(attributes[index], SpirvDecoration.NoPerspective);
+        }
+
+        var functionType = module.TypeFunction(voidType);
+        var main = module.BeginFunction(voidType, functionType);
+        module.AddName(main, "main");
+        module.AddLabel();
+
+        var positionValue = module.AddInstruction(SpirvOp.Load, vec4Type, positionInput);
+        module.AddStatement(SpirvOp.Store, position, positionValue);
+
+        if (attributes.Length != 0)
+        {
+            var zeroFloat = module.ConstantFloat(floatType, 0f);
+            var zeroVec = module.AddInstruction(
+                SpirvOp.CompositeConstruct,
+                vec4Type,
+                zeroFloat,
+                zeroFloat,
+                zeroFloat,
+                zeroFloat);
+            foreach (var attribute in attributes)
+            {
+                module.AddStatement(SpirvOp.Store, attribute, zeroVec);
+            }
+        }
+
+        module.AddStatement(SpirvOp.Return);
+        module.EndFunction();
+
+        var interfaces = new uint[2 + attributes.Length];
+        interfaces[0] = positionInput;
+        interfaces[1] = position;
+        attributes.CopyTo(interfaces, 2);
+        module.AddEntryPoint(SpirvExecutionModel.Vertex, main, "main", interfaces);
+        return module.Build();
+    }
+
     public static byte[] CreateCopyFragment()
     {
         var module = new SpirvModuleBuilder();

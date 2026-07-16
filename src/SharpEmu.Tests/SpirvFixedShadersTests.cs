@@ -32,6 +32,25 @@ public sealed class SpirvFixedShadersTests
         Assert.Equal(2 + attributeCount, interfaceCount);
     }
 
+    [Theory]
+    [MemberData(nameof(AttributeCounts))]
+    public void PositionPassthroughVertex_IsStructurallyValidSpirv(uint attributeCount)
+    {
+        var module = SpirvModuleAssert.Parse(
+            SpirvFixedShaders.CreatePositionPassthroughVertex(attributeCount));
+
+        // Loads the location-0 position and (for attributeCount > 0) builds one
+        // zero vec4, so it always carries at least the position Load.
+        var entryPoint = AssertCommonInvariants(
+            module,
+            ExecutionModelVertex,
+            minResultBearingInstructions: 1);
+
+        // positionInput + position + one interface entry per attribute.
+        var interfaceCount = CountEntryPointInterfaces(entryPoint.Words);
+        Assert.Equal(2 + attributeCount, interfaceCount);
+    }
+
     [Fact]
     public void CopyFragment_IsStructurallyValidSpirv()
     {

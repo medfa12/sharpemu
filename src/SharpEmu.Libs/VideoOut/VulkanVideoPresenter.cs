@@ -172,7 +172,16 @@ internal sealed record VulkanTranslatedGuestDraw(
     uint PrimitiveType,
     VulkanGuestIndexBuffer? IndexBuffer,
     VulkanGuestRenderState RenderState,
-    VulkanGuestIndirectArgs? IndirectArgs = null);
+    VulkanGuestIndirectArgs? IndirectArgs = null,
+    // Position-capture prepass for a pass-through NGG draw. When
+    // ComputeCaptureSpirv is non-null the presenter runs the export shader as a
+    // compute kernel that writes one clip-space vec4 per vertex into a
+    // device-local buffer, then draws that buffer as a location-0 vertex stream
+    // with a passthrough vertex shader. Null on every ordinary draw.
+    byte[]? ComputeCaptureSpirv = null,
+    NggComputeCapture? ComputeCapture = null,
+    uint ComputeInvocationCount = 0,
+    IReadOnlyList<VulkanGuestMemoryBuffer>? ComputeCaptureInputs = null);
 
 internal sealed record VulkanOffscreenGuestDraw(
     VulkanTranslatedGuestDraw Draw,
@@ -627,7 +636,11 @@ internal static unsafe class VulkanVideoPresenter
         IReadOnlyList<VulkanGuestVertexBuffer>? vertexBuffers = null,
         VulkanGuestRenderState? renderState = null,
         VulkanGuestDepthTarget? depthTarget = null,
-        VulkanGuestIndirectArgs? indirectArgs = null)
+        VulkanGuestIndirectArgs? indirectArgs = null,
+        byte[]? computeCaptureSpirv = null,
+        NggComputeCapture? computeCapture = null,
+        uint computeInvocationCount = 0,
+        IReadOnlyList<VulkanGuestMemoryBuffer>? computeCaptureInputs = null)
     {
         if (pixelSpirv.Length == 0 ||
             targets.Count == 0 ||
@@ -721,7 +734,11 @@ internal static unsafe class VulkanVideoPresenter
                         primitiveType,
                         indexBuffer,
                         effectiveRenderState,
-                        indexBuffer is not null ? indirectArgs : null),
+                        indexBuffer is not null ? indirectArgs : null,
+                        computeCaptureSpirv,
+                        computeCapture,
+                        computeInvocationCount,
+                        computeCaptureInputs),
                     targets.ToArray(),
                     PublishTarget: true,
                     Depth: depthTarget));
@@ -2148,6 +2165,18 @@ internal static unsafe class VulkanVideoPresenter
             public VulkanGuestViewport? Viewport;
             public RenderPass TransientRenderPass;
             public Framebuffer TransientFramebuffer;
+            // NGG position-capture prepass. When CaptureInvocationCount > 0 the
+            // recorder dispatches CaptureCompute (the export-as-compute kernel)
+            // to fill CaptureOutputBuffer with one clip-space vec4 per vertex,
+            // barriers it compute-write -> vertex-read, then draws it as this
+            // draw's location-0 vertex stream. CaptureCompute owns the compute
+            // pipeline/descriptor pool and every capture buffer (inputs + the
+            // device-local output), so it is destroyed after the fence with the
+            // graphics resources; CaptureOutputBuffer here is a non-owning handle
+            // used only to build the pipeline barrier.
+            public TranslatedDrawResources? CaptureCompute;
+            public uint CaptureInvocationCount;
+            public VkBuffer CaptureOutputBuffer;
         }
 
         private sealed class TextureResource
@@ -2201,6 +2230,10 @@ internal static unsafe class VulkanVideoPresenter
             public uint NumberFormat;
             public uint Stride;
             public uint OffsetBytes;
+            // Set when Buffer is owned by another resource (the NGG capture
+            // output buffer, also held by CaptureCompute). The destroy path must
+            // not recycle/free it a second time through the vertex-buffer loop.
+            public bool External;
         }
 
         private sealed record PendingGuestSubmission(
@@ -3665,7 +3698,37 @@ internal static unsafe class VulkanVideoPresenter
                     "color attachment formats and blend states must have matching counts");
             }
 
-            if (vertexSpirv.Length == 0 &&
+            // A pass-through NGG draw runs its export shader as a compute prepass
+            // (ComputeCaptureSpirv) that writes one clip-space vec4 per vertex.
+            // We only take that path when every capture field is present and the
+            // input-buffer count matches the SPIR-V's expectation
+            // (guestBuffers[0..K-1] inputs, [K] the appended output); otherwise we
+            // fall back to the ordinary draw so a bad capture never breaks it.
+            byte[]? captureSpirv = null;
+            NggComputeCapture captureLayout = default;
+            IReadOnlyList<VulkanGuestMemoryBuffer>? captureInputs = null;
+            var captureInvocations = 0u;
+            if (draw.ComputeCaptureSpirv is { Length: > 0 } candidateSpirv &&
+                draw.ComputeCapture is { } candidateLayout &&
+                draw.ComputeInvocationCount > 0 &&
+                draw.ComputeCaptureInputs is { } candidateInputs &&
+                candidateInputs.Count == candidateLayout.PositionBufferBindingIndex)
+            {
+                captureSpirv = candidateSpirv;
+                captureLayout = candidateLayout;
+                captureInputs = candidateInputs;
+                captureInvocations = draw.ComputeInvocationCount;
+            }
+
+            var useCapture = captureSpirv is not null;
+            if (useCapture)
+            {
+                // The pass-through export already applies the full transform in
+                // the compute prepass, so the raster VS just forwards the captured
+                // clip-space position bound at vertex-input location 0.
+                vertexSpirv = SpirvFixedShaders.CreatePositionPassthroughVertex(draw.AttributeCount);
+            }
+            else if (vertexSpirv.Length == 0 &&
                 !TryCompileFullscreenVertexShader(
                     draw.AttributeCount,
                     out vertexSpirv,
@@ -3680,9 +3743,13 @@ internal static unsafe class VulkanVideoPresenter
                 Textures = new TextureResource[draw.Textures.Count],
                 GlobalMemoryBuffers =
                     new GlobalBufferResource[draw.GlobalMemoryBuffers.Count],
-                VertexBuffers = new VertexBufferResource[draw.VertexBuffers.Count],
-                VertexCount = GetDrawVertexCount(draw.PrimitiveType, draw.VertexCount, draw.IndexBuffer),
-                InstanceCount = Math.Max(draw.InstanceCount, 1),
+                VertexBuffers = useCapture
+                    ? []
+                    : new VertexBufferResource[draw.VertexBuffers.Count],
+                VertexCount = useCapture
+                    ? captureInvocations
+                    : GetDrawVertexCount(draw.PrimitiveType, draw.VertexCount, draw.IndexBuffer),
+                InstanceCount = useCapture ? 1 : Math.Max(draw.InstanceCount, 1),
                 Topology = GetPrimitiveTopology(draw.PrimitiveType),
                 Blends = draw.RenderState.Blends.ToArray(),
                 Scissor = draw.RenderState.Scissor,
@@ -3708,6 +3775,28 @@ internal static unsafe class VulkanVideoPresenter
                 {
                     resources.GlobalMemoryBuffers[index] =
                         CreateGlobalBufferResource(draw.GlobalMemoryBuffers[index]);
+                }
+
+                if (useCapture)
+                {
+                    BuildNggCaptureDrawResources(
+                        resources,
+                        captureSpirv!,
+                        captureLayout,
+                        captureInputs!,
+                        captureInvocations);
+                    CreateTranslatedDescriptorResources(
+                        resources,
+                        ShaderStageFlags.VertexBit | ShaderStageFlags.FragmentBit);
+                    CreateTranslatedPipeline(
+                        resources,
+                        vertexSpirv,
+                        draw.PixelSpirv,
+                        renderPass,
+                        renderTargetFormats,
+                        extent,
+                        depth);
+                    return resources;
                 }
 
                 for (var index = 0; index < draw.VertexBuffers.Count; index++)
@@ -3760,6 +3849,177 @@ internal static unsafe class VulkanVideoPresenter
                 DestroyTranslatedDrawResources(resources);
                 throw;
             }
+        }
+
+        // Builds the resources for the NGG position-capture path onto an existing
+        // graphics TranslatedDrawResources: a device-local output buffer, a child
+        // compute TranslatedDrawResources that binds the K export-as-compute input
+        // buffers plus that output buffer as guestBuffers[0..K], and the graphics
+        // vertex/index streams that draw the captured positions. The output buffer
+        // is created with both storage (compute write) and vertex (raster read)
+        // usage and is owned solely by the child compute resources, so the
+        // graphics vertex-buffer entry that aliases it is flagged External.
+        private void BuildNggCaptureDrawResources(
+            TranslatedDrawResources resources,
+            byte[] captureSpirv,
+            NggComputeCapture captureLayout,
+            IReadOnlyList<VulkanGuestMemoryBuffer> captureInputs,
+            uint invocationCount)
+        {
+            var inputCount = captureInputs.Count;
+            var vertexStride = Math.Max(captureLayout.PositionDwordStride, 1) * (uint)sizeof(uint);
+            var outputSize = (ulong)invocationCount * vertexStride;
+
+            VkBuffer outputBuffer = default;
+            DeviceMemory outputMemory = default;
+            TranslatedDrawResources? captureResources = null;
+            try
+            {
+                outputBuffer = CreateBuffer(
+                    outputSize,
+                    BufferUsageFlags.StorageBufferBit | BufferUsageFlags.VertexBufferBit,
+                    MemoryPropertyFlags.DeviceLocalBit,
+                    out outputMemory);
+
+                captureResources = new TranslatedDrawResources
+                {
+                    DebugName = "SharpEmu ngg-capture-compute",
+                    GlobalMemoryBuffers = new GlobalBufferResource[inputCount + 1],
+                };
+                // Own the output buffer through the child first so any later
+                // failure frees it via DestroyTranslatedDrawResources.
+                captureResources.GlobalMemoryBuffers[inputCount] = new GlobalBufferResource
+                {
+                    Buffer = outputBuffer,
+                    Memory = outputMemory,
+                    Size = outputSize,
+                };
+                for (var index = 0; index < inputCount; index++)
+                {
+                    captureResources.GlobalMemoryBuffers[index] =
+                        CreateGlobalBufferResource(captureInputs[index]);
+                }
+
+                CreateTranslatedDescriptorResources(captureResources, ShaderStageFlags.ComputeBit);
+                CreateComputePipeline(captureResources, captureSpirv);
+            }
+            catch
+            {
+                if (captureResources is not null)
+                {
+                    DestroyTranslatedDrawResources(captureResources);
+                }
+                else if (outputBuffer.Handle != 0)
+                {
+                    _vk.DestroyBuffer(_device, outputBuffer, null);
+                    FreeDeviceMemory(outputMemory);
+                }
+
+                throw;
+            }
+
+            resources.CaptureCompute = captureResources;
+            resources.CaptureInvocationCount = invocationCount;
+            resources.CaptureOutputBuffer = outputBuffer;
+
+            // Draw the captured clip-space positions as a single location-0 vec4
+            // stream (14/7 -> R32G32B32A32_SFLOAT). External: owned by the child.
+            resources.VertexBuffers =
+            [
+                new VertexBufferResource
+                {
+                    Buffer = outputBuffer,
+                    Memory = default,
+                    Size = outputSize,
+                    Location = 0,
+                    ComponentCount = 4,
+                    DataFormat = 14,
+                    NumberFormat = 7,
+                    Stride = vertexStride,
+                    OffsetBytes = 0,
+                    External = true,
+                },
+            ];
+
+            // One 32-bit index per captured vertex, in dispatch order, so the
+            // ordinary CmdBindIndexBuffer + CmdDrawIndexed branch is taken.
+            var indexData = new byte[checked((int)((long)invocationCount * sizeof(uint)))];
+            var indexWords = MemoryMarshal.Cast<byte, uint>(indexData.AsSpan());
+            for (var index = 0; index < indexWords.Length; index++)
+            {
+                indexWords[index] = (uint)index;
+            }
+
+            resources.IndexBuffer = CreateHostBuffer(
+                indexData,
+                BufferUsageFlags.IndexBufferBit,
+                out resources.IndexMemory);
+            resources.Index32Bit = true;
+            resources.VertexCount = invocationCount;
+            resources.InstanceCount = 1;
+            resources.HasIndirectArgs = false;
+        }
+
+        // Records the NGG position-capture compute prepass into the offscreen
+        // command buffer, ahead of the graphics render pass, then a
+        // compute-write -> vertex-read buffer barrier on the output buffer. The
+        // command buffer already had its texture/target transitions recorded; a
+        // buffer barrier is legal here because we are still outside the render
+        // pass instance.
+        private void RecordNggCaptureDispatch(TranslatedDrawResources resources)
+        {
+            if (resources.CaptureCompute is not { } capture ||
+                resources.CaptureInvocationCount == 0)
+            {
+                return;
+            }
+
+            _vk.CmdBindPipeline(
+                _commandBuffer,
+                PipelineBindPoint.Compute,
+                capture.Pipeline);
+            if (capture.DescriptorSet.Handle != 0)
+            {
+                var descriptorSet = capture.DescriptorSet;
+                _vk.CmdBindDescriptorSets(
+                    _commandBuffer,
+                    PipelineBindPoint.Compute,
+                    capture.PipelineLayout,
+                    0,
+                    1,
+                    &descriptorSet,
+                    0,
+                    null);
+            }
+
+            // Must equal AgcExports.NggCaptureLocalSizeX: the capture SPIR-V bakes
+            // local_size_x = 64, so we launch ceil(N / 64) workgroups.
+            const uint localSizeX = 64;
+            var groupCount = (resources.CaptureInvocationCount + localSizeX - 1) / localSizeX;
+            _vk.CmdDispatch(_commandBuffer, groupCount, 1, 1);
+
+            var barrier = new BufferMemoryBarrier
+            {
+                SType = StructureType.BufferMemoryBarrier,
+                SrcAccessMask = AccessFlags.ShaderWriteBit,
+                DstAccessMask = AccessFlags.VertexAttributeReadBit,
+                SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                Buffer = resources.CaptureOutputBuffer,
+                Offset = 0,
+                Size = Vk.WholeSize,
+            };
+            _vk.CmdPipelineBarrier(
+                _commandBuffer,
+                PipelineStageFlags.ComputeShaderBit,
+                PipelineStageFlags.VertexInputBit,
+                0,
+                0,
+                null,
+                1,
+                &barrier,
+                0,
+                null);
         }
 
         [MethodImpl(MethodImplOptions.NoInlining)]
@@ -6576,6 +6836,16 @@ internal static unsafe class VulkanVideoPresenter
                             AccessFlags.DepthStencilAttachmentReadBit);
                 }
 
+                if (resources.CaptureInvocationCount > 0)
+                {
+                    RecordNggCaptureDispatch(resources);
+                    TraceVulkanShader(
+                        $"vk.ngg_compute_draw invocations={resources.CaptureInvocationCount} " +
+                        $"outBytes={(ulong)resources.CaptureInvocationCount * 16} " +
+                        $"target=0x{work.Targets[0].Address:X16} " +
+                        $"{firstTarget.Width}x{firstTarget.Height}");
+                }
+
                 RecordTranslatedGraphicsPass(
                     resources,
                     renderPass,
@@ -8898,7 +9168,7 @@ internal static unsafe class VulkanVideoPresenter
 
             foreach (var vertexBuffer in resources.VertexBuffers)
             {
-                if (vertexBuffer is null)
+                if (vertexBuffer is null || vertexBuffer.External)
                 {
                     continue;
                 }
@@ -8929,6 +9199,16 @@ internal static unsafe class VulkanVideoPresenter
                 resources.DescriptorSetLayout.Handle != 0)
             {
                 _vk.DestroyDescriptorSetLayout(_device, resources.DescriptorSetLayout, null);
+            }
+
+            // The capture-compute child owns the NGG prepass pipeline/descriptor
+            // pool and every capture buffer (the K host inputs plus the
+            // device-local position output). Releasing it here means it is freed
+            // on exactly the same fence as the graphics resources it feeds.
+            if (resources.CaptureCompute is not null)
+            {
+                DestroyTranslatedDrawResources(resources.CaptureCompute);
+                resources.CaptureCompute = null;
             }
         }
 

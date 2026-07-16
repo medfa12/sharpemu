@@ -382,7 +382,14 @@ public static class AgcExports
         // ComputeInvocationCount is N (one invocation per output vertex).
         byte[]? ComputeCaptureSpirv = null,
         NggComputeCapture? ComputeCapture = null,
-        uint ComputeInvocationCount = 0);
+        uint ComputeInvocationCount = 0,
+        // The export-as-compute kernel reads its per-vertex source data as raw
+        // storage buffers (vertex-input resolution disabled), so it needs its own
+        // global-buffer set distinct from the draw's pixel/export globals. These
+        // are the K = ComputeCapture.PositionBufferBindingIndex input buffers the
+        // capture SPIR-V binds at guestBuffers[0..K-1]; the presenter appends the
+        // position output buffer as guestBuffers[K].
+        IReadOnlyList<VulkanGuestMemoryBuffer>? ComputeCaptureInputs = null);
 
     private sealed record TranslatedImageBinding(
         TextureDescriptor Descriptor,
@@ -4109,7 +4116,11 @@ public static class AgcExports
                                 depth.WriteEnable,
                                 depth.CompareOp)
                             : null,
-                        state.PendingIndirectArgs);
+                        state.PendingIndirectArgs,
+                        translatedDraw.ComputeCaptureSpirv,
+                        translatedDraw.ComputeCapture,
+                        translatedDraw.ComputeInvocationCount,
+                        translatedDraw.ComputeCaptureInputs);
             }
             else
             {
@@ -4453,6 +4464,8 @@ public static class AgcExports
             ComputeCaptureSpirv = computeShader.Spirv,
             ComputeCapture = capture,
             ComputeInvocationCount = invocationCount,
+            ComputeCaptureInputs =
+                CreateVulkanGuestMemoryBuffers(computeEvaluation.GlobalMemoryBindings),
         };
         TraceAgc(
             $"agc.ngg_compute_compile es=0x{exportShaderAddress:X16} " +
