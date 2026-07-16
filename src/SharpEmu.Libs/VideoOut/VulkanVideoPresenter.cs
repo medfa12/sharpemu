@@ -10,6 +10,7 @@ using Silk.NET.Vulkan.Extensions.KHR;
 using Silk.NET.Vulkan.Extensions.EXT;
 using Silk.NET.Windowing;
 using System.Diagnostics;
+using System.Globalization;
 using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
@@ -2177,6 +2178,12 @@ internal static unsafe class VulkanVideoPresenter
             public TranslatedDrawResources? CaptureCompute;
             public uint CaptureInvocationCount;
             public VkBuffer CaptureOutputBuffer;
+            // Diagnostic (SHARPEMU_NGG_READBACK=1): host-visible copy of the
+            // capture output, logged at destroy time (after the fence) to see
+            // what positions the compute actually wrote.
+            public VkBuffer CaptureReadbackBuffer;
+            public DeviceMemory CaptureReadbackMemory;
+            public ulong CaptureReadbackSize;
         }
 
         private sealed class TextureResource
@@ -3875,9 +3882,14 @@ internal static unsafe class VulkanVideoPresenter
             TranslatedDrawResources? captureResources = null;
             try
             {
+                var readback = string.Equals(
+                    Environment.GetEnvironmentVariable("SHARPEMU_NGG_READBACK"),
+                    "1",
+                    StringComparison.Ordinal);
                 outputBuffer = CreateBuffer(
                     outputSize,
-                    BufferUsageFlags.StorageBufferBit | BufferUsageFlags.VertexBufferBit,
+                    BufferUsageFlags.StorageBufferBit | BufferUsageFlags.VertexBufferBit |
+                        (readback ? BufferUsageFlags.TransferSrcBit : 0),
                     MemoryPropertyFlags.DeviceLocalBit,
                     out outputMemory);
 
@@ -3921,6 +3933,18 @@ internal static unsafe class VulkanVideoPresenter
             resources.CaptureCompute = captureResources;
             resources.CaptureInvocationCount = invocationCount;
             resources.CaptureOutputBuffer = outputBuffer;
+            if (string.Equals(
+                    Environment.GetEnvironmentVariable("SHARPEMU_NGG_READBACK"),
+                    "1",
+                    StringComparison.Ordinal))
+            {
+                resources.CaptureReadbackBuffer = CreateBuffer(
+                    outputSize,
+                    BufferUsageFlags.TransferDstBit,
+                    MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit,
+                    out resources.CaptureReadbackMemory);
+                resources.CaptureReadbackSize = outputSize;
+            }
 
             // Draw the captured clip-space positions as a single location-0 vec4
             // stream (14/7 -> R32G32B32A32_SFLOAT). External: owned by the child.
@@ -4020,6 +4044,17 @@ internal static unsafe class VulkanVideoPresenter
                 &barrier,
                 0,
                 null);
+
+            if (resources.CaptureReadbackBuffer.Handle != 0)
+            {
+                var copy = new BufferCopy { Size = resources.CaptureReadbackSize };
+                _vk.CmdCopyBuffer(
+                    _commandBuffer,
+                    resources.CaptureOutputBuffer,
+                    resources.CaptureReadbackBuffer,
+                    1,
+                    &copy);
+            }
         }
 
         [MethodImpl(MethodImplOptions.NoInlining)]
@@ -9113,6 +9148,34 @@ internal static unsafe class VulkanVideoPresenter
 
         private void DestroyTranslatedDrawResources(TranslatedDrawResources resources)
         {
+            if (resources.CaptureReadbackBuffer.Handle != 0)
+            {
+                // The fence has signalled by the time resources are destroyed, so
+                // the readback holds the compute's actual output. Log the first
+                // few captured vec4 positions to see if the compute wrote real
+                // clip-space or zeros.
+                void* mapped = null;
+                var floatCount = (int)Math.Min(resources.CaptureReadbackSize / sizeof(float), 16UL);
+                if (_vk.MapMemory(
+                        _device, resources.CaptureReadbackMemory, 0,
+                        resources.CaptureReadbackSize, 0, &mapped) == Result.Success)
+                {
+                    var floats = new ReadOnlySpan<float>(mapped, floatCount);
+                    var parts = new string[floatCount];
+                    for (var i = 0; i < floatCount; i++)
+                    {
+                        parts[i] = floats[i].ToString("0.###", CultureInfo.InvariantCulture);
+                    }
+
+                    Console.Error.WriteLine(
+                        $"[LOADER][TRACE] vk.ngg_capture_out first16=[{string.Join(",", parts)}]");
+                    _vk.UnmapMemory(_device, resources.CaptureReadbackMemory);
+                }
+
+                _vk.DestroyBuffer(_device, resources.CaptureReadbackBuffer, null);
+                FreeDeviceMemory(resources.CaptureReadbackMemory);
+            }
+
             if (resources.TransientFramebuffer.Handle != 0)
             {
                 _vk.DestroyFramebuffer(_device, resources.TransientFramebuffer, null);
