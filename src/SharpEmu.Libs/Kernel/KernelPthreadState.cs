@@ -27,8 +27,14 @@ internal static class KernelPthreadState
     internal static ulong GetCurrentThreadHandle()
     {
         var guestThreadHandle = GuestThreadExecution.CurrentGuestThreadHandle;
-        if (guestThreadHandle != 0 && TryGetThreadIdentity(guestThreadHandle, out _))
+        if (guestThreadHandle != 0)
         {
+            // A running guest thread's handle is a stable per-thread identity.
+            // Lazily register it if some non-pthread creation path never did, so
+            // callers never fall back to the host-worker-static handle -- which
+            // changes as the thread migrates across the worker pool and breaks
+            // identity-keyed guest code (e.g. Havok's thread->context map).
+            EnsureGuestThreadIdentity(guestThreadHandle);
             return guestThreadHandle;
         }
 
@@ -39,14 +45,21 @@ internal static class KernelPthreadState
     internal static ulong GetCurrentThreadUniqueId()
     {
         var guestThreadHandle = GuestThreadExecution.CurrentGuestThreadHandle;
-        if (guestThreadHandle != 0 && TryGetThreadIdentity(guestThreadHandle, out var identity))
+        if (guestThreadHandle != 0)
         {
-            return identity.UniqueId;
+            return EnsureGuestThreadIdentity(guestThreadHandle).UniqueId;
         }
 
         EnsureCurrentThreadRegistered();
         return _currentThreadUniqueId;
     }
+
+    private static ThreadIdentity EnsureGuestThreadIdentity(ulong guestThreadHandle) =>
+        Threads.GetOrAdd(guestThreadHandle, static _ =>
+        {
+            var uniqueId = unchecked((ulong)Interlocked.Increment(ref _nextUniqueThreadId));
+            return new ThreadIdentity(uniqueId, $"Thread-{uniqueId:X}");
+        });
 
     internal static ulong CreateThreadHandle(string name)
     {
