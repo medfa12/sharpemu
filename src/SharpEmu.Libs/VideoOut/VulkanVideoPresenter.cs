@@ -2192,6 +2192,9 @@ internal static unsafe class VulkanVideoPresenter
             public DeviceMemory CaptureTargetReadbackMemory;
             public ulong CaptureTargetReadbackSize;
             public uint CaptureTargetBpp;
+            public ulong CaptureTargetAddress;
+            public uint CaptureTargetWidth;
+            public uint CaptureTargetHeight;
         }
 
         private sealed class TextureResource
@@ -6930,12 +6933,20 @@ internal static unsafe class VulkanVideoPresenter
 
                 // NGG debug: copy the just-drawn target into a host buffer in THIS
                 // command buffer, so a later pass overwriting it can't hide whether
-                // the capture geometry rasterized.
-                if (resources.CaptureInvocationCount > 0 &&
-                    string.Equals(
-                        Environment.GetEnvironmentVariable("SHARPEMU_NGG_DEBUG"),
-                        "1",
-                        StringComparison.Ordinal))
+                // the capture geometry rasterized. SHARPEMU_TRACE_DRAW_TARGETS
+                // widens this to EVERY offscreen draw so we can see, per draw,
+                // which target first gains real (RGB) content vs stays black.
+                var traceAllDrawTargets = string.Equals(
+                    Environment.GetEnvironmentVariable("SHARPEMU_TRACE_DRAW_TARGETS"),
+                    "1",
+                    StringComparison.Ordinal);
+                if ((traceAllDrawTargets ||
+                        (resources.CaptureInvocationCount > 0 &&
+                            string.Equals(
+                                Environment.GetEnvironmentVariable("SHARPEMU_NGG_DEBUG"),
+                                "1",
+                                StringComparison.Ordinal))) &&
+                    targets.Length > 0)
                 {
                     var t = targets[0];
                     var bpp = GetReadbackBytesPerPixel(t.Format);
@@ -6949,6 +6960,9 @@ internal static unsafe class VulkanVideoPresenter
                             out resources.CaptureTargetReadbackMemory);
                         resources.CaptureTargetReadbackSize = size;
                         resources.CaptureTargetBpp = bpp;
+                        resources.CaptureTargetAddress = t.Address;
+                        resources.CaptureTargetWidth = t.Width;
+                        resources.CaptureTargetHeight = t.Height;
                         TransitionGuestImage(
                             t,
                             ImageLayout.TransferSrcOptimal,
@@ -9317,12 +9331,35 @@ internal static unsafe class VulkanVideoPresenter
                     }
 
                     var bpp = (int)resources.CaptureTargetBpp;
+                    // Count pixels whose RGB (not just alpha) is non-zero, so an
+                    // opaque-black target (alpha=1, rgb=0) is not mistaken for
+                    // real content -- the exact false positive that made the
+                    // composite chain look filled when it was black.
+                    long nonblackPixels = 0;
+                    var pixelCount = bpp > 0 ? bytes.Length / bpp : 0;
+                    var rgbBytes = Math.Max(bpp - (bpp / 4), 0);
+                    for (var p = 0; p < pixelCount; p++)
+                    {
+                        var pixel = bytes.Slice(p * bpp, bpp);
+                        for (var k = 0; k < rgbBytes; k++)
+                        {
+                            if (pixel[k] != 0)
+                            {
+                                nonblackPixels++;
+                                break;
+                            }
+                        }
+                    }
+
                     var center = resources.CaptureTargetReadbackSize >= (ulong)bpp
                         ? Convert.ToHexString(
                             bytes.Slice((bytes.Length / 2) & ~(bpp - 1), bpp))
                         : "";
                     Console.Error.WriteLine(
                         "[LOADER][TRACE] vk.ngg_target_readback " +
+                        $"addr=0x{resources.CaptureTargetAddress:X16} " +
+                        $"size={resources.CaptureTargetWidth}x{resources.CaptureTargetHeight} " +
+                        $"nonblack_pixels={nonblackPixels}/{pixelCount} " +
                         $"nonzero_bytes={nonzero}/{resources.CaptureTargetReadbackSize} " +
                         $"center={center}");
                     _vk.UnmapMemory(_device, resources.CaptureTargetReadbackMemory);
