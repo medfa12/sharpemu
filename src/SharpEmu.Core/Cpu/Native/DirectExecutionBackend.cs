@@ -1636,6 +1636,32 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		"1",
 		StringComparison.Ordinal);
 	private readonly HashSet<ulong> _tracedTlsFallbackHandles = new HashSet<ulong>();
+	private readonly HashSet<ulong> _tracedUnregisteredEntries = new HashSet<ulong>();
+
+	// Catches the exact path where guest code begins executing without a
+	// registered guest-thread identity (CurrentGuestThreadHandle==0) -- the
+	// handle=0 crash signature. Deduped per entry point.
+	private void TraceUnregisteredGuestEntry(ulong entryPoint, string name)
+	{
+		if (!_traceTlsIdentity ||
+			SharpEmu.HLE.GuestThreadExecution.CurrentGuestThreadHandle != 0)
+		{
+			return;
+		}
+
+		bool firstForEntry;
+		lock (_tracedUnregisteredEntries)
+		{
+			firstForEntry = _tracedUnregisteredEntries.Add(entryPoint);
+		}
+
+		if (firstForEntry)
+		{
+			Console.Error.WriteLine(
+				$"[LOADER][WARN] guest.unregistered_entry entry=0x{entryPoint:X16} " +
+				$"name={name} handle=0 (guest code running unregistered)");
+		}
+	}
 
 	private unsafe void BindTlsBase(CpuContext context)
 	{
@@ -3838,6 +3864,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			reason = "guest thread stack pointer is zero";
 			return GuestNativeCallExitReason.Exception;
 		}
+		TraceUnregisteredGuestEntry(entryPoint, name);
 		const uint stubSize = 512u;
 		void* ptr = (void*)_hostMemory.Allocate(0, stubSize, HostPageProtection.ReadWriteExecute);
 		if (ptr == null)
@@ -4036,6 +4063,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			reason = "guest thread stack pointer is zero";
 			return GuestNativeCallExitReason.Exception;
 		}
+		TraceUnregisteredGuestEntry(entryPoint, name);
 		const uint stubSize = 512u;
 		void* ptr = (void*)_hostMemory.Allocate(0, stubSize, HostPageProtection.ReadWriteExecute);
 		if (ptr == null)
