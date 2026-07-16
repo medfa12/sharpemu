@@ -4467,11 +4467,17 @@ public static class AgcExports
             ComputeCaptureInputs =
                 CreateVulkanGuestMemoryBuffers(computeEvaluation.GlobalMemoryBindings),
         };
+        var inputAddrs = string.Join(
+            ",",
+            computeEvaluation.GlobalMemoryBindings.Select(b => $"0x{b.BaseAddress:X}"));
+        var vtxAddrs = string.Join(
+            ",",
+            vertexInputs.Select(v => $"0x{v.BaseAddress:X}(stride{v.Stride})"));
         TraceAgc(
             $"agc.ngg_compute_compile es=0x{exportShaderAddress:X16} " +
             $"vgpr={vertexIndexVgpr} out_binding={capture.PositionBufferBindingIndex} " +
             $"stride={capture.PositionDwordStride} bytes={computeShader.Spirv.Length} " +
-            $"invocations={invocationCount}");
+            $"invocations={invocationCount} inputs=[{inputAddrs}] vtxInputs=[{vtxAddrs}]");
     }
 
     /// <summary>
