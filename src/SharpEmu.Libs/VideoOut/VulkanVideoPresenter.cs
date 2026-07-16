@@ -2065,7 +2065,7 @@ internal static unsafe class VulkanVideoPresenter
                 ? d
                 : 60;
         private static readonly System.Diagnostics.Stopwatch RenderDocClock = new();
-        private int _frameDumpBudget = 6;
+        private int _frameDumpBudget = 24;
         private bool _swapchainReadbackPending;
         private bool _deviceLost;
         private bool _deviceLostLogged;
@@ -9558,10 +9558,18 @@ internal static unsafe class VulkanVideoPresenter
                 }
             }
 
+            // SHARPEMU_DUMP_SWAPCHAIN enables the swapchain readback + FRAMEDUMP
+            // independently of the (OOM-prone) per-guest-image readback, and
+            // captures far more frames, so a late-appearing intro/menu frame is
+            // actually sampled instead of only the first few black loading frames.
+            var dumpSwapchain = string.Equals(
+                Environment.GetEnvironmentVariable("SHARPEMU_DUMP_SWAPCHAIN"),
+                "1",
+                StringComparison.Ordinal);
             var traceDestination =
-                ShouldTracePresentedGuestImageContentsForDiagnostics() &&
-                _swapchainCaptureCount < 80 &&
-                (_totalPresentCount <= 20 || _totalPresentCount % 40 == 0);
+                (ShouldTracePresentedGuestImageContentsForDiagnostics() || dumpSwapchain) &&
+                _swapchainCaptureCount < 400 &&
+                (_totalPresentCount <= 40 || _totalPresentCount % 8 == 0);
             if (traceDestination)
             {
                 _swapchainCaptureCount++;
@@ -9766,8 +9774,15 @@ internal static unsafe class VulkanVideoPresenter
                     $"nonblack_pixels={nonblackPixels}/{(ulong)_extent.Width * _extent.Height} " +
                     $"hash=0x{hash:X16}");
 
+                // When an explicit swapchain dump is requested, dump the frame
+                // regardless of the nonblack heuristic -- the heuristic itself may
+                // be undercounting, so capture the raw pixels to see the truth.
+                var forceDump = string.Equals(
+                    Environment.GetEnvironmentVariable("SHARPEMU_DUMP_SWAPCHAIN"),
+                    "1",
+                    StringComparison.Ordinal);
                 var contentThreshold = (long)_extent.Width * _extent.Height / 50;
-                if (_frameDumpBudget > 0 && nonblackPixels > contentThreshold)
+                if (_frameDumpBudget > 0 && (forceDump || nonblackPixels > contentThreshold))
                 {
                     _frameDumpBudget--;
                     const int outWidth = 384;
