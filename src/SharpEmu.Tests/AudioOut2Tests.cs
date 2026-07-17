@@ -163,6 +163,55 @@ public sealed class AudioOut2Tests
     }
 
     [Fact]
+    public void PortGetState_WritesKytyLayoutWithNonNegativeVolume()
+    {
+        var ctx = NewContext(out _);
+        var port = CreatePort(ctx);
+
+        ctx[CpuRegister.Rdi] = port;
+        ctx[CpuRegister.Rsi] = 0x7000;
+        AudioOut2Exports.AudioOut2PortGetState(ctx);
+
+        Assert.Equal(0, Result(ctx));
+        Assert.True(ctx.TryReadUInt16(0x7000, out var output));
+        Assert.Equal(0x01, output); // main output for a non-pad port type
+        Assert.True(ctx.TryReadByte(0x7002, out var channels));
+        Assert.Equal(2, channels);
+        Assert.True(ctx.TryReadUInt16(0x7004, out var volume));
+        Assert.Equal(127, unchecked((short)volume)); // i16 volume, never -1
+    }
+
+    [Fact]
+    public void GetSpeakerInfo_ReportsStereoBitsAndAngles_WithinFiftyBytes()
+    {
+        var ctx = NewContext(out _);
+
+        // Sentinel right after the 0x50-byte struct; the caller's frame has
+        // exactly 0x50 bytes reserved (canary sits at info+0x50 in the eboot).
+        Assert.True(ctx.TryWriteUInt64(0x8050, 0xDEADBEEFCAFEF00D));
+
+        ctx[CpuRegister.Rdi] = 0x8000;
+        ctx[CpuRegister.Rsi] = 1; // flags argument
+        AudioOut2Exports.AudioOut2GetSpeakerInfo(ctx);
+
+        Assert.Equal(0, Result(ctx));
+        Assert.True(ctx.TryReadByte(0x8000, out var type));
+        Assert.Equal(0, type); // stereo speakers
+        Assert.True(ctx.TryReadUInt32(0x8004, out var availableBits));
+        Assert.Equal(0x3u, availableBits); // front-left | front-right
+        Assert.True(ctx.TryReadUInt32(0x8008, out var flags));
+        Assert.Equal(0u, flags); // no sample rate smuggled into flags
+        Assert.True(ctx.TryReadUInt16(0x8010, out var azimuth0));
+        Assert.Equal(-30, unchecked((short)azimuth0));
+        Assert.True(ctx.TryReadUInt16(0x8012, out var elevation0));
+        Assert.Equal(0, unchecked((short)elevation0));
+        Assert.True(ctx.TryReadUInt16(0x8014, out var azimuth1));
+        Assert.Equal(30, unchecked((short)azimuth1));
+        Assert.True(ctx.TryReadUInt64(0x8050, out var sentinel));
+        Assert.Equal(0xDEADBEEFCAFEF00D, sentinel);
+    }
+
+    [Fact]
     public void ContextGetQueueLevel_AlwaysReportsEmpty_PushAndAdvanceDoNotChangeIt()
     {
         // Real hardware drains this queue via DMA essentially instantly from

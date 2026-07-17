@@ -161,14 +161,18 @@ public static class AudioOut2Exports
             return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
         }
 
+        // SceAudioOut2PortState (0x40 bytes, Kyty layout): u16 output, u8
+        // numChannels, u8 pad, i16 volume, u16 rerouteCounter, u32 flags, then
+        // reserved zeros. Volume is 0..127; the earlier -1 here fed a negative
+        // volume into Astro Bot's mixer gain math.
         var type = (int)((handle >> 16) & 0xFF);
-        Span<byte> state = stackalloc byte[0x20];
+        Span<byte> state = stackalloc byte[0x40];
         state.Clear();
         var output = type == 2 ? 0x40 : 0x01;
         var channels = type == 2 ? 1 : 2;
         BinaryPrimitives.WriteUInt16LittleEndian(state[0x00..], unchecked((ushort)output));
         state[0x02] = unchecked((byte)channels);
-        BinaryPrimitives.WriteInt16LittleEndian(state[0x04..], -1);
+        BinaryPrimitives.WriteInt16LittleEndian(state[0x04..], 127);
 
         Trace($"port_get_state handle=0x{handle:X} type={type} output=0x{output:X} channels={channels}");
         return ctx.Memory.TryWrite(stateAddress, state)
@@ -189,11 +193,22 @@ public static class AudioOut2Exports
             return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
         }
 
-        Span<byte> info = stackalloc byte[0x40];
+        // SceAudioOut2SpeakerInfo (0x50 bytes, Kyty layout): u8 type, pad[3],
+        // u32 availableBits, u32 flags, u32 pad, then 16 {i16 azimuth, i16
+        // elevation} speaker angles. Astro Bot's SceSndzAudioOutMain thread
+        // re-reads this on its speaker-reconfig path (eboot 0x800DED1A8+): it
+        // walks availableBits per channel, converts the i16 azimuths, and on
+        // any change rewrites its speaker layout records and panning matrices.
+        // The old reply (u32 1, u32 2, u32 48000) marked front-left absent and
+        // put a sample rate in the flags field, and the resulting bad rebuild
+        // smashed a 16-byte gain row over the propagation mixer's shared_ptr
+        // at +0x58 (AV at 0x800F6053E). Stereo is type 0, bits 0x3, angles
+        // -30/+30 degrees, matching real hardware defaults.
+        Span<byte> info = stackalloc byte[0x50];
         info.Clear();
-        BinaryPrimitives.WriteUInt32LittleEndian(info[0x00..], 1);
-        BinaryPrimitives.WriteUInt32LittleEndian(info[0x04..], 2);
-        BinaryPrimitives.WriteUInt32LittleEndian(info[0x08..], 48000);
+        BinaryPrimitives.WriteUInt32LittleEndian(info[0x04..], 0x3);
+        BinaryPrimitives.WriteInt16LittleEndian(info[0x10..], -30);
+        BinaryPrimitives.WriteInt16LittleEndian(info[0x14..], 30);
 
         Trace("get_speaker_info");
         return ctx.Memory.TryWrite(infoAddress, info)
