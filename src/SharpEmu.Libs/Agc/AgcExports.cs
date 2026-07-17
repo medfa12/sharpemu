@@ -102,11 +102,13 @@ public static class AgcExports
     private const uint CbBlend0Control = 0x1E0;
     private const uint PaScModeCntl0 = 0x292;
     private const uint DbDepthControl = 0x200; // Z_ENABLE / Z_WRITE_ENABLE / ZFUNC
+    // GFX10 DB context registers (register byte address minus 0x28000, / 4).
+    private const uint DbDepthSizeXy = 0x007; // X_MAX / Y_MAX
     private const uint DbZInfo = 0x010; // FORMAT / SW_MODE
     private const uint DbZReadBase = 0x012; // depth read address >> 8
-    private const uint DbZWriteBase = 0x016; // depth address >> 8
-    private const uint DbZWriteBaseHi = 0x017; // depth address [47:40]
-    private const uint DbDepthSizeXy = 0x01A; // X_MAX / Y_MAX
+    private const uint DbZWriteBase = 0x014; // depth write address >> 8
+    private const uint DbZReadBaseHi = 0x01A; // depth read address [47:40]
+    private const uint DbZWriteBaseHi = 0x01C; // depth write address [47:40]
     private const int ColorTargetCount = 8;
     private const uint PsTextureUserDataRegister = 0xC;
     private const uint VsUserDataRegister = 0x4C;
@@ -507,7 +509,7 @@ public static class AgcExports
         uint NumberType,
         uint TileMode);
 
-    private readonly record struct DepthTargetDescriptor(
+    internal readonly record struct DepthTargetDescriptor(
         ulong Address,
         uint Width,
         uint Height,
@@ -4951,7 +4953,7 @@ public static class AgcExports
         return targets;
     }
 
-    private static DepthTargetDescriptor? GetDepthTarget(
+    internal static DepthTargetDescriptor? GetDepthTarget(
         IReadOnlyDictionary<uint, uint> registers)
     {
         var hasZWrite = registers.TryGetValue(DbZWriteBase, out var zWriteBase);
@@ -4968,13 +4970,18 @@ public static class AgcExports
                 $"zEn={(depthControlProbe >> 1) & 1u} zWrEn={(depthControlProbe >> 2) & 1u}");
         }
 
-        if (!hasZWrite || !hasZInfo)
+        if (!hasZInfo || (!hasZWrite && zReadBaseProbe == 0))
         {
             return null;
         }
 
+        registers.TryGetValue(DbZReadBaseHi, out var zReadHi);
         registers.TryGetValue(DbZWriteBaseHi, out var zWriteHi);
-        var address = ((ulong)(zWriteHi & 0xFFu) << 40) | ((ulong)zWriteBase << 8);
+        var readAddress = ((ulong)(zReadHi & 0xFFu) << 40) | ((ulong)zReadBaseProbe << 8);
+        var writeAddress = ((ulong)(zWriteHi & 0xFFu) << 40) | ((ulong)zWriteBase << 8);
+        // A read-only depth surface may bind only DB_Z_READ_BASE; prefer the
+        // write address whenever it is set.
+        var address = writeAddress != 0 ? writeAddress : readAddress;
 
         var format = zInfo & 0x3u; // FORMAT [1:0]; 0 == Z_INVALID -> no depth bound
         if (address == 0 || format == 0)
@@ -4982,7 +4989,7 @@ public static class AgcExports
             return null;
         }
 
-        var tileMode = (zInfo >> 11) & 0x1Fu; // SW_MODE [15:11]
+        var tileMode = (zInfo >> 4) & 0x1Fu; // SW_MODE [8:4]
 
         uint width = 0, height = 0;
         if (registers.TryGetValue(DbDepthSizeXy, out var sizeXy))

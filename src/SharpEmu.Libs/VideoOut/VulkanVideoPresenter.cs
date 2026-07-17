@@ -240,6 +240,8 @@ internal static unsafe class VulkanVideoPresenter
     private static readonly Dictionary<ulong, uint> _renderTargetGuestImages = new();
     private static readonly HashSet<(ulong Address, uint Width, uint Height)>
         _tracedGuestImageSubmissions = [];
+    private static readonly HashSet<(ulong Address, uint Width, uint Height)>
+        _tracedDepthExtentRepairs = [];
     private static readonly HashSet<ulong> _dumpedFailedDrawShaders = [];
     // Most recently GPU-published render target large enough to be the game's
     // final composite frame. Flips of registered display buffers that never
@@ -1130,6 +1132,7 @@ internal static unsafe class VulkanVideoPresenter
             _gpuGuestImages.Clear();
             _renderTargetGuestImages.Clear();
             _tracedGuestImageSubmissions.Clear();
+            _tracedDepthExtentRepairs.Clear();
             _latestPresentableGuestImageAddress = 0;
             _frameCompositeCandidateAddress = 0;
             _frameCompositeCandidateScore = 0;
@@ -6829,18 +6832,69 @@ internal static unsafe class VulkanVideoPresenter
             {
                 var extent = new Extent2D(firstTarget.Width, firstTarget.Height);
 
-                // Resolve the depth attachment (if any). A depth surface with
-                // matching dimensions is bound as the pass's depth attachment
-                // and, after the pass, transitioned to a sampleable layout so a
-                // later deferred-lighting pass reads real depth at this address.
-                if (work.Depth is { } depthTarget &&
-                    depthTarget.Width == firstTarget.Width &&
-                    depthTarget.Height == firstTarget.Height)
+                // Resolve the depth attachment (if any). A depth surface at
+                // least as large as the color target is bound as the pass's
+                // depth attachment and, after the pass, transitioned to a
+                // sampleable layout so a later deferred-lighting pass reads
+                // real depth at this address.
+                VulkanGuestDepthTarget? effectiveDepth = null;
+                if (work.Depth is { } depthTarget)
                 {
-                    depthImage = GetOrCreateGuestDepthImage(depthTarget);
+                    var repairedDepth = depthTarget;
+                    if (depthTarget.Width < firstTarget.Width ||
+                        depthTarget.Height < firstTarget.Height)
+                    {
+                        // Some Gen5 streams leave DB_DEPTH_SIZE_XY at a stale
+                        // clear-state value while binding a full-size depth
+                        // surface. Prefer the extent of a bound texture at the
+                        // same guest address; failing that, treat an exact 1x1
+                        // as clear-state and adopt the color target extent.
+                        // Taking the stale value literally silently drops the
+                        // depth test for the whole draw.
+                        var matchingTexture = work.Draw.Textures.FirstOrDefault(
+                            texture =>
+                                texture.Address == depthTarget.Address &&
+                                texture.Width >= firstTarget.Width &&
+                                texture.Height >= firstTarget.Height);
+                        if (matchingTexture is not null)
+                        {
+                            repairedDepth = depthTarget with
+                            {
+                                Width = matchingTexture.Width,
+                                Height = matchingTexture.Height,
+                            };
+                        }
+                        else if (depthTarget is { Width: 1, Height: 1 })
+                        {
+                            repairedDepth = depthTarget with
+                            {
+                                Width = firstTarget.Width,
+                                Height = firstTarget.Height,
+                            };
+                        }
+
+                        if (!ReferenceEquals(repairedDepth, depthTarget) &&
+                            _tracedDepthExtentRepairs.Add(
+                                (depthTarget.Address,
+                                 repairedDepth.Width,
+                                 repairedDepth.Height)))
+                        {
+                            Console.Error.WriteLine(
+                                $"[LOADER][WARN] Vulkan repaired stale guest depth extent " +
+                                $"addr=0x{depthTarget.Address:X16} " +
+                                $"{depthTarget.Width}x{depthTarget.Height} -> " +
+                                $"{repairedDepth.Width}x{repairedDepth.Height}");
+                        }
+                    }
+
+                    if (repairedDepth.Width >= firstTarget.Width &&
+                        repairedDepth.Height >= firstTarget.Height)
+                    {
+                        depthImage = GetOrCreateGuestDepthImage(repairedDepth);
+                        effectiveDepth = repairedDepth;
+                    }
                 }
 
-                var effectiveDepth = depthImage is null ? null : work.Depth;
                 var clearDepth = depthImage is { Initialized: false };
 
                 var renderPass = firstTarget.RenderPass;
