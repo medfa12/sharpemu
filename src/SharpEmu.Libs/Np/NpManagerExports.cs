@@ -10,6 +10,8 @@ public static class NpManagerExports
 {
     private const int NpTitleIdSize = 16;
     private const int NpTitleSecretSize = 128;
+    private const uint NpReachabilityStateUnavailable = 0;
+    private const ulong OfflineAccountId = 1;
 
     [SysAbiExport(
         Nid = "3Zl8BePTh9Y",
@@ -57,17 +59,52 @@ public static class NpManagerExports
         return WriteOfflineOnlineId(ctx, ctx[CpuRegister.Rsi]);
     }
 
+    // sceNpGetAccountIdA(userId, SceNpAccountId*): the out parameter is a plain 64-bit account
+    // id, not an OnlineId structure. A stable local-only id keeps titles that use it as a profile
+    // key consistent with the signed-in state reported by sceNpGetState.
     [SysAbiExport(
         Nid = "rbknaUjpqWo",
         ExportName = "sceNpGetAccountIdA",
         Target = Generation.Gen5,
         LibraryName = "libSceNpManager")]
-    public static int NpGetOnlineIdA(CpuContext ctx)
+    public static int NpGetAccountIdA(CpuContext ctx)
     {
-        // The A variant takes a user ID before OnlineId.
-        return WriteOfflineOnlineId(ctx, ctx[CpuRegister.Rsi]);
+        var userId = unchecked((int)ctx[CpuRegister.Rdi]);
+        var accountIdAddress = ctx[CpuRegister.Rsi];
+        if (userId == -1 || accountIdAddress == 0)
+        {
+            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        return ctx.TryWriteUInt64(accountIdAddress, OfflineAccountId)
+            ? ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK)
+            : ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
     }
 
+    // sceNpGetAccountCountryA(userId, SceNpCountryCode*): a two-letter ISO code plus terminator.
+    [SysAbiExport(
+        Nid = "JT+t00a3TxA",
+        ExportName = "sceNpGetAccountCountryA",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceNpManager")]
+    public static int NpGetAccountCountryA(CpuContext ctx)
+    {
+        var userId = unchecked((int)ctx[CpuRegister.Rdi]);
+        var countryAddress = ctx[CpuRegister.Rsi];
+        if (userId == -1 || countryAddress == 0)
+        {
+            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        Span<byte> country = stackalloc byte[4];
+        "US"u8.CopyTo(country);
+        return ctx.Memory.TryWrite(countryAddress, country)
+            ? ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK)
+            : ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+    }
+
+    // Offline profile: PSN is unreachable, and the out parameter must say so. Leaving the state
+    // untouched lets titles read stale stack data and keep polling for connectivity.
     [SysAbiExport(
         Nid = "e-ZuhGEoeC4",
         ExportName = "sceNpGetNpReachabilityState",
@@ -75,8 +112,16 @@ public static class NpManagerExports
         LibraryName = "libSceNpManager")]
     public static int NpGetNpReachabilityState(CpuContext ctx)
     {
-        ctx[CpuRegister.Rax] = 0;
-        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+        var userId = unchecked((int)ctx[CpuRegister.Rdi]);
+        var stateAddress = ctx[CpuRegister.Rsi];
+        if (userId == -1 || stateAddress == 0)
+        {
+            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        return ctx.TryWriteUInt32(stateAddress, NpReachabilityStateUnavailable)
+            ? ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK)
+            : ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
     }
 
     [SysAbiExport(
