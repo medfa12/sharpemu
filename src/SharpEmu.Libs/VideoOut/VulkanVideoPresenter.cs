@@ -142,7 +142,8 @@ internal sealed record VulkanGuestRenderTarget(
     uint Height,
     uint Format,
     uint NumberType,
-    uint MipLevels = 1);
+    uint MipLevels = 1,
+    uint ComponentSwap = 0);
 
 internal sealed record VulkanGuestDepthTarget(
     ulong Address,
@@ -1372,7 +1373,8 @@ internal static unsafe class VulkanVideoPresenter
             Format.R8Unorm => 36,
             Format.R8Uint => 49,
             Format.R8G8Unorm => 3,
-            Format.A2R10G10B10UnormPack32 => 9,
+            Format.A2R10G10B10UnormPack32 or
+                Format.A2B10G10R10UnormPack32 => 9,
             Format.B10G11R11UfloatPack32 => 7,
             Format.R32Uint => GuestFormatR32Uint,
             Format.R32Sint => GuestFormatR32Sint,
@@ -1397,6 +1399,13 @@ internal static unsafe class VulkanVideoPresenter
     internal static bool TryDecodeRenderTargetFormat(
         uint dataFormat,
         uint numberType,
+        out VulkanRenderTargetFormat result) =>
+        TryDecodeRenderTargetFormat(dataFormat, numberType, componentSwap: 0, out result);
+
+    internal static bool TryDecodeRenderTargetFormat(
+        uint dataFormat,
+        uint numberType,
+        uint componentSwap,
         out VulkanRenderTargetFormat result)
     {
         var format = (dataFormat, numberType) switch
@@ -1407,7 +1416,12 @@ internal static unsafe class VulkanVideoPresenter
             (5, 4) => Format.R16G16Uint,
             (5, 5) => Format.R16G16Sint,
             (5, 7) => Format.R16G16Sfloat,
-            (9, _) => Format.A2R10G10B10UnormPack32,
+            // CB_COLOR_INFO.COMP_SWAP is independent from FORMAT. For
+            // COLOR_2_10_10_10, STD exposes the low 10-bit component as R
+            // (A2B10G10R10 in Vulkan); ALT reverses R and B.
+            (9, _) when componentSwap == 0 => Format.A2B10G10R10UnormPack32,
+            (9, _) when componentSwap == 1 => Format.A2R10G10B10UnormPack32,
+            (9, _) => Format.Undefined,
             (10, 4) => Format.R8G8B8A8Uint,
             (10, 5) => Format.R8G8B8A8Sint,
             (10, _) => Format.R8G8B8A8Unorm,
@@ -1487,9 +1501,11 @@ internal static unsafe class VulkanVideoPresenter
             Format.R16G16Sint or
             Format.R16G16Sfloat or
             Format.R8G8B8A8Unorm or
+            Format.R8G8B8A8Srgb or
             Format.R8G8B8A8Uint or
             Format.R8G8B8A8Sint or
             Format.A2R10G10B10UnormPack32 or
+            Format.A2B10G10R10UnormPack32 or
             Format.B10G11R11UfloatPack32 => 32,
             Format.R32G32Uint or
             Format.R32G32Sint or
@@ -6760,7 +6776,11 @@ internal static unsafe class VulkanVideoPresenter
             for (var index = 0; index < targetFormats.Length; index++)
             {
                 var target = work.Targets[index];
-                if (!TryDecodeRenderTargetFormat(target.Format, target.NumberType, out targetFormats[index]) ||
+                if (!TryDecodeRenderTargetFormat(
+                        target.Format,
+                        target.NumberType,
+                        target.ComponentSwap,
+                        out targetFormats[index]) ||
                     !SupportsColorAttachment(targetFormats[index].Format))
                 {
                     Console.Error.WriteLine(
@@ -7693,7 +7713,8 @@ internal static unsafe class VulkanVideoPresenter
         private static uint GetGuestTextureFormat(Format format) =>
             format switch
             {
-                Format.A2R10G10B10UnormPack32 => 9,
+                Format.A2R10G10B10UnormPack32 or
+                    Format.A2B10G10R10UnormPack32 => 9,
                 Format.R8G8B8A8Unorm => 56,
                 Format.R16G16Unorm => 5,
                 Format.R16G16B16A16Unorm => 12,
@@ -8572,7 +8593,8 @@ internal static unsafe class VulkanVideoPresenter
                 Format.R8G8B8A8Uint or
                 Format.R8G8B8A8Sint or
                 Format.R8G8B8A8Unorm or
-                Format.A2R10G10B10UnormPack32 => 4,
+                Format.A2R10G10B10UnormPack32 or
+                Format.A2B10G10R10UnormPack32 => 4,
                 Format.R16G16B16A16Uint or
                 Format.R16G16B16A16Sint or
                 Format.R16G16B16A16Sfloat => 8,
@@ -8596,7 +8618,8 @@ internal static unsafe class VulkanVideoPresenter
                 var pixel = bytes.Slice(offset, (int)bytesPerPixel);
                 var hasColor = format switch
                 {
-                    Format.A2R10G10B10UnormPack32 =>
+                    Format.A2R10G10B10UnormPack32 or
+                    Format.A2B10G10R10UnormPack32 =>
                         (BitConverter.ToUInt32(pixel) & 0x3FFFFFFFu) != 0,
                     Format.R8G8B8A8Uint or
                     Format.R8G8B8A8Sint or

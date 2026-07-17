@@ -1286,6 +1286,7 @@ internal static class Gen5ShaderTranslator
         name.StartsWith("Image", StringComparison.Ordinal);
 
     internal static bool IsStorageImageOperation(string name) =>
+        name.StartsWith("ImageLoad", StringComparison.Ordinal) ||
         name.StartsWith("ImageStore", StringComparison.Ordinal) ||
         name.StartsWith("ImageAtomic", StringComparison.Ordinal);
 

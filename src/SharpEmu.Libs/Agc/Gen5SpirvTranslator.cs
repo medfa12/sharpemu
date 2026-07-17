@@ -1829,7 +1829,8 @@ internal static partial class Gen5SpirvTranslator
                 return true;
             }
 
-            if (resource.IsStorage)
+            if (resource.IsStorage &&
+                instruction.Opcode is not ("ImageLoad" or "ImageLoadMip"))
             {
                 error = $"unsupported storage image opcode {instruction.Opcode}";
                 return false;
@@ -1845,18 +1846,31 @@ internal static partial class Gen5SpirvTranslator
                         out var height)
                     ? BuildClampedIntegerCoordinates(image, 0, width, height)
                     : BuildIntegerCoordinates(image, 0);
-                var mipLevel = _evaluation.ImageBindings[bindingIndex].MipLevel ?? 0;
-                var fetchedImage = _module.AddInstruction(
-                    SpirvOp.Image,
-                    resource.ImageType,
-                    imageObject);
-                sampled = _module.AddInstruction(
-                    SpirvOp.ImageFetch,
-                    resource.VectorType,
-                    fetchedImage,
-                    coordinates,
-                    2,
-                    UInt(mipLevel));
+                if (resource.IsStorage)
+                {
+                    // ImageLoad binds as a storage image (the same descriptor
+                    // can also be stored to); read the texels directly.
+                    sampled = _module.AddInstruction(
+                        SpirvOp.ImageRead,
+                        resource.VectorType,
+                        imageObject,
+                        coordinates);
+                }
+                else
+                {
+                    var mipLevel = _evaluation.ImageBindings[bindingIndex].MipLevel ?? 0;
+                    var fetchedImage = _module.AddInstruction(
+                        SpirvOp.Image,
+                        resource.ImageType,
+                        imageObject);
+                    sampled = _module.AddInstruction(
+                        SpirvOp.ImageFetch,
+                        resource.VectorType,
+                        fetchedImage,
+                        coordinates,
+                        2,
+                        UInt(mipLevel));
+                }
             }
             else if (instruction.Opcode.StartsWith(
                          "ImageSample",

@@ -48,6 +48,23 @@ public sealed class Gen5ShaderTranslatorTests
         return error;
     }
 
+    [Theory]
+    [InlineData("ImageLoad", true)]
+    [InlineData("ImageLoadMip", true)]
+    [InlineData("ImageStore", true)]
+    [InlineData("ImageStoreMip", true)]
+    [InlineData("ImageAtomicAdd", true)]
+    [InlineData("ImageSample", false)]
+    [InlineData("ImageSampleLzO", false)]
+    [InlineData("ImageGetResinfo", false)]
+    public void IsStorageImageOperation_ClassifiesMimgOpcodes(string opcode, bool expected)
+    {
+        // ImageLoad reads through a storage image binding (OpImageRead); the
+        // same descriptor can also be stored to, so both must share one
+        // storage-class declaration.
+        Assert.Equal(expected, Gen5ShaderTranslator.IsStorageImageOperation(opcode));
+    }
+
     [Fact]
     public void Decode_SMovB32WithLiteral_YieldsLiteralOperand()
     {

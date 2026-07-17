@@ -118,6 +118,7 @@ public static class AgcExports
     private const uint NggUserDataScalarRegisterBase = 8;
     private const uint Gen5TextureFormatR8G8B8A8Unorm = 56;
     private const uint Gen5TextureFormatR16G16B16A16Float = 71;
+    private const uint Gen5TextureType1D = 8;
     private const uint Gen5TextureType2D = 9;
     private const ulong MaxPresentedTextureBytes = 128UL * 1024UL * 1024UL;
     private const ulong VideoOutPixelFormatA8R8G8B8Srgb = 0x80000000;
@@ -507,6 +508,7 @@ public static class AgcExports
         uint Height,
         uint Format,
         uint NumberType,
+        uint ComponentSwap,
         uint TileMode);
 
     internal readonly record struct DepthTargetDescriptor(
@@ -4258,7 +4260,8 @@ public static class AgcExports
                             target.Width,
                             target.Height,
                             target.Format,
-                            target.NumberType)).ToArray(),
+                            target.NumberType,
+                            ComponentSwap: target.ComponentSwap)).ToArray(),
                         translatedDraw.VertexSpirv,
                         translatedDraw.VertexCount,
                         translatedDraw.InstanceCount,
@@ -4414,6 +4417,7 @@ public static class AgcExports
             if (!VulkanVideoPresenter.TryDecodeRenderTargetFormat(
                     target.Format,
                     target.NumberType,
+                    target.ComponentSwap,
                     out renderTargetFormats[index]))
             {
                 error =
@@ -4947,6 +4951,7 @@ public static class AgcExports
                 (attrib2 & 0x3FFFu) + 1,
                 (info >> 2) & 0x1Fu,
                 (info >> 8) & 0x7u,
+                (info >> 11) & 0x3u,
                 (attrib3 >> 14) & 0x1Fu));
         }
 
@@ -5289,7 +5294,8 @@ public static class AgcExports
                 ',',
                 draw.RenderTargets.Select(target =>
                     $"{target.Slot}:0x{target.Address:X16}:{target.Width}x{target.Height}:" +
-                    $"fmt{target.Format}/num{target.NumberType}/tile{target.TileMode}"));
+                    $"fmt{target.Format}/num{target.NumberType}" +
+                    $"/swap{target.ComponentSwap}/tile{target.TileMode}"));
         var probes = new Dictionary<ulong, string>();
         var textures = string.Join(
             ',',
@@ -5457,7 +5463,10 @@ public static class AgcExports
         out VulkanGuestDrawTexture texture)
     {
         texture = default!;
-        if (descriptor.Type != Gen5TextureType2D ||
+        // 1D descriptors decode with height 1 (the T# height field reads as
+        // raw+1) and flow through the 2D upload/detile path unchanged.
+        if ((descriptor.Type != Gen5TextureType1D &&
+             descriptor.Type != Gen5TextureType2D) ||
             descriptor.Width == 0 ||
             descriptor.Height == 0 ||
             descriptor.Width > 8192 ||

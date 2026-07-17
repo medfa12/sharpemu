@@ -276,6 +276,35 @@ public sealed class VulkanPresenterGuestSurfaceCacheTests
     }
 
     [Fact]
+    public void SrgbSampleViewAliasesUnormRenderTarget()
+    {
+        var cache = new VulkanVideoPresenter.GuestSurfaceCache();
+        var rgba8 = Surface(Address, Format.R8G8B8A8Unorm, 1920, 1080);
+        cache.Add(rgba8);
+
+        // A UNORM-rendered target sampled through an SRGB T# must get a true
+        // reinterpreting alias view (both are 32-bit class) instead of the
+        // wrong-gamma native-format fallback.
+        Assert.True(cache.TryFindSampleAlias(
+            Texture(Address, 1920, 1080), Format.R8G8B8A8Srgb, out var chosen));
+        Assert.Same(rgba8, chosen);
+    }
+
+    [Fact]
+    public void TenBitUnormSampleViewAliasesUnormRenderTarget()
+    {
+        var cache = new VulkanVideoPresenter.GuestSurfaceCache();
+        var rgba8 = Surface(Address, Format.R8G8B8A8Unorm, 1920, 1080);
+        cache.Add(rgba8);
+
+        // A2B10G10R10 (COLOR_2_10_10_10 with COMP_SWAP=STD) shares the 32-bit
+        // texel class as well.
+        Assert.True(cache.TryFindSampleAlias(
+            Texture(Address, 1920, 1080), Format.A2B10G10R10UnormPack32, out var chosen));
+        Assert.Same(rgba8, chosen);
+    }
+
+    [Fact]
     public void CrossClassSampleFallsBackToNativeAlias()
     {
         var cache = new VulkanVideoPresenter.GuestSurfaceCache();
@@ -375,5 +404,55 @@ public sealed class VulkanPresenterGuestSurfaceCacheTests
         Assert.True(cache.Remove(first));
         Assert.False(cache.ContainsAddress(Address));
         Assert.False(cache.TryFindPresentable(Address, out _));
+    }
+}
+
+/// <summary>
+/// CB_COLOR_INFO decode: COLOR_2_10_10_10 (data format 9) picks its Vulkan
+/// format from COMP_SWAP. STD exposes the low 10-bit component as R
+/// (A2B10G10R10 in Vulkan); ALT reverses R and B. Astro Bot's final flip
+/// target is 2:10:10:10 and renders with a blue cast under the wrong swap.
+/// </summary>
+public sealed class VulkanRenderTargetFormatDecodeTests
+{
+    [Fact]
+    public void TenBitFormatWithStdSwapDecodesAsAbgr()
+    {
+        Assert.True(VulkanVideoPresenter.TryDecodeRenderTargetFormat(
+            dataFormat: 9, numberType: 0, componentSwap: 0, out var decoded));
+        Assert.Equal(Format.A2B10G10R10UnormPack32, decoded.Format);
+    }
+
+    [Fact]
+    public void TenBitFormatWithAltSwapDecodesAsArgb()
+    {
+        Assert.True(VulkanVideoPresenter.TryDecodeRenderTargetFormat(
+            dataFormat: 9, numberType: 0, componentSwap: 1, out var decoded));
+        Assert.Equal(Format.A2R10G10B10UnormPack32, decoded.Format);
+    }
+
+    [Theory]
+    [InlineData(2u)]
+    [InlineData(3u)]
+    public void TenBitFormatWithReversedSwapsIsRejected(uint componentSwap)
+    {
+        Assert.False(VulkanVideoPresenter.TryDecodeRenderTargetFormat(
+            dataFormat: 9, numberType: 0, componentSwap, out _));
+    }
+
+    [Fact]
+    public void TenBitFormatDefaultsToStdSwap()
+    {
+        Assert.True(VulkanVideoPresenter.TryDecodeRenderTargetFormat(
+            dataFormat: 9, numberType: 0, out var decoded));
+        Assert.Equal(Format.A2B10G10R10UnormPack32, decoded.Format);
+    }
+
+    [Fact]
+    public void ComponentSwapDoesNotAffectOtherFormats()
+    {
+        Assert.True(VulkanVideoPresenter.TryDecodeRenderTargetFormat(
+            dataFormat: 10, numberType: 0, componentSwap: 1, out var decoded));
+        Assert.Equal(Format.R8G8B8A8Unorm, decoded.Format);
     }
 }
