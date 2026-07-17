@@ -1246,8 +1246,8 @@ public static class AvPlayerExports
         {
             return false;
         }
-        var ffprobe = Path.Combine(Path.GetDirectoryName(ffmpeg) ?? string.Empty, "ffprobe");
-        if (!File.Exists(ffprobe))
+        var ffprobe = FindFfprobe();
+        if (ffprobe is null)
         {
             return false;
         }
@@ -1329,15 +1329,74 @@ public static class AvPlayerExports
         }
     }
 
-    private static string? FindFfmpeg()
+    private static readonly string[] FfmpegSearchDirs =
     {
-        var configured = Environment.GetEnvironmentVariable("SHARPEMU_FFMPEG_PATH");
+        "/opt/homebrew/bin",
+        "/usr/local/bin",
+        "/usr/bin",
+        "/bin",
+        @"C:\ffmpeg\bin",
+        @"C:\Program Files\ffmpeg\bin",
+        @"C:\Program Files (x86)\ffmpeg\bin",
+        @"C:\ProgramData\chocolatey\bin",
+    };
+
+    private static string? FindFfmpeg() => FindFfmpegTool("ffmpeg", "SHARPEMU_FFMPEG_PATH");
+
+    private static string? FindFfprobe() => FindFfmpegTool("ffprobe", "SHARPEMU_FFPROBE_PATH");
+
+    // Locates an ffmpeg-family binary across host OSes: honours an explicit
+    // override, then the directory of a configured ffmpeg (so ffprobe is found
+    // beside a hand-set ffmpeg), then PATH, then common install dirs. Appends
+    // the platform executable suffix so the Windows VM resolves ffmpeg.exe.
+    private static string? FindFfmpegTool(string tool, string envVar)
+    {
+        var configured = Environment.GetEnvironmentVariable(envVar);
         if (!string.IsNullOrWhiteSpace(configured) && File.Exists(configured))
         {
             return configured;
         }
-        foreach (var candidate in new[] { "/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg" })
+
+        var exeName = OperatingSystem.IsWindows() ? tool + ".exe" : tool;
+
+        var ffmpegConfigured = Environment.GetEnvironmentVariable("SHARPEMU_FFMPEG_PATH");
+        if (!string.IsNullOrWhiteSpace(ffmpegConfigured) && File.Exists(ffmpegConfigured))
         {
+            var sibling = Path.Combine(Path.GetDirectoryName(ffmpegConfigured) ?? string.Empty, exeName);
+            if (File.Exists(sibling))
+            {
+                return sibling;
+            }
+        }
+
+        var pathEnv = Environment.GetEnvironmentVariable("PATH");
+        if (!string.IsNullOrWhiteSpace(pathEnv))
+        {
+            foreach (var dir in pathEnv.Split(Path.PathSeparator))
+            {
+                if (string.IsNullOrWhiteSpace(dir))
+                {
+                    continue;
+                }
+                string candidate;
+                try
+                {
+                    candidate = Path.Combine(dir.Trim(), exeName);
+                }
+                catch (ArgumentException)
+                {
+                    continue;
+                }
+                if (File.Exists(candidate))
+                {
+                    return candidate;
+                }
+            }
+        }
+
+        foreach (var dir in FfmpegSearchDirs)
+        {
+            var candidate = Path.Combine(dir, exeName);
             if (File.Exists(candidate))
             {
                 return candidate;
