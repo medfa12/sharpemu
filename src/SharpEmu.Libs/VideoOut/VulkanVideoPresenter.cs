@@ -243,6 +243,9 @@ internal static unsafe class VulkanVideoPresenter
         _tracedGuestImageSubmissions = [];
     private static readonly HashSet<(ulong Address, uint Width, uint Height)>
         _tracedDepthExtentRepairs = [];
+    // One line per unique irregular MRT layout (mismatched extents or
+    // duplicate-address slots) so a per-frame draw does not spam the log.
+    private static readonly HashSet<string> _tracedIrregularMrtLayouts = [];
     private static readonly HashSet<ulong> _dumpedFailedDrawShaders = [];
     // Most recently GPU-published render target large enough to be the game's
     // final composite frame. Flips of registered display buffers that never
@@ -655,16 +658,10 @@ internal static unsafe class VulkanVideoPresenter
             return;
         }
 
+        // Mismatched target extents and duplicate-address slots are handled at
+        // execution time (min-extent render area, scratch redirect); neither is
+        // a reason to drop the draw here.
         var firstTarget = targets[0];
-        if (targets.Any(target =>
-                target.Width != firstTarget.Width || target.Height != firstTarget.Height) ||
-            targets.Select(target => target.Address).Distinct().Count() != targets.Count)
-        {
-            Console.Error.WriteLine(
-                "[LOADER][WARN] Vulkan skipped MRT draw with mismatched dimensions or aliased targets.");
-            return;
-        }
-
         if (ShouldTracePresentedGuestImageContentsForDiagnostics())
         {
             Console.Error.WriteLine(
@@ -1134,6 +1131,7 @@ internal static unsafe class VulkanVideoPresenter
             _renderTargetGuestImages.Clear();
             _tracedGuestImageSubmissions.Clear();
             _tracedDepthExtentRepairs.Clear();
+            _tracedIrregularMrtLayouts.Clear();
             _latestPresentableGuestImageAddress = 0;
             _frameCompositeCandidateAddress = 0;
             _frameCompositeCandidateScore = 0;
@@ -1283,6 +1281,60 @@ internal static unsafe class VulkanVideoPresenter
             }
         }
     }
+
+    // MRT attachments may disagree on extent (a half-res aux target bound next
+    // to the full-res scene target). Vulkan requires every framebuffer
+    // attachment to be at least framebuffer-sized, so the pass renders at the
+    // shared minimum extent; the primary target still receives the draw.
+    internal static (uint Width, uint Height) ComputeMrtRenderExtent(
+        IReadOnlyList<VulkanGuestRenderTarget> targets)
+    {
+        var width = targets[0].Width;
+        var height = targets[0].Height;
+        for (var index = 1; index < targets.Count; index++)
+        {
+            width = Math.Min(width, targets[index].Width);
+            height = Math.Min(height, targets[index].Height);
+        }
+
+        return (width, height);
+    }
+
+    // Slots whose address duplicates an earlier color slot alias the same
+    // guest surface (games leave don't-care MRT slots bound to an already-used
+    // target). Returns null when every address is distinct; otherwise flags
+    // each duplicate slot so its writes can be redirected to a scratch surface
+    // instead of double-binding one image as two color attachments, which
+    // Vulkan forbids.
+    internal static bool[]? FindAliasedColorSlots(
+        IReadOnlyList<VulkanGuestRenderTarget> targets)
+    {
+        bool[]? aliased = null;
+        for (var index = 1; index < targets.Count; index++)
+        {
+            for (var prior = 0; prior < index; prior++)
+            {
+                if (targets[index].Address == targets[prior].Address)
+                {
+                    aliased ??= new bool[targets.Count];
+                    aliased[index] = true;
+                    break;
+                }
+            }
+        }
+
+        return aliased;
+    }
+
+    // Synthetic guest address for a duplicate MRT slot's scratch surface. The
+    // top bits sit far above any canonical guest VA, and folding the slot and
+    // extent into the address lets differently-shaped draws keep their scratch
+    // surfaces cached side by side instead of thrashing one cache entry.
+    internal static ulong AliasedSlotScratchAddress(int slot, uint width, uint height) =>
+        0xFFFF_0000_0000_0000UL |
+        ((ulong)(uint)slot << 40) |
+        ((ulong)(width & 0xFFFFF) << 20) |
+        (height & 0xFFFFF);
 
     public static bool TrySubmitGuestImageBlit(
         ulong sourceAddress,
@@ -6881,11 +6933,48 @@ internal static unsafe class VulkanVideoPresenter
                 return;
             }
 
+            var (renderWidth, renderHeight) = ComputeMrtRenderExtent(work.Targets);
+            var aliasedColorSlots = FindAliasedColorSlots(work.Targets);
+            var mismatchedExtents = work.Targets.Any(target =>
+                target.Width != renderWidth || target.Height != renderHeight);
+            if (mismatchedExtents || aliasedColorSlots is not null)
+            {
+                var layout = string.Join(
+                    ',',
+                    work.Targets.Select((target, index) =>
+                        $"{index}:0x{target.Address:X16}:" +
+                        $"{target.Width}x{target.Height}:" +
+                        $"f{target.Format}/n{target.NumberType}"));
+                if (_tracedIrregularMrtLayouts.Add(layout))
+                {
+                    Console.Error.WriteLine(
+                        "[LOADER][WARN] Vulkan executing irregular MRT draw " +
+                        $"mismatched_extents={mismatchedExtents} " +
+                        $"aliased_slots={aliasedColorSlots is not null} " +
+                        $"render_extent={renderWidth}x{renderHeight} " +
+                        $"targets=[{layout}].");
+                }
+            }
+
             var targets = new GuestImageResource[work.Targets.Count];
             EnsureGuestSubmissionCapacity();
             for (var index = 0; index < targets.Length; index++)
             {
-                targets[index] = GetOrCreateGuestImage(work.Targets[index], formats[index]);
+                var slotTarget = work.Targets[index];
+                if (aliasedColorSlots is not null && aliasedColorSlots[index])
+                {
+                    // A duplicate-address slot is a don't-care binding on real
+                    // hardware. Its writes land in a cached scratch surface so
+                    // the draw still executes and the first slot at the address
+                    // keeps the authoritative content.
+                    slotTarget = slotTarget with
+                    {
+                        Address = AliasedSlotScratchAddress(
+                            index, slotTarget.Width, slotTarget.Height),
+                    };
+                }
+
+                targets[index] = GetOrCreateGuestImage(slotTarget, formats[index]);
             }
 
             var firstTarget = targets[0];
@@ -6897,7 +6986,7 @@ internal static unsafe class VulkanVideoPresenter
             GuestImageResource? depthImage = null;
             try
             {
-                var extent = new Extent2D(firstTarget.Width, firstTarget.Height);
+                var extent = new Extent2D(renderWidth, renderHeight);
 
                 // Resolve the depth attachment (if any). A depth surface at
                 // least as large as the color target is bound as the pass's
@@ -6908,8 +6997,8 @@ internal static unsafe class VulkanVideoPresenter
                 if (work.Depth is { } depthTarget)
                 {
                     var repairedDepth = depthTarget;
-                    if (depthTarget.Width < firstTarget.Width ||
-                        depthTarget.Height < firstTarget.Height)
+                    if (depthTarget.Width < renderWidth ||
+                        depthTarget.Height < renderHeight)
                     {
                         // Some Gen5 streams leave DB_DEPTH_SIZE_XY at a stale
                         // clear-state value while binding a full-size depth
@@ -6921,8 +7010,8 @@ internal static unsafe class VulkanVideoPresenter
                         var matchingTexture = work.Draw.Textures.FirstOrDefault(
                             texture =>
                                 texture.Address == depthTarget.Address &&
-                                texture.Width >= firstTarget.Width &&
-                                texture.Height >= firstTarget.Height);
+                                texture.Width >= renderWidth &&
+                                texture.Height >= renderHeight);
                         if (matchingTexture is not null)
                         {
                             repairedDepth = depthTarget with
@@ -6935,8 +7024,8 @@ internal static unsafe class VulkanVideoPresenter
                         {
                             repairedDepth = depthTarget with
                             {
-                                Width = firstTarget.Width,
-                                Height = firstTarget.Height,
+                                Width = renderWidth,
+                                Height = renderHeight,
                             };
                         }
 
@@ -6954,8 +7043,8 @@ internal static unsafe class VulkanVideoPresenter
                         }
                     }
 
-                    if (repairedDepth.Width >= firstTarget.Width &&
-                        repairedDepth.Height >= firstTarget.Height)
+                    if (repairedDepth.Width >= renderWidth &&
+                        repairedDepth.Height >= renderHeight)
                     {
                         depthImage = GetOrCreateGuestDepthImage(repairedDepth);
                         effectiveDepth = repairedDepth;
@@ -6974,8 +7063,8 @@ internal static unsafe class VulkanVideoPresenter
                     (renderPass, framebuffer) = CreateRenderPassAndFramebuffer(
                         formats,
                         targets.Select(target => target.AttachmentView).ToArray(),
-                        firstTarget.Width,
-                        firstTarget.Height,
+                        renderWidth,
+                        renderHeight,
                         depthImage?.Format,
                         depthImage?.View ?? default,
                         clearDepth);
@@ -6996,7 +7085,7 @@ internal static unsafe class VulkanVideoPresenter
                 resources.DebugName =
                     $"SharpEmu offscreen mrt={targets.Length} " +
                     $"first=0x{work.Targets[0].Address:X16} " +
-                    $"{firstTarget.Width}x{firstTarget.Height}";
+                    $"{renderWidth}x{renderHeight}";
 
                 commandBuffer = AllocateGuestCommandBuffer();
                 _commandBuffer = commandBuffer;
@@ -7041,7 +7130,7 @@ internal static unsafe class VulkanVideoPresenter
                         $"vk.ngg_compute_draw invocations={resources.CaptureInvocationCount} " +
                         $"outBytes={(ulong)resources.CaptureInvocationCount * 16} " +
                         $"target=0x{work.Targets[0].Address:X16} " +
-                        $"{firstTarget.Width}x{firstTarget.Height}");
+                        $"{renderWidth}x{renderHeight}");
                 }
 
                 RecordTranslatedGraphicsPass(
@@ -7168,6 +7257,14 @@ internal static unsafe class VulkanVideoPresenter
                 {
                     for (var index = 0; index < targets.Length; index++)
                     {
+                        // A duplicate-address slot rendered into scratch never
+                        // becomes guest-visible content; publishing its
+                        // synthetic address would pollute the flip election.
+                        if (aliasedColorSlots is not null && aliasedColorSlots[index])
+                        {
+                            continue;
+                        }
+
                         var guestTextureFormat = VulkanVideoPresenter.GetGuestTextureFormat(
                             work.Targets[index].Format,
                             work.Targets[index].NumberType);
@@ -7216,7 +7313,7 @@ internal static unsafe class VulkanVideoPresenter
                 }
                 TraceVulkanShader(
                     $"vk.offscreen_draw mrt={targets.Length} " +
-                    $"size={firstTarget.Width}x{firstTarget.Height} " +
+                    $"size={renderWidth}x{renderHeight} " +
                     $"textures={work.Draw.Textures.Count}");
             }
             catch (Exception exception)
