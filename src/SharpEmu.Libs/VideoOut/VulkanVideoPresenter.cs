@@ -2097,6 +2097,7 @@ internal static unsafe class VulkanVideoPresenter
         private bool _supportsMemoryBudget;
         private ulong _useStamp;
         private bool _reclaimInProgress;
+        private bool _memoryPanic;
         private readonly HashSet<(ulong Address, uint Width, uint Height, Format Format)> _tracedTextureCacheHits = new();
         private static readonly bool _dumpTextures = string.Equals(
             Environment.GetEnvironmentVariable("SHARPEMU_DUMP_TEXTURES"),
@@ -3467,9 +3468,20 @@ internal static unsafe class VulkanVideoPresenter
                 Check(status, $"vkGetFenceStatus(guest: {submission.DebugName})");
                 _pendingGuestSubmissions.Dequeue();
 
-                foreach (var image in submission.TraceImages)
+                try
                 {
-                    TraceGuestImageContents(image);
+                    foreach (var image in submission.TraceImages)
+                    {
+                        TraceGuestImageContents(image);
+                    }
+                }
+                catch (Exception exception)
+                {
+                    // Diagnostics only: a failed readback (e.g. OOM on its
+                    // host buffer) must not leak the submission's resources,
+                    // command buffer, or fence below.
+                    Console.Error.WriteLine(
+                        $"[LOADER][ERROR] guest readback trace failed: {exception.Message}");
                 }
 
                 DestroyTranslatedDrawResources(submission.Resources);
@@ -6378,6 +6390,16 @@ internal static unsafe class VulkanVideoPresenter
                     $"live={_deviceMemoryLedger.LiveDeviceLocalBytes / (1024 * 1024)}MB " +
                     $"live_host={_deviceMemoryLedger.LiveHostVisibleBytes / (1024 * 1024)}MB; " +
                     "reclaiming and retrying");
+                if (!_memoryPanic)
+                {
+                    // First OOM: the driver is under real memory pressure and
+                    // may crash natively on later API calls. Shed all optional
+                    // diagnostics readback allocations for the rest of the run.
+                    _memoryPanic = true;
+                    Console.Error.WriteLine(
+                        "[LOADER][VKMEM] memory panic: diagnostics readbacks disabled");
+                }
+
                 if (deviceLocal)
                 {
                     EvictLeastRecentlyUsedGuestImages(ulong.MaxValue);
@@ -6385,6 +6407,11 @@ internal static unsafe class VulkanVideoPresenter
                 else
                 {
                     ReclaimHostVisibleMemory();
+                    // Both heaps share the same physical RAM on small hosts:
+                    // a host-visible OOM with hundreds of MB of live
+                    // device-local images means the driver itself is starved.
+                    // Freeing idle images relieves that pressure too.
+                    EvictLeastRecentlyUsedGuestImages(ulong.MaxValue);
                 }
 
                 result = _vk.AllocateMemory(_device, &allocationInfo, null, out memory);
@@ -6438,6 +6465,14 @@ internal static unsafe class VulkanVideoPresenter
                     if (surface.LastUseStamp >= _useStamp)
                     {
                         // Referenced by the draw currently being translated.
+                        // Invariant: _useStamp++ runs at the start of every
+                        // dispatch/draw/present, and every image resolved into
+                        // a partially-built TranslatedDrawResources goes
+                        // through GetOrCreateGuestImage (storage images via
+                        // ResolveStorageGuestImage), which stamps
+                        // LastUseStamp = _useStamp. So a reclaim triggered by
+                        // an allocation mid-build can never free an image the
+                        // current resource set references.
                         continue;
                     }
 
@@ -8377,6 +8412,18 @@ internal static unsafe class VulkanVideoPresenter
 
         private void TraceGuestImageContents(GuestImageResource image)
         {
+            if (_reclaimInProgress)
+            {
+                // Reclaim drains in-flight submissions, and collecting those
+                // submissions traces their images -- which would allocate a
+                // fresh host-visible readback buffer, the very memory class
+                // being reclaimed, re-entering CreateBuffer mid-reclaim.
+                TraceVulkanShader(
+                    $"vk.guest_image addr=0x{image.Address:X16} " +
+                    "readback=skipped_reclaim");
+                return;
+            }
+
             var bytesPerPixel = GetReadbackBytesPerPixel(image.Format);
             if (bytesPerPixel == 0)
             {
@@ -9119,6 +9166,14 @@ internal static unsafe class VulkanVideoPresenter
 
         private bool ShouldTraceGuestImageContents(GuestImageResource image)
         {
+            if (_memoryPanic)
+            {
+                // After a first vkAllocateMemory OOM every optional readback
+                // (each allocates a per-image host-visible buffer) is shed to
+                // keep the starved driver alive.
+                return false;
+            }
+
             if (image.Address == 0)
             {
                 return false;
