@@ -21,6 +21,7 @@ public static class AudioOut2Exports
     private const uint AudioOut2GrainSamples = 512;
     private const uint AudioOut2SampleRate = 48000;
     private const int AudioOut2ErrorNotReady = unchecked((int)0x80268008);
+    private const int AudioOut2ErrorPortFull = unchecked((int)0x80268012);
     private static long _nextContextHandle = 1;
     private static long _nextUserHandle = 1;
     private static int _nextPortId;
@@ -104,6 +105,31 @@ public static class AudioOut2Exports
             state.LastUpdateMicros = now;
         }
     }
+
+    // Kill switch for the guest-side Sndz audio-out pipeline. Astro Bot's
+    // SceSndzAudioOutMain thread (thread main at eboot 0x800EB31B0) creates
+    // its first port through a wrapper (0x800EB3E10) whose result is the only
+    // init return the thread ever checks (test/jns at 0x800EB32BC): on failure
+    // it logs through the Sndz printf hook (0x800DFDC80), usleeps one second,
+    // and retries forever, never reaching the render loop at 0x800EB3800 that
+    // virtual-calls the mixer render (0x800F60400). That render dies on every
+    // long session reading a mixer object whose head has been stomped with
+    // {x, y, z, 1.0f} NaN vec4s (index dword at obj+0xC8 holds float bits;
+    // AVs at 0x800F6053E / 0x800F60549). Until the stomper is found, failing
+    // PortCreate parks the thread in that benign retry loop. Every other
+    // PortCreate call site (0x800EB2521, 0x800EB25C4, 0x800EB2BFC, 0x800EB3560,
+    // 0x800EB3690) compiles to the same log-then-continue pattern, the engine
+    // leaves failed slots at -1 and already calls PortSetAttributes(-1)
+    // harmlessly, and the ready byte the thread would set (global+0x51) is
+    // never read anywhere in the eboot, so nothing blocks on the port coming
+    // up. Set SHARPEMU_DISABLE_SNDZ=0 to mint ports again; unset or any other
+    // value keeps audio-out disabled. Read per call: port creation is rare
+    // (init/retry cadence) and tests flip the variable at runtime.
+    private static bool SndzAudioOutDisabled =>
+        !string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_DISABLE_SNDZ"),
+            "0",
+            StringComparison.Ordinal);
 
     // Cached once: several of these exports (port_set_attributes, port_get_state,
     // context_push, queue level) run thousands of times per second, and a per-call
@@ -240,6 +266,17 @@ public static class AudioOut2Exports
         if (paramAddress == 0 || outPortAddress == 0)
         {
             return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        if (SndzAudioOutDisabled)
+        {
+            // PORT_FULL is what the real library reports when no port slot is
+            // free (KytyPS5 libAudio2 PortCreate does the same when out of
+            // slots), so retry-styled callers treat it as a transient miss.
+            // The out slot stays untouched: the Sndz wrapper leaves its port
+            // handle at -1 and only stores on success (eboot 0x800EB3FB0).
+            Trace($"port_create context={contextHandle} refused (SHARPEMU_DISABLE_SNDZ)");
+            return ctx.SetReturn(AudioOut2ErrorPortFull);
         }
 
         if (!ctx.TryReadUInt16(paramAddress, out var portType) ||

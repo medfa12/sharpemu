@@ -14,6 +14,36 @@ namespace SharpEmu.Tests;
 /// </summary>
 public sealed class AudioOut2Tests
 {
+    private const string DisableSndzVariable = "SHARPEMU_DISABLE_SNDZ";
+
+    /// <summary>
+    /// Sndz audio-out is disabled by default (Astro Bot's mixer render dies
+    /// on a stomped mixer object; failing PortCreate parks the
+    /// SceSndzAudioOutMain thread in its benign one-second retry loop).
+    /// Ports are only minted when the variable is explicitly "0".
+    /// </summary>
+    private static EnvScope SndzEnabled() => new EnvScope(DisableSndzVariable, "0");
+
+    private static EnvScope SndzDisabled(string? value) => new EnvScope(DisableSndzVariable, value);
+
+    private sealed class EnvScope : IDisposable
+    {
+        private readonly string _name;
+        private readonly string? _previous;
+
+        public EnvScope(string name, string? value)
+        {
+            _name = name;
+            _previous = Environment.GetEnvironmentVariable(name);
+            Environment.SetEnvironmentVariable(name, value);
+        }
+
+        public void Dispose()
+        {
+            Environment.SetEnvironmentVariable(_name, _previous);
+        }
+    }
+
     private static CpuContext NewContext(out SparseGuestMemory memory)
     {
         memory = new SparseGuestMemory();
@@ -27,6 +57,7 @@ public sealed class AudioOut2Tests
         // sceAudioOut2PortCreate(context, const PortParam*, out u64*): the
         // param struct carries the u16 port type at +0x00 and the u32 data
         // format at +0x04 (main port, stereo float here).
+        using var _ = SndzEnabled();
         ctx.TryWriteUInt16(0x3000, 0); // port type: main
         ctx.TryWriteUInt32(0x3004, 0x200); // data format: 2-channel float
         ctx[CpuRegister.Rdi] = 1; // context handle
@@ -46,6 +77,70 @@ public sealed class AudioOut2Tests
         AudioOut2Exports.AudioOut2ContextCreate(ctx);
         ctx.TryReadUInt64(0x4100, out var context);
         return context;
+    }
+
+    private const int AudioOut2ErrorPortFull = unchecked((int)0x80268012);
+
+    [Fact]
+    public void PortCreate_RefusedByDefault_AndLeavesOutSlotUntouched()
+    {
+        using var scope = SndzDisabled(null);
+        var ctx = NewContext(out _);
+
+        // The Sndz wrapper keeps its port slot at -1 until PortCreate stores a
+        // handle; a refused create must not write through the out pointer.
+        ctx.TryWriteUInt64(0x3100, ulong.MaxValue);
+        ctx.TryWriteUInt16(0x3000, 0);
+        ctx.TryWriteUInt32(0x3004, 0x200);
+        ctx[CpuRegister.Rdi] = 1;
+        ctx[CpuRegister.Rsi] = 0x3000;
+        ctx[CpuRegister.Rdx] = 0x3100;
+        AudioOut2Exports.AudioOut2PortCreate(ctx);
+
+        Assert.Equal(AudioOut2ErrorPortFull, Result(ctx));
+        Assert.True(ctx.TryReadUInt64(0x3100, out var slot));
+        Assert.Equal(ulong.MaxValue, slot);
+    }
+
+    [Fact]
+    public void PortCreate_RefusedWhenVariableIsNotZero()
+    {
+        using var scope = SndzDisabled("1");
+        var ctx = NewContext(out _);
+
+        ctx.TryWriteUInt16(0x3000, 0);
+        ctx.TryWriteUInt32(0x3004, 0x200);
+        ctx[CpuRegister.Rdi] = 1;
+        ctx[CpuRegister.Rsi] = 0x3000;
+        ctx[CpuRegister.Rdx] = 0x3100;
+        AudioOut2Exports.AudioOut2PortCreate(ctx);
+
+        Assert.Equal(AudioOut2ErrorPortFull, Result(ctx));
+    }
+
+    [Fact]
+    public void PortCreate_NullArgumentsStillRejectedWhileRefused()
+    {
+        using var scope = SndzDisabled(null);
+        var ctx = NewContext(out _);
+
+        ctx[CpuRegister.Rdi] = 1;
+        ctx[CpuRegister.Rsi] = 0;
+        ctx[CpuRegister.Rdx] = 0x3100;
+        AudioOut2Exports.AudioOut2PortCreate(ctx);
+
+        Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT, Result(ctx));
+    }
+
+    [Fact]
+    public void PortCreate_MintsPortWhenExplicitlyEnabled()
+    {
+        var ctx = NewContext(out _);
+
+        var port = CreatePort(ctx);
+
+        Assert.Equal(0, Result(ctx));
+        Assert.NotEqual(0UL, port);
     }
 
     [Fact]

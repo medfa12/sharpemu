@@ -26,8 +26,28 @@ public sealed class AudioOut2ExportsTests
         return new CpuContext(new FakeCpuMemory(MemoryBase, 0x1000), Generation.Gen5);
     }
 
+    // Sndz audio-out is disabled by default (failing PortCreate parks Astro
+    // Bot's SceSndzAudioOutMain thread away from its stomped mixer render);
+    // these tests pin the enabled-path contract, so opt back in per call.
+    private sealed class SndzEnabledScope : IDisposable
+    {
+        private const string Name = "SHARPEMU_DISABLE_SNDZ";
+        private readonly string? _previous = Environment.GetEnvironmentVariable(Name);
+
+        public SndzEnabledScope()
+        {
+            Environment.SetEnvironmentVariable(Name, "0");
+        }
+
+        public void Dispose()
+        {
+            Environment.SetEnvironmentVariable(Name, _previous);
+        }
+    }
+
     private static ulong CreatePort(CpuContext ctx, ushort portType, uint dataFormat)
     {
+        using var scope = new SndzEnabledScope();
         Span<byte> param = stackalloc byte[0x30];
         param.Clear();
         BinaryPrimitives.WriteUInt16LittleEndian(param, portType);
