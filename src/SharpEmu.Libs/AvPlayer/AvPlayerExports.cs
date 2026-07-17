@@ -17,9 +17,12 @@ namespace SharpEmu.Libs.AvPlayer;
 /// video is decoded to NV12 frames (guest-allocated textures when the title
 /// provides an allocator callback) and audio to 48kHz stereo s16le frames.
 /// When the source cannot be resolved or probed, the player falls back to
-/// synthetic metadata and the first data poll after start raises
-/// end-of-stream, so titles that gate progress on their intro video (poll
-/// GetVideoData, wait for IsActive to drop) skip straight past it.
+/// synthetic metadata: the first video poll after start delivers a single
+/// black NV12 frame and the next poll raises end-of-stream, so titles that
+/// gate progress on their intro video skip straight past it whether they
+/// wait for a first frame, for IsActive to drop, or for the StateStop
+/// event. A title that never polls data still finishes: IsActive reports
+/// the synthetic stream as ended once its synthetic duration elapses.
 /// </summary>
 public static class AvPlayerExports
 {
@@ -79,6 +82,7 @@ public static class AvPlayerExports
         public bool Paused { get; set; }
         public bool Looping { get; set; }
         public bool EndOfStream { get; set; }
+        public bool SyntheticFrameDelivered { get; set; }
         public Process? Decoder { get; set; }
         public Stream? DecoderOutput { get; set; }
         public Process? AudioDecoder { get; set; }
@@ -137,6 +141,7 @@ public static class AvPlayerExports
             NextFrameIndex = 0;
             NextAudioFrameIndex = 0;
             EndOfStream = false;
+            SyntheticFrameDelivered = false;
         }
     }
 
@@ -475,12 +480,36 @@ public static class AvPlayerExports
         LibraryName = "libSceAvPlayer")]
     public static int AvPlayerIsActive(CpuContext ctx)
     {
+        PlayerState? stoppedPlayer = null;
+        int active;
         lock (StateGate)
         {
-            return ctx.SetReturn(
-                Players.TryGetValue(ctx[CpuRegister.Rdi], out var player) &&
-                player.Started && !player.EndOfStream ? 1 : 0);
+            if (!Players.TryGetValue(ctx[CpuRegister.Rdi], out var player))
+            {
+                active = 0;
+            }
+            else
+            {
+                // A synthetic source must never keep the title waiting: even
+                // if it polls no data at all, playback ends once the synthetic
+                // duration elapses so an IsActive-only wait loop terminates.
+                if (!player.HasRealSource && player.Started && !player.EndOfStream &&
+                    (ulong)player.PlaybackClock.ElapsedMilliseconds >= SyntheticDurationMilliseconds)
+                {
+                    player.EndOfStream = true;
+                    player.PlaybackClock.Stop();
+                    stoppedPlayer = player;
+                    Trace($"end_of_stream handle=0x{player.Handle:X16} reason=synthetic_timeout");
+                }
+                active = player.Started && !player.EndOfStream ? 1 : 0;
+            }
         }
+
+        if (stoppedPlayer is not null)
+        {
+            NotifyEvent(ctx, stoppedPlayer, StateStop);
+        }
+        return ctx.SetReturn(active);
     }
 
     [SysAbiExport(
@@ -513,7 +542,10 @@ public static class AvPlayerExports
             }
             if (!player.HasRealSource)
             {
-                return PollDataAsEndOfStream(ctx);
+                // Synthetic mode never produces audio. End-of-stream is driven
+                // by the video poll (or the IsActive timeout) so an audio poll
+                // racing ahead cannot cancel the single synthetic video frame.
+                return ctx.SetReturn(0);
             }
             if (infoAddress == 0 || !player.Started || player.Paused || player.EndOfStream ||
                 !EnsureAudioDecoder(player))
@@ -710,56 +742,79 @@ public static class AvPlayerExports
     private static int GetVideoData(CpuContext ctx, bool extended)
     {
         var infoAddress = ctx[CpuRegister.Rsi];
+        PlayerState? stoppedPlayer = null;
+        int result;
         lock (StateGate)
         {
-            if (!Players.TryGetValue(ctx[CpuRegister.Rdi], out var player))
-            {
-                return ctx.SetReturn(0);
-            }
-            if (!player.HasRealSource)
-            {
-                return PollDataAsEndOfStream(ctx);
-            }
-            if (infoAddress == 0 || !player.Started || player.Paused || player.EndOfStream)
-            {
-                return ctx.SetReturn(0);
-            }
-
-            if (!EnsureDecoder(player))
-            {
-                player.EndOfStream = true;
-                return ctx.SetReturn(0);
-            }
-
-            var fps = Math.Max(1.0, player.FramesPerSecond);
-            var expectedFrame = (long)Math.Floor(player.PlaybackClock.Elapsed.TotalSeconds * fps);
-            while (player.NextFrameIndex < expectedFrame)
-            {
-                if (!ReadFrame(player))
-                {
-                    return FinishStream(ctx, player);
-                }
-                player.NextFrameIndex++;
-            }
-
-            if (!ReadFrame(player))
-            {
-                return FinishStream(ctx, player);
-            }
-
-            var timestamp = checked((ulong)Math.Round(player.NextFrameIndex * 1000.0 / fps));
-            player.NextFrameIndex++;
-            if (!WriteVideoFrame(ctx, player, infoAddress, timestamp, extended))
-            {
-                return ctx.SetReturn(0);
-            }
-
-            Trace($"video_frame handle=0x{player.Handle:X16} ex={extended} ts={timestamp} data=0x{player.LastGuestBuffer:X16}");
-            return ctx.SetReturn(1);
+            result = GetVideoDataLocked(ctx, extended, infoAddress, ref stoppedPlayer);
         }
+
+        // The real player raises a StateStop event when playback completes.
+        // Fire it outside StateGate: the callback is guest code and may
+        // immediately re-enter an AvPlayer export from another guest worker.
+        if (stoppedPlayer is not null)
+        {
+            NotifyEvent(ctx, stoppedPlayer, StateStop);
+        }
+        return result;
     }
 
-    private static int FinishStream(CpuContext ctx, PlayerState player)
+    private static int GetVideoDataLocked(
+        CpuContext ctx,
+        bool extended,
+        ulong infoAddress,
+        ref PlayerState? stoppedPlayer)
+    {
+        if (!Players.TryGetValue(ctx[CpuRegister.Rdi], out var player))
+        {
+            return ctx.SetReturn(0);
+        }
+        if (!player.HasRealSource)
+        {
+            return PollSyntheticVideo(ctx, player, infoAddress, extended, ref stoppedPlayer);
+        }
+        if (infoAddress == 0 || !player.Started || player.Paused || player.EndOfStream)
+        {
+            return ctx.SetReturn(0);
+        }
+
+        if (!EnsureDecoder(player))
+        {
+            player.EndOfStream = true;
+            player.PlaybackClock.Stop();
+            stoppedPlayer = player;
+            Trace($"end_of_stream handle=0x{player.Handle:X16} reason=decoder_unavailable");
+            return ctx.SetReturn(0);
+        }
+
+        var fps = Math.Max(1.0, player.FramesPerSecond);
+        var expectedFrame = (long)Math.Floor(player.PlaybackClock.Elapsed.TotalSeconds * fps);
+        while (player.NextFrameIndex < expectedFrame)
+        {
+            if (!ReadFrame(player))
+            {
+                return FinishStream(ctx, player, ref stoppedPlayer);
+            }
+            player.NextFrameIndex++;
+        }
+
+        if (!ReadFrame(player))
+        {
+            return FinishStream(ctx, player, ref stoppedPlayer);
+        }
+
+        var timestamp = checked((ulong)Math.Round(player.NextFrameIndex * 1000.0 / fps));
+        player.NextFrameIndex++;
+        if (!WriteVideoFrame(ctx, player, infoAddress, timestamp, extended))
+        {
+            return ctx.SetReturn(0);
+        }
+
+        Trace($"video_frame handle=0x{player.Handle:X16} ex={extended} ts={timestamp} data=0x{player.LastGuestBuffer:X16}");
+        return ctx.SetReturn(1);
+    }
+
+    private static int FinishStream(CpuContext ctx, PlayerState player, ref PlayerState? stoppedPlayer)
     {
         if (player.Looping)
         {
@@ -770,9 +825,60 @@ public static class AvPlayerExports
         {
             player.EndOfStream = true;
             player.PlaybackClock.Stop();
+            stoppedPlayer = player;
             Trace($"end_of_stream handle=0x{player.Handle:X16}");
         }
         return ctx.SetReturn(0);
+    }
+
+    // Skip path taken by GetVideoData/GetVideoDataEx when no real source is
+    // attached: the first poll of a started player delivers a single black
+    // NV12 frame through the normal frame machinery (so titles that require
+    // one presented frame before transitioning still get it) and the next
+    // poll raises end-of-stream so IsActive drops and the caller finishes
+    // its video.
+    private static int PollSyntheticVideo(
+        CpuContext ctx,
+        PlayerState player,
+        ulong infoAddress,
+        bool extended,
+        ref PlayerState? stoppedPlayer)
+    {
+        if (!player.Started || player.EndOfStream)
+        {
+            return ctx.SetReturn(0);
+        }
+
+        if (infoAddress != 0 && !player.Paused && !player.SyntheticFrameDelivered)
+        {
+            EnsureSyntheticBlackFrame(player);
+            if (WriteVideoFrame(ctx, player, infoAddress, timestamp: 0, extended))
+            {
+                player.SyntheticFrameDelivered = true;
+                Trace($"video_frame handle=0x{player.Handle:X16} ex={extended} ts=0 data=0x{player.LastGuestBuffer:X16} synthetic=1");
+                return ctx.SetReturn(1);
+            }
+        }
+
+        player.EndOfStream = true;
+        player.PlaybackClock.Stop();
+        stoppedPlayer = player;
+        Trace($"end_of_stream handle=0x{player.Handle:X16}");
+        return ctx.SetReturn(0);
+    }
+
+    // Black in NV12: luma at video black level, chroma at the unsigned
+    // midpoint.
+    private static void EnsureSyntheticBlackFrame(PlayerState player)
+    {
+        var lumaSize = checked(player.Width * player.Height);
+        var frameSize = checked(lumaSize * 3 / 2);
+        if (player.RawFrame is null || player.RawFrame.Length != frameSize)
+        {
+            player.RawFrame = new byte[frameSize];
+        }
+        player.RawFrame.AsSpan(0, lumaSize).Fill(0x10);
+        player.RawFrame.AsSpan(lumaSize).Fill(0x80);
     }
 
     private static bool EnsureDecoder(PlayerState player)
@@ -1275,26 +1381,6 @@ public static class AvPlayerExports
         return candidate.StartsWith(root, StringComparison.OrdinalIgnoreCase) && File.Exists(candidate)
             ? candidate
             : null;
-    }
-
-    // Skip path shared by GetVideoData/GetVideoDataEx/GetAudioData when no
-    // real source is attached: never produce a frame, and let the first poll
-    // of a started player raise end-of-stream so IsActive drops and the
-    // caller finishes its video.
-    private static int PollDataAsEndOfStream(CpuContext ctx)
-    {
-        lock (StateGate)
-        {
-            if (Players.TryGetValue(ctx[CpuRegister.Rdi], out var player) &&
-                player.Started && !player.EndOfStream)
-            {
-                player.EndOfStream = true;
-                player.PlaybackClock.Stop();
-                Trace($"end_of_stream handle=0x{player.Handle:X16}");
-            }
-
-            return ctx.SetReturn(0);
-        }
     }
 
     private static void NotifyEvent(CpuContext ctx, PlayerState player, ulong eventId)
