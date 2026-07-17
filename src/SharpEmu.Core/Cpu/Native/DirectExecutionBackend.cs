@@ -59,16 +59,6 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 		public ImportStubTraceFlags TraceFlags { get; }
 
-		// Leaf/no-block classification hoisted to stub-setup time so the dispatch
-		// hot path reads precomputed flags instead of re-matching the NID string
-		// on every import call. IsUsleepLeaf marks the one leaf whose eligibility
-		// additionally depends on the runtime _logUsleep flag (see DispatchImport).
-		public bool IsLeaf { get; }
-
-		public bool IsUsleepLeaf { get; }
-
-		public bool IsNoBlockLeaf { get; }
-
 		public ImportStubEntry(ulong address, string nid, ExportedFunction? export)
 		{
 			Address = address;
@@ -76,9 +66,6 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			Export = export;
 			Kind = ClassifyKind(nid);
 			TraceFlags = ClassifyTraceFlags(nid);
-			IsLeaf = IsLeafImportNid(nid);
-			IsUsleepLeaf = string.Equals(nid, "1jfXLRVzisc", StringComparison.Ordinal);
-			IsNoBlockLeaf = IsNoBlockLeafImport(nid);
 		}
 
 		private static ImportStubKind ClassifyKind(string nid) => nid switch
@@ -352,8 +339,6 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 	private bool _logUsleep;
 
-	private bool _logFiber;
-
 	private bool _logBootstrap;
 
 	private bool _logAllImports;
@@ -595,15 +580,6 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	private int _readyGuestThreadCount;
 
 	private readonly Dictionary<ulong, GuestThreadState> _guestThreads = new Dictionary<ulong, GuestThreadState>();
-
-	// Count of threads parked with a blocked continuation per wake key. Written
-	// only under _guestThreadGate; read lock-free by WakeBlockedThreads so the
-	// unlock-side hot path can skip the scheduler gate when nobody is parked on
-	// the key. A registration that has not yet published its count is
-	// indistinguishable from the wake linearizing before the block, which the
-	// wake-handler recheck on the blocked transition already recovers.
-	private readonly ConcurrentDictionary<string, int> _blockedContinuationWakeKeyCounts =
-		new(StringComparer.Ordinal);
 
 	private int _guestThreadPumpDepth;
 
@@ -1014,7 +990,6 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		_logGuestContext = string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_CONTEXT"), "1", StringComparison.Ordinal);
 		_logGuestThreads = string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_GUEST_THREADS"), "1", StringComparison.Ordinal);
 		_logUsleep = string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_USLEEP"), "1", StringComparison.Ordinal);
-		_logFiber = string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_FIBER"), "1", StringComparison.Ordinal);
 		_logBootstrap = string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_BOOTSTRAP"), "1", StringComparison.Ordinal);
 		_logAllImports = string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_ALL_IMPORTS"), "1", StringComparison.Ordinal);
 		_logImportFrames = string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_IMPORT_FRAMES"), "1", StringComparison.Ordinal);
@@ -3104,16 +3079,6 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			return 0;
 		}
 
-		// Uncontended fast path: mutex/rwlock unlocks call this on every release,
-		// and taking the scheduler gate to scan every guest thread is the dominant
-		// cost when nothing is parked on the key. See the count field's comment
-		// for why a racing not-yet-published registration is safe to miss here.
-		if (!_blockedContinuationWakeKeyCounts.TryGetValue(wakeKey, out var parkedCount) ||
-			parkedCount <= 0)
-		{
-			return 0;
-		}
-
 		var wakeCount = 0;
 		lock (_guestThreadGate)
 		{
@@ -3205,49 +3170,12 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				return;
 			}
 
-			if (thread.HasBlockedContinuation)
-			{
-				DecrementBlockedWakeKeyCountLocked(thread.BlockWakeKey);
-			}
-
 			thread.BlockedContinuation = continuation;
 			thread.HasBlockedContinuation = true;
 			thread.BlockWakeKey = wakeKey;
 			thread.BlockResumeHandler = resumeHandler;
 			thread.BlockWakeHandler = wakeHandler;
 			thread.BlockDeadlineTimestamp = blockDeadlineTimestamp;
-			IncrementBlockedWakeKeyCountLocked(wakeKey);
-		}
-	}
-
-	// Both helpers must be called with _guestThreadGate held; the counts mirror
-	// the set of threads whose HasBlockedContinuation is true, keyed by their
-	// BlockWakeKey, so WakeBlockedThreads can skip the gate for idle keys.
-	private void IncrementBlockedWakeKeyCountLocked(string? wakeKey)
-	{
-		if (string.IsNullOrEmpty(wakeKey))
-		{
-			return;
-		}
-
-		_blockedContinuationWakeKeyCounts.AddOrUpdate(wakeKey, 1, static (_, count) => count + 1);
-	}
-
-	private void DecrementBlockedWakeKeyCountLocked(string? wakeKey)
-	{
-		if (string.IsNullOrEmpty(wakeKey) ||
-			!_blockedContinuationWakeKeyCounts.TryGetValue(wakeKey, out var count))
-		{
-			return;
-		}
-
-		if (count <= 1)
-		{
-			_blockedContinuationWakeKeyCounts.TryRemove(wakeKey, out _);
-		}
-		else
-		{
-			_blockedContinuationWakeKeyCounts[wakeKey] = count - 1;
 		}
 	}
 
@@ -3292,13 +3220,29 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		{
 			Pump(callerContext, reason);
 
-			// Tally run states under the lock without allocating a snapshot every
-			// spin (this loop can iterate rapidly); the full snapshot is only
-			// materialized for the gated diagnostic dump below.
-			GetGuestThreadActivity(out var threadCount, out var hasReadyThread, out var hasRunningThread, out var hasBlockedThread);
-			if (threadCount == 0)
+			var threads = SnapshotGuestThreads();
+			if (threads.Length == 0)
 			{
 				return;
+			}
+
+			var hasReadyThread = false;
+			var hasRunningThread = false;
+			var hasBlockedThread = false;
+			foreach (var thread in threads)
+			{
+				switch (thread.State)
+				{
+					case GuestThreadRunState.Ready:
+						hasReadyThread = true;
+						break;
+					case GuestThreadRunState.Running:
+						hasRunningThread = true;
+						break;
+					case GuestThreadRunState.Blocked:
+						hasBlockedThread = true;
+						break;
+				}
 			}
 
 			if (hasReadyThread)
@@ -3313,7 +3257,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 			if (_logGuestThreads && Stopwatch.GetTimestamp() >= nextSnapshotTimestamp)
 			{
-				foreach (var thread in SnapshotGuestThreads())
+				foreach (var thread in threads)
 				{
 					Console.Error.WriteLine(
 						$"[LOADER][TRACE] guest_thread.idle_wait reason={reason} handle=0x{thread.ThreadHandle:X16} " +
@@ -3333,36 +3277,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	{
 		lock (_guestThreadGate)
 		{
-			var snapshot = new GuestThreadState[_guestThreads.Count];
-			_guestThreads.Values.CopyTo(snapshot, 0);
-			return snapshot;
-		}
-	}
-
-	// Allocation-free run-state tally for the idle spin loop.
-	private void GetGuestThreadActivity(out int count, out bool hasReady, out bool hasRunning, out bool hasBlocked)
-	{
-		hasReady = false;
-		hasRunning = false;
-		hasBlocked = false;
-		lock (_guestThreadGate)
-		{
-			count = _guestThreads.Count;
-			foreach (var thread in _guestThreads.Values)
-			{
-				switch (thread.State)
-				{
-					case GuestThreadRunState.Ready:
-						hasReady = true;
-						break;
-					case GuestThreadRunState.Running:
-						hasRunning = true;
-						break;
-					case GuestThreadRunState.Blocked:
-						hasBlocked = true;
-						break;
-				}
-			}
+			return _guestThreads.Values.ToArray();
 		}
 	}
 
@@ -3589,7 +3504,6 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 						continuation = owner.BlockedContinuation;
 						owner.BlockedContinuation = default;
 						owner.HasBlockedContinuation = false;
-						DecrementBlockedWakeKeyCountLocked(owner.BlockWakeKey);
 						owner.BlockWakeKey = null;
 						resumeHandler = owner.BlockResumeHandler;
 						owner.BlockResumeHandler = null;
@@ -3880,7 +3794,6 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			_readyGuestThreads.Clear();
 			Interlocked.Exchange(ref _readyGuestThreadCount, 0);
 			_guestThreads.Clear();
-			_blockedContinuationWakeKeyCounts.Clear();
 		}
 
 		foreach (var runner in runners)
@@ -4177,7 +4090,6 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 					continuation = thread.BlockedContinuation;
 					thread.BlockedContinuation = default;
 					thread.HasBlockedContinuation = false;
-					DecrementBlockedWakeKeyCountLocked(thread.BlockWakeKey);
 					thread.BlockWakeKey = null;
 					resumeHandler = thread.BlockResumeHandler;
 					thread.BlockResumeHandler = null;

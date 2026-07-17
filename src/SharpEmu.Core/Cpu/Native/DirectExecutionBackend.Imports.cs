@@ -136,13 +136,10 @@ public sealed partial class DirectExecutionBackend
 		// Leaf imports take a scalar-only fast path that reads its own operands and
 		// intentionally bypasses the SysV variadic XMM marshalling below. This is safe
 		// only while the leaf set contains no float-variadic or float-returning function.
-		// The constraint and the audited list live on IsLeafImportNid — do not add a
+		// The constraint and the audited list live on IsLeafImport — do not add a
 		// function that consumes xmm0-7 args or returns in xmm0 to the leaf set;
 		// such functions must stay on the full gateway path below.
-		// Classification is precomputed on the stub entry; sceKernelUsleep is the one
-		// leaf that additionally drops back to the full path when usleep logging is on.
-		if (importStubEntry.IsLeaf &&
-			(!importStubEntry.IsUsleepLeaf || !_logUsleep) &&
+		if (IsLeafImport(importStubEntry.Nid) &&
 			TryDispatchLeafImport(cpuContext, importStubEntry, argPackPtr, num, out var leafResult))
 		{
 			return leafResult;
@@ -535,7 +532,7 @@ public sealed partial class DirectExecutionBackend
 				}
 
 				*(ulong*)(argPackPtr + 96) = unchecked((ulong)transferStub);
-				if (_logFiber)
+				if (string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_FIBER"), "1", StringComparison.Ordinal))
 				{
 					Console.Error.WriteLine(
 						$"[LOADER][TRACE] fiber.context-transfer rip=0x{transferTarget.Rip:X16} " +
@@ -674,7 +671,7 @@ public sealed partial class DirectExecutionBackend
 		}
 
 		int returnValue;
-		if (importStubEntry.IsNoBlockLeaf)
+		if (IsNoBlockLeafImport(importStubEntry.Nid))
 		{
 			cpuContext.ClearRaxWriteFlag();
 			returnValue = export.Function(cpuContext);
@@ -748,16 +745,11 @@ public sealed partial class DirectExecutionBackend
 
 	// Subset of the leaf set that additionally skips the import-call-frame
 	// bookkeeping. The same scalar-only (no XMM args, no XMM return) constraint
-	// as IsLeafImportNid applies — see the note there before adding entries.
-	// Every entry must also be verified never to block and never to consult the
-	// import call frame (GuestThreadExecution.TryGetCurrentImportCallFrame /
-	// RequestCurrentThreadBlock): mutex/rwlock unlock only release and wake,
-	// trylock is nonblocking by design (its !tryOnly guard short-circuits the
-	// cooperative-block path), and the time/audio getters are pure reads.
-	// NOTE: this filter is only consulted after IsLeafImportNid accepts the NID;
-	// entries listed here but not in IsLeafImportNid (scePadOpen,
-	// sceUserServiceGetEvent, sceUserServiceGetPlatformPrivacySetting)
-	// currently take the full gateway path.
+	// as IsLeafImport applies — see the note there before adding entries.
+	// NOTE: this filter is only consulted after IsLeafImport accepts the NID;
+	// entries listed here but not in IsLeafImport (scePadRead, scePadOpen,
+	// sceUserServiceGetEvent, sceUserServiceGetPlatformPrivacySetting,
+	// pthread_mutex_trylock) currently take the full gateway path.
 	private static bool IsNoBlockLeafImport(string nid) =>
 		nid is
 			"8aI7R7WaOlc" or // sceAmprCommandBufferConstructor
@@ -788,15 +780,7 @@ public sealed partial class DirectExecutionBackend
 			"xk0AcarP3V4" or // scePadOpen
 			"yH17Q6NWtVg" or // sceUserServiceGetEvent
 			"D-CzAxQL0XI" or // sceUserServiceGetPlatformPrivacySetting
-			"K-jXhbt2gn4" or // pthread_mutex_trylock
-			"upoVrzMHFeE" or // scePthreadMutexTrylock (same nonblocking core as pthread_mutex_trylock)
-			"tn3VlD0hG60" or // scePthreadMutexUnlock (release + wake only, never blocks)
-			"2Z+PpY6CaJg" or // pthread_mutex_unlock
-			"+L98PIbGttk" or // scePthreadRwlockUnlock (release + wake only, never blocks)
-			"EgmLo6EWgso" or // pthread_rwlock_unlock
-			"4J2sUJmuHZQ" or // sceKernelGetProcessTime (Stopwatch read into rax)
-			"8XTArSPyWHk" or // sceAudioOut2PortSetAttributes (accepts and returns 0)
-			"gatEUKG+Ea4";   // sceAudioOut2PortGetState (fills 0x40-byte state struct)
+			"K-jXhbt2gn4";   // pthread_mutex_trylock (scePthreadMutexTrylock is upoVrzMHFeE)
 
 	private bool ShouldLogImportResult(string nid, OrbisGen2Result result)
 	{
@@ -819,8 +803,7 @@ public sealed partial class DirectExecutionBackend
 			string.Equals(nid, "JTvBflhYazQ", StringComparison.Ordinal) &&
 			result == OrbisGen2Result.ORBIS_GEN2_ERROR_TIMED_OUT;
 		var expectedMutexTrylockBusy =
-			(string.Equals(nid, "K-jXhbt2gn4", StringComparison.Ordinal) ||
-			 string.Equals(nid, "upoVrzMHFeE", StringComparison.Ordinal)) &&
+			string.Equals(nid, "K-jXhbt2gn4", StringComparison.Ordinal) &&
 			result == OrbisGen2Result.ORBIS_GEN2_ERROR_BUSY;
 		var expectedUserServiceNoEvent =
 			string.Equals(nid, "yH17Q6NWtVg", StringComparison.Ordinal) &&
@@ -856,15 +839,11 @@ public sealed partial class DirectExecutionBackend
 		return count <= 8 || count % 10000 == 0;
 	}
 
-	// Cached once: this gate sits on the expected-result path of hot imports
-	// (trylock busy, timed-wait timeouts), where a per-call
-	// Environment.GetEnvironmentVariable is a P/Invoke plus a transient string.
-	private static readonly bool _logExpectedImportResults = string.Equals(
-		Environment.GetEnvironmentVariable("SHARPEMU_LOG_EXPECTED_IMPORT_RESULTS"),
-		"1",
-		StringComparison.Ordinal);
-
-	private static bool ShouldLogExpectedImportResults() => _logExpectedImportResults;
+	private static bool ShouldLogExpectedImportResults() =>
+		string.Equals(
+			Environment.GetEnvironmentVariable("SHARPEMU_LOG_EXPECTED_IMPORT_RESULTS"),
+			"1",
+			StringComparison.Ordinal);
 
 	private static bool IsExpectedFileProbeNotFoundNid(string nid) =>
 		nid is
@@ -891,25 +870,21 @@ public sealed partial class DirectExecutionBackend
 	// Audited 2026-07-11 (PR #59): every NID below maps to a registered
 	// SysAbiExport whose handler neither reads nor writes CpuContext XMM state
 	// and whose known guest signature is integer/pointer only.
-	// Classification runs once at stub setup (ImportStubEntry ctor); the
-	// dispatch hot path reads the precomputed IsLeaf flag. sceKernelUsleep's
-	// runtime _logUsleep opt-out is applied at the call site in DispatchImport.
-	private static bool IsLeafImportNid(string nid)
+	private bool IsLeafImport(string nid)
 	{
+		if (nid == "1jfXLRVzisc") // sceKernelUsleep
+		{
+			return !_logUsleep;
+		}
+
 		// Mutex lock uses this block-capable leaf path. Keep it out of the no-block subset.
 		return nid is
-			"1jfXLRVzisc" or // sceKernelUsleep (leaf only while !_logUsleep; gated in DispatchImport)
 			"9UK1vLZQft4" or // scePthreadMutexLock
 			"7H0iTOciTLo" or // pthread_mutex_lock
 			"tn3VlD0hG60" or // scePthreadMutexUnlock
 			"2Z+PpY6CaJg" or // pthread_mutex_unlock
-			"upoVrzMHFeE" or // scePthreadMutexTrylock
-			"K-jXhbt2gn4" or // pthread_mutex_trylock
 			"EgmLo6EWgso" or // pthread_rwlock_unlock
 			"+L98PIbGttk" or // scePthreadRwlockUnlock
-			"4J2sUJmuHZQ" or // sceKernelGetProcessTime
-			"8XTArSPyWHk" or // sceAudioOut2PortSetAttributes
-			"gatEUKG+Ea4" or // sceAudioOut2PortGetState
 			"q1cHNfGycLI" or // scePadRead
 			"8aI7R7WaOlc" or // sceAmprCommandBufferConstructor
 			"zgXifHT9ErY" or // sceVideoOutIsFlipPending
