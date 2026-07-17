@@ -28,9 +28,35 @@ namespace SharpEmu.Libs.Audio;
 /// - SourceGetAudioPathCount(source rdi, out u32* count rsi).
 /// - System/SourceGetRays(handle rdi, rayArray rsi, in-out u32* count rdx);
 ///   the caller pre-zeroes the ray array, so reporting zero rays is safe.
+///
+/// Disable gate: a long-running Astro Bot session dies ~20-35 min in with an
+/// AV inside memcpy on SceSndzAudioOutMain when the propagation output bus
+/// object's render-buffer pointer (bus+0x18) has been stomped with float
+/// data ({x, y, z, 1.0f} vec4-shaped writes at bus+0x10..0x1F). Until the
+/// direct writer is caught, the whole subsystem can be switched off by
+/// failing every handle-creating call with NOT_IMPLEMENTED. Disassembly of
+/// every Astro Bot call site (SystemQueryMemory/SystemCreate at 0x800F427DF
+/// and 0x800F42845, RoomCreate at 0x800F4B177, plus the copy-out sanity
+/// checks at 0x800F44B75/0x800F44BB7) shows the same compiled pattern on
+/// failure: stash the code in r9d, call the logging hook at 0x800001aa0,
+/// then jump straight back into the success path - no assert, no abort, no
+/// skipped semaphore posts - so failing creates is safe for boot progress.
+/// The zero-count getters keep succeeding even when disabled because their
+/// zero writes are the already-proven-benign contract the game consumes.
+/// Set SHARPEMU_DISABLE_AUDIO_PROPAGATION=0 to hand out handles again;
+/// unset or any other value leaves the subsystem disabled.
 /// </summary>
 public static class AudioPropagationExports
 {
+    // Disabled unless the environment variable is explicitly "0". Read per
+    // call: creates are rare (game init), and tests flip the variable at
+    // runtime.
+    private static bool PropagationDisabled =>
+        !string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_DISABLE_AUDIO_PROPAGATION"),
+            "0",
+            StringComparison.Ordinal);
+
     // Handed back through SystemQueryMemory; the game allocates this many
     // bytes (16-byte aligned) and passes the block to SystemCreate. We never
     // touch the block, so any modest non-zero size is fine.
@@ -97,6 +123,13 @@ public static class AudioPropagationExports
         var paramAddress = ctx[CpuRegister.Rdi];
         var memoryInfoAddress = ctx[CpuRegister.Rsi];
         var outSystemAddress = ctx[CpuRegister.Rdx];
+        if (PropagationDisabled)
+        {
+            // The out-handle slot is caller-zeroed and must stay untouched so
+            // the game keeps carrying a null system handle.
+            Trace($"system_create param=0x{paramAddress:X} info=0x{memoryInfoAddress:X} -> disabled");
+            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_IMPLEMENTED);
+        }
         if (paramAddress == 0 || memoryInfoAddress == 0 || outSystemAddress == 0)
         {
             return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
@@ -118,6 +151,11 @@ public static class AudioPropagationExports
     {
         var systemHandle = ctx[CpuRegister.Rdi];
         var outRoomAddress = ctx[CpuRegister.Rsi];
+        if (PropagationDisabled)
+        {
+            Trace($"room_create system=0x{systemHandle:X} -> disabled");
+            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_IMPLEMENTED);
+        }
         if (outRoomAddress == 0)
         {
             return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
@@ -143,6 +181,11 @@ public static class AudioPropagationExports
         var systemHandle = ctx[CpuRegister.Rdi];
         var paramAddress = ctx[CpuRegister.Rsi];
         var outPortalAddress = ctx[CpuRegister.Rdx];
+        if (PropagationDisabled)
+        {
+            Trace($"portal_create system=0x{systemHandle:X} -> disabled");
+            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_IMPLEMENTED);
+        }
         if (paramAddress == 0 || outPortalAddress == 0)
         {
             return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
@@ -164,6 +207,11 @@ public static class AudioPropagationExports
     {
         var systemHandle = ctx[CpuRegister.Rdi];
         var outSourceAddress = ctx[CpuRegister.Rsi];
+        if (PropagationDisabled)
+        {
+            Trace($"source_create system=0x{systemHandle:X} -> disabled");
+            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_IMPLEMENTED);
+        }
         if (outSourceAddress == 0)
         {
             return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
@@ -186,6 +234,11 @@ public static class AudioPropagationExports
         var systemHandle = ctx[CpuRegister.Rdi];
         var paramAddress = ctx[CpuRegister.Rsi];
         var outMaterialAddress = ctx[CpuRegister.Rdx];
+        if (PropagationDisabled)
+        {
+            Trace($"system_register_material system=0x{systemHandle:X} -> disabled");
+            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_IMPLEMENTED);
+        }
         if (paramAddress == 0 || outMaterialAddress == 0)
         {
             return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);

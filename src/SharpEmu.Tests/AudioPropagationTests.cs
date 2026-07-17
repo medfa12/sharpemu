@@ -19,6 +19,35 @@ public sealed class AudioPropagationTests
     private const ulong MemInfoAddress = 0x2000;
     private const ulong OutHandleAddress = 0x3000;
 
+    private const string DisableVariable = "SHARPEMU_DISABLE_AUDIO_PROPAGATION";
+
+    /// <summary>
+    /// The subsystem defaults to disabled (Astro Bot's output-bus buffer
+    /// pointer keeps getting stomped mid-session); handle-creating exports
+    /// only mint handles when the variable is explicitly "0".
+    /// </summary>
+    private static EnvScope PropagationEnabled() => new EnvScope(DisableVariable, "0");
+
+    private static EnvScope PropagationDisabled(string? value) => new EnvScope(DisableVariable, value);
+
+    private sealed class EnvScope : IDisposable
+    {
+        private readonly string _name;
+        private readonly string? _previous;
+
+        public EnvScope(string name, string? value)
+        {
+            _name = name;
+            _previous = Environment.GetEnvironmentVariable(name);
+            Environment.SetEnvironmentVariable(name, value);
+        }
+
+        public void Dispose()
+        {
+            Environment.SetEnvironmentVariable(_name, _previous);
+        }
+    }
+
     private static CpuContext NewContext()
     {
         return new CpuContext(new SparseGuestMemory(), Generation.Gen5);
@@ -67,6 +96,7 @@ public sealed class AudioPropagationTests
     public void SystemCreate_WritesNonNullHandleThroughRdx()
     {
         var ctx = NewContext();
+        using var _ = PropagationEnabled();
         ctx[CpuRegister.Rdi] = 0x1000; // param struct
         ctx[CpuRegister.Rsi] = MemInfoAddress;
         ctx[CpuRegister.Rdx] = OutHandleAddress;
@@ -82,6 +112,7 @@ public sealed class AudioPropagationTests
     public void RoomCreate_WritesHandleThroughRsi_AndNeverThroughRdx()
     {
         var ctx = NewContext();
+        using var _ = PropagationEnabled();
 
         // At Astro Bot's call site rdx holds a stale rodata pointer from the
         // previous call, so RoomCreate must leave it strictly alone.
@@ -105,6 +136,7 @@ public sealed class AudioPropagationTests
     public void PortalCreate_WritesNonNullHandleThroughRdx()
     {
         var ctx = NewContext();
+        using var _ = PropagationEnabled();
         ctx[CpuRegister.Rdi] = 0x4150000100000001; // system handle
         ctx[CpuRegister.Rsi] = 0x1000; // portal param struct
         ctx[CpuRegister.Rdx] = OutHandleAddress;
@@ -120,6 +152,7 @@ public sealed class AudioPropagationTests
     public void SourceCreate_WritesNonNullHandleThroughRsi()
     {
         var ctx = NewContext();
+        using var _ = PropagationEnabled();
         ctx[CpuRegister.Rdi] = 0x4150000100000001; // system handle
         ctx[CpuRegister.Rsi] = OutHandleAddress;
 
@@ -134,6 +167,7 @@ public sealed class AudioPropagationTests
     public void SystemRegisterMaterial_WritesUniqueHandlesThroughRdx()
     {
         var ctx = NewContext();
+        using var _ = PropagationEnabled();
         ctx[CpuRegister.Rdi] = 0x4150000100000001; // system handle
         ctx[CpuRegister.Rsi] = 0x1000; // material param struct
         ctx[CpuRegister.Rdx] = OutHandleAddress;
@@ -155,6 +189,7 @@ public sealed class AudioPropagationTests
     public void CreateCalls_MintDistinctHandlesAcrossObjectTypes()
     {
         var ctx = NewContext();
+        using var _ = PropagationEnabled();
         var handles = new ulong[4];
 
         ctx[CpuRegister.Rdi] = 0x1000;
@@ -187,6 +222,7 @@ public sealed class AudioPropagationTests
     public void CreateCalls_RejectNullOutPointers()
     {
         var ctx = NewContext();
+        using var _ = PropagationEnabled();
 
         ctx[CpuRegister.Rdi] = 0x1000;
         ctx[CpuRegister.Rsi] = MemInfoAddress;
@@ -281,5 +317,87 @@ public sealed class AudioPropagationTests
             call(ctx);
             Assert.Equal(0, Result(ctx));
         }
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("1")]
+    [InlineData("true")]
+    public void CreateCalls_FailWithoutWriting_WhenPropagationDisabled(string? value)
+    {
+        var ctx = NewContext();
+        using var _ = PropagationDisabled(value);
+
+        // The game pre-zeroes every out-handle slot; a failing create must
+        // leave it that way so the title keeps carrying a null handle into
+        // its (log-and-continue) error paths.
+        Assert.True(ctx.TryWriteUInt64(OutHandleAddress, 0));
+
+        ctx[CpuRegister.Rdi] = 0x1000;
+        ctx[CpuRegister.Rsi] = MemInfoAddress;
+        ctx[CpuRegister.Rdx] = OutHandleAddress;
+        AudioPropagationExports.SystemCreate(ctx);
+        Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_IMPLEMENTED, Result(ctx));
+
+        ctx[CpuRegister.Rdi] = 0;
+        ctx[CpuRegister.Rsi] = OutHandleAddress;
+        AudioPropagationExports.RoomCreate(ctx);
+        Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_IMPLEMENTED, Result(ctx));
+
+        ctx[CpuRegister.Rdi] = 0;
+        ctx[CpuRegister.Rsi] = 0x1000;
+        ctx[CpuRegister.Rdx] = OutHandleAddress;
+        AudioPropagationExports.PortalCreate(ctx);
+        Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_IMPLEMENTED, Result(ctx));
+
+        ctx[CpuRegister.Rdi] = 0;
+        ctx[CpuRegister.Rsi] = OutHandleAddress;
+        AudioPropagationExports.SourceCreate(ctx);
+        Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_IMPLEMENTED, Result(ctx));
+
+        ctx[CpuRegister.Rdi] = 0;
+        ctx[CpuRegister.Rsi] = 0x1000;
+        ctx[CpuRegister.Rdx] = OutHandleAddress;
+        AudioPropagationExports.SystemRegisterMaterial(ctx);
+        Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_IMPLEMENTED, Result(ctx));
+
+        Assert.True(ctx.TryReadUInt64(OutHandleAddress, out var untouched));
+        Assert.Equal(0u, untouched);
+    }
+
+    [Fact]
+    public void QueryMemoryAndZeroCountGetters_StillSucceed_WhenPropagationDisabled()
+    {
+        var ctx = NewContext();
+        using var _ = PropagationDisabled(null);
+
+        // The ctor reads the size back and allocates before SystemCreate can
+        // fail, so QueryMemory keeps its normal contract even when disabled.
+        ctx[CpuRegister.Rdi] = 0x1000;
+        ctx[CpuRegister.Rsi] = MemInfoAddress;
+        AudioPropagationExports.SystemQueryMemory(ctx);
+        Assert.Equal(0, Result(ctx));
+        Assert.True(ctx.TryReadUInt64(MemInfoAddress + 0x18, out var size));
+        Assert.True(size > 0);
+
+        // Zero-count getters keep their proven-benign writes: the game reads
+        // these counts back unconditionally in its per-frame loops.
+        const ulong countAddress = 0x5000;
+        Assert.True(ctx.TryWriteUInt32(countAddress, 0x40));
+        ctx[CpuRegister.Rdi] = 0;
+        ctx[CpuRegister.Rsi] = 0x6000;
+        ctx[CpuRegister.Rdx] = countAddress;
+        AudioPropagationExports.SystemGetRays(ctx);
+        Assert.Equal(0, Result(ctx));
+        Assert.True(ctx.TryReadUInt32(countAddress, out var rays));
+        Assert.Equal(0u, rays);
+
+        Assert.True(ctx.TryWriteUInt32(countAddress, 0x1234));
+        ctx[CpuRegister.Rdi] = 0;
+        ctx[CpuRegister.Rsi] = countAddress;
+        AudioPropagationExports.SourceGetAudioPathCount(ctx);
+        Assert.Equal(0, Result(ctx));
+        Assert.True(ctx.TryReadUInt32(countAddress, out var paths));
+        Assert.Equal(0u, paths);
     }
 }
