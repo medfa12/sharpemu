@@ -1647,6 +1647,13 @@ internal static unsafe class VulkanVideoPresenter
         public DeviceMemory Memory;
         public ImageView View;
         public ImageView[] MipViews = [];
+
+        // The single-mip view an attachment must bind. Render-target surfaces
+        // expose one view per mip; CPU-backed upload surfaces have no per-mip
+        // views and alias their single-mip texture view in View. Indexing
+        // MipViews[0] directly threw on every MRT draw whose target address
+        // was first seen as a CPU texture upload.
+        public ImageView AttachmentView => MipViews.Length > 0 ? MipViews[0] : View;
         public Dictionary<(Format Format, uint MipLevel, uint LevelCount, uint DstSelect), ImageView> FormatViews { get; } = new();
         public RenderPass RenderPass;
         public Framebuffer Framebuffer;
@@ -6966,7 +6973,7 @@ internal static unsafe class VulkanVideoPresenter
                 {
                     (renderPass, framebuffer) = CreateRenderPassAndFramebuffer(
                         formats,
-                        targets.Select(target => target.MipViews[0]).ToArray(),
+                        targets.Select(target => target.AttachmentView).ToArray(),
                         firstTarget.Width,
                         firstTarget.Height,
                         depthImage?.Format,
@@ -7338,12 +7345,9 @@ internal static unsafe class VulkanVideoPresenter
                     existing.LastUseStamp = _useStamp;
                     if (existing.RenderPass.Handle == 0)
                     {
-                        var attachmentView = existing.MipViews.Length > 0
-                            ? existing.MipViews[0]
-                            : existing.View;
                         var (promotedRenderPass, promotedFramebuffer) = CreateRenderPassAndFramebuffer(
                             existing.Format,
-                            attachmentView,
+                            existing.AttachmentView,
                             existing.Width,
                             existing.Height);
                         existing.RenderPass = promotedRenderPass;

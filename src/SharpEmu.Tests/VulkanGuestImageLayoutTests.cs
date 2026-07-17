@@ -231,3 +231,44 @@ public sealed class VulkanGuestImageLayoutTests
         Assert.Equal(1u, barrier.SubresourceRange.LevelCount);
     }
 }
+
+/// <summary>
+/// The attachment view an MRT framebuffer binds per color target. A target
+/// address first seen as a CPU texture upload is backed by a surface with no
+/// per-mip views (its single-mip view lives in View); indexing MipViews[0]
+/// directly threw IndexOutOfRangeException on every such mrt&gt;1 draw and
+/// dropped the producing pass, blacking out everything sampling its targets.
+/// </summary>
+public sealed class VulkanGuestImageAttachmentViewTests
+{
+    [Fact]
+    public void CpuBackedUploadSurfaceFallsBackToItsSingleMipView()
+    {
+        var image = new VulkanVideoPresenter.GuestImageResource
+        {
+            Width = 3840,
+            Height = 2160,
+            MipLevels = 1,
+            View = new ImageView(0x1111),
+            MipViews = [],
+            IsCpuBacked = true,
+        };
+
+        Assert.Equal(new ImageView(0x1111), image.AttachmentView);
+    }
+
+    [Fact]
+    public void RenderTargetSurfaceBindsItsMipZeroView()
+    {
+        var image = new VulkanVideoPresenter.GuestImageResource
+        {
+            Width = 1920,
+            Height = 1080,
+            MipLevels = 2,
+            View = new ImageView(0x2222),
+            MipViews = [new ImageView(0x3333), new ImageView(0x4444)],
+        };
+
+        Assert.Equal(new ImageView(0x3333), image.AttachmentView);
+    }
+}
