@@ -4,6 +4,7 @@
 using SharpEmu.HLE;
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
+using System.Diagnostics;
 
 namespace SharpEmu.Libs.Audio;
 
@@ -17,6 +18,9 @@ public static class AudioOut2Exports
     private const int AudioOut2ContextParamSize = 0x30;
     private const int AudioOut2ContextMemorySize = 0x10000;
     private const uint AudioOut2QueueCapacity = 4;
+    private const uint AudioOut2GrainSamples = 512;
+    private const uint AudioOut2SampleRate = 48000;
+    private const int AudioOut2ErrorNotReady = unchecked((int)0x80268008);
     private static long _nextContextHandle = 1;
     private static long _nextUserHandle = 1;
     private static int _nextPortId;
@@ -26,6 +30,80 @@ public static class AudioOut2Exports
     // from the handle bits alone broke as soon as PortCreate's argument
     // layout was corrected (see AudioOut2PortCreate).
     private static readonly ConcurrentDictionary<ulong, (ushort PortType, uint DataFormat)> Ports = new();
+
+    // Per-context grain queue, keyed by context handle. The Sndz audio-out
+    // loop (eboot 0x800EB3800) renders a grain into every port, then calls
+    // ContextAdvance + ContextPush(ctx, blocking=1) + ContextGetQueueLevel.
+    // On real hardware Push blocks until the DMA drains a queue slot, so that
+    // loop IS the game's real-time audio clock. When Push returned instantly
+    // the loop free-ran, the game's audio time raced ahead of wall time, and
+    // the A/V sync gate on the main thread stalled presents forever while the
+    // audio thread kept spinning. Model Kyty's libAudio2: a queue of depth 4
+    // that drains one grain (512 samples @ 48kHz, ~10.67ms) per grain period
+    // of wall time.
+    private sealed class AudioOut2ContextState
+    {
+        public uint QueueDepth = AudioOut2QueueCapacity;
+        public uint NumGrains = AudioOut2GrainSamples;
+        public uint Queued;
+        public long LastUpdateMicros;
+    }
+
+    private static readonly ConcurrentDictionary<ulong, AudioOut2ContextState> Contexts = new();
+    private static readonly long ClockOrigin = Stopwatch.GetTimestamp();
+
+    // Test seam: lets unit tests drive the drain clock deterministically.
+    internal static Func<long>? MicrosecondClockOverride;
+
+    private static long NowMicros()
+    {
+        var overrideClock = MicrosecondClockOverride;
+        if (overrideClock != null)
+        {
+            return overrideClock();
+        }
+
+        var elapsed = Stopwatch.GetTimestamp() - ClockOrigin;
+        return (elapsed / Stopwatch.Frequency) * 1_000_000L
+            + (elapsed % Stopwatch.Frequency) * 1_000_000L / Stopwatch.Frequency;
+    }
+
+    private static uint GrainMicros(uint numGrains)
+    {
+        var samples = numGrains == 0 ? AudioOut2GrainSamples : numGrains;
+        return Math.Max(samples * 1_000_000u / AudioOut2SampleRate, 1000u);
+    }
+
+    // Drain queued grains at the real-time grain rate. Mirrors Kyty's
+    // audioout2_update_context_locked; caller must hold the state lock.
+    private static void DrainQueueLocked(AudioOut2ContextState state, long now)
+    {
+        if (state.LastUpdateMicros == 0 || state.Queued == 0)
+        {
+            state.LastUpdateMicros = now;
+            return;
+        }
+
+        long grainMicros = GrainMicros(state.NumGrains);
+        if (now <= state.LastUpdateMicros)
+        {
+            return;
+        }
+
+        var elapsed = now - state.LastUpdateMicros;
+        var drained = Math.Min(state.Queued, (uint)Math.Min(elapsed / grainMicros, uint.MaxValue));
+        if (drained == 0)
+        {
+            return;
+        }
+
+        state.Queued -= drained;
+        state.LastUpdateMicros += drained * grainMicros;
+        if (state.Queued == 0)
+        {
+            state.LastUpdateMicros = now;
+        }
+    }
 
     private static void Trace(string message)
     {
@@ -113,6 +191,7 @@ public static class AudioOut2Exports
         }
 
         var handle = (ulong)Interlocked.Increment(ref _nextContextHandle);
+        Contexts[handle] = new AudioOut2ContextState { LastUpdateMicros = NowMicros() };
         Trace($"context_create param=0x{paramAddress:X} mem=0x{memoryAddress:X} size=0x{memorySize:X} -> handle={handle}");
         return ctx.TryWriteUInt64(outContextAddress, handle)
             ? ctx.SetReturn(0)
@@ -126,6 +205,7 @@ public static class AudioOut2Exports
         LibraryName = "libSceAudioOut2")]
     public static int AudioOut2ContextDestroy(CpuContext ctx)
     {
+        Contexts.TryRemove(ctx[CpuRegister.Rdi], out _);
         Trace($"context_destroy handle={ctx[CpuRegister.Rdi]}");
         return ctx.SetReturn(0);
     }
@@ -314,13 +394,51 @@ public static class AudioOut2Exports
     public static int AudioOut2ContextPush(CpuContext ctx)
     {
         var contextHandle = ctx[CpuRegister.Rdi];
+        var blocking = (uint)ctx[CpuRegister.Rsi];
         if (contextHandle == 0)
         {
             return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
         }
 
-        Trace($"context_push handle={contextHandle} arg1=0x{ctx[CpuRegister.Rsi]:X}");
-        return ctx.SetReturn(0);
+        if (!Contexts.TryGetValue(contextHandle, out var state))
+        {
+            // Unknown handle: accept it rather than blocking forever.
+            Trace($"context_push handle={contextHandle} blocking={blocking} (untracked)");
+            return ctx.SetReturn(0);
+        }
+
+        for (; ; )
+        {
+            uint sleepMicros;
+            lock (state)
+            {
+                var now = NowMicros();
+                DrainQueueLocked(state, now);
+                sleepMicros = GrainMicros(state.NumGrains);
+                if (state.Queued < state.QueueDepth)
+                {
+                    if (state.Queued == 0)
+                    {
+                        state.LastUpdateMicros = now;
+                    }
+
+                    state.Queued++;
+                    Trace($"context_push handle={contextHandle} blocking={blocking} -> queued={state.Queued}");
+                    return ctx.SetReturn(0);
+                }
+            }
+
+            if (blocking == 0)
+            {
+                Trace($"context_push handle={contextHandle} blocking=0 -> not_ready");
+                return ctx.SetReturn(AudioOut2ErrorNotReady);
+            }
+
+            // Queue full: wait one grain period, exactly the cadence the DMA
+            // would drain a slot at. This is what paces SceSndzAudioOutMain.
+            GuestThreadExecution.Scheduler?.Pump(ctx, "sceAudioOut2ContextPush");
+            Thread.Sleep((int)Math.Max(sleepMicros / 1000u, 1u));
+        }
     }
 
     [SysAbiExport(
@@ -338,20 +456,32 @@ public static class AudioOut2Exports
             return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
         }
 
-        // Real hardware drains this queue via DMA essentially instantly from
-        // the CPU's perspective; reporting it as always-empty (never full)
-        // matched observed behavior better than tracking a real depth here.
-        if (!ctx.TryWriteUInt32(outLevelAddress, 0))
+        // Report the real, wall-clock-drained queue level (Kyty's model). The
+        // second out parameter is the number of free queue slots, not the
+        // total capacity.
+        var level = 0u;
+        var available = AudioOut2QueueCapacity;
+        if (Contexts.TryGetValue(contextHandle, out var state))
+        {
+            lock (state)
+            {
+                DrainQueueLocked(state, NowMicros());
+                level = state.Queued;
+                available = state.Queued < state.QueueDepth ? state.QueueDepth - state.Queued : 0;
+            }
+        }
+
+        if (!ctx.TryWriteUInt32(outLevelAddress, level))
         {
             return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
         }
 
-        if (outCapacityAddress != 0 && !ctx.TryWriteUInt32(outCapacityAddress, AudioOut2QueueCapacity))
+        if (outCapacityAddress != 0 && !ctx.TryWriteUInt32(outCapacityAddress, available))
         {
             return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
         }
 
-        Trace($"context_get_queue_level handle={contextHandle} -> level=0 capacity={AudioOut2QueueCapacity}");
+        Trace($"context_get_queue_level handle={contextHandle} -> level={level} available={available}");
         return ctx.SetReturn(0);
     }
 
@@ -366,6 +496,14 @@ public static class AudioOut2Exports
         if (contextHandle == 0)
         {
             return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        if (Contexts.TryGetValue(contextHandle, out var state))
+        {
+            lock (state)
+            {
+                DrainQueueLocked(state, NowMicros());
+            }
         }
 
         Trace($"context_advance handle={contextHandle}");

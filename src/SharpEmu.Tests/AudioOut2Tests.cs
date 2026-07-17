@@ -215,24 +215,164 @@ public sealed class AudioOut2Tests
         Assert.Equal(0xDEADBEEFCAFEF00D, sentinel);
     }
 
-    [Fact]
-    public void ContextGetQueueLevel_AlwaysReportsEmpty_PushAndAdvanceDoNotChangeIt()
+    // One grain is 512 samples at 48kHz: 10666 microseconds.
+    private const long GrainMicros = 512L * 1_000_000L / 48_000L;
+
+    private static uint ReadQueueLevel(CpuContext ctx, ulong context, out uint available)
     {
-        // Real hardware drains this queue via DMA essentially instantly from
-        // the CPU's perspective, so it never meaningfully backs up; Push and
-        // Advance are accepted but do not affect what GetQueueLevel reports.
+        ctx[CpuRegister.Rdi] = context;
+        ctx[CpuRegister.Rsi] = 0x6000;
+        ctx[CpuRegister.Rdx] = 0x6010;
+        AudioOut2Exports.AudioOut2ContextGetQueueLevel(ctx);
+        Assert.Equal(0, Result(ctx));
+        Assert.True(ctx.TryReadUInt32(0x6000, out var level));
+        Assert.True(ctx.TryReadUInt32(0x6010, out available));
+        return level;
+    }
+
+    [Fact]
+    public void ContextPush_QueuesGrains_AndWallClockDrainsThem()
+    {
+        // The Sndz audio-out loop (eboot 0x800EB3800) is paced by
+        // ContextPush(ctx, blocking=1): each pushed grain must take one grain
+        // period (512 samples @ 48kHz) of wall time to drain, or the game's
+        // audio clock runs away from real time and the A/V sync gate stalls
+        // presents while the audio thread spins.
+        long now = 1_000_000; // nonzero: 0 is the "clock unset" sentinel in the drain
+        AudioOut2Exports.MicrosecondClockOverride = () => now;
+        try
+        {
+            var ctx = NewContext(out _);
+            var context = CreateContext(ctx);
+
+            ctx[CpuRegister.Rdi] = context;
+            ctx[CpuRegister.Rsi] = 1; // blocking, but the queue has room
+            AudioOut2Exports.AudioOut2ContextPush(ctx);
+            AudioOut2Exports.AudioOut2ContextPush(ctx);
+            Assert.Equal(2u, ReadQueueLevel(ctx, context, out var available));
+            Assert.Equal(2u, available);
+
+            // One grain period of wall time drains exactly one grain.
+            now += GrainMicros;
+            Assert.Equal(1u, ReadQueueLevel(ctx, context, out available));
+            Assert.Equal(3u, available);
+
+            // Long idle drains the rest but never underflows.
+            now += 100 * GrainMicros;
+            Assert.Equal(0u, ReadQueueLevel(ctx, context, out available));
+            Assert.Equal(4u, available);
+        }
+        finally
+        {
+            AudioOut2Exports.MicrosecondClockOverride = null;
+        }
+    }
+
+    [Fact]
+    public void ContextPush_NonBlocking_ReportsNotReadyWhenFull_AndRecoversAfterDrain()
+    {
+        long now = 1_000_000; // nonzero: 0 is the "clock unset" sentinel in the drain
+        AudioOut2Exports.MicrosecondClockOverride = () => now;
+        try
+        {
+            var ctx = NewContext(out _);
+            var context = CreateContext(ctx);
+
+            ctx[CpuRegister.Rdi] = context;
+            ctx[CpuRegister.Rsi] = 0; // non-blocking
+            for (var i = 0; i < 4; i++)
+            {
+                AudioOut2Exports.AudioOut2ContextPush(ctx);
+                Assert.Equal(0, Result(ctx));
+            }
+
+            // Queue depth is 4: the fifth push with frozen time must fail
+            // with SCE_AUDIO_OUT2_ERROR_NOT_READY instead of succeeding.
+            AudioOut2Exports.AudioOut2ContextPush(ctx);
+            Assert.Equal(unchecked((int)0x80268008), Result(ctx));
+
+            // After one grain of wall time a slot frees up again.
+            now += GrainMicros;
+            AudioOut2Exports.AudioOut2ContextPush(ctx);
+            Assert.Equal(0, Result(ctx));
+            Assert.Equal(4u, ReadQueueLevel(ctx, context, out _));
+        }
+        finally
+        {
+            AudioOut2Exports.MicrosecondClockOverride = null;
+        }
+    }
+
+    [Fact]
+    public void ContextAdvance_DrainsQueueOnWallClock()
+    {
+        long now = 1_000_000; // nonzero: 0 is the "clock unset" sentinel in the drain
+        AudioOut2Exports.MicrosecondClockOverride = () => now;
+        try
+        {
+            var ctx = NewContext(out _);
+            var context = CreateContext(ctx);
+
+            ctx[CpuRegister.Rdi] = context;
+            ctx[CpuRegister.Rsi] = 0;
+            AudioOut2Exports.AudioOut2ContextPush(ctx);
+            AudioOut2Exports.AudioOut2ContextPush(ctx);
+            AudioOut2Exports.AudioOut2ContextPush(ctx);
+
+            now += 2 * GrainMicros;
+            ctx[CpuRegister.Rdi] = context;
+            AudioOut2Exports.AudioOut2ContextAdvance(ctx);
+            Assert.Equal(0, Result(ctx));
+            Assert.Equal(1u, ReadQueueLevel(ctx, context, out _));
+        }
+        finally
+        {
+            AudioOut2Exports.MicrosecondClockOverride = null;
+        }
+    }
+
+    [Fact]
+    public void ContextPush_Blocking_UnblocksOnRealClockWhenFull()
+    {
+        // Real clock: fill the queue, then a blocking push must return once a
+        // grain (~10.7ms) drains rather than hanging or failing.
         var ctx = NewContext(out _);
         var context = CreateContext(ctx);
 
         ctx[CpuRegister.Rdi] = context;
-        AudioOut2Exports.AudioOut2ContextPush(ctx);
-        AudioOut2Exports.AudioOut2ContextPush(ctx);
-        AudioOut2Exports.AudioOut2ContextAdvance(ctx);
+        ctx[CpuRegister.Rsi] = 1;
+        for (var i = 0; i < 5; i++)
+        {
+            AudioOut2Exports.AudioOut2ContextPush(ctx);
+            Assert.Equal(0, Result(ctx));
+        }
+    }
 
-        ctx[CpuRegister.Rsi] = 0x6000;
-        ctx[CpuRegister.Rdx] = 0;
-        AudioOut2Exports.AudioOut2ContextGetQueueLevel(ctx);
-        Assert.True(ctx.TryReadUInt32(0x6000, out var level));
-        Assert.Equal(0u, level);
+    [Fact]
+    public void ContextDestroy_ForgetsQueueState()
+    {
+        long now = 1_000_000; // nonzero: 0 is the "clock unset" sentinel in the drain
+        AudioOut2Exports.MicrosecondClockOverride = () => now;
+        try
+        {
+            var ctx = NewContext(out _);
+            var context = CreateContext(ctx);
+
+            ctx[CpuRegister.Rdi] = context;
+            ctx[CpuRegister.Rsi] = 0;
+            AudioOut2Exports.AudioOut2ContextPush(ctx);
+
+            ctx[CpuRegister.Rdi] = context;
+            AudioOut2Exports.AudioOut2ContextDestroy(ctx);
+            Assert.Equal(0, Result(ctx));
+
+            // A stale handle reports an empty queue instead of leaking level.
+            Assert.Equal(0u, ReadQueueLevel(ctx, context, out var available));
+            Assert.Equal(4u, available);
+        }
+        finally
+        {
+            AudioOut2Exports.MicrosecondClockOverride = null;
+        }
     }
 }
