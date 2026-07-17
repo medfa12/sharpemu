@@ -577,7 +577,9 @@ public static class AvPlayerExports
                 eventId,
                 0,
                 0,
+                0,
                 $"avplayer_event_{eventId}",
+                out _,
                 out error))
         {
             Console.Error.WriteLine(

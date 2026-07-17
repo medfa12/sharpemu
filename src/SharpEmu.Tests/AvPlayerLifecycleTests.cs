@@ -179,7 +179,12 @@ public sealed class AvPlayerLifecycleTests
             {
                 Assert.Equal(EventCallbackEntry, call.EntryPoint);
                 Assert.Equal(EventObject, call.Arg0);
+                Assert.Equal(0UL, call.Arg2);
             });
+
+            // Events must go through the returnValue overload so a blocked
+            // callback resumes via the scheduler instead of being dropped.
+            Assert.Equal(0, scheduler.LegacyOverloadCalls);
         }
         finally
         {
@@ -211,7 +216,11 @@ public sealed class AvPlayerLifecycleTests
 
     private sealed class RecordingScheduler : IGuestThreadScheduler
     {
-        public List<(ulong EntryPoint, ulong Arg0, ulong Arg1)> Calls { get; } = new();
+        public List<(ulong EntryPoint, ulong Arg0, ulong Arg1, ulong Arg2)> Calls { get; } = new();
+
+        public int LegacyOverloadCalls { get; private set; }
+
+        public ulong NextReturnValue { get; set; }
 
         public bool SupportsGuestContextTransfer => false;
 
@@ -246,8 +255,35 @@ public sealed class AvPlayerLifecycleTests
             string reason,
             out string? error)
         {
+            LegacyOverloadCalls++;
+            return TryCallGuestFunction(
+                callerContext,
+                entryPoint,
+                arg0,
+                arg1,
+                0,
+                stackAddress,
+                stackSize,
+                reason,
+                out _,
+                out error);
+        }
+
+        public bool TryCallGuestFunction(
+            CpuContext callerContext,
+            ulong entryPoint,
+            ulong arg0,
+            ulong arg1,
+            ulong arg2,
+            ulong stackAddress,
+            ulong stackSize,
+            string reason,
+            out ulong returnValue,
+            out string? error)
+        {
             error = null;
-            Calls.Add((entryPoint, arg0, arg1));
+            returnValue = NextReturnValue;
+            Calls.Add((entryPoint, arg0, arg1, arg2));
             return true;
         }
 
