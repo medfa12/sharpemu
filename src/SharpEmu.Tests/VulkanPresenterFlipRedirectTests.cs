@@ -1,6 +1,7 @@
 // Copyright (C) 2026 SharpEmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+using System;
 using SharpEmu.Libs.VideoOut;
 using Xunit;
 
@@ -195,5 +196,103 @@ public sealed class VulkanPresenterFlipRedirectTests
         Assert.True(VulkanVideoPresenter.TryResolveDisplayBufferSourceForTests(
             DisplayBuffer0, out var source));
         Assert.Equal(0x53B9F0000UL, source);
+    }
+
+    private const ulong ColorTarget = 0x00000005104A0000;
+
+    // A readback that observes the elected composite as all-black while a
+    // color-bearing target exists must redirect the flip to the color target;
+    // this is the black-title-menu failure mode (a 15-input composite resolving
+    // to opaque black winning over the colored display-format target).
+    [Fact]
+    public void BlackCompositeYieldsToNonblackContentTarget()
+    {
+        VulkanVideoPresenter.ResetGuestImageTrackingForTests();
+        VulkanVideoPresenter.RegisterKnownDisplayBuffer(DisplayBuffer0, Rgba8Format);
+        VulkanVideoPresenter.PublishRenderedGuestImageForTests(
+            CompositeTarget, Rgba8Format, 1920, 1080, inputTextureCount: 15);
+        VulkanVideoPresenter.PublishRenderedGuestImageForTests(
+            ColorTarget, Rgba8Format, 1920, 1080, inputTextureCount: 0);
+        VulkanVideoPresenter.NoteGuestImageContentObserved(
+            CompositeTarget, 1920, 1080, hasNonblackContent: false);
+        VulkanVideoPresenter.NoteGuestImageContentObserved(
+            ColorTarget, 1920, 1080, hasNonblackContent: true);
+
+        Assert.True(VulkanVideoPresenter.TryResolveDisplayBufferSourceForTests(
+            DisplayBuffer0, out var source));
+        Assert.Equal(ColorTarget, source);
+    }
+
+    // The refinement is off with no readback evidence: an unknown composite (no
+    // observed content) keeps the plain most-inputs choice, so an ordinary run
+    // that never reads back is unaffected.
+    [Fact]
+    public void UnknownCompositeContentKeepsComposite()
+    {
+        VulkanVideoPresenter.ResetGuestImageTrackingForTests();
+        VulkanVideoPresenter.RegisterKnownDisplayBuffer(DisplayBuffer0, Rgba8Format);
+        VulkanVideoPresenter.PublishRenderedGuestImageForTests(
+            CompositeTarget, Rgba8Format, 1920, 1080, inputTextureCount: 15);
+        VulkanVideoPresenter.PublishRenderedGuestImageForTests(
+            ColorTarget, Rgba8Format, 1920, 1080, inputTextureCount: 0);
+        // Only the color target was read back; the composite is unknown, so no
+        // override fires.
+        VulkanVideoPresenter.NoteGuestImageContentObserved(
+            ColorTarget, 1920, 1080, hasNonblackContent: true);
+
+        Assert.True(VulkanVideoPresenter.TryResolveDisplayBufferSourceForTests(
+            DisplayBuffer0, out var source));
+        Assert.Equal(CompositeTarget, source);
+    }
+
+    // A composite that a readback saw as nonblack is a legitimate frame and is
+    // never displaced by an earlier color target.
+    [Fact]
+    public void NonblackCompositeKeepsComposite()
+    {
+        VulkanVideoPresenter.ResetGuestImageTrackingForTests();
+        VulkanVideoPresenter.RegisterKnownDisplayBuffer(DisplayBuffer0, Rgba8Format);
+        VulkanVideoPresenter.PublishRenderedGuestImageForTests(
+            CompositeTarget, Rgba8Format, 1920, 1080, inputTextureCount: 15);
+        VulkanVideoPresenter.NoteGuestImageContentObserved(
+            ColorTarget, 1920, 1080, hasNonblackContent: true);
+        VulkanVideoPresenter.NoteGuestImageContentObserved(
+            CompositeTarget, 1920, 1080, hasNonblackContent: true);
+
+        Assert.True(VulkanVideoPresenter.TryResolveDisplayBufferSourceForTests(
+            DisplayBuffer0, out var source));
+        Assert.Equal(CompositeTarget, source);
+    }
+
+    // SHARPEMU_PRESENT_CONTENT_PREFER=0 restores the pure most-inputs heuristic
+    // for a live bisect even when black/nonblack evidence exists.
+    [Fact]
+    public void ContentPreferDisabledKeepsBlackComposite()
+    {
+        var previous = Environment.GetEnvironmentVariable(
+            "SHARPEMU_PRESENT_CONTENT_PREFER");
+        Environment.SetEnvironmentVariable("SHARPEMU_PRESENT_CONTENT_PREFER", "0");
+        try
+        {
+            VulkanVideoPresenter.ResetGuestImageTrackingForTests();
+            VulkanVideoPresenter.RegisterKnownDisplayBuffer(DisplayBuffer0, Rgba8Format);
+            VulkanVideoPresenter.PublishRenderedGuestImageForTests(
+                CompositeTarget, Rgba8Format, 1920, 1080, inputTextureCount: 15);
+            VulkanVideoPresenter.PublishRenderedGuestImageForTests(
+                ColorTarget, Rgba8Format, 1920, 1080, inputTextureCount: 0);
+            VulkanVideoPresenter.NoteGuestImageContentObserved(
+                CompositeTarget, 1920, 1080, hasNonblackContent: false);
+            VulkanVideoPresenter.NoteGuestImageContentObserved(
+                ColorTarget, 1920, 1080, hasNonblackContent: true);
+
+            Assert.True(VulkanVideoPresenter.TryResolveDisplayBufferSourceForTests(
+                DisplayBuffer0, out var source));
+            Assert.Equal(CompositeTarget, source);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(
+                "SHARPEMU_PRESENT_CONTENT_PREFER", previous);
+        }
     }
 }

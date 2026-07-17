@@ -258,6 +258,18 @@ internal static unsafe class VulkanVideoPresenter
     private static ulong _frameCompositeCandidateAddress;
     private static long _frameCompositeCandidateScore;
     private static ulong _lastFrameCompositeAddress;
+    // Per rendered-target address, the last RGB content signal observed by a
+    // guest-image readback: absent = never sampled (unknown), true = holds
+    // color, false = observed all-black (opaque black or zeroed). Populated
+    // only when a readback actually runs (diagnostic guest-image traces / an
+    // NGG capture), so it stays empty on an ordinary run and the present path
+    // then behaves exactly as before.
+    private static readonly Dictionary<ulong, bool> _renderedContentNonblack = new();
+    // Most recent presentable-sized target a readback observed to be nonblack.
+    // When the elected composite is positively known to be all-black this is
+    // presented instead, so a black many-input composite no longer wins over a
+    // color-bearing target. Gated by SHARPEMU_PRESENT_CONTENT_PREFER.
+    private static ulong _latestNonblackPresentableAddress;
     // Display buffers registered through sceVideoOutRegisterBuffers and, per
     // buffer, the source of the last observed DMA/copy into it; a copy source
     // is the authoritative image to present when that buffer is flipped.
@@ -1050,6 +1062,25 @@ internal static unsafe class VulkanVideoPresenter
             : _lastFrameCompositeAddress;
         if (composite != 0 && _gpuGuestImages.ContainsKey(composite))
         {
+            // The most-inputs heuristic can elect an all-black composite (Astro
+            // Bot's title composite reads many inputs yet resolves to opaque
+            // black) over a color-bearing target. When a readback has positively
+            // observed the elected composite as all-black AND a different
+            // presentable target as nonblack, present the color-bearing target
+            // instead. Only fires on positive black/nonblack evidence, so an
+            // ordinary run with no readback keeps the plain composite choice.
+            if (ShouldPreferNonblackPresentContent() &&
+                _renderedContentNonblack.TryGetValue(composite, out var compositeNonblack) &&
+                !compositeNonblack &&
+                _latestNonblackPresentableAddress != 0 &&
+                _latestNonblackPresentableAddress != composite &&
+                _gpuGuestImages.ContainsKey(_latestNonblackPresentableAddress))
+            {
+                sourceAddress = _latestNonblackPresentableAddress;
+                reason = "composite_black_prefer_content";
+                return true;
+            }
+
             sourceAddress = composite;
             reason = "composite";
             return true;
@@ -1102,6 +1133,48 @@ internal static unsafe class VulkanVideoPresenter
         _frameCompositeCandidateScore = 0;
     }
 
+    // SHARPEMU_PRESENT_CONTENT_PREFER gates the "present a nonblack target over
+    // an all-black composite" refinement. Default on; set to "0" to fall back
+    // to the pure most-inputs composite heuristic during a live bisect.
+    private static bool ShouldPreferNonblackPresentContent() =>
+        !string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_PRESENT_CONTENT_PREFER"),
+            "0",
+            StringComparison.Ordinal);
+
+    // Records what a guest-image readback observed for a rendered target so the
+    // flip resolver can prefer color-bearing targets over an all-black
+    // composite. Runs on the render thread; takes _gate itself (Monitor is
+    // reentrant, so calling it from a site that already holds _gate is safe).
+    internal static void NoteGuestImageContentObserved(
+        ulong address,
+        uint width,
+        uint height,
+        bool hasNonblackContent)
+    {
+        if (address == 0)
+        {
+            return;
+        }
+
+        lock (_gate)
+        {
+            _renderedContentNonblack[address] = hasNonblackContent;
+            if (hasNonblackContent)
+            {
+                if (width >= MinPresentableGuestImageWidth &&
+                    height >= MinPresentableGuestImageHeight)
+                {
+                    _latestNonblackPresentableAddress = address;
+                }
+            }
+            else if (_latestNonblackPresentableAddress == address)
+            {
+                _latestNonblackPresentableAddress = 0;
+            }
+        }
+    }
+
     // Caller must hold _gate.
     private static void ForgetRenderedGuestImageLocked(ulong address)
     {
@@ -1120,6 +1193,12 @@ internal static unsafe class VulkanVideoPresenter
         {
             _lastFrameCompositeAddress = 0;
         }
+
+        _renderedContentNonblack.Remove(address);
+        if (_latestNonblackPresentableAddress == address)
+        {
+            _latestNonblackPresentableAddress = 0;
+        }
     }
 
     internal static void ResetGuestImageTrackingForTests()
@@ -1136,6 +1215,8 @@ internal static unsafe class VulkanVideoPresenter
             _frameCompositeCandidateAddress = 0;
             _frameCompositeCandidateScore = 0;
             _lastFrameCompositeAddress = 0;
+            _renderedContentNonblack.Clear();
+            _latestNonblackPresentableAddress = 0;
             _registeredDisplayBuffers.Clear();
             _displayBufferCopySources.Clear();
             _tracedDisplayBufferCopies.Clear();
@@ -8620,6 +8701,13 @@ internal static unsafe class VulkanVideoPresenter
                         bytes,
                         image.Format,
                         bytesPerPixel);
+                    // Feed the observed color signal to the flip resolver so a
+                    // color-bearing target can outrank an all-black composite.
+                    NoteGuestImageContentObserved(
+                        image.Address,
+                        image.Width,
+                        image.Height,
+                        nonblackPixels > 0);
                     var centerOffset = checked(
                         ((int)(image.Height / 2) * (int)image.Width +
                          (int)(image.Width / 2)) *
@@ -9589,6 +9677,11 @@ internal static unsafe class VulkanVideoPresenter
                         }
                     }
 
+                    NoteGuestImageContentObserved(
+                        resources.CaptureTargetAddress,
+                        resources.CaptureTargetWidth,
+                        resources.CaptureTargetHeight,
+                        nonblackPixels > 0);
                     var center = resources.CaptureTargetReadbackSize >= (ulong)bpp
                         ? Convert.ToHexString(
                             bytes.Slice((bytes.Length / 2) & ~(bpp - 1), bpp))
