@@ -27,6 +27,26 @@ public sealed class Gen5SpirvCompileTests
         0xBF810000,
     ];
 
+    // v_interp_p1_f32 v0, v0, attr0.x; v_interp_p1_f32 v1, v0, attr1.x;
+    // exp mrt0 done compr vm v0, v1; s_endpgm. Reads two attributes so the
+    // interpolant-routing tests can observe both fragment input locations.
+    private static readonly uint[] TwoAttributePs =
+    [
+        0xC8000000,
+        0xC8040400,
+        0xF8001C0F, 0x00000100,
+        0xBF810000,
+    ];
+
+    // exp param5 v0, v0, v0, v0; exp pos0 done v0, v0, v0, v0; s_endpgm.
+    // A vertex program whose only parameter export is guest location 5.
+    private static readonly uint[] Param5ExportVs =
+    [
+        0xF800025F, 0x00000000,
+        0xF80008CF, 0x00000000,
+        0xBF810000,
+    ];
+
     private static (Gen5ShaderState State, Gen5ShaderEvaluation Evaluation, CpuContext Ctx) DecodeAndEvaluate(uint[] words)
     {
         var memory = new SparseGuestMemory();
@@ -107,6 +127,138 @@ public sealed class Gen5SpirvCompileTests
         AssertVectorCompositeConstituentsMatchComponentType(shader.Spirv);
     }
 
+    [Fact]
+    public void VertexShader_WithSwappedInputControls_DeclaresOneOutputPerAttribute()
+    {
+        var (state, evaluation, _) = DecodeAndEvaluate(Param5ExportVs);
+
+        // Controls [1, 0]: fragment attribute 0 reads guest parameter 1 and
+        // attribute 1 reads guest parameter 0.
+        var ok = Gen5SpirvTranslator.TryCompileVertexShader(
+            state, evaluation, out var shader, out var error,
+            pixelInputControls: [1u, 0u]);
+        Assert.True(ok, $"TryCompileVertexShader failed: {error}");
+
+        var module = SpirvModuleAssert.Parse(shader.Spirv);
+        var outputs = CollectVariableLocations(module, StorageClassOutput);
+        Assert.Equal([0u, 1u], outputs.Values.Order());
+    }
+
+    [Fact]
+    public void VertexShader_WithAliasedInputControls_FansExportIntoUniqueLocations()
+    {
+        var (state, evaluation, _) = DecodeAndEvaluate(Param5ExportVs);
+
+        // Two SPI_PS_INPUT_CNTL entries alias the same guest parameter 5. The
+        // single guest export must fan out into two unique host locations.
+        var ok = Gen5SpirvTranslator.TryCompileVertexShader(
+            state, evaluation, out var shader, out var error,
+            pixelInputControls: [5u, 5u]);
+        Assert.True(ok, $"TryCompileVertexShader failed: {error}");
+
+        var module = SpirvModuleAssert.Parse(shader.Spirv);
+        var outputs = CollectVariableLocations(module, StorageClassOutput);
+        Assert.Equal([0u, 1u], outputs.Values.Order());
+
+        // Both variables receive the zero-init store and the fanned-out
+        // export store; a dropped fan-out leaves only the single init store.
+        foreach (var variable in outputs.Keys)
+        {
+            var stores = module.Instructions.Count(
+                i => i.Opcode == OpStore && i.Words[1] == variable);
+            Assert.True(
+                stores >= 2,
+                $"output variable {variable} has {stores} stores; expected the zero-init plus the export fan-out");
+        }
+    }
+
+    [Fact]
+    public void VertexShader_WithoutControls_KeepsGuestExportLocations()
+    {
+        var (state, evaluation, _) = DecodeAndEvaluate(Param5ExportVs);
+
+        var ok = Gen5SpirvTranslator.TryCompileVertexShader(
+            state, evaluation, out var shader, out var error);
+        Assert.True(ok, $"TryCompileVertexShader failed: {error}");
+
+        var module = SpirvModuleAssert.Parse(shader.Spirv);
+        var outputs = CollectVariableLocations(module, StorageClassOutput);
+        Assert.Equal([5u], outputs.Values.Order());
+    }
+
+    [Fact]
+    public void PixelShader_WithAliasedControls_KeepsFragmentLocationsUnique()
+    {
+        var (state, evaluation, _) = DecodeAndEvaluate(TwoAttributePs);
+
+        // Fragment locations stay keyed by attribute index even when both
+        // controls select the same guest parameter; deriving them from the
+        // control value would declare location 5 twice and fail validation.
+        var ok = Gen5SpirvTranslator.TryCompilePixelShader(
+            state, evaluation, Gen5PixelOutputKind.Float, out var shader, out var error,
+            pixelInputControls: [5u, 5u]);
+        Assert.True(ok, $"TryCompilePixelShader failed: {error}");
+
+        var module = SpirvModuleAssert.Parse(shader.Spirv);
+        var inputs = CollectVariableLocations(module, StorageClassInput);
+        Assert.Equal([0u, 1u], inputs.Values.Order());
+    }
+
+    [Fact]
+    public void PixelShader_FlatControlBit_DecoratesInputFlat()
+    {
+        var (state, evaluation, _) = DecodeAndEvaluate(TwoAttributePs);
+
+        var ok = Gen5SpirvTranslator.TryCompilePixelShader(
+            state, evaluation, Gen5PixelOutputKind.Float, out var shader, out var error,
+            pixelInputControls: [0x400u, 1u]);
+        Assert.True(ok, $"TryCompilePixelShader failed: {error}");
+
+        var module = SpirvModuleAssert.Parse(shader.Spirv);
+        var inputs = CollectVariableLocations(module, StorageClassInput);
+        var flatTargets = module.Instructions
+            .Where(i => i.Opcode == OpDecorate &&
+                        i.Words[2] == DecorationFlat)
+            .Select(i => i.Words[1])
+            .ToHashSet();
+        var location0 = Assert.Single(inputs, pair => pair.Value == 0u).Key;
+        var location1 = Assert.Single(inputs, pair => pair.Value == 1u).Key;
+        Assert.Contains(location0, flatTargets);
+        Assert.DoesNotContain(location1, flatTargets);
+    }
+
+    private const ushort OpDecorate = 71;
+    private const ushort OpVariable = 59;
+    private const ushort OpStore = 62;
+    private const uint StorageClassInput = 1;
+    private const uint StorageClassOutput = 3;
+    private const uint DecorationLocation = 30;
+    private const uint DecorationFlat = 14;
+
+    // Maps variable id -> Location for every location-decorated variable of
+    // the given storage class. Builtins carry no Location and are excluded.
+    private static Dictionary<uint, uint> CollectVariableLocations(
+        SpirvModuleAssert.ParsedModule module,
+        uint storageClass)
+    {
+        var variables = module.Instructions
+            .Where(i => i.Opcode == OpVariable && i.Words[3] == storageClass)
+            .Select(i => i.Words[2])
+            .ToHashSet();
+        var locations = new Dictionary<uint, uint>();
+        foreach (var (opcode, words) in module.Instructions)
+        {
+            if (opcode == OpDecorate &&
+                words[2] == DecorationLocation &&
+                variables.Contains(words[1]))
+            {
+                locations.Add(words[1], words[3]);
+            }
+        }
+
+        return locations;
+    }
+
     // The disabled-channel padding is emitted as an OpConstant, so a mismatched
     // pad shows up as an integer-typed constant fed into a float-vector
     // OpCompositeConstruct -- exactly what the driver rejects. Constants have an
@@ -160,7 +312,7 @@ public sealed class Gen5SpirvCompileTests
     private const uint ExportV0Rgba = 0xF8001C0F; // exp mrt0 v0,v0,v0,v0 done vm
     private const uint SEndpgm = 0xBF810000;
 
-    private const ushort OpName = 5, OpConstant = 43, OpStore = 62,
+    private const ushort OpName = 5, OpConstant = 43,
         OpAccessChain = 65, OpLogicalOr = 166, OpLogicalAnd = 167,
         OpSelect = 169, OpULessThan = 176, OpFOrdLessThan = 184;
 

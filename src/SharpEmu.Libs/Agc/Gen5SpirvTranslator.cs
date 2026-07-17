@@ -19,7 +19,8 @@ internal static partial class Gen5SpirvTranslator
         int globalBufferBase = 0,
         int totalGlobalBufferCount = -1,
         int imageBindingBase = 0,
-        int scalarRegisterBufferIndex = -1) =>
+        int scalarRegisterBufferIndex = -1,
+        IReadOnlyList<uint>? pixelInputControls = null) =>
         TryCompilePixelShader(
             state,
             evaluation,
@@ -29,7 +30,8 @@ internal static partial class Gen5SpirvTranslator
             globalBufferBase,
             totalGlobalBufferCount,
             imageBindingBase,
-            scalarRegisterBufferIndex);
+            scalarRegisterBufferIndex,
+            pixelInputControls);
 
     public static bool TryCompilePixelShader(
         Gen5ShaderState state,
@@ -40,7 +42,8 @@ internal static partial class Gen5SpirvTranslator
         int globalBufferBase = 0,
         int totalGlobalBufferCount = -1,
         int imageBindingBase = 0,
-        int scalarRegisterBufferIndex = -1)
+        int scalarRegisterBufferIndex = -1,
+        IReadOnlyList<uint>? pixelInputControls = null)
     {
         if (outputs.Count > 8 || outputs.Any(output => output.GuestSlot > 7))
         {
@@ -78,7 +81,8 @@ internal static partial class Gen5SpirvTranslator
             globalBufferBase,
             totalGlobalBufferCount,
             imageBindingBase,
-            scalarRegisterBufferIndex);
+            scalarRegisterBufferIndex,
+            pixelInputControls: pixelInputControls);
         return context.TryCompile(out shader, out error);
     }
 
@@ -92,7 +96,8 @@ internal static partial class Gen5SpirvTranslator
         int imageBindingBase = 0,
         int scalarRegisterBufferIndex = -1,
         bool instanceIdFromVertexIndex = false,
-        IReadOnlyCollection<uint>? requiredVertexOutputLocations = null)
+        IReadOnlyCollection<uint>? requiredVertexOutputLocations = null,
+        IReadOnlyList<uint>? pixelInputControls = null)
     {
         var context = new CompilationContext(
             Gen5SpirvStage.Vertex,
@@ -108,7 +113,8 @@ internal static partial class Gen5SpirvTranslator
             scalarRegisterBufferIndex,
             instanceIdFromVertexIndex,
             computeCapture: null,
-            requiredVertexOutputLocations: requiredVertexOutputLocations);
+            requiredVertexOutputLocations: requiredVertexOutputLocations,
+            pixelInputControls: pixelInputControls);
         return context.TryCompile(out shader, out error);
     }
 
@@ -187,9 +193,13 @@ internal static partial class Gen5SpirvTranslator
         private readonly int _scalarRegisterBufferIndex;
         private readonly bool _instanceIdFromVertexIndex;
         private readonly NggComputeCapture? _computeCapture;
+        private readonly IReadOnlyList<uint> _pixelInputControls;
         private readonly List<uint> _interfaces = [];
         private readonly Dictionary<uint, uint> _pixelInputs = [];
         private readonly Dictionary<uint, SpirvPixelOutput> _pixelOutputs = [];
+        // Fragment locations are keyed by pixel-attribute index so they remain
+        // unique when multiple SPI_PS_INPUT_CNTL entries alias one guest
+        // parameter. Vertex exports are fanned out through the reverse map.
         private readonly Dictionary<uint, uint> _vertexOutputs = [];
         // Vertex Output variables declared only to satisfy the paired pixel
         // shader's input interface (Locations it interpolates that this vertex
@@ -197,6 +207,8 @@ internal static partial class Gen5SpirvTranslator
         // varyings are defined rather than undefined.
         private readonly List<uint> _paddedVertexOutputs = [];
         private readonly IReadOnlyCollection<uint> _requiredVertexOutputLocations;
+        private readonly Dictionary<uint, List<uint>>
+            _vertexOutputsByGuestLocation = [];
         private readonly Dictionary<uint, SpirvVertexInput> _vertexInputsByPc = [];
         private readonly List<SpirvImageResource> _imageResources = [];
         private readonly Dictionary<uint, int> _imageBindingByPc = [];
@@ -277,13 +289,15 @@ internal static partial class Gen5SpirvTranslator
             int scalarRegisterBufferIndex,
             bool instanceIdFromVertexIndex = false,
             NggComputeCapture? computeCapture = null,
-            IReadOnlyCollection<uint>? requiredVertexOutputLocations = null)
+            IReadOnlyCollection<uint>? requiredVertexOutputLocations = null,
+            IReadOnlyList<uint>? pixelInputControls = null)
         {
             _stage = stage;
             _state = state;
             _requiredVertexOutputLocations = requiredVertexOutputLocations ?? [];
             _evaluation = evaluation;
             _pixelOutputBindings = pixelOutputBindings;
+            _pixelInputControls = pixelInputControls ?? [];
             _localSizeX = localSizeX;
             _localSizeY = localSizeY;
             _localSizeZ = localSizeZ;
@@ -765,22 +779,39 @@ internal static partial class Gen5SpirvTranslator
                     (uint)SpirvBuiltIn.Position);
                 _interfaces.Add(_positionOutput);
 
-                var parameters = _state.Program.Instructions
-                    .Select(instruction => instruction.Control)
-                    .OfType<Gen5ExportControl>()
-                    .Where(export => export.Target is >= 32 and < 64)
-                    .Select(export => export.Target - 32)
-                    .Distinct()
-                    .Order()
-                    .ToArray();
-                foreach (var parameter in parameters)
+                if (_pixelInputControls.Count != 0)
                 {
-                    var variable = _module.AddGlobalVariable(
-                        outputPointer,
-                        SpirvStorageClass.Output);
-                    _module.AddDecoration(variable, SpirvDecoration.Location, parameter);
-                    _vertexOutputs.Add(parameter, variable);
-                    _interfaces.Add(variable);
+                    // One output per fragment attribute: the host location is
+                    // the attribute index and the guest location is the vertex
+                    // parameter the control selects. Aliased controls fan one
+                    // guest export into several unique host locations.
+                    for (var attribute = 0;
+                         attribute < _pixelInputControls.Count;
+                         attribute++)
+                    {
+                        DeclareVertexParameterOutput(
+                            outputPointer,
+                            checked((uint)attribute),
+                            _pixelInputControls[attribute] & 0x1Fu);
+                    }
+                }
+                else
+                {
+                    var parameters = _state.Program.Instructions
+                        .Select(instruction => instruction.Control)
+                        .OfType<Gen5ExportControl>()
+                        .Where(export => export.Target is >= 32 and < 64)
+                        .Select(export => export.Target - 32)
+                        .Distinct()
+                        .Order()
+                        .ToArray();
+                    foreach (var parameter in parameters)
+                    {
+                        DeclareVertexParameterOutput(
+                            outputPointer,
+                            parameter,
+                            parameter);
+                    }
                 }
 
                 // Pad the interface with any Location the paired pixel shader
@@ -819,7 +850,14 @@ internal static partial class Gen5SpirvTranslator
                     var variable = _module.AddGlobalVariable(
                         inputVec4Pointer,
                         SpirvStorageClass.Input);
+                    // The paired vertex module remaps the guest source selected
+                    // by this control into the unique pixel-attribute location.
                     _module.AddDecoration(variable, SpirvDecoration.Location, attribute);
+                    if ((GetPixelInputControl(attribute) & 0x400u) != 0)
+                    {
+                        _module.AddDecoration(variable, SpirvDecoration.Flat);
+                    }
+
                     _pixelInputs.Add(attribute, variable);
                     _interfaces.Add(variable);
                 }
@@ -888,6 +926,33 @@ internal static partial class Gen5SpirvTranslator
                 }
             }
         }
+
+        private void DeclareVertexParameterOutput(
+            uint outputPointer,
+            uint hostLocation,
+            uint guestLocation)
+        {
+            var variable = _module.AddGlobalVariable(
+                outputPointer,
+                SpirvStorageClass.Output);
+            _module.AddDecoration(variable, SpirvDecoration.Location, hostLocation);
+            _vertexOutputs.Add(hostLocation, variable);
+            if (!_vertexOutputsByGuestLocation.TryGetValue(
+                    guestLocation,
+                    out var consumers))
+            {
+                consumers = [];
+                _vertexOutputsByGuestLocation.Add(guestLocation, consumers);
+            }
+
+            consumers.Add(variable);
+            _interfaces.Add(variable);
+        }
+
+        private uint GetPixelInputControl(uint attribute) =>
+            attribute < (uint)_pixelInputControls.Count
+                ? _pixelInputControls[(int)attribute]
+                : attribute;
 
         private void DeclareVertexInputs()
         {
@@ -972,6 +1037,17 @@ internal static partial class Gen5SpirvTranslator
                         _uintType,
                         _instanceIdFromVertexIndex ? _vertexIndexInput : _instanceIndexInput),
                     guardWithExec: false);
+                if (_pixelInputControls.Count != 0)
+                {
+                    // With input controls every fragment attribute owns an
+                    // output variable, including ones whose guest parameter
+                    // this program never exports. Zero-fill them all so the
+                    // unexported extras read as zero instead of garbage.
+                    foreach (var variable in _vertexOutputs.Values)
+                    {
+                        Store(variable, _module.ConstantNull(_vec4Type));
+                    }
+                }
             }
             else if (_stage == Gen5SpirvStage.Pixel)
             {
@@ -2378,7 +2454,7 @@ internal static partial class Gen5SpirvTranslator
                 return true;
             }
 
-            uint outputVariable;
+            IReadOnlyList<uint> outputVariables;
             if (export.Target is >= 12 and < 16)
             {
                 if (export.Target != 12)
@@ -2386,12 +2462,14 @@ internal static partial class Gen5SpirvTranslator
                     return true;
                 }
 
-                outputVariable = _positionOutput;
+                outputVariables = [_positionOutput];
             }
             else if (export.Target is >= 32 and < 64 &&
-                     _vertexOutputs.TryGetValue(export.Target - 32, out var parameter))
+                     _vertexOutputsByGuestLocation.TryGetValue(
+                         export.Target - 32,
+                         out var parameters))
             {
-                outputVariable = parameter;
+                outputVariables = parameters;
             }
             else
             {
@@ -2414,13 +2492,18 @@ internal static partial class Gen5SpirvTranslator
                 SpirvOp.CompositeConstruct,
                 _vec4Type,
                 components);
-            outputValue = _module.AddInstruction(
-                SpirvOp.Select,
-                _vec4Type,
-                Load(_boolType, _exec),
-                outputValue,
-                Load(_vec4Type, outputVariable));
-            Store(outputVariable, outputValue);
+            var exportActive = Load(_boolType, _exec);
+            foreach (var outputVariable in outputVariables)
+            {
+                var selectedValue = _module.AddInstruction(
+                    SpirvOp.Select,
+                    _vec4Type,
+                    exportActive,
+                    outputValue,
+                    Load(_vec4Type, outputVariable));
+                Store(outputVariable, selectedValue);
+            }
+
             return true;
         }
 
