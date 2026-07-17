@@ -20,6 +20,13 @@ public sealed partial class DirectExecutionBackend
 	private readonly object _importResultLogSampleGate = new();
 	private readonly Dictionary<string, int> _importResultLogSamples = new(StringComparer.Ordinal);
 
+	// SHARPEMU_IGNORE_STACK_CHK=1 — opt-in recovery for guest stack-protector
+	// failures whose call site matches the known compiler epilogue exactly.
+	private static readonly bool _ignoreGuestStackCheck = string.Equals(
+		Environment.GetEnvironmentVariable("SHARPEMU_IGNORE_STACK_CHK"),
+		"1",
+		StringComparison.Ordinal);
+
 	private static ulong ImportDispatchGatewayManaged(nint backendHandle, int importIndex, nint argPackPtr)
 	{
 		if (LogThreadMode)
@@ -198,6 +205,23 @@ public sealed partial class DirectExecutionBackend
 					break;
 				}
 			}
+		}
+		// Opt-in compatibility escape hatch for a guest stack-protector failure
+		// whose noreturn call is immediately followed by UD2. Returning normally
+		// from the HLE export would execute that UD2; redirect this one well-known
+		// compiler epilogue back through its register/stack unwind instead of
+		// dispatching the fatal export. The strict byte-pattern gate keeps the
+		// opt-in from guessing at an unrelated function layout.
+		if (_ignoreGuestStackCheck &&
+			string.Equals(importStubEntry.Nid, "Ou3iL1abvng", StringComparison.Ordinal) &&
+			IsRecoverableStackCheckReturnSite(num7))
+		{
+			var recoveredReturn = num7 - 20;
+			*(ulong*)(argPackPtr + 96) = recoveredReturn;
+			cpuContext[CpuRegister.Rax] = 0uL;
+			Console.Error.WriteLine(
+				$"[LOADER][WARN] Recovered guest stack-check epilogue ret=0x{num7:X16} -> 0x{recoveredReturn:X16}");
+			return 0uL;
 		}
 		if (_activeGuestThreadState is { } activeGuestThreadState)
 		{
@@ -580,6 +604,24 @@ public sealed partial class DirectExecutionBackend
 			DrainDeferredBootstrapTraces();
 			return 18446744071562199298uL;
 		}
+	}
+
+	// The recoverable __stack_chk_fail return site: the canary compare's jne
+	// (75 0F) skips a 20-byte failure path, the passing path continues at the
+	// add rsp, imm8 epilogue (48 83 C4) 20 bytes before the return address, and
+	// the noreturn call is padded with UD2 (0F 0B) at the return address itself.
+	private static unsafe bool IsRecoverableStackCheckReturnSite(ulong returnRip)
+	{
+		if (returnRip < 0x20)
+		{
+			return false;
+		}
+
+		var returnCode = (byte*)returnRip;
+		return returnCode[0] == 0x0F && returnCode[1] == 0x0B &&
+			returnCode[-22] == 0x75 && returnCode[-21] == 0x0F &&
+			returnCode[-20] == 0x48 && returnCode[-19] == 0x83 &&
+			returnCode[-18] == 0xC4;
 	}
 
 	private unsafe bool TryDispatchLeafImport(
