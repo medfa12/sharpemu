@@ -271,6 +271,10 @@ internal static unsafe class VulkanVideoPresenter
     private static bool _presenterCloseRequested;
     private const string DebugUtilsExtensionName = "VK_EXT_debug_utils";
     private const uint NvidiaVendorId = 0x10DE;
+    private const uint AmdVendorId = 0x1002;
+    // Other GPU PCI vendor IDs, for reference when adding future rules:
+    // Intel 0x8086, Apple 0x106B, Qualcomm 0x5143 (Windows-on-ARM), Microsoft software 0x1414.
+    private const int LastResortPenalty = 1000;
     private const string PortabilityEnumerationExtensionName = "VK_KHR_portability_enumeration";
     private const string PortabilitySubsetExtensionName = "VK_KHR_portability_subset";
     private const int GlfwPlatformHint = 0x00050003;
@@ -279,6 +283,50 @@ internal static unsafe class VulkanVideoPresenter
     private const int GlfwPlatformWayland = 0x00060003;
     private const int GlfwPlatformX11 = 0x00060004;
     private const int GlfwPlatformNull = 0x00060005;
+
+    internal static int ScorePhysicalDevice(
+        PhysicalDeviceProperties properties,
+        string name,
+        string? deviceOverride)
+    {
+        if (!string.IsNullOrWhiteSpace(deviceOverride))
+        {
+            return name.Contains(deviceOverride, StringComparison.OrdinalIgnoreCase) ? 1000 : -1000;
+        }
+
+        var score = properties.DeviceType switch
+        {
+            PhysicalDeviceType.DiscreteGpu => 300,
+            PhysicalDeviceType.VirtualGpu => 100,
+            PhysicalDeviceType.IntegratedGpu => 50,
+            PhysicalDeviceType.Cpu => 20,
+            _ => 10,
+        };
+
+        if (properties.VendorID == NvidiaVendorId)
+        {
+            score += 500;
+        }
+
+        score -= ComputeDevicePenalty(properties, OperatingSystem.IsWindows());
+
+        return score;
+    }
+
+    internal static int ComputeDevicePenalty(PhysicalDeviceProperties properties, bool isWindows)
+    {
+        var penalty = 0;
+
+        if (isWindows &&
+            properties.DeviceType == PhysicalDeviceType.IntegratedGpu &&
+            properties.VendorID == AmdVendorId)
+        {
+            penalty += LastResortPenalty;
+        }
+
+        return penalty;
+    }
+
     private static bool _splashHidden;
     private static long _enqueuedGuestWorkSequence;
     // Largest contiguous completed sequence, retained for compact diagnostics.
@@ -3198,33 +3246,6 @@ internal static unsafe class VulkanVideoPresenter
                 $"[LOADER][INFO] Vulkan device: {selectedName} ({selected.DeviceType})");
             VideoOutExports.SetSelectedGpuName(selectedName);
             _window.Title = VideoOutExports.GetWindowTitle();
-        }
-
-        private static int ScorePhysicalDevice(
-            PhysicalDeviceProperties properties,
-            string name,
-            string? deviceOverride)
-        {
-            if (!string.IsNullOrWhiteSpace(deviceOverride))
-            {
-                return name.Contains(deviceOverride, StringComparison.OrdinalIgnoreCase) ? 1000 : -1000;
-            }
-
-            var score = properties.DeviceType switch
-            {
-                PhysicalDeviceType.DiscreteGpu => 300,
-                PhysicalDeviceType.VirtualGpu => 100,
-                PhysicalDeviceType.Cpu => 50,
-                PhysicalDeviceType.IntegratedGpu => -100,
-                _ => 10,
-            };
-
-            if (properties.VendorID == NvidiaVendorId)
-            {
-                score += 500;
-            }
-
-            return score;
         }
 
         private void LoadComputeDeviceLimits()
