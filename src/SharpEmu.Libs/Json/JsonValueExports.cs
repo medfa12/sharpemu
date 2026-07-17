@@ -11,9 +11,10 @@ namespace SharpEmu.Libs.Json;
 // payload is modelled in JsonObjectHeap; here we only translate the C++ ABI (registers in, `this`
 // back out) and never write the guest object, so a stack-allocated Value/String is left intact.
 //
-// Only the complete-object variants (C1/D1) are bound — those are what standalone locals emit and
-// what the observed Prospero imports use. The base-object variants (C2/D2) are left for a title
-// that actually imports them.
+// Only the complete-object variants (C1/D1) are bound here — those are what standalone locals emit
+// and what the observed Prospero imports use. The base-object variants (C2/D2) and the parser read
+// side live in JsonExports; the destructors below also drop that read-side shadow so a reused
+// stack address never resurrects a stale parsed element.
 public static class JsonValueExports
 {
     private const int MaxStringLength = 0x10000;
@@ -117,7 +118,9 @@ public static class JsonValueExports
         Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceJson")]
     public static int ValueDestructor(CpuContext ctx)
     {
-        JsonObjectHeap.RemoveValue(ctx[CpuRegister.Rdi]);
+        var thisAddress = ctx[CpuRegister.Rdi];
+        JsonExports.RemoveValueShadow(thisAddress);
+        JsonObjectHeap.RemoveValue(thisAddress);
         return ReturnVoid(ctx);
     }
 
@@ -228,7 +231,9 @@ public static class JsonValueExports
         Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceJson")]
     public static int StringDestructor(CpuContext ctx)
     {
-        JsonObjectHeap.RemoveString(ctx[CpuRegister.Rdi]);
+        var thisAddress = ctx[CpuRegister.Rdi];
+        JsonExports.RemoveStringShadow(thisAddress);
+        JsonObjectHeap.RemoveString(thisAddress);
         return ReturnVoid(ctx);
     }
 }
