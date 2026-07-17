@@ -32,7 +32,6 @@ EXPORT_NAME_RE = re.compile(r'ExportName\s*=\s*"([^"]+)"')
 
 # NID -> reason. Keep minimal; fix ExportName when safe instead of growing this list.
 ALLOWLISTED_NIDS: dict[str, str] = {
-    "KMcEa+rHsIo": "Historic kernel MapMemory stub bound to sceAvPlayerAddSource NID; API rewrite deferred.",
     "WV1GwM32NgY": "Historic WebApi2 init alias for PushEventCreateHandle NID; ABI rewrite deferred.",
 }
 
