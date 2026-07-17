@@ -723,12 +723,23 @@ public static class KernelPthreadCompatExports
         var acquired = state.Semaphore.Wait(0);
         if (!acquired)
         {
-            // The contended path lives in a separate method so its lambdas do not
-            // force a closure allocation at method entry on the uncontended
-            // lock/trylock fast path (captured parameters hoist the display class
-            // to the top of the capturing method).
-            if (TryRequestContendedMutexBlock(ctx, mutexAddress, resolvedAddress, state, currentThreadId, tryOnly))
+            TraceContendedMutex(ctx, mutexAddress, resolvedAddress, state, currentThreadId);
+            var waiter = new PthreadMutexWaiter { ThreadId = currentThreadId };
+            // Fibers retain the synchronous fallback to preserve switch state.
+            var currentFiber = FiberExports.GetCurrentFiberAddressForDiagnostics(ctx);
+            var canCooperativelyBlock = _enableMutexLockBlocking || currentFiber == 0;
+            if (canCooperativelyBlock &&
+                !tryOnly &&
+                GuestThreadExecution.IsGuestThread &&
+                GuestThreadExecution.TryGetCurrentImportCallFrame(out _) &&
+                GuestThreadExecution.RequestCurrentThreadBlock(
+                    ctx,
+                    "pthread_mutex_lock",
+                    state.WakeKey,
+                    () => CompleteBlockedMutexLock(ctx, mutexAddress, resolvedAddress, state, waiter),
+                    () => TryReserveBlockedMutexLock(ctx, mutexAddress, resolvedAddress, state, waiter)))
             {
+                TracePthreadMutex(ctx, "lock-block", mutexAddress, resolvedAddress, state, currentThreadId, (int)OrbisGen2Result.ORBIS_GEN2_OK);
                 return (int)OrbisGen2Result.ORBIS_GEN2_OK;
             }
 
@@ -754,37 +765,6 @@ public static class KernelPthreadCompatExports
 
         TracePthreadMutex(ctx, tryOnly ? "trylock" : "lock", mutexAddress, resolvedAddress, state, currentThreadId, (int)OrbisGen2Result.ORBIS_GEN2_OK);
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
-    }
-
-    private static bool TryRequestContendedMutexBlock(
-        CpuContext ctx,
-        ulong mutexAddress,
-        ulong resolvedAddress,
-        PthreadMutexState state,
-        ulong currentThreadId,
-        bool tryOnly)
-    {
-        TraceContendedMutex(ctx, mutexAddress, resolvedAddress, state, currentThreadId);
-        var waiter = new PthreadMutexWaiter { ThreadId = currentThreadId };
-        // Fibers retain the synchronous fallback to preserve switch state.
-        var currentFiber = FiberExports.GetCurrentFiberAddressForDiagnostics(ctx);
-        var canCooperativelyBlock = _enableMutexLockBlocking || currentFiber == 0;
-        if (canCooperativelyBlock &&
-            !tryOnly &&
-            GuestThreadExecution.IsGuestThread &&
-            GuestThreadExecution.TryGetCurrentImportCallFrame(out _) &&
-            GuestThreadExecution.RequestCurrentThreadBlock(
-                ctx,
-                "pthread_mutex_lock",
-                state.WakeKey,
-                () => CompleteBlockedMutexLock(ctx, mutexAddress, resolvedAddress, state, waiter),
-                () => TryReserveBlockedMutexLock(ctx, mutexAddress, resolvedAddress, state, waiter)))
-        {
-            TracePthreadMutex(ctx, "lock-block", mutexAddress, resolvedAddress, state, currentThreadId, (int)OrbisGen2Result.ORBIS_GEN2_OK);
-            return true;
-        }
-
-        return false;
     }
 
     private static void TraceContendedMutex(
@@ -1743,16 +1723,14 @@ public static class KernelPthreadCompatExports
             : TimeSpan.FromTicks((long)timeoutUsec * 10L);
     }
 
-    // Cached once; cond waits consult this per wait and a per-call
-    // Environment.GetEnvironmentVariable is a P/Invoke plus a transient string.
-    private static readonly TimeSpan _condSpuriousWakeTimeout =
-        int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_PTHREAD_COND_SPURIOUS_WAKE_MS"), out var _condSpuriousWakeMilliseconds)
-            ? TimeSpan.FromMilliseconds(Math.Max(1, _condSpuriousWakeMilliseconds))
-            : TimeSpan.FromMilliseconds(DefaultSpuriousCondWakeMilliseconds);
-
     private static TimeSpan GetCondSpuriousWakeTimeout()
     {
-        return _condSpuriousWakeTimeout;
+        if (int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_PTHREAD_COND_SPURIOUS_WAKE_MS"), out var milliseconds))
+        {
+            return TimeSpan.FromMilliseconds(Math.Max(1, milliseconds));
+        }
+
+        return TimeSpan.FromMilliseconds(DefaultSpuriousCondWakeMilliseconds);
     }
 
     private static int NormalizeMutexType(int type)

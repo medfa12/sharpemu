@@ -136,17 +136,9 @@ public static class AudioOut2Exports
             "1",
             StringComparison.Ordinal);
 
-    // Cached once: several of these exports (port_set_attributes, port_get_state,
-    // context_push, queue level) run thousands of times per second, and a per-call
-    // Environment.GetEnvironmentVariable is a P/Invoke plus a transient string.
-    // Hot call sites also check this flag before building their interpolated
-    // message so tracing-off costs no allocation at all.
-    private static readonly bool _traceAudio =
-        string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_AUDIO"), "1", StringComparison.Ordinal);
-
     private static void Trace(string message)
     {
-        if (_traceAudio)
+        if (string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_AUDIO"), "1", StringComparison.Ordinal))
         {
             Console.Error.WriteLine($"[LOADER][TRACE] audioout2.{message}");
         }
@@ -333,10 +325,7 @@ public static class AudioOut2Exports
         state[0x02] = unchecked((byte)channels);
         BinaryPrimitives.WriteInt16LittleEndian(state[0x04..], 127);
 
-        if (_traceAudio)
-        {
-            Trace($"port_get_state handle=0x{handle:X} type=0x{port.PortType:X} output=0x{output:X} channels={channels}");
-        }
+        Trace($"port_get_state handle=0x{handle:X} type=0x{port.PortType:X} output=0x{output:X} channels={channels}");
         return ctx.Memory.TryWrite(stateAddress, state)
             ? ctx.SetReturn(0)
             : ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
@@ -435,10 +424,7 @@ public static class AudioOut2Exports
             return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
         }
 
-        if (_traceAudio)
-        {
-            Trace($"port_set_attributes handle=0x{portHandle:X} arg1=0x{ctx[CpuRegister.Rsi]:X} arg2=0x{ctx[CpuRegister.Rdx]:X} arg3=0x{ctx[CpuRegister.Rcx]:X}");
-        }
+        Trace($"port_set_attributes handle=0x{portHandle:X} arg1=0x{ctx[CpuRegister.Rsi]:X} arg2=0x{ctx[CpuRegister.Rdx]:X} arg3=0x{ctx[CpuRegister.Rcx]:X}");
         return ctx.SetReturn(0);
     }
 
@@ -459,10 +445,7 @@ public static class AudioOut2Exports
         if (!Contexts.TryGetValue(contextHandle, out var state))
         {
             // Unknown handle: accept it rather than blocking forever.
-            if (_traceAudio)
-            {
-                Trace($"context_push handle={contextHandle} blocking={blocking} (untracked)");
-            }
+            Trace($"context_push handle={contextHandle} blocking={blocking} (untracked)");
             return ctx.SetReturn(0);
         }
 
@@ -482,20 +465,14 @@ public static class AudioOut2Exports
                     }
 
                     state.Queued++;
-                    if (_traceAudio)
-                    {
-                        Trace($"context_push handle={contextHandle} blocking={blocking} -> queued={state.Queued}");
-                    }
+                    Trace($"context_push handle={contextHandle} blocking={blocking} -> queued={state.Queued}");
                     return ctx.SetReturn(0);
                 }
             }
 
             if (blocking == 0)
             {
-                if (_traceAudio)
-                {
-                    Trace($"context_push handle={contextHandle} blocking=0 -> not_ready");
-                }
+                Trace($"context_push handle={contextHandle} blocking=0 -> not_ready");
                 return ctx.SetReturn(AudioOut2ErrorNotReady);
             }
 
@@ -546,10 +523,7 @@ public static class AudioOut2Exports
             return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
         }
 
-        if (_traceAudio)
-        {
-            Trace($"context_get_queue_level handle={contextHandle} -> level={level} available={available}");
-        }
+        Trace($"context_get_queue_level handle={contextHandle} -> level={level} available={available}");
         return ctx.SetReturn(0);
     }
 
@@ -574,10 +548,7 @@ public static class AudioOut2Exports
             }
         }
 
-        if (_traceAudio)
-        {
-            Trace($"context_advance handle={contextHandle}");
-        }
+        Trace($"context_advance handle={contextHandle}");
         return ctx.SetReturn(0);
     }
 }

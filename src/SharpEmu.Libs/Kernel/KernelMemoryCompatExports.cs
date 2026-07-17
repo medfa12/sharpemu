@@ -6086,14 +6086,9 @@ public static class KernelMemoryCompatExports
             $"[LOADER][TRACE] {operation}: ret=0x{returnRip:X16} len=0x{length:X16} align=0x{alignment:X16} type=0x{memoryType:X8} out=0x{outAddress:X16} selected=0x{selectedAddress:X16} result={result?.ToString() ?? "<pending>"}");
     }
 
-    // Cached once; direct-memory ops consult this on every call and a per-call
-    // Environment.GetEnvironmentVariable is a P/Invoke plus a transient string.
-    private static readonly bool _traceDirectMemory =
-        string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_DIRECT_MEMORY"), "1", StringComparison.Ordinal);
-
     private static bool ShouldTraceDirectMemory()
     {
-        return _traceDirectMemory;
+        return string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_DIRECT_MEMORY"), "1", StringComparison.Ordinal);
     }
 
     private static bool TryAllocateDirectMemoryLocked(

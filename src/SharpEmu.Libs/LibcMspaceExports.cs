@@ -124,14 +124,7 @@ public static class LibcMspaceExports
         var mspace = ctx[CpuRegister.Rdi];
         var size = ctx[CpuRegister.Rsi];
         var address = Allocate(ctx, mspace, size, DefaultAlignment);
-        // Peek the budget before building the message: this is the hottest
-        // import during level loads, and the interpolation plus the ContainsKey
-        // probe would otherwise run on every call long after the budget is spent.
-        if (Volatile.Read(ref _traceBudget) > 0)
-        {
-            Trace($"malloc mspace=0x{mspace:X} size=0x{size:X} -> 0x{address:X} known={_arenas.ContainsKey(mspace)}");
-        }
-
+        Trace($"malloc mspace=0x{mspace:X} size=0x{size:X} -> 0x{address:X} known={_arenas.ContainsKey(mspace)}");
         return ReturnPointer(ctx, address);
     }
 
