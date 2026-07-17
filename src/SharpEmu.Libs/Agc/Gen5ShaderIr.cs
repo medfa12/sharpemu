@@ -256,7 +256,8 @@ internal sealed record Gen5SdwaControl(
     uint AbsoluteMask,
     uint NegateMask,
     uint OutputModifier,
-    bool Clamp) : Gen5InstructionControl;
+    bool Clamp,
+    uint? ScalarDestination) : Gen5InstructionControl;
 
 internal sealed record Gen5DppControl(
     uint Control,

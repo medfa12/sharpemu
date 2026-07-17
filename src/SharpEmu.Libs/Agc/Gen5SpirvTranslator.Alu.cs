@@ -959,20 +959,24 @@ internal static partial class Gen5SpirvTranslator
                 condition = _module.AddInstruction(operation, _boolType, left, right);
             }
 
+            // Vector compares fully overwrite the destination mask, but only
+            // lanes enabled by EXEC can pass the test.
+            var activeCondition = MaskWithExec(condition);
+
             // On gfx10, VCmpx writes EXEC only and preserves VCC; the sdst
-            // operand was removed from the cmpx encodings on this generation.
+            // operand was removed from the cmpx encodings on this generation,
+            // so the SDWA scalar destination must never be written here.
             if (opcode.StartsWith("VCmpx", StringComparison.Ordinal))
             {
-                var active = _module.AddInstruction(
-                    SpirvOp.LogicalAnd,
-                    _boolType,
-                    Load(_boolType, _exec),
-                    condition);
-                StoreWaveMask(126, active);
+                StoreWaveMask(126, activeCondition);
             }
             else
             {
-                StoreWaveMask(106, condition);
+                var destination = instruction.Control is
+                    Gen5SdwaControl { ScalarDestination: { } register }
+                    ? register
+                    : 106u;
+                StoreWaveMask(destination, activeCondition);
             }
 
             return true;
@@ -2290,7 +2294,7 @@ internal static partial class Gen5SpirvTranslator
                 _boolType,
                 _module.AddInstruction(SpirvOp.ULessThan, _boolType, partial, left),
                 _module.AddInstruction(SpirvOp.ULessThan, _boolType, result, partial));
-            StoreWaveMask(106, carry);
+            StoreWaveMask(106, MaskWithExec(carry));
             return result;
         }
 
@@ -2321,7 +2325,7 @@ internal static partial class Gen5SpirvTranslator
                     _boolType,
                     partial,
                     borrowIn));
-            StoreWaveMask(106, borrow);
+            StoreWaveMask(106, MaskWithExec(borrow));
             return result;
         }
 
@@ -2329,25 +2333,16 @@ internal static partial class Gen5SpirvTranslator
             Gen5ShaderInstruction instruction,
             uint carry)
         {
+            // The carry-out is a per-lane ballot like VCC, not a scalar 0/1:
+            // an explicit sdst pair receives the same EXEC-masked lane mask.
+            var activeCarry = MaskWithExec(carry);
             if (instruction.Control is Gen5Vop3Control { ScalarDestination: { } register })
             {
-                StoreS(
-                    register,
-                    _module.AddInstruction(
-                        SpirvOp.Select,
-                        _uintType,
-                        carry,
-                        UInt(1),
-                        UInt(0)));
-                if (register == 106)
-                {
-                    StoreWaveMask(106, carry);
-                }
-
+                StoreWaveMask(register, activeCarry);
                 return;
             }
 
-            StoreWaveMask(106, carry);
+            StoreWaveMask(106, activeCarry);
         }
 
         private uint EmitPermlane16(

@@ -1410,7 +1410,8 @@ internal static class Gen5ShaderTranslator
                         (extra >> 21) & 1,
                         (extra >> 20) & 1,
                         (extra >> 14) & 0x3,
-                        ((extra >> 13) & 1) != 0);
+                        ((extra >> 13) & 1) != 0,
+                        ScalarDestination: null);
                 }
                 else
                 {
@@ -1449,7 +1450,8 @@ internal static class Gen5ShaderTranslator
                         ((extra >> 21) & 1) | (((extra >> 29) & 1) << 1),
                         ((extra >> 20) & 1) | (((extra >> 28) & 1) << 1),
                         (extra >> 14) & 0x3,
-                        ((extra >> 13) & 1) != 0);
+                        ((extra >> 13) & 1) != 0,
+                        ScalarDestination: null);
                 }
                 else
                 {
@@ -1503,14 +1505,20 @@ internal static class Gen5ShaderTranslator
                         Gen5Operand.Source(source0),
                         Gen5Operand.Source(source1),
                     ];
+                    // VOPC uses the SDWAB layout: bits 8-14 hold an sdst for
+                    // the compare mask with its valid bit at 15, replacing the
+                    // dst_sel/dst_u/clamp/omod fields of the plain SDWA word.
+                    // Compares ballot a full lane mask, so dst_sel is forced
+                    // to the no-op dword select.
                     control = new Gen5SdwaControl(
-                        (extra >> 8) & 0x7,
+                        6,
                         (extra >> 16) & 0x7,
                         (extra >> 24) & 0x7,
                         ((extra >> 21) & 1) | (((extra >> 29) & 1) << 1),
                         ((extra >> 20) & 1) | (((extra >> 28) & 1) << 1),
-                        (extra >> 14) & 0x3,
-                        ((extra >> 13) & 1) != 0);
+                        0,
+                        false,
+                        ((extra >> 15) & 1) != 0 ? (extra >> 8) & 0x7F : 106);
                 }
                 else
                 {

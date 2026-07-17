@@ -210,4 +210,46 @@ public sealed class Gen5ShaderTranslatorTests
         Assert.Equal(0x2222u, evaluation.ScalarRegisters[1]);
         Assert.Equal(0x1111_2222u, evaluation.ScalarRegisters[2]);
     }
+
+    [Fact]
+    public void Decode_VCmpSdwa_ExplicitScalarDestination_RoutesSdst()
+    {
+        // v_cmp_lt_f32_sdwa s[38:39], v0, v1 with dword selects. VOPC uses
+        // the SDWAB layout: sdst at bits 8-14, its valid bit at 15.
+        var program = Decode(0x7C0202F9, 0x0606A600, SEndpgm);
+
+        var compare = program.Instructions[0];
+        Assert.Equal("VCmpLtF32", compare.Opcode);
+        var control = Assert.IsType<Gen5SdwaControl>(compare.Control);
+        Assert.Equal(38u, control.ScalarDestination);
+        Assert.Equal(6u, control.DestinationSelect); // forced no-op dword select
+        Assert.Equal(6u, control.Source0Select);
+        Assert.Equal(6u, control.Source1Select);
+        Assert.Equal(0u, control.OutputModifier); // sdst bits, not omod/clamp
+        Assert.False(control.Clamp);
+    }
+
+    [Fact]
+    public void Decode_VCmpSdwa_NoScalarDestination_DefaultsToVcc()
+    {
+        // Same compare with SD=0: the mask goes to VCC (s106).
+        var program = Decode(0x7C0202F9, 0x0606_0000, SEndpgm);
+
+        var control = Assert.IsType<Gen5SdwaControl>(program.Instructions[0].Control);
+        Assert.Equal(106u, control.ScalarDestination);
+    }
+
+    [Fact]
+    public void Decode_Vop2Sdwa_HasNoScalarDestination()
+    {
+        // v_add_f32_sdwa v0, v0, v1 uses the plain SDWA word, whose bits 8-15
+        // are dst_sel/dst_u/clamp/omod rather than an sdst.
+        var program = Decode(0x0600_02F9, 0x0606_0600, SEndpgm);
+
+        var add = program.Instructions[0];
+        Assert.Equal("VAddF32", add.Opcode);
+        var control = Assert.IsType<Gen5SdwaControl>(add.Control);
+        Assert.Null(control.ScalarDestination);
+        Assert.Equal(6u, control.DestinationSelect);
+    }
 }

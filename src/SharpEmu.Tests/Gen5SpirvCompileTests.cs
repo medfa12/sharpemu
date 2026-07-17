@@ -156,4 +156,173 @@ public sealed class Gen5SpirvCompileTests
             }
         }
     }
+
+    private const uint ExportV0Rgba = 0xF8001C0F; // exp mrt0 v0,v0,v0,v0 done vm
+    private const uint SEndpgm = 0xBF810000;
+
+    private const ushort OpName = 5, OpConstant = 43, OpStore = 62,
+        OpAccessChain = 65, OpLogicalOr = 166, OpLogicalAnd = 167,
+        OpSelect = 169, OpULessThan = 176, OpFOrdLessThan = 184;
+
+    private static SpirvModuleAssert.ParsedModule CompilePixelShader(params uint[] words)
+    {
+        var (state, evaluation, _) = DecodeAndEvaluate(words);
+        var ok = Gen5SpirvTranslator.TryCompilePixelShader(
+            state, evaluation, Gen5PixelOutputKind.Float, out var shader, out var error);
+        Assert.True(ok, $"TryCompilePixelShader failed: {error}");
+        return SpirvModuleAssert.Parse(shader.Spirv);
+    }
+
+    private static string DebugName(uint[] w)
+    {
+        var bytes = new List<byte>();
+        for (var word = 2; word < w.Length; word++)
+        {
+            for (var shift = 0; shift < 32; shift += 8)
+            {
+                var value = (byte)(w[word] >> shift);
+                if (value == 0)
+                {
+                    return System.Text.Encoding.UTF8.GetString(bytes.ToArray());
+                }
+
+                bytes.Add(value);
+            }
+        }
+
+        return System.Text.Encoding.UTF8.GetString(bytes.ToArray());
+    }
+
+    // How many times each SGPR index is stored, keyed off the OpAccessChain
+    // constant index into the OpName-tagged "sgpr" array.
+    private static Dictionary<uint, int> ScalarRegisterStoreCounts(
+        SpirvModuleAssert.ParsedModule module)
+    {
+        uint sgpr = 0;
+        var constants = new Dictionary<uint, uint>(); // 32-bit constant id -> value
+        var pointers = new Dictionary<uint, uint>();  // pointer id -> sgpr index
+        var counts = new Dictionary<uint, int>();
+        foreach (var (opcode, w) in module.Instructions)
+        {
+            switch (opcode)
+            {
+                case OpName when DebugName(w) == "sgpr":
+                    sgpr = w[1];
+                    break;
+                case OpConstant when w.Length == 4:
+                    constants[w[2]] = w[3];
+                    break;
+                case OpAccessChain when w.Length == 5 && sgpr != 0 && w[3] == sgpr:
+                    pointers[w[2]] = constants[w[4]];
+                    break;
+                case OpStore when pointers.TryGetValue(w[1], out var register):
+                    counts[register] = counts.GetValueOrDefault(register) + 1;
+                    break;
+            }
+        }
+
+        return counts;
+    }
+
+    private static uint SingleResultOf(
+        SpirvModuleAssert.ParsedModule module,
+        ushort opcode)
+    {
+        var (_, words) = Assert.Single(module.Instructions, i => i.Opcode == opcode);
+        return words[2];
+    }
+
+    [Fact]
+    public void PixelShader_VectorCompare_BallotIsMaskedWithExec()
+    {
+        // v_cmp_lt_f32 vcc, v1, v2: the VCC ballot must be EXEC & condition;
+        // a raw-condition ballot leaks disabled-lane results into later
+        // saveexec/branch sequences.
+        var module = CompilePixelShader(0x7C020501, ExportV0Rgba, 0x00000000, SEndpgm);
+
+        var compare = SingleResultOf(module, OpFOrdLessThan);
+        var masked = Assert.Single(
+            module.Instructions,
+            i => i.Opcode == OpLogicalAnd && (i.Words[3] == compare || i.Words[4] == compare));
+        Assert.Contains(
+            module.Instructions,
+            i => i.Opcode == OpSelect && i.Words[3] == masked.Words[2]);
+        Assert.DoesNotContain(
+            module.Instructions,
+            i => i.Opcode == OpSelect && i.Words[3] == compare);
+
+        var stores = ScalarRegisterStoreCounts(module);
+        Assert.Equal(1, stores.GetValueOrDefault(106u));
+        Assert.Equal(1, stores.GetValueOrDefault(107u));
+    }
+
+    [Fact]
+    public void PixelShader_VCmpSdwaScalarDestination_TargetsSdstPairNotVcc()
+    {
+        // v_cmp_lt_f32_sdwa s[38:39], v0, v1 (SD=1, sdst=38): the mask lands
+        // in the encoded sdst pair and VCC stays untouched.
+        var module = CompilePixelShader(0x7C0202F9, 0x0606A600, ExportV0Rgba, 0x00000000, SEndpgm);
+
+        var stores = ScalarRegisterStoreCounts(module);
+        Assert.Equal(1, stores.GetValueOrDefault(38u));
+        Assert.Equal(1, stores.GetValueOrDefault(39u));
+        Assert.Equal(0, stores.GetValueOrDefault(106u));
+        Assert.Equal(0, stores.GetValueOrDefault(107u));
+    }
+
+    [Fact]
+    public void PixelShader_VCmpxSdwa_WritesExecOnlyAndIgnoresSdst()
+    {
+        // v_cmpx_lt_f32_sdwa with SD=1 sdst=38 encoded: gfx10 VCmpx writes
+        // EXEC only; the sdst bits must not clobber an SGPR pair or VCC. The
+        // prologue seeds s126 once from the evaluator's initial EXEC value
+        // (the zero s127 half is skipped), so the compare accounts for the
+        // second s126 store and the only s127 store.
+        var module = CompilePixelShader(0x7C2202F9, 0x0606A600, ExportV0Rgba, 0x00000000, SEndpgm);
+
+        var stores = ScalarRegisterStoreCounts(module);
+        Assert.Equal(0, stores.GetValueOrDefault(38u));
+        Assert.Equal(0, stores.GetValueOrDefault(39u));
+        Assert.Equal(0, stores.GetValueOrDefault(106u));
+        Assert.Equal(0, stores.GetValueOrDefault(107u));
+        Assert.Equal(2, stores.GetValueOrDefault(126u));
+        Assert.Equal(1, stores.GetValueOrDefault(127u));
+    }
+
+    [Fact]
+    public void PixelShader_AddCarryOut_ScalarDestinationReceivesExecMaskedLaneMask()
+    {
+        // v_add_co_u32 v0, s[40:41], v1, v2 (VOP3B): the carry-out is a
+        // per-lane ballot like VCC, stored to both halves of the sdst pair
+        // and masked with EXEC, not a scalar 0/1.
+        var module = CompilePixelShader(0xD70F2800, 0x00020501, ExportV0Rgba, 0x00000000, SEndpgm);
+
+        var carry = SingleResultOf(module, OpULessThan);
+        Assert.Contains(
+            module.Instructions,
+            i => i.Opcode == OpLogicalAnd && (i.Words[3] == carry || i.Words[4] == carry));
+
+        var stores = ScalarRegisterStoreCounts(module);
+        Assert.Equal(1, stores.GetValueOrDefault(40u));
+        Assert.Equal(1, stores.GetValueOrDefault(41u));
+        Assert.Equal(0, stores.GetValueOrDefault(106u));
+    }
+
+    [Fact]
+    public void PixelShader_AddWithCarry_VccBallotIsMaskedWithExec()
+    {
+        // v_add_co_ci_u32 v0, vcc, v1, v2, vcc: the carry-out ballot
+        // (LogicalOr of the two overflow tests) must be ANDed with EXEC
+        // before it lands in VCC.
+        var module = CompilePixelShader(0x50000501, ExportV0Rgba, 0x00000000, SEndpgm);
+
+        var carry = SingleResultOf(module, OpLogicalOr);
+        Assert.Contains(
+            module.Instructions,
+            i => i.Opcode == OpLogicalAnd && (i.Words[3] == carry || i.Words[4] == carry));
+
+        var stores = ScalarRegisterStoreCounts(module);
+        Assert.Equal(1, stores.GetValueOrDefault(106u));
+        Assert.Equal(1, stores.GetValueOrDefault(107u));
+    }
 }

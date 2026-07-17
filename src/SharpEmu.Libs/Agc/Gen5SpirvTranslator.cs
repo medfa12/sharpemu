@@ -2733,6 +2733,16 @@ internal static partial class Gen5SpirvTranslator
         private void StoreWaveMask(uint register, uint condition) =>
             StoreS64(register, BooleanToLaneMask(condition));
 
+        // Only lanes enabled by EXEC can contribute to a balloted mask;
+        // letting disabled lanes through leaks stale results into later
+        // saveexec/branch sequences.
+        private uint MaskWithExec(uint condition) =>
+            _module.AddInstruction(
+                SpirvOp.LogicalAnd,
+                _boolType,
+                Load(_boolType, _exec),
+                condition);
+
         private void EmitExecConditional(Action emit)
         {
             var activeLabel = _module.AllocateId();
