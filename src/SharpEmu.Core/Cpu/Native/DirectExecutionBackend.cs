@@ -589,6 +589,33 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 	private bool _forcedGuestExit;
 
+	// One shared page for the guarded memcpy/memset intrinsics: qword 0 is a
+	// lock-xadd event counter, entries start at +0x40, 32 bytes each (guest
+	// return address with bit 63 set for memset, then rdi/rsi/rdx). The stubs
+	// append an entry whenever they swallow a nonzero out-of-range pointer;
+	// the stall watchdog and the crash dump drain it and WARN once per return
+	// address, so the first touch of corrupted state is pinpointed instead of
+	// surfacing as an unexplained AV minutes later.
+	private ulong _importGuardRingAddress;
+
+	private ulong _importGuardRingDrainedCount;
+
+	private readonly HashSet<ulong> _importGuardWarnedReturns = new HashSet<ulong>();
+
+	private const int ImportGuardRingEntryCount = 64;
+
+	private const int ImportGuardRingHeaderBytes = 0x40;
+
+	private const int ImportGuardRingEntryBytes = 32;
+
+	private const ulong ImportGuardRingBytes = 4096;
+
+	// Byte offsets of the "mov r10, imm64" ring-base immediates inside the
+	// guarded memcpy/memset intrinsic byte arrays in TryCreateNativeImportIntrinsic.
+	private const int MemcpyGuardRingPatchOffset = 0x50;
+
+	private const int MemsetGuardRingPatchOffset = 0x48;
+
 	private ulong _lastAvTraceRip;
 
 	private ulong _lastAvTraceType;
@@ -1131,6 +1158,15 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			return false;
 		}
 
+		if (nid is "Q3VBxCXhUHs" or "8zTFvBIAIN8" && EnsureImportGuardRing() == 0)
+		{
+			// Without the swallow ring the guarded stubs would have to drop the
+			// diagnostic record; fall back to the HLE dispatch path instead, which
+			// can log through managed code.
+			address = 0;
+			return false;
+		}
+
 		ReadOnlySpan<byte> code = nid switch
 		{
 			"-2IRUCO--PM" =>
@@ -1303,19 +1339,22 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			// slow for a function this hot - so this stub keeps the native leaf path and adds
 			// the same guards as memset below: it silently returns dst without copying when dst
 			// or src is null/low-page (< 0x10000) or outside canonical user space, or when len
-			// is 0 or absurd (> 512MB).
+			// is 0 or absurd (> 512MB). Nonzero out-of-range pointers additionally append a
+			// record (tagged guest return address, rdi, rsi, rdx) to the swallow ring at
+			// _importGuardRingAddress so the first touch of corrupted state shows up as a WARN
+			// on the next drain instead of an unexplained AV minutes later.
 			"Q3VBxCXhUHs" =>
 			[
 				0x48, 0x89, 0xF8,                                           // mov rax, rdi (return dst)
 				0x48, 0x81, 0xFF, 0x00, 0x00, 0x01, 0x00,                   // cmp rdi, 0x10000
-				0x72, 0x31,                                                 // jb done
+				0x72, 0x32,                                                 // jb bad_dst
 				0x49, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, // mov r8, 0x800000000000
 				0x4C, 0x39, 0xC7,                                           // cmp rdi, r8
-				0x73, 0x22,                                                 // jae done
+				0x73, 0x23,                                                 // jae bad_dst
 				0x48, 0x81, 0xFE, 0x00, 0x00, 0x01, 0x00,                   // cmp rsi, 0x10000
-				0x72, 0x19,                                                 // jb done
+				0x72, 0x21,                                                 // jb bad_src
 				0x4C, 0x39, 0xC6,                                           // cmp rsi, r8
-				0x73, 0x14,                                                 // jae done
+				0x73, 0x1C,                                                 // jae bad_src
 				0x48, 0x81, 0xFA, 0x00, 0x00, 0x00, 0x20,                   // cmp rdx, 0x20000000
 				0x77, 0x0B,                                                 // ja done
 				0x48, 0x85, 0xD2,                                           // test rdx, rdx
@@ -1324,12 +1363,31 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				0xFC,                                                       // cld
 				0xF3, 0xA4,                                                 // rep movsb
 				0xC3,                                                       // done: ret
+				0x48, 0x85, 0xFF,                                           // bad_dst: test rdi, rdi
+				0x74, 0xFA,                                                 // jz done (null dst is a known-benign swallow)
+				0xEB, 0x05,                                                 // jmp record
+				0x48, 0x85, 0xF6,                                           // bad_src: test rsi, rsi
+				0x74, 0xF3,                                                 // jz done (null src is a known-benign swallow)
+				0x4C, 0x8B, 0x0C, 0x24,                                     // record: mov r9, [rsp] (guest return address)
+				0x49, 0xBA, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // mov r10, ring base (patched)
+				0x41, 0xBB, 0x01, 0x00, 0x00, 0x00,                         // mov r11d, 1
+				0xF0, 0x4D, 0x0F, 0xC1, 0x1A,                               // lock xadd [r10], r11 (claim slot)
+				0x41, 0x83, 0xE3, 0x3F,                                     // and r11d, 0x3F (64 entries)
+				0x49, 0xC1, 0xE3, 0x05,                                     // shl r11, 5 (32-byte entries)
+				0x4F, 0x8D, 0x54, 0x1A, 0x40,                               // lea r10, [r10 + r11 + 0x40]
+				0x4D, 0x89, 0x0A,                                           // mov [r10], r9
+				0x49, 0x89, 0x7A, 0x08,                                     // mov [r10+0x08], rdi
+				0x49, 0x89, 0x72, 0x10,                                     // mov [r10+0x10], rsi
+				0x49, 0x89, 0x52, 0x18,                                     // mov [r10+0x18], rdx
+				0xC3,                                                       // ret (rax already dst)
 			],
 			// memset: guarded native fill. An earlier unguarded version crashed with a write AV
 			// at address 0 (NGS2 audio streaming init memsets a never-populated buffer field),
 			// so this one mirrors the HLE guards and silently returns dst without writing when
 			// dst is null/low-page (< 0x10000), dst is outside canonical user space, or len is
-			// absurd (> 512MB, e.g. the 0x27060035 / sign-extended values NGS2 passes). Routing
+			// absurd (> 512MB, e.g. the 0x27060035 / sign-extended values NGS2 passes). Like
+			// memcpy above, a nonzero out-of-range dst also appends a record to the swallow
+			// ring (return address tagged with bit 63 to mark it as memset). Routing
 			// memset through the HLE trampoline instead is not viable: parse/streaming loops
 			// issue hundreds of thousands of small memsets back-to-back, which crawls at
 			// dispatch speed and looks like a repeating-import hang to the loop guard.
@@ -1347,10 +1405,10 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			[
 				0x48, 0x89, 0xF8,                                           // mov rax, rdi (return dst)
 				0x48, 0x81, 0xFF, 0x00, 0x00, 0x01, 0x00,                   // cmp rdi, 0x10000
-				0x72, 0x2B,                                                 // jb done
+				0x72, 0x2C,                                                 // jb bad
 				0x49, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, // mov r8, 0x800000000000
 				0x4C, 0x39, 0xC7,                                           // cmp rdi, r8
-				0x73, 0x1C,                                                 // jae done
+				0x73, 0x1D,                                                 // jae bad
 				0x48, 0x81, 0xFA, 0x00, 0x00, 0x00, 0x20,                   // cmp rdx, 0x20000000
 				0x77, 0x13,                                                 // ja done
 				0x48, 0x85, 0xD2,                                           // test rdx, rdx
@@ -1362,6 +1420,21 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				0xF3, 0xAA,                                                 // rep stosb
 				0x4C, 0x89, 0xC8,                                           // mov rax, r9
 				0xC3,                                                       // done: ret
+				0x48, 0x85, 0xFF,                                           // bad: test rdi, rdi
+				0x74, 0xFA,                                                 // jz done (null dst is a known-benign swallow)
+				0x4C, 0x8B, 0x0C, 0x24,                                     // mov r9, [rsp] (guest return address)
+				0x49, 0x0F, 0xBA, 0xE9, 0x3F,                               // bts r9, 63 (tag entry as memset)
+				0x49, 0xBA, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // mov r10, ring base (patched)
+				0x41, 0xBB, 0x01, 0x00, 0x00, 0x00,                         // mov r11d, 1
+				0xF0, 0x4D, 0x0F, 0xC1, 0x1A,                               // lock xadd [r10], r11 (claim slot)
+				0x41, 0x83, 0xE3, 0x3F,                                     // and r11d, 0x3F (64 entries)
+				0x49, 0xC1, 0xE3, 0x05,                                     // shl r11, 5 (32-byte entries)
+				0x4F, 0x8D, 0x54, 0x1A, 0x40,                               // lea r10, [r10 + r11 + 0x40]
+				0x4D, 0x89, 0x0A,                                           // mov [r10], r9
+				0x49, 0x89, 0x7A, 0x08,                                     // mov [r10+0x08], rdi
+				0x49, 0x89, 0x72, 0x10,                                     // mov [r10+0x10], rsi
+				0x49, 0x89, 0x52, 0x18,                                     // mov [r10+0x18], rdx
+				0xC3,                                                       // ret (rax already dst)
 			],
 			_ => default,
 		};
@@ -1389,6 +1462,14 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			*(nint*)((byte*)memory + 20) = _switchToThreadAddress;
 			*(nint*)((byte*)memory + 64) = _sleepAddress;
 		}
+		else if (nid == "Q3VBxCXhUHs")
+		{
+			*(ulong*)((byte*)memory + MemcpyGuardRingPatchOffset) = _importGuardRingAddress;
+		}
+		else if (nid == "8zTFvBIAIN8")
+		{
+			*(ulong*)((byte*)memory + MemsetGuardRingPatchOffset) = _importGuardRingAddress;
+		}
 		uint oldProtect = 0;
 		if (!_hostMemory.Protect((ulong)memory, intrinsicAllocationSize, HostPageProtection.ReadExecute, out oldProtect))
 		{
@@ -1401,6 +1482,60 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		address = (nint)memory;
 		_importHandlerTrampolines.Add(address);
 		return true;
+	}
+
+	private unsafe ulong EnsureImportGuardRing()
+	{
+		if (_importGuardRingAddress == 0)
+		{
+			var ring = _hostMemory.Allocate(0, ImportGuardRingBytes, HostPageProtection.ReadWrite);
+			if (ring != 0)
+			{
+				new Span<byte>((void*)ring, (int)ImportGuardRingBytes).Clear();
+			}
+			_importGuardRingAddress = ring;
+		}
+		return _importGuardRingAddress;
+	}
+
+	private unsafe void DrainImportGuardRing(string stage)
+	{
+		var ring = _importGuardRingAddress;
+		if (ring == 0)
+		{
+			return;
+		}
+
+		lock (_importGuardWarnedReturns)
+		{
+			ulong produced = (ulong)Volatile.Read(ref *(long*)ring);
+			ulong drained = _importGuardRingDrainedCount;
+			if (produced == drained)
+			{
+				return;
+			}
+			if (produced - drained > ImportGuardRingEntryCount)
+			{
+				// The ring wrapped between drains; only the newest entries survive.
+				drained = produced - ImportGuardRingEntryCount;
+			}
+			for (ulong i = drained; i < produced; i++)
+			{
+				ulong* entry = (ulong*)(ring + ImportGuardRingHeaderBytes +
+					(i % ImportGuardRingEntryCount) * ImportGuardRingEntryBytes);
+				ulong taggedReturn = entry[0];
+				bool isMemset = (taggedReturn & 0x8000000000000000UL) != 0;
+				ulong returnAddress = taggedReturn & 0x7FFFFFFFFFFFFFFFUL;
+				if (!_importGuardWarnedReturns.Add(returnAddress))
+				{
+					continue;
+				}
+				Console.Error.WriteLine(
+					$"[LOADER][WARN] GuardSwallow[{stage}]: {(isMemset ? "memset" : "memcpy")} intrinsic swallowed out-of-range pointer" +
+					$" ret=0x{returnAddress:X16} rdi=0x{entry[1]:X16} rsi=0x{entry[2]:X16} rdx=0x{entry[3]:X16}");
+			}
+			_importGuardRingDrainedCount = produced;
+		}
 	}
 
 	private bool TryResolveDirectImportTarget(string nid, out ulong targetAddress, out string resolvedSymbol)
@@ -4773,6 +4908,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				{
 					break;
 				}
+				DrainImportGuardRing("watchdog");
 				long num2 = Stopwatch.GetTimestamp() - Volatile.Read(ref _lastProgressTimestamp);
 				if (num2 < num)
 				{

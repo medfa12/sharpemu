@@ -380,6 +380,10 @@ public sealed partial class DirectExecutionBackend
 					DumpGuestDisasmDiagnostics(rip, rbp);
 					DumpGuestReferenceDiagnostics();
 					DumpGuestPointerWindowDiagnostics();
+					// Flush any not-yet-drained guarded-intrinsic swallows: the most
+					// recent ones are often the first touch of whatever corrupted
+					// state this fault is now tripping over.
+					DrainImportGuardRing("crash");
 					break;
 				case WindowsFaultCodes.Breakpoint:
 					Console.Error.WriteLine("[LOADER][WARNING]   Type: Breakpoint (int3)");
