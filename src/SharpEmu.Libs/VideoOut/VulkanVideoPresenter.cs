@@ -3719,7 +3719,12 @@ internal static unsafe class VulkanVideoPresenter
             {
                 foreach (var texture in draw.Textures)
                 {
-                    if (texture.IsStorage)
+                    // Skip address-0 storage bindings here: the real resolution
+                    // path (ResolveStorageImageResource) uses a scratch image for
+                    // those, but ResolveStorageGuestImage throws on address 0,
+                    // which dropped the whole producer draw of the present or
+                    // composite target every frame.
+                    if (texture.IsStorage && texture.Address != 0)
                     {
                         _ = ResolveStorageGuestImage(texture);
                     }
