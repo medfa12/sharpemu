@@ -17,12 +17,12 @@ public sealed class AudioOut2Tests
     private const string DisableSndzVariable = "SHARPEMU_DISABLE_SNDZ";
 
     /// <summary>
-    /// Sndz audio-out is disabled by default (Astro Bot's mixer render dies
-    /// on a stomped mixer object; failing PortCreate parks the
-    /// SceSndzAudioOutMain thread in its benign one-second retry loop).
-    /// Ports are only minted when the variable is explicitly "0".
+    /// Sndz audio-out runs by default; parking the mixer (SHARPEMU_DISABLE_SNDZ=1)
+    /// is an opt-in long-run stability experiment because refusing the port
+    /// deadlocks the audio pipeline before the title screen. Ports are minted
+    /// unless the variable is exactly "1".
     /// </summary>
-    private static EnvScope SndzEnabled() => new EnvScope(DisableSndzVariable, "0");
+    private static EnvScope SndzEnabled() => new EnvScope(DisableSndzVariable, null);
 
     private static EnvScope SndzDisabled(string? value) => new EnvScope(DisableSndzVariable, value);
 
@@ -82,9 +82,9 @@ public sealed class AudioOut2Tests
     private const int AudioOut2ErrorPortFull = unchecked((int)0x80268012);
 
     [Fact]
-    public void PortCreate_RefusedByDefault_AndLeavesOutSlotUntouched()
+    public void PortCreate_RefusedWhenParked_AndLeavesOutSlotUntouched()
     {
-        using var scope = SndzDisabled(null);
+        using var scope = SndzDisabled("1");
         var ctx = NewContext(out _);
 
         // The Sndz wrapper keeps its port slot at -1 until PortCreate stores a
@@ -119,9 +119,9 @@ public sealed class AudioOut2Tests
     }
 
     [Fact]
-    public void PortCreate_NullArgumentsStillRejectedWhileRefused()
+    public void PortCreate_NullArgumentsStillRejectedWhileParked()
     {
-        using var scope = SndzDisabled(null);
+        using var scope = SndzDisabled("1");
         var ctx = NewContext(out _);
 
         ctx[CpuRegister.Rdi] = 1;

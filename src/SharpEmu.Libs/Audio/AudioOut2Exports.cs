@@ -120,15 +120,20 @@ public static class AudioOut2Exports
     // PortCreate call site (0x800EB2521, 0x800EB25C4, 0x800EB2BFC, 0x800EB3560,
     // 0x800EB3690) compiles to the same log-then-continue pattern, the engine
     // leaves failed slots at -1 and already calls PortSetAttributes(-1)
-    // harmlessly, and the ready byte the thread would set (global+0x51) is
-    // never read anywhere in the eboot, so nothing blocks on the port coming
-    // up. Set SHARPEMU_DISABLE_SNDZ=0 to mint ports again; unset or any other
-    // value keeps audio-out disabled. Read per call: port creation is rare
+    // harmlessly. HOWEVER this is OPT-IN (default off): parking the mixer
+    // deadlocks the audio pipeline before the game reaches its title screen --
+    // SceSndzRenderThread and sndz_stream_task_service block on event flags the
+    // running mixer signals, so refusing the port stalls the whole game (boot
+    // titledx1: global stall at material setup, PROCESS EXIT code=4). The mixer
+    // crash it avoids only occurs ~79 min in, long after the title is rendered,
+    // so the park is not needed for the menu. Set SHARPEMU_DISABLE_SNDZ=1 to
+    // park the mixer for a long-run stability experiment; unset or any other
+    // value runs audio-out normally. Read per call: port creation is rare
     // (init/retry cadence) and tests flip the variable at runtime.
     private static bool SndzAudioOutDisabled =>
-        !string.Equals(
+        string.Equals(
             Environment.GetEnvironmentVariable("SHARPEMU_DISABLE_SNDZ"),
-            "0",
+            "1",
             StringComparison.Ordinal);
 
     // Cached once: several of these exports (port_set_attributes, port_get_state,
