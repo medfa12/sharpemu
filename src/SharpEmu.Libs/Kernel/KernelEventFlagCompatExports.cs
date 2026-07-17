@@ -129,7 +129,10 @@ public static class KernelEventFlagCompatExports
         {
             state.Bits |= pattern;
             Monitor.PulseAll(state.Gate);
-            TraceEventFlag($"set handle=0x{handle:X16} pattern=0x{pattern:X16} bits=0x{state.Bits:X16} ret=0x{returnRip:X16}");
+            if (_traceEventFlags)
+            {
+                TraceEventFlag($"set handle=0x{handle:X16} pattern=0x{pattern:X16} bits=0x{state.Bits:X16} ret=0x{returnRip:X16}");
+            }
         }
 
         _ = GuestThreadExecution.Scheduler?.WakeBlockedThreads(GetEventFlagWakeKey(handle));
@@ -153,7 +156,10 @@ public static class KernelEventFlagCompatExports
         lock (state.Gate)
         {
             state.Bits &= pattern;
-            TraceEventFlag($"clear handle=0x{handle:X16} mask=0x{pattern:X16} bits=0x{state.Bits:X16}");
+            if (_traceEventFlags)
+            {
+                TraceEventFlag($"clear handle=0x{handle:X16} mask=0x{pattern:X16} bits=0x{state.Bits:X16}");
+            }
         }
 
         return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
@@ -194,7 +200,10 @@ public static class KernelEventFlagCompatExports
             }
 
             ApplyClearMode(state, pattern, waitMode);
-            TraceEventFlag($"poll handle=0x{handle:X16} pattern=0x{pattern:X16} mode=0x{waitMode:X2} bits=0x{state.Bits:X16}");
+            if (_traceEventFlags)
+            {
+                TraceEventFlag($"poll handle=0x{handle:X16} pattern=0x{pattern:X16} mode=0x{waitMode:X2} bits=0x{state.Bits:X16}");
+            }
             return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
         }
     }
@@ -308,8 +317,13 @@ public static class KernelEventFlagCompatExports
                     blockedWaitResult = preparedResult;
                     return true;
                 });
-            TraceEventFlag($"wait-unsatisfied handle=0x{handle:X16} pattern=0x{pattern:X16} bits=0x{state.Bits:X16} guest_thread=0x{currentGuestThread:X16} fiber=0x{currentFiber:X16} managed={managedThread} block={requestedBlock} ret=0x{returnRip:X16} frames={FormatFrameChain(ctx)}");
-            TraceEventFlag($"wait-object handle=0x{handle:X16} name='{state.Name}' {FormatGuestWaitObject(ctx)}");
+            if (_traceEventFlags)
+            {
+                // FormatFrameChain/FormatGuestWaitObject walk guest memory and build
+                // strings; only do that work when tracing is actually enabled.
+                TraceEventFlag($"wait-unsatisfied handle=0x{handle:X16} pattern=0x{pattern:X16} bits=0x{state.Bits:X16} guest_thread=0x{currentGuestThread:X16} fiber=0x{currentFiber:X16} managed={managedThread} block={requestedBlock} ret=0x{returnRip:X16} frames={FormatFrameChain(ctx)}");
+                TraceEventFlag($"wait-object handle=0x{handle:X16} name='{state.Name}' {FormatGuestWaitObject(ctx)}");
+            }
             if (!requestedBlock)
             {
                 var scheduler = GuestThreadExecution.Scheduler;
@@ -582,9 +596,16 @@ public static class KernelEventFlagCompatExports
     private static bool TryWriteResultPattern(CpuContext ctx, ulong address, ulong bits) =>
         address == 0 || ctx.TryWriteUInt64(address, bits);
 
+    // Cached once; set/clear/poll/wait run on hot guest paths and a per-call
+    // Environment.GetEnvironmentVariable is a P/Invoke plus a transient string.
+    // The hottest call sites also check this flag before building their
+    // interpolated message so tracing-off costs no allocation at all.
+    private static readonly bool _traceEventFlags =
+        string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_EVENT_FLAG"), "1", StringComparison.Ordinal);
+
     private static void TraceEventFlag(string message)
     {
-        if (string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_EVENT_FLAG"), "1", StringComparison.Ordinal))
+        if (_traceEventFlags)
         {
             Console.Error.WriteLine($"[LOADER][TRACE] event_flag.{message}");
         }
