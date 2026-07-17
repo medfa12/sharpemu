@@ -195,4 +195,113 @@ public sealed class Gen5ShaderTranslatorTests
         Assert.Equal(0x2222u, evaluation.ScalarRegisters[1]);
         Assert.Equal(0x1111_2222u, evaluation.ScalarRegisters[2]);
     }
+
+    private const ulong HeaderAddress = 0x9000;
+    private const uint ShaderSizeOffset = 0x44;
+    private const uint SNop = 0xBF80_0000;
+
+    [Fact]
+    public void Decode_ProgramLongerThan4096Instructions_ReachesEndProgram()
+    {
+        // Old decoder capped at 4096 instructions; 4097 must now decode fully.
+        var words = new uint[4097];
+        Array.Fill(words, SNop);
+        words[^1] = SEndpgm;
+
+        var program = Decode(words);
+
+        Assert.Equal(4097, program.Instructions.Count);
+        Assert.Equal("SEndpgm", program.Instructions[^1].Opcode);
+    }
+
+    [Fact]
+    public void Decode_HeaderDeclaredSize_BoundsDecode()
+    {
+        var memory = new SparseGuestMemory();
+        memory.WriteWords(ShaderAddress, SNop, SEndpgm);
+        memory.WriteUInt32(HeaderAddress + ShaderSizeOffset, 8); // exact byte length
+
+        var ok = Gen5ShaderTranslator.TryCreateState(
+            new CpuContext(memory, Generation.Gen5),
+            ShaderAddress,
+            HeaderAddress,
+            shaderRegisters: new Dictionary<uint, uint>(),
+            userDataBaseRegister: 0,
+            out var state,
+            out var error);
+
+        Assert.True(ok, error);
+        Assert.Equal(2, state.Program.Instructions.Count);
+    }
+
+    [Theory]
+    [InlineData(0u)] // zero
+    [InlineData(6u)] // not dword-aligned
+    [InlineData(1024u * 1024u + 4u)] // above the 1MB ceiling
+    public void Decode_InvalidHeaderSize_Fails(uint declaredSize)
+    {
+        var memory = new SparseGuestMemory();
+        memory.WriteWords(ShaderAddress, SEndpgm);
+        memory.WriteUInt32(HeaderAddress + ShaderSizeOffset, declaredSize);
+
+        var ok = Gen5ShaderTranslator.TryCreateState(
+            new CpuContext(memory, Generation.Gen5),
+            ShaderAddress,
+            HeaderAddress,
+            shaderRegisters: new Dictionary<uint, uint>(),
+            userDataBaseRegister: 0,
+            out _,
+            out var error);
+
+        Assert.False(ok);
+        Assert.StartsWith("invalid-shader-size", error);
+    }
+
+    [Fact]
+    public void Decode_DeclaredSizeTruncatingProgram_Fails()
+    {
+        // SEndpgm sits at byte 8, but the header only declares 8 bytes.
+        var memory = new SparseGuestMemory();
+        memory.WriteWords(ShaderAddress, SNop, SNop, SEndpgm);
+        memory.WriteUInt32(HeaderAddress + ShaderSizeOffset, 8);
+
+        var ok = Gen5ShaderTranslator.TryCreateState(
+            new CpuContext(memory, Generation.Gen5),
+            ShaderAddress,
+            HeaderAddress,
+            shaderRegisters: new Dictionary<uint, uint>(),
+            userDataBaseRegister: 0,
+            out _,
+            out var error);
+
+        Assert.False(ok);
+        Assert.Contains("unterminated", error);
+        Assert.Contains("size=0x8", error);
+    }
+
+    [Fact]
+    public void Decode_CacheIsKeyedByAddressAndSize()
+    {
+        var memory = new SparseGuestMemory();
+        memory.WriteWords(ShaderAddress, SNop, SEndpgm);
+        var ctx = new CpuContext(memory, Generation.Gen5);
+        var registers = new Dictionary<uint, uint>();
+
+        // Headerless decode succeeds and is cached under (address, 0).
+        Assert.True(Gen5ShaderTranslator.TryCreateState(
+            ctx, ShaderAddress, 0, registers, 0, out _, out var error), error);
+
+        // A header declaring 4 bytes truncates before SEndpgm; an address-only
+        // cache would wrongly return the cached full decode here.
+        memory.WriteUInt32(HeaderAddress + ShaderSizeOffset, 4);
+        Assert.False(Gen5ShaderTranslator.TryCreateState(
+            ctx, ShaderAddress, HeaderAddress, registers, 0, out _, out error));
+        Assert.Contains("unterminated", error);
+
+        // The full declared size still decodes independently.
+        memory.WriteUInt32(HeaderAddress + ShaderSizeOffset, 8);
+        Assert.True(Gen5ShaderTranslator.TryCreateState(
+            ctx, ShaderAddress, HeaderAddress, registers, 0, out var state, out error), error);
+        Assert.Equal(2, state.Program.Instructions.Count);
+    }
 }

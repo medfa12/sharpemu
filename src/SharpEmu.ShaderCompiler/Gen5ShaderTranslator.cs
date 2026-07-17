@@ -10,7 +10,11 @@ namespace SharpEmu.ShaderCompiler;
 
 public static class Gen5ShaderTranslator
 {
-    private const int MaxInstructions = 4096;
+    // Headerless compatibility paths have no authoritative byte length. Keep
+    // those scans byte-bounded; normal AGC-created shaders use their declared size.
+    private const uint MaximumHeaderlessShaderBytes = 64 * 1024;
+    private const ulong ShaderSizeOffset = 0x44;
+    private const uint MaximumShaderSizeBytes = 1024 * 1024;
     private const int MinimumUserDataDwords = 16;
     private const int MaximumUserDataDwords = 256;
     private static readonly ConditionalWeakTable<object, ShaderDecodeCache> _decodeCaches = new();
@@ -18,7 +22,7 @@ public static class Gen5ShaderTranslator
     private sealed class ShaderDecodeCache
     {
         public object Gate { get; } = new();
-        public Dictionary<ulong, Gen5ShaderProgram> Programs { get; } = new();
+        public Dictionary<(ulong Address, uint SizeBytes), Gen5ShaderProgram> Programs { get; } = new();
         public Dictionary<ulong, Gen5ShaderMetadata?> Metadata { get; } = new();
     }
 
@@ -126,23 +130,43 @@ public static class Gen5ShaderTranslator
     {
         state = default!;
         error = string.Empty;
+        uint shaderSizeBytes = 0;
+        if (shaderHeaderAddress != 0 &&
+            (!ctx.TryReadUInt32(
+                 shaderHeaderAddress + ShaderSizeOffset,
+                 out shaderSizeBytes) ||
+             shaderSizeBytes == 0 ||
+             (shaderSizeBytes & (sizeof(uint) - 1)) != 0 ||
+             shaderSizeBytes > MaximumShaderSizeBytes))
+        {
+            error = $"invalid-shader-size header=0x{shaderHeaderAddress:X} " +
+                $"size=0x{shaderSizeBytes:X}";
+            return false;
+        }
+
         var cache = _decodeCaches.GetValue(ctx.Memory, static _ => new ShaderDecodeCache());
+        var programKey = (shaderAddress, shaderSizeBytes);
         Gen5ShaderProgram? program;
         lock (cache.Gate)
         {
-            cache.Programs.TryGetValue(shaderAddress, out program);
+            cache.Programs.TryGetValue(programKey, out program);
         }
 
         if (program is null)
         {
-            if (!TryDecodeProgram(ctx, shaderAddress, out program, out error))
+            if (!TryDecodeProgram(
+                    ctx,
+                    shaderAddress,
+                    shaderSizeBytes,
+                    out program,
+                    out error))
             {
                 return false;
             }
 
             lock (cache.Gate)
             {
-                cache.Programs.TryAdd(shaderAddress, program);
+                cache.Programs.TryAdd(programKey, program);
             }
         }
 
@@ -281,6 +305,14 @@ public static class Gen5ShaderTranslator
         CpuContext ctx,
         ulong address,
         out Gen5ShaderProgram program,
+        out string error) =>
+        TryDecodeProgram(ctx, address, 0, out program, out error);
+
+    private static bool TryDecodeProgram(
+        CpuContext ctx,
+        ulong address,
+        uint shaderSizeBytes,
+        out Gen5ShaderProgram program,
         out string error)
     {
         program = new Gen5ShaderProgram(address, []);
@@ -293,8 +325,19 @@ public static class Gen5ShaderTranslator
 
         var instructions = new List<Gen5ShaderInstruction>();
         var instructionCount = 0;
-        for (uint pc = 0; instructionCount < MaxInstructions;)
+        var programLimitBytes = shaderSizeBytes == 0
+            ? MaximumHeaderlessShaderBytes
+            : shaderSizeBytes;
+        var maximumInstructions = checked((int)(programLimitBytes / sizeof(uint)));
+        uint pc = 0;
+        for (; instructionCount < maximumInstructions && pc < programLimitBytes;)
         {
+            if (programLimitBytes - pc < sizeof(uint))
+            {
+                error = $"truncated-word pc=0x{pc:X} limit=0x{programLimitBytes:X}";
+                return false;
+            }
+
             if (!ctx.TryReadUInt32(address + pc, out var word))
             {
                 error = $"read-failed pc=0x{pc:X}";
@@ -306,11 +349,20 @@ public static class Gen5ShaderTranslator
                     address,
                     pc,
                     word,
+                    programLimitBytes - pc,
                     out var encoding,
                     out var name,
                     out var sizeDwords,
                     out error))
             {
+                return false;
+            }
+
+            var instructionBytes = sizeDwords * sizeof(uint);
+            if (instructionBytes > programLimitBytes - pc)
+            {
+                error = $"truncated-instruction pc=0x{pc:X} " +
+                    $"dwords={sizeDwords} limit=0x{programLimitBytes:X}";
                 return false;
             }
 
@@ -328,7 +380,7 @@ public static class Gen5ShaderTranslator
             instructions.Add(CreateInstruction(pc, encoding, name, words));
             instructionCount++;
 
-            pc += sizeDwords * sizeof(uint);
+            pc += instructionBytes;
             if (string.Equals(name, "SEndpgm", StringComparison.Ordinal))
             {
                 program = new Gen5ShaderProgram(address, instructions);
@@ -336,7 +388,10 @@ public static class Gen5ShaderTranslator
             }
         }
 
-        error = "unterminated";
+        error = $"unterminated pc=0x{pc:X} instructions={instructionCount}" +
+            (shaderSizeBytes == 0
+                ? $" fallback_limit=0x{programLimitBytes:X}"
+                : $" size=0x{shaderSizeBytes:X}");
         return false;
     }
 
@@ -345,6 +400,7 @@ public static class Gen5ShaderTranslator
         ulong baseAddress,
         uint pc,
         uint word,
+        uint availableBytes,
         out Gen5ShaderEncoding encoding,
         out string name,
         out uint sizeDwords,
@@ -398,7 +454,8 @@ public static class Gen5ShaderTranslator
             case 0x34:
             case 0x35:
                 encoding = Gen5ShaderEncoding.Vop3;
-                if (!ctx.TryReadUInt32(baseAddress + pc + sizeof(uint), out var vop3Extra))
+                if (availableBytes < 2 * sizeof(uint) ||
+                    !ctx.TryReadUInt32(baseAddress + pc + sizeof(uint), out var vop3Extra))
                 {
                     error = $"vop3-extra-read-failed pc=0x{pc:X}";
                     return false;
@@ -419,7 +476,8 @@ public static class Gen5ShaderTranslator
                 return DecodeFlat(word, out name, out sizeDwords, out error);
             case 0x38:
                 encoding = Gen5ShaderEncoding.Mubuf;
-                if (!ctx.TryReadUInt32(baseAddress + pc + sizeof(uint), out var mubufExtra))
+                if (availableBytes < 2 * sizeof(uint) ||
+                    !ctx.TryReadUInt32(baseAddress + pc + sizeof(uint), out var mubufExtra))
                 {
                     error = $"mubuf-extra-read-failed pc=0x{pc:X}";
                     return false;
@@ -428,7 +486,8 @@ public static class Gen5ShaderTranslator
                 return DecodeMubuf(word, mubufExtra, out name, out sizeDwords, out error);
             case 0x3A:
                 encoding = Gen5ShaderEncoding.Mtbuf;
-                if (!ctx.TryReadUInt32(baseAddress + pc + sizeof(uint), out var mtbufExtra))
+                if (availableBytes < 2 * sizeof(uint) ||
+                    !ctx.TryReadUInt32(baseAddress + pc + sizeof(uint), out var mtbufExtra))
                 {
                     error = $"mtbuf-extra-read-failed pc=0x{pc:X}";
                     return false;
