@@ -171,6 +171,7 @@ public static class AgcExports
     private static readonly object _frameHistGate = new();
     private static readonly Dictionary<uint, int> _frameOpHist = new();
     private static readonly HashSet<ulong> _tracedSuspendTargets = new();
+    private static readonly HashSet<ulong> _tracedForcedWaitTargets = new();
     private static int _frameSuspendCount;
     private static int _frameResumeCount;
     private static int _frameAutoDraws;
@@ -189,6 +190,14 @@ public static class AgcExports
         Environment.GetEnvironmentVariable("SHARPEMU_LOG_AGC"),
         "1",
         StringComparison.Ordinal);
+    // SHARPEMU_GPU_WAIT_MODE=force restores the legacy behaviour of writing a
+    // satisfying value into the watched label when a WAIT_REG_MEM condition is
+    // not met, so parsing continues instead of suspending the DCB. Default
+    // (flag absent or any other value) keeps the suspend/resume path.
+    private static readonly bool _gpuWaitForceMode = string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_GPU_WAIT_MODE"),
+        "force",
+        StringComparison.OrdinalIgnoreCase);
     private static readonly bool _traceAgcShader =
         _traceAgc ||
         string.Equals(
@@ -3214,7 +3223,8 @@ public static class AgcExports
                         Is64Bit = register == RWaitMem64,
                         State = state,
                     };
-                    if (hasCurVal && !GpuWaitRegistry.Compare(waiter, curVal))
+                    if (hasCurVal && !GpuWaitRegistry.Compare(waiter, curVal) &&
+                        !TryForceSatisfyGpuWait(ctx, waiter, waitAddr, curVal))
                     {
                         GpuWaitRegistry.Register(waitAddr, waiter);
 
@@ -3255,7 +3265,8 @@ public static class AgcExports
                         Is64Bit = false,
                         State = state,
                     };
-                    if (!GpuWaitRegistry.Compare(waiter, curVal))
+                    if (!GpuWaitRegistry.Compare(waiter, curVal) &&
+                        !TryForceSatisfyGpuWait(ctx, waiter, waitAddr, curVal))
                     {
                         GpuWaitRegistry.Register(waitAddr, waiter);
 
@@ -7323,6 +7334,41 @@ public static class AgcExports
 
         Console.Error.WriteLine(
             $"[LOADER][TRACE] agc.create_shader dst=0x{destinationAddress:X16} header=0x{headerAddress:X16} code=0x{codeAddress:X16} {detail}");
+    }
+
+    // Legacy SHARPEMU_GPU_WAIT_MODE=force path: instead of suspending the DCB on
+    // an unmet WAIT_REG_MEM condition, write a value satisfying the comparison
+    // into the watched label and keep parsing. Returns false (caller suspends)
+    // when force mode is off, no satisfying value exists, or the write fails.
+    private static bool TryForceSatisfyGpuWait(
+        CpuContext ctx,
+        in GpuWaitRegistry.WaitingDcb waiter,
+        ulong waitAddr,
+        ulong currentValue)
+    {
+        if (!_gpuWaitForceMode ||
+            !GpuWaitRegistry.TryGetForceSatisfyValue(waiter, currentValue, out var satisfied))
+        {
+            return false;
+        }
+
+        var written = waiter.Is64Bit
+            ? ctx.TryWriteUInt64(waitAddr, satisfied)
+            : ctx.TryWriteUInt32(waitAddr, (uint)satisfied);
+        if (!written)
+        {
+            return false;
+        }
+
+        if (_tracedForcedWaitTargets.Add(waitAddr))
+        {
+            TraceAgc(
+                $"agc.wait_forced addr=0x{waitAddr:X16} cur=0x{currentValue:X16} " +
+                $"new=0x{satisfied:X16} ref=0x{waiter.ReferenceValue:X16} " +
+                $"mask=0x{waiter.Mask:X16} cmp={waiter.CompareFunction}");
+        }
+
+        return true;
     }
 
     // Packet layouts mirror what DcbWaitRegMem emits.

@@ -83,6 +83,45 @@ internal static class GpuWaitRegistry
         return woken;
     }
 
+    // Computes a label value that satisfies the waiter's comparison: bits outside
+    // the mask keep their current value and the masked bits are replaced with a
+    // value derived from the reference (ref-1 for '<', ref for '<='/'=='/'>=',
+    // ~ref for '!=', ref+1 for '>'). Returns false when no masked value can pass
+    // Compare (e.g. "< 0", "> mask", a reference with bits outside the mask, or a
+    // zero mask). Only the SHARPEMU_GPU_WAIT_MODE=force legacy path may use this
+    // to mutate a watched label.
+    public static bool TryGetForceSatisfyValue(
+        in WaitingDcb waiter,
+        ulong currentValue,
+        out ulong satisfied)
+    {
+        satisfied = 0;
+        var mask = waiter.Mask;
+        if (mask == 0)
+        {
+            return false;
+        }
+
+        var reference = waiter.ReferenceValue;
+        var candidate = waiter.CompareFunction switch
+        {
+            1 => (reference - 1) & mask,     // <
+            2 or 3 or 5 => reference & mask, // <=, ==, >=
+            4 => ~reference & mask,          // !=
+            6 => (reference + 1) & mask,     // >
+            _ => currentValue & mask,        // 0 "always" / 7 reserved already pass
+        };
+
+        var value = (currentValue & ~mask) | candidate;
+        if (!Compare(waiter, value))
+        {
+            return false;
+        }
+
+        satisfied = value;
+        return true;
+    }
+
     public static bool Compare(in WaitingDcb waiter, ulong value)
     {
         var masked = value & waiter.Mask;
