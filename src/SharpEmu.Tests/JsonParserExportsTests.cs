@@ -230,6 +230,20 @@ public sealed class JsonParserExportsTests
     }
 
     [Fact]
+    public void Parse_ToleratesTrailingNulFromCStringLength()
+    {
+        // strlen()+1 style call: the buffer length covers the terminating NUL.
+        Assert.Equal(0, Parse("{\"count\":3}\0"));
+        Assert.Equal(2UL, GetType(IndexByKey(RootValueAddress, "count")));
+    }
+
+    [Fact]
+    public void Parse_AllNulBufferReturnsEmptyBufferError()
+    {
+        Assert.Equal(ParserErrorEmptyBuffer, Parse("\0\0"));
+    }
+
+    [Fact]
     public void Parse_UnreadableBufferReturnsMemoryFault()
     {
         _ctx[CpuRegister.Rdi] = RootValueAddress;

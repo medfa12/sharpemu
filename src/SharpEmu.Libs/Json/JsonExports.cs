@@ -235,15 +235,29 @@ public static class JsonExports
             return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
         }
 
+        // Titles routinely pass strlen()+1 style lengths; System.Text.Json rejects the trailing
+        // NUL as an invalid token, so trim it before parsing.
+        var text = buffer.AsMemory();
+        while (text.Length > 0 && text.Span[^1] == 0)
+        {
+            text = text[..^1];
+        }
+
+        if (text.IsEmpty)
+        {
+            return ctx.SetReturn(SceJsonParserErrorEmptyBuffer);
+        }
+
         try
         {
-            using var document = JsonDocument.Parse(buffer);
+            using var document = JsonDocument.Parse(text);
             StoreValue(ctx, valueAddress, document.RootElement);
-            TraceJsonText("Parser.parse", valueAddress, Encoding.UTF8.GetString(buffer));
+            TraceJsonText("Parser.parse", valueAddress, Encoding.UTF8.GetString(text.Span));
             return ctx.SetReturn(0);
         }
         catch (JsonException)
         {
+            TraceJsonText("Parser.parse.invalid", valueAddress, Encoding.UTF8.GetString(text.Span));
             return ctx.SetReturn(SceJsonParserErrorInvalidToken);
         }
     }
