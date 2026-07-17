@@ -3671,7 +3671,11 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 	private static bool InitializeGuestThreadTls(CpuContext context, ulong tlsBase, ulong threadHandle)
 	{
+		// Seed the module's PT_TLS init image (Variant II: block below the
+		// thread pointer) after the legacy below-TP zero write so the image
+		// bytes win, and before the TCB qwords are written above the TP.
 		return context.TryWriteUInt64(tlsBase - 0xF0, 0) &&
+			GuestTlsImage.TrySeedThreadBlock(context.Memory, tlsBase, GuestThreadTlsPrefixSize) &&
 			context.TryWriteUInt64(tlsBase + 0x00, tlsBase) &&
 			context.TryWriteUInt64(tlsBase + 0x10, threadHandle) &&
 			context.TryWriteUInt64(tlsBase + 0x28, 0xC0DEC0DECAFEBABEUL) &&

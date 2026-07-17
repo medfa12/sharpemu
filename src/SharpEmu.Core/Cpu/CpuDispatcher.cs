@@ -377,7 +377,11 @@ public sealed class CpuDispatcher : ICpuDispatcher, IDisposable
 
     private static bool InitializeTls(CpuContext context, ulong tlsBase)
     {
+        // Seed the module's PT_TLS init image (Variant II: block below the
+        // thread pointer) after the legacy below-TP zero write so the image
+        // bytes win, and before the TCB qwords are written above the TP.
         return context.TryWriteUInt64(tlsBase - 0xF0, 0) &&
+               GuestTlsImage.TrySeedThreadBlock(context.Memory, tlsBase, TlsPrefixSize) &&
                context.TryWriteUInt64(tlsBase + 0x00, tlsBase) &&
                context.TryWriteUInt64(tlsBase + 0x10, tlsBase) &&
                context.TryWriteUInt64(tlsBase + 0x28, 0xC0DEC0DECAFEBABEUL) &&
