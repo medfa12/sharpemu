@@ -765,12 +765,15 @@ public sealed partial class DirectExecutionBackend
 			"C+IEj+BsAFM" or // sceAmprMeasureCommandSizeWriteAddressOnCompletion
 			"tZDDEo2tE5k" or // sceAmprCommandBufferGetSize
 			"GnxKOHEawhk" or // sceAmprCommandBufferGetCurrentOffset
+			"gzndltBEzWc" or // sceAmprCommandBufferGetNumCommands
 			"H896Pt-yB4I" or // sceAmprCommandBufferWriteKernelEventQueue_04_00
 			"sJXyWHjP-F8" or // sceAmprCommandBufferWriteAddressOnCompletion
 			"ASoW5WE-UPo" or // sceKernelAprSubmitCommandBufferAndGetResult
 			"rqwFKI4PAiM" or // sceKernelAprWaitCommandBuffer
 			"eE4Szl8sil8" or // sceKernelAprSubmitCommandBuffer
 			"qvMUCyyaCSI" or // sceKernelAprSubmitCommandBufferAndGetId
+			"mPpPxv5CZt4" or // sceSystemServiceGetHdrToneMapLuminance
+			"1FZBKy8HeNU" or // sceVideoOutGetVblankStatus
 			"Q2V+iqvjgC0" or // vsnprintf
 			"AV6ipCNa4Rw" or // strcasecmp
 			"q1cHNfGycLI" or // scePadRead
@@ -921,12 +924,15 @@ public sealed partial class DirectExecutionBackend
 			"C+IEj+BsAFM" or // sceAmprMeasureCommandSizeWriteAddressOnCompletion
 			"tZDDEo2tE5k" or // sceAmprCommandBufferGetSize
 			"GnxKOHEawhk" or // sceAmprCommandBufferGetCurrentOffset
+			"gzndltBEzWc" or // sceAmprCommandBufferGetNumCommands
 			"H896Pt-yB4I" or // sceAmprCommandBufferWriteKernelEventQueue_04_00
 			"sJXyWHjP-F8" or // sceAmprCommandBufferWriteAddressOnCompletion
 			"ASoW5WE-UPo" or // sceKernelAprSubmitCommandBufferAndGetResult
 			"rqwFKI4PAiM" or // sceKernelAprWaitCommandBuffer
 			"eE4Szl8sil8" or // sceKernelAprSubmitCommandBuffer
 			"qvMUCyyaCSI" or // sceKernelAprSubmitCommandBufferAndGetId
+			"mPpPxv5CZt4" or // sceSystemServiceGetHdrToneMapLuminance
+			"1FZBKy8HeNU" or // sceVideoOutGetVblankStatus
 			"Vo5V8KAwCmk" or // sceSystemServiceHideSplashScreen
 			"TywrFKCoLGY" or // sceSaveDataInitialize3
 			"dyIhnXq-0SM" or // sceSaveDataDirNameSearch

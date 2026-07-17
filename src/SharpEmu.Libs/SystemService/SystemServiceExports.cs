@@ -13,6 +13,7 @@ public static class SystemServiceExports
     private const int OrbisSystemServiceErrorNoEvent = unchecked((int)0x80A10004);
     private const int SystemServiceStatusSize = 0x0C;
     private const int DisplaySafeAreaInfoSize = sizeof(float) + 128;
+    private const int HdrToneMapLuminanceSize = 3 * sizeof(float);
 
     [SysAbiExport(
         Nid = "fZo48un7LK4",
@@ -135,13 +136,25 @@ public static class SystemServiceExports
     [SysAbiExport(
         Nid = "mPpPxv5CZt4",
         ExportName = "sceSystemServiceGetHdrToneMapLuminance",
-        Target = Generation.Gen5,
+        Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libSceSystemService")]
     public static int SystemServiceGetHdrToneMapLuminance(CpuContext ctx)
     {
-        // Out-parameter layout is undocumented; reporting success without
-        // touching guest memory lets HDR-agnostic titles proceed.
-        return ctx.SetReturn(0);
+        // Out-parameter is three floats {max, maxFrameAverage, min} in nits;
+        // report bright-HDR-display defaults so titles pick a sane tone map.
+        var luminanceAddress = ctx[CpuRegister.Rdi];
+        if (luminanceAddress == 0)
+        {
+            return ctx.SetReturn(OrbisSystemServiceErrorParameter);
+        }
+
+        Span<byte> luminance = stackalloc byte[HdrToneMapLuminanceSize];
+        BinaryPrimitives.WriteSingleLittleEndian(luminance, 1000.0f);
+        BinaryPrimitives.WriteSingleLittleEndian(luminance[sizeof(float)..], 1000.0f);
+        BinaryPrimitives.WriteSingleLittleEndian(luminance[(sizeof(float) * 2)..], 0.01f);
+        return ctx.Memory.TryWrite(luminanceAddress, luminance)
+            ? ctx.SetReturn(0)
+            : ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
     }
 
     [SysAbiExport(

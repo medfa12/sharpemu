@@ -33,6 +33,7 @@ public static class VideoOutExports
     private const int VideoOutBufferAttribute2Size = 0x50;
     private const int VideoOutBuffersEntrySize = 0x20;
     private const int VideoOutOutputStatusSize = 0x30;
+    private const int VideoOutVblankStatusSize = 0x28;
     private const ulong SceVideoOutPixelFormatA8R8G8B8Srgb = 0x80000000;
     private const ulong SceVideoOutPixelFormatA8B8G8R8Srgb = 0x80002200;
     private const ulong SceVideoOutPixelFormatB8G8R8A8Unorm = 0x8100000000000000;
@@ -279,6 +280,7 @@ public static class VideoOutExports
     private sealed class VideoOutPortState
     {
         public required int Handle { get; init; }
+        public long OpenTimestamp { get; init; }
         public int FlipRate { get; set; }
         public ulong VblankCount { get; set; }
         public ulong FlipCount { get; set; }
@@ -358,10 +360,27 @@ public static class VideoOutExports
             _ports[handle] = new VideoOutPortState
             {
                 Handle = handle,
+                OpenTimestamp = Stopwatch.GetTimestamp(),
             };
             EnsureVblankPumpStarted();
             return handle;
         }
+    }
+
+    [SysAbiExport(
+        Nid = "Nv8c-Kb+DUM",
+        ExportName = "sceVideoOutIsOutputSupported",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceVideoOut")]
+    public static int VideoOutIsOutputSupported(CpuContext ctx)
+    {
+        var busType = unchecked((int)ctx[CpuRegister.Rdi]);
+        _ = ctx[CpuRegister.Rsi]; // pixelFormat
+        _ = ctx[CpuRegister.Rdx]; // aspectRatio
+
+        // Vulkan presentation handles any pixel format and aspect ratio on
+        // the main bus: report 1 (supported) there and 0 elsewhere.
+        return busType == SceVideoOutBusTypeMain ? 1 : 0;
     }
 
     [SysAbiExport(
@@ -548,6 +567,54 @@ public static class VideoOutExports
         SignalVblank(port);
 
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "1FZBKy8HeNU",
+        ExportName = "sceVideoOutGetVblankStatus",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceVideoOut")]
+    public static int VideoOutGetVblankStatus(CpuContext ctx)
+    {
+        var handle = unchecked((int)ctx[CpuRegister.Rdi]);
+        var statusAddress = ctx[CpuRegister.Rsi];
+        if (statusAddress == 0)
+        {
+            return OrbisVideoOutErrorInvalidAddress;
+        }
+
+        if (!TryGetPort(handle, out var port))
+        {
+            return OrbisVideoOutErrorInvalidHandle;
+        }
+
+        // Titles poll this between waits; derive the count from wall time
+        // since open so it keeps advancing even when nothing drives
+        // WaitVblank, but never let it regress below the pump-driven count.
+        var now = Stopwatch.GetTimestamp();
+        ulong count;
+        long openedAt;
+        lock (_stateGate)
+        {
+            openedAt = port.OpenTimestamp;
+            var elapsedTicks = Math.Max(now - openedAt, 0);
+            var elapsedCount = unchecked((ulong)(elapsedTicks *
+                Math.Max(1L, (long)port.RefreshRate) / Stopwatch.Frequency));
+            port.VblankCount = Math.Max(port.VblankCount, elapsedCount);
+            count = port.VblankCount;
+        }
+
+        var elapsedMicroseconds = unchecked((ulong)(Math.Max(now - openedAt, 0) *
+            1_000_000L / Stopwatch.Frequency));
+        Span<byte> status = stackalloc byte[VideoOutVblankStatusSize];
+        status.Clear();
+        BinaryPrimitives.WriteUInt64LittleEndian(status, count);
+        BinaryPrimitives.WriteUInt64LittleEndian(status[0x08..], elapsedMicroseconds);
+        BinaryPrimitives.WriteUInt64LittleEndian(status[0x10..], unchecked((ulong)now));
+        status[0x20] = 0; // flags: not inside a vblank window
+        return ctx.Memory.TryWrite(statusAddress, status)
+            ? (int)OrbisGen2Result.ORBIS_GEN2_OK
+            : (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
     }
 
     [SysAbiExport(
@@ -1644,6 +1711,17 @@ public static class VideoOutExports
                bufferNum >= 1 &&
                bufferNum <= MaxDisplayBuffers &&
                startIndex + bufferNum <= MaxDisplayBuffers;
+    }
+
+    internal static void SetVblankCountForTests(int handle, ulong count)
+    {
+        lock (_stateGate)
+        {
+            if (_ports.TryGetValue(handle, out var port))
+            {
+                port.VblankCount = count;
+            }
+        }
     }
 
     private static bool TryGetPort(int handle, [NotNullWhen(true)] out VideoOutPortState? port)
