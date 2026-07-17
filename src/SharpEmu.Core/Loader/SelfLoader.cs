@@ -156,6 +156,7 @@ public sealed class SelfLoader : ISelfLoader
         {
             virtualMemory.Clear();
             _nextTlsModuleId = 1;
+            GuestTlsImage.Reset();
         }
 
         var tlsModuleId = _nextTlsModuleId == 0 ? 1u : _nextTlsModuleId;
@@ -198,6 +199,11 @@ public sealed class SelfLoader : ISelfLoader
         }
 
         MapLoadSegments(imageData, loadContext, programHeaders, virtualMemory, imageBase);
+        if (tlsModuleId == 1)
+        {
+            RegisterTlsInitializationImage(programHeaders, virtualMemory, imageBase);
+        }
+
         var importStubs = ResolveAndPatchImportStubs(
             imageData,
             loadContext,
@@ -446,6 +452,50 @@ public sealed class SelfLoader : ISelfLoader
                 sourceOffset,
                 fileData,
                 header.Flags);
+        }
+    }
+
+    private static void RegisterTlsInitializationImage(
+        IReadOnlyList<ProgramHeader> programHeaders,
+        IVirtualMemory virtualMemory,
+        ulong imageBase)
+    {
+        for (var index = 0; index < programHeaders.Count; index++)
+        {
+            var header = programHeaders[index];
+            if (header.HeaderType != ProgramHeaderType.Tls)
+            {
+                continue;
+            }
+
+            if (header.MemorySize == 0)
+            {
+                return;
+            }
+
+            if (header.MemorySize > int.MaxValue || header.FileSize > header.MemorySize)
+            {
+                Log.Warning(
+                    $"PT_TLS segment has invalid sizes (filesz=0x{header.FileSize:X}, memsz=0x{header.MemorySize:X}); ignoring.");
+                return;
+            }
+
+            // The LOAD segments are already mapped, so the .tdata bytes can be
+            // read straight from virtual memory without SELF-offset math.
+            var initImage = new byte[(int)Math.Min(header.FileSize, header.MemorySize)];
+            if (initImage.Length != 0 && !virtualMemory.TryRead(imageBase + header.VirtualAddress, initImage))
+            {
+                Log.Warning(
+                    $"PT_TLS init image at 0x{imageBase + header.VirtualAddress:X16} " +
+                    $"(filesz=0x{header.FileSize:X}) is not readable; ignoring.");
+                return;
+            }
+
+            GuestTlsImage.Set(initImage, header.MemorySize, header.Alignment, imageBase + header.VirtualAddress);
+            Console.WriteLine(
+                $"[LOADER] PT_TLS: vaddr=0x{imageBase + header.VirtualAddress:X16} filesz=0x{header.FileSize:X} " +
+                $"memsz=0x{header.MemorySize:X} align=0x{header.Alignment:X} block=0x{GuestTlsImage.BlockSize:X}");
+            return;
         }
     }
 
