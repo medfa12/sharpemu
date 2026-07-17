@@ -223,14 +223,71 @@ public static class AgcExports
     private static readonly ConditionalWeakTable<object, RegisterDefaultsAllocation> _registerDefaultsAllocations = new();
     private static readonly ConditionalWeakTable<object, SubmittedGpuState> _submittedGpuStates = new();
 
+    // Full Gen5 primary register defaults as reverse-engineered by Kyty (MIT):
+    // hashes, offsets, and values match the tables the PS5 AGC SDK consumes.
+    // Every context (0-77), shader (0-28), and uconfig (0-19) group must be
+    // present or the guest walks a null group pointer and falls back to
+    // invalid indirect register writes.
     private static readonly RegisterDefaultGroup[] PrimaryRegisterDefaults =
     [
         new(0, 0, 0xE24F806D, [new(CbColorControl, 0x00CC0010)]),
-        new(0, 3, 0x0BC65DA4, [new(0x08F, 0)]),
-        new(0, 4, 0x9E5AD592, [new(0x08E, 0)]),
-        new(0, 12, 0x6DE4C312, [new(0x203, 0)]),
+        new(0, 1, 0xF6C28182, [new(0x109, 0)]), // CB_DCC_CONTROL
+        new(0, 2, 0x6F6E55A5, [new(0x104, 0)]), // CB_RMI_GL2_CACHE_CONTROL
+        new(0, 3, 0x0BC65DA4, [new(0x08F, 0)]), // CB_SHADER_MASK
+        new(0, 4, 0x9E5AD592, [new(CbTargetMask, 0x0000000F)]),
+        new(0, 5, 0xBB513B98, [new(0x2DC, 0x0000AA00)]), // DB_ALPHA_TO_MASK
+        new(0, 6, 0xAB64B23B, [new(0x001, 0)]), // DB_COUNT_CONTROL
+        new(0, 7, 0x53C39964, [new(DbDepthControl, 0)]),
+        new(0, 8, 0x01396B11, [new(0x201, 0)]), // DB_EQAA
+        new(0, 9, 0x7D42019A, [new(0x000, 0)]), // DB_RENDER_CONTROL
+        new(0, 10, 0x3548F523, [new(0x006, 0)]), // PS_SHADER_SAMPLE_EXCLUSION_MASK
+        new(0, 11, 0xF43AD28A, [new(0x01F, 0)]), // DB_RMI_L2_CACHE_CONTROL
+        new(0, 12, 0x6DE4C312, [new(0x203, 0)]), // DB_SHADER_CONTROL
+        new(0, 13, 0x00A77AE0, [new(0x2B0, 0)]), // DB_SRESULTS_COMPARE_STATE0
+        new(0, 14, 0x00A779B7, [new(0x2B1, 0)]), // DB_SRESULTS_COMPARE_STATE1
+        new(0, 15, 0x5100100C, [new(0x10C, 0)]), // DB_STENCILREFMASK
+        new(0, 16, 0x59958BBA, [new(0x10D, 0)]), // DB_STENCILREFMASK_BF
+        new(0, 17, 0x0C06F17C, [new(0x10B, 0)]), // DB_STENCIL_CONTROL
+        new(0, 18, 0x6F104B72, [new(0x1FF, 0)]), // GE_MAX_OUTPUT_PER_SUBGROUP
+        new(0, 19, 0x25C70D9C, [new(0x204, 0)]), // PA_CL_CLIP_CNTL
+        new(0, 20, 0x3881201E, [new(0x20D, 0)]), // PA_CL_OBJPRIM_ID_CNTL
+        new(0, 21, 0x09AFDDAF, [new(0x206, 0x0000043F)]), // PA_CL_VTE_CNTL
+        new(0, 22, 0x367D63CF, [new(0x2F8, 0)]), // PA_SC_AA_CONFIG
+        new(0, 23, 0x43707DB8, [new(0x083, 0x0000FFFF)]), // PA_SC_CLIPRECT_RULE
+        new(0, 24, 0xF6AE26BA, [new(0x313, 0)]), // PA_SC_CONSERVATIVE_RASTERIZATION_CNTL
+        new(0, 25, 0x1B917652, [new(0x800003FE, 0)]), // PA_SC_FSR_ENABLE
+        new(0, 26, 0x94B1E4F7, [new(0x0EA, 0)]), // PA_SC_HORIZ_GRID
+        new(0, 27, 0xE3661B6C, [new(0x0E9, 0)]), // PA_SC_LEFT_VERT_GRID
         new(0, 28, 0x1EB8D73A, [new(PaScModeCntl0, 0x00000002)]),
+        new(0, 29, 0x15051FA3, [new(0x293, 0)]), // PA_SC_MODE_CNTL_1
+        new(0, 30, 0x9C51A7F1, [new(0x0E8, 0)]), // PA_SC_RIGHT_VERT_GRID
         new(0, 31, 0xA20EFC70, [new(PaScWindowOffset, 0)]),
+        new(0, 32, 0x0EC09F6E, [new(0x211, 0)]), // PA_STATE_STEREO_X
+        new(0, 33, 0x34A7D6D3, [new(0x210, 0)]), // PA_STEREO_CNTL
+        new(0, 34, 0xCE831B94, [new(0x08D, 0)]), // PA_SU_HARDWARE_SCREEN_OFFSET
+        new(0, 35, 0x5CC72A74, [new(0x282, 0x00000008)]), // PA_SU_LINE_CNTL
+        new(0, 36, 0x3B77713C, [new(0x281, 0xFFFF0000)]), // PA_SU_POINT_MINMAX
+        new(0, 37, 0x40F64410, [new(0x280, 0x00080008)]), // PA_SU_POINT_SIZE
+        new(0, 38, 0x69441268, [new(0x2DF, 0)]), // PA_SU_POLY_OFFSET_CLAMP
+        new(0, 39, 0x2E418B83, [new(0x2DE, 0x000001E9)]), // PA_SU_POLY_OFFSET_DB_FMT_CNTL
+        new(0, 40, 0xA00D0C8D, [new(0x205, 0x00000240)]), // PA_SU_SC_MODE_CNTL
+        new(0, 41, 0xB1289FB3, [new(0x20C, 0x00000001)]), // PA_SU_SMALL_PRIM_FILTER_CNTL
+        new(0, 42, 0x144832FB, [new(0x2F9, 0x0000002D)]), // PA_SU_VTX_CNTL
+        new(0, 43, 0x9890D9FA, [new(0x1BA, 0)]), // SPI_TMPRING_SIZE
+        new(0, 44, 0x9016FAF1, [new(0x2A6, 0)]), // VGT_DRAW_PAYLOAD_CNTL
+        new(0, 45, 0x4B73CE27, [new(0x2CE, 0x00000400)]), // VGT_GS_MAX_VERT_OUT
+        new(0, 46, 0x5F5A3E7B, [new(0x29B, 0x00000002)]), // VGT_GS_OUT_PRIM_TYPE
+        new(0, 47, 0xD4AF3A51, [new(0x2D6, 0)]), // VGT_LS_HS_CONFIG
+        new(0, 48, 0x6CF4F543, [new(0x2A3, 0xFFFFFFFF)]), // VGT_PRIMITIVEID_RESET
+        new(0, 49, 0x5FB86CCB, [new(0x2A1, 0)]), // VGT_PRIMITIVEID_EN
+        new(0, 50, 0xEDEFA188, [new(0x2AD, 0)]), // VGT_REUSE_OFF
+        new(0, 51, 0xD0DE9EE6, [new(VgtShaderStagesEn, 0)]),
+        new(0, 52, 0xC5831803, [new(0x2D4, 0x88101000)]), // VGT_TESS_DISTRIBUTION
+        new(0, 53, 0x8E6DE84B, [new(0x2DB, 0)]), // VGT_TF_PARAM
+        new(0, 54, 0xD0771662, [new(0x2F5, 0), new(0x2F6, 0)]), // PA_SC_CENTROID_PRIORITY_0/1
+        new(0, 55, 0x569F7444, [new(0x2FE, 0)]), // PA_SC_AA_SAMPLE_LOCS_PIXEL_X0Y0_0
+        new(0, 56, 0x5C6637CD, [new(0x30E, 0xFFFFFFFF), new(0x30F, 0xFFFFFFFF)]), // PA_SC_AA_MASK_X0Y0_X1Y0 / X0Y1_X1Y1
+        new(0, 57, 0xCAE3E690, [new(0x311, 0x00000002), new(0x312, 0x03FF0080)]), // PA_SC_BINNER_CNTL_0/1
         new(0, 58, 0x43FBD769,
         [
             new(CbBlendRed, 0),
@@ -239,11 +296,46 @@ public static class AgcExports
             new(CbBlendAlpha, 0),
         ]),
         new(0, 59, 0xEF550356, [new(CbBlend0Control, 0x20010001)]),
+        new(0, 60, 0x8F52E279, [new(0x020, 0), new(0x021, 0)]), // TA_BC_BASE_ADDR / _HI
+        new(0, 61, 0x1F2D8149, [new(0x084, 0), new(0x085, 0x20002000)]), // PA_SC_CLIPRECT_0_TL/BR
+        new(0, 62, 0x853D0614, [new(0x800003FF, 0)]), // CX_NOP
+        new(0, 63, 0x4413C6F9, [new(0x008, 0), new(0x009, 0)]), // DB_DEPTH_BOUNDS_MIN/MAX
+        new(0, 64, 0x67096014, // DB_Z_INFO .. DB_STENCIL_CLEAR depth-surface block
+        [
+            new(0x010, 0x80000000),
+            new(0x011, 0x20000000),
+            new(0x012, 0),
+            new(0x013, 0),
+            new(0x014, 0),
+            new(0x015, 0),
+            new(0x01A, 0),
+            new(0x01B, 0),
+            new(0x01C, 0),
+            new(0x01D, 0),
+            new(0x01E, 0),
+            new(0x002, 0),
+            new(0x005, 0),
+            new(0x007, 0),
+            new(0x00B, 0),
+            new(0x00A, 0),
+        ]),
+        new(0, 65, 0x88F5E915, [new(0x0EB, 0xFF00FF00), new(0x0EC, 0)]), // PA_SC_FOV_WINDOW_LR/TB
+        new(0, 66, 0x033F1EFF, [new(0x800003FC, 0), new(0x800003FD, 0)]), // FSR_RECURSIONS0/1
         new(0, 67, 0x918106BB,
         [
             new(PaScGenericScissorTl, 0x80000000),
             new(PaScGenericScissorBr, 0x40004000),
         ]),
+        new(0, 68, 0x95F0E7AC, // PA_CL_GB_VERT/HORZ_CLIP/DISC_ADJ
+        [
+            new(0x2FA, 0x4E7E0000),
+            new(0x2FB, 0x4E7E0000),
+            new(0x2FC, 0x4E7E0000),
+            new(0x2FD, 0x4E7E0000),
+        ]),
+        new(0, 69, 0xB48CBAB2, [new(0x2E2, 0), new(0x2E3, 0)]), // PA_SU_POLY_OFFSET_BACK_SCALE/OFFSET
+        new(0, 70, 0x05BB3BC6, [new(0x2E0, 0), new(0x2E1, 0)]), // PA_SU_POLY_OFFSET_FRONT_SCALE/OFFSET
+        new(0, 71, 0x94FABA07, [new(0x003, 0), new(0x004, 0)]), // DB_RENDER_OVERRIDE / _OVERRIDE2
         new(0, 72, 0x38E92C91,
         [
             new(0x318, 0),
@@ -265,6 +357,13 @@ public static class AgcExports
         ]),
         new(0, 73, 0x0B177B43, [new(0x00C, 0), new(0x00D, 0x40004000)]),
         new(0, 74, 0x48531062, [new(0x191, 0)]),
+        new(0, 75, 0xAAA964B9, // PA_CL_UCP_0_X/Y/Z/W
+        [
+            new(0x16F, 0),
+            new(0x170, 0),
+            new(0x171, 0),
+            new(0x172, 0),
+        ]),
         new(0, 76, 0x7690AF6F,
         [
             new(0x10F, 0x4E7E0000),
@@ -283,12 +382,61 @@ public static class AgcExports
             new(PaScWindowScissorTl, 0x80000000),
             new(PaScWindowScissorBr, 0x40004000),
         ]),
+        new(1, 0, 0x5D6E3EC7, [new(0x212, 0)]), // COMPUTE_PGM_RSRC1
+        new(1, 1, 0x57E7079A, [new(0x213, 0)]), // COMPUTE_PGM_RSRC2
+        new(1, 2, 0x7467FAFD, [new(0x228, 0)]), // COMPUTE_PGM_RSRC3
+        new(1, 3, 0x9E826B50, [new(0x215, 0)]), // COMPUTE_RESOURCE_LIMITS
+        new(1, 4, 0xDC484F18, [new(0x218, 0)]), // COMPUTE_TMPRING_SIZE
+        new(1, 5, 0x5DA8BCA3, [new(0x08A, 0)]), // SPI_SHADER_PGM_RSRC1_GS
+        new(1, 6, 0x5CA726D8, [new(0x10A, 0)]), // SPI_SHADER_PGM_RSRC1_HS
+        new(1, 7, 0x5DD28360, [new(0x00A, 0)]), // SPI_SHADER_PGM_RSRC1_PS
+        new(1, 8, 0x57EFA0BE, [new(0x08B, 0)]), // SPI_SHADER_PGM_RSRC2_GS
+        new(1, 9, 0x502363D5, [new(0x10B, 0)]), // SPI_SHADER_PGM_RSRC2_HS
+        new(1, 10, 0x506D14BD, [new(0x00B, 0)]), // SPI_SHADER_PGM_RSRC2_PS
+        new(1, 11, 0xB2609506, [new(0x224, 0)]), // COMPUTE_USER_ACCUM_0
+        new(1, 12, 0x9E5CFB8A, [new(0x107, 0), new(0x087, 0), new(0x007, 0)]), // SPI_SHADER_PGM_RSRC3_HS/GS/PS
         new(1, 13, 0xC918DF3E, [new(0x20C, 0), new(0x20D, 0)]),
         new(1, 14, 0xC9751C9C, [new(0x0C8, 0), new(0x0C9, 0)]),
+        new(1, 15, 0xC97EF77A, [new(0x088, 0), new(0x089, 0)]), // SPI_SHADER_PGM_LO/HI_GS
+        new(1, 16, 0xC927C6B9, [new(0x108, 0), new(0x109, 0)]), // SPI_SHADER_PGM_LO/HI_HS
+        new(1, 17, 0xC92A1EC5, [new(0x148, 0), new(0x149, 0)]), // SPI_SHADER_PGM_LO/HI_LS
         new(1, 18, 0xC9E01B31, [new(0x008, 0), new(0x009, 0)]),
-        new(2, 3, 0x105971C2, [new(0x25B, 0)]),
-        new(2, 7, 0x40D49AD1, [new(0x262, 0)]),
-        new(2, 12, 0x9EBFAB10, [new(0x242, 0)]),
+        new(1, 19, 0x50685F29, [new(0x800002FF, 0)]), // SH_NOP
+        new(1, 20, 0xB26219CA, [new(0x0B2, 0)]), // SPI_SHADER_USER_ACCUM_ESGS_0
+        new(1, 21, 0xB25B6CF9, [new(0x132, 0)]), // SPI_SHADER_USER_ACCUM_LSHS_0
+        new(1, 22, 0xB2F86101, [new(0x032, 0)]), // SPI_SHADER_USER_ACCUM_PS_0
+        new(1, 23, 0x07E3B155, [new(0x082, 0), new(0x083, 0)]), // SPI_SHADER_USER_DATA_ADDR_LO/HI_GS
+        new(1, 24, 0x07E383C6, [new(0x102, 0), new(0x103, 0)]), // SPI_SHADER_USER_DATA_ADDR_LO/HI_HS
+        new(1, 25, 0xBDA98653, [new(0x240, 0)]), // COMPUTE_USER_DATA_0
+        new(1, 26, 0xBDBD1D0F, [new(0x08C, 0)]), // SPI_SHADER_USER_DATA_GS_0
+        new(1, 27, 0xBD946FD4, [new(0x10C, 0)]), // SPI_SHADER_USER_DATA_HS_0
+        new(1, 28, 0xBDF02A4C, [new(0x00C, 0)]), // SPI_SHADER_USER_DATA_PS_0
+        new(2, 0, 0x19E93E85, [new(0x41F, 0)]), // GDS_OA_ADDRESS
+        new(2, 1, 0x3B5C2AF3, [new(0x41D, 0)]), // GDS_OA_CNTL
+        new(2, 2, 0x47974A35, [new(0x41E, 0)]), // GDS_OA_COUNTER
+        new(2, 3, 0x105971C2, [new(0x25B, 0)]), // GE_CNTL
+        new(2, 4, 0x7D137765, [new(0x24A, 0)]), // GE_INDX_OFFSET
+        new(2, 5, 0xD187FEBC, [new(0x24B, 0)]), // GE_MULTI_PRIM_IB_RESET_EN
+        new(2, 6, 0x12F854AC, [new(0x25F, 0)]), // GE_STEREO_CNTL
+        new(2, 7, 0x40D49AD1, [new(0x262, 0)]), // GE_USER_VGPR_EN
+        new(2, 8, 0x8C0923DA, [new(0x80003FF4, 0)]), // FSR_EXTEND_SUBPIXEL_ROUNDING
+        new(2, 9, 0xBB8DF494, [new(0x80003FFD, 0)]), // TEXTURE_GRADIENT_CONTROL
+        new(2, 10, 0xF6D8A76E, [new(0x382, 0x40000040)]), // TEXTURE_GRADIENT_FACTORS
+        new(2, 11, 0x7620F1E9, [new(0x248, 0)]), // VGT_OBJECT_ID
+        new(2, 12, 0x9EBFAB10, [new(0x242, 0)]), // VGT_PRIMITIVE_TYPE
+        new(2, 13, 0x98A09D0E, [new(0x380, 0), new(0x381, 0)]), // TA_CS_BC_BASE_ADDR / _HI
+        new(2, 14, 0x195D37D2, [new(0x80003FF5, 0), new(0x80003FF6, 0)]), // FSR_ALPHA_VALUE0/1
+        new(2, 15, 0xF9EC4F85, // FSR_CONTROL_POINT0..3
+        [
+            new(0x80003FF7, 0),
+            new(0x80003FF8, 0),
+            new(0x80003FF9, 0),
+            new(0x80003FFA, 0),
+        ]),
+        new(2, 16, 0x4626B750, [new(0x80003FFB, 0), new(0x80003FFC, 0)]), // FSR_WINDOW0/1
+        new(2, 17, 0x4CC673A0, [new(0x80003FFE, 0)]), // MEMORY_MAPPING_MASK
+        new(2, 18, 0xDE5B3431, [new(0x80003FFF, 0)]), // UC_NOP
+        new(2, 19, 0x036AC8A6, [new(0x25C, 0)]), // GE_USER_VGPR1
     ];
 
     private static readonly RegisterDefaultGroup[] InternalRegisterDefaults =
