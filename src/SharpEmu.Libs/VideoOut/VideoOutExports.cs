@@ -36,6 +36,7 @@ public static class VideoOutExports
     private const int VideoOutBufferAttribute2Size = 0x50;
     private const int VideoOutBuffersEntrySize = 0x20;
     private const int VideoOutOutputStatusSize = 0x30;
+    private const int VideoOutVblankStatusSize = 0x28;
     private const ulong SceVideoOutPixelFormatA8R8G8B8Srgb = 0x80000000;
     private const ulong SceVideoOutPixelFormatA8B8G8R8Srgb = 0x80002200;
     private const ulong SceVideoOutPixelFormatB8G8R8A8Unorm = 0x8100000000000000;
@@ -298,6 +299,7 @@ public static class VideoOutExports
     private sealed class VideoOutPortState
     {
         public required int Handle { get; init; }
+        public long OpenTimestamp { get; init; } = Stopwatch.GetTimestamp();
         public int FlipRate { get; set; }
         public ulong VblankCount { get; set; }
         public ulong FlipCount { get; set; }
@@ -475,6 +477,55 @@ public static class VideoOutExports
         BinaryPrimitives.WriteInt32LittleEndian(status[0x00..0x04], resolutionClass);
         BinaryPrimitives.WriteInt32LittleEndian(status[0x04..0x08], 1);
         BinaryPrimitives.WriteUInt64LittleEndian(status[0x08..0x10], port.RefreshRate);
+        return ctx.Memory.TryWrite(statusAddress, status)
+            ? (int)OrbisGen2Result.ORBIS_GEN2_OK
+            : (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+    }
+
+    [SysAbiExport(
+        Nid = "1FZBKy8HeNU",
+        ExportName = "sceVideoOutGetVblankStatus",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceVideoOut")]
+    public static int VideoOutGetVblankStatus(CpuContext ctx)
+    {
+        var handle = unchecked((int)ctx[CpuRegister.Rdi]);
+        var statusAddress = ctx[CpuRegister.Rsi];
+        if (statusAddress == 0)
+        {
+            return OrbisVideoOutErrorInvalidAddress;
+        }
+
+        if (!TryGetPort(handle, out var port))
+        {
+            return OrbisVideoOutErrorInvalidHandle;
+        }
+
+        // Keep the reported count monotonic against wall-clock progress even
+        // when no guest thread is pumping WaitVblank: engines divide by the
+        // delta between successive counts/timestamps, so a frozen count of
+        // zero ends in a division fault on host-callback threads.
+        var now = Stopwatch.GetTimestamp();
+        ulong count;
+        long openedAt;
+        lock (_stateGate)
+        {
+            openedAt = port.OpenTimestamp;
+            var elapsedTicks = Math.Max(now - openedAt, 0);
+            var elapsedCount = unchecked((ulong)(elapsedTicks *
+                Math.Max(1L, (long)port.RefreshRate) / Stopwatch.Frequency));
+            port.VblankCount = Math.Max(port.VblankCount, elapsedCount);
+            count = port.VblankCount;
+        }
+
+        var elapsedMicroseconds = unchecked((ulong)(Math.Max(now - openedAt, 0) *
+            1_000_000L / Stopwatch.Frequency));
+        Span<byte> status = stackalloc byte[VideoOutVblankStatusSize];
+        status.Clear();
+        BinaryPrimitives.WriteUInt64LittleEndian(status, count);
+        BinaryPrimitives.WriteUInt64LittleEndian(status[0x08..], elapsedMicroseconds);
+        BinaryPrimitives.WriteUInt64LittleEndian(status[0x10..], unchecked((ulong)now));
+        status[0x20] = 0;
         return ctx.Memory.TryWrite(statusAddress, status)
             ? (int)OrbisGen2Result.ORBIS_GEN2_OK
             : (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
