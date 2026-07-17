@@ -24,10 +24,14 @@ public sealed class AudioOut2Tests
 
     private static ulong CreatePort(CpuContext ctx)
     {
-        ctx[CpuRegister.Rdi] = 0; // type
-        ctx[CpuRegister.Rsi] = 0x3000; // param address (unused content)
+        // sceAudioOut2PortCreate(context, const PortParam*, out u64*): the
+        // param struct carries the u16 port type at +0x00 and the u32 data
+        // format at +0x04 (main port, stereo float here).
+        ctx.TryWriteUInt16(0x3000, 0); // port type: main
+        ctx.TryWriteUInt32(0x3004, 0x200); // data format: 2-channel float
+        ctx[CpuRegister.Rdi] = 1; // context handle
+        ctx[CpuRegister.Rsi] = 0x3000; // param address
         ctx[CpuRegister.Rdx] = 0x3100; // out port address
-        ctx[CpuRegister.Rcx] = 1; // context handle placeholder
         AudioOut2Exports.AudioOut2PortCreate(ctx);
         ctx.TryReadUInt64(0x3100, out var port);
         return port;

@@ -3,6 +3,7 @@
 
 using SharpEmu.HLE;
 using System.Buffers.Binary;
+using System.Collections.Concurrent;
 
 namespace SharpEmu.Libs.Audio;
 
@@ -19,6 +20,12 @@ public static class AudioOut2Exports
     private static long _nextContextHandle = 1;
     private static long _nextUserHandle = 1;
     private static int _nextPortId;
+
+    // Per-port creation info, keyed by the handle we hand out. PortGetState
+    // must answer with the port's real type and channel count; deriving them
+    // from the handle bits alone broke as soon as PortCreate's argument
+    // layout was corrected (see AudioOut2PortCreate).
+    private static readonly ConcurrentDictionary<ulong, (ushort PortType, uint DataFormat)> Ports = new();
 
     private static void Trace(string message)
     {
@@ -130,18 +137,33 @@ public static class AudioOut2Exports
         LibraryName = "libSceAudioOut2")]
     public static int AudioOut2PortCreate(CpuContext ctx)
     {
-        var type = unchecked((int)ctx[CpuRegister.Rdi]);
+        // sceAudioOut2PortCreate(context rdi, const PortParam* rsi, out u64*
+        // port rdx). Kyty and Astro Bot's call sites (eboot 0x800EB2587,
+        // 0x800EB3F4E+) agree on the PortParam layout: u16 port_type at +0x00
+        // (low byte = output: 0 main, 3 pad speaker; 0x100 bit = object
+        // port), u32 data_format at +0x04 (channels = (fmt >> 8) & 0xFF),
+        // u32 sampling_freq at +0x08, u32 flags, u64 user handle. The old
+        // reading treated rdi as a port type, so every port inherited the
+        // context handle's value (2) and PortGetState reported the mono pad
+        // speaker shape for the game's 12-channel float main port.
+        var contextHandle = ctx[CpuRegister.Rdi];
         var paramAddress = ctx[CpuRegister.Rsi];
         var outPortAddress = ctx[CpuRegister.Rdx];
-        var contextAddress = ctx[CpuRegister.Rcx];
-        if (type < 0 || type > 255 || paramAddress == 0 || outPortAddress == 0 || contextAddress == 0)
+        if (paramAddress == 0 || outPortAddress == 0)
         {
             return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
         }
 
+        if (!ctx.TryReadUInt16(paramAddress, out var portType) ||
+            !ctx.TryReadUInt32(paramAddress + 0x04, out var dataFormat))
+        {
+            return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
         var portId = unchecked((uint)Interlocked.Increment(ref _nextPortId)) & 0xFF;
-        var handle = 0x2000_0000UL | ((ulong)(uint)type << 16) | portId;
-        Trace($"port_create type={type} param=0x{paramAddress:X} context={contextAddress} -> handle=0x{handle:X}");
+        var handle = 0x2000_0000UL | ((ulong)portType << 16) | portId;
+        Ports[handle] = (portType, dataFormat);
+        Trace($"port_create context={contextHandle} type=0x{portType:X} format=0x{dataFormat:X} -> handle=0x{handle:X}");
         return ctx.TryWriteUInt64(outPortAddress, handle)
             ? ctx.SetReturn(0)
             : ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
@@ -164,17 +186,24 @@ public static class AudioOut2Exports
         // SceAudioOut2PortState (0x40 bytes, Kyty layout): u16 output, u8
         // numChannels, u8 pad, i16 volume, u16 rerouteCounter, u32 flags, then
         // reserved zeros. Volume is 0..127; the earlier -1 here fed a negative
-        // volume into Astro Bot's mixer gain math.
-        var type = (int)((handle >> 16) & 0xFF);
+        // volume into Astro Bot's mixer gain math. Output and channel count
+        // come from the port's creation params (see AudioOut2PortCreate): the
+        // low type byte selects the output (3 = pad speaker, bit 6, which the
+        // Sndz main loop tests at eboot 0x800EB3890), and the channel count is
+        // the data format's (fmt >> 8) & 0xFF with 0 meaning stereo, capped at
+        // 16, exactly as Kyty's audioout2_data_format_channels does.
+        Ports.TryGetValue(handle, out var port);
+        var isPadSpeaker = (port.PortType & 0xFF) == 3;
+        var output = isPadSpeaker ? 0x40 : 0x01;
+        var channels = (int)((port.DataFormat >> 8) & 0xFF);
+        channels = channels == 0 ? 2 : Math.Min(channels, 16);
         Span<byte> state = stackalloc byte[0x40];
         state.Clear();
-        var output = type == 2 ? 0x40 : 0x01;
-        var channels = type == 2 ? 1 : 2;
         BinaryPrimitives.WriteUInt16LittleEndian(state[0x00..], unchecked((ushort)output));
         state[0x02] = unchecked((byte)channels);
         BinaryPrimitives.WriteInt16LittleEndian(state[0x04..], 127);
 
-        Trace($"port_get_state handle=0x{handle:X} type={type} output=0x{output:X} channels={channels}");
+        Trace($"port_get_state handle=0x{handle:X} type=0x{port.PortType:X} output=0x{output:X} channels={channels}");
         return ctx.Memory.TryWrite(stateAddress, state)
             ? ctx.SetReturn(0)
             : ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
@@ -223,6 +252,7 @@ public static class AudioOut2Exports
         LibraryName = "libSceAudioOut2")]
     public static int AudioOut2PortDestroy(CpuContext ctx)
     {
+        Ports.TryRemove(ctx[CpuRegister.Rdi], out _);
         Trace($"port_destroy handle=0x{ctx[CpuRegister.Rdi]:X}");
         return ctx.SetReturn(0);
     }
