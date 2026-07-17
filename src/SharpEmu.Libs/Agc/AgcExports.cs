@@ -159,7 +159,7 @@ public static class AgcExports
     private static readonly HashSet<uint> _tracedSubmittedDrawOpcodes = new();
     private static readonly Dictionary<(ulong Ps, ulong State, Gen5PixelOutputKind Output), byte[]> _pixelSpirvCache = new();
     private static readonly Dictionary<
-        (ulong Es, ulong EsState, ulong Ps, ulong PsState, string OutputLayout, uint Attributes),
+        (ulong Es, ulong EsState, ulong Ps, ulong PsState, string OutputLayout, uint Attributes, ulong InputControls),
         (byte[] Vertex, byte[] Pixel)> _graphicsSpirvCache = new();
     private static readonly Dictionary<
         (ulong Cs, ulong State, uint LocalX, uint LocalY, uint LocalZ),
@@ -630,51 +630,177 @@ public static class AgcExports
         var geometryShaderAddress = ctx[CpuRegister.Rsi];
         var pixelShaderAddress = ctx[CpuRegister.Rdx];
 
-        if (registersAddress == 0 || geometryShaderAddress == 0)
+        if (registersAddress == 0)
         {
             return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
         }
 
-        if (!ctx.TryReadUInt64(geometryShaderAddress + ShaderOutputSemanticsOffset, out var outputSemanticsAddress) ||
-            !ctx.TryReadUInt32(geometryShaderAddress + ShaderNumOutputSemanticsOffset, out var outputSemanticsCount))
+        if (pixelShaderAddress == 0)
+        {
+            return WriteIdentityInterpolantMapping(ctx, registersAddress, 0);
+        }
+
+        if (!ctx.TryReadUInt64(
+                pixelShaderAddress + ShaderInputSemanticsOffset,
+                out var inputSemanticsAddress) ||
+            !ctx.TryReadUInt32(
+                pixelShaderAddress + ShaderNumInputSemanticsOffset,
+                out var inputSemanticsCount))
         {
             return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
         }
 
-        ulong inputSemanticsAddress = 0;
-        if (pixelShaderAddress != 0 &&
-            (!ctx.TryReadUInt64(pixelShaderAddress + ShaderInputSemanticsOffset, out inputSemanticsAddress) ||
-             !ctx.TryReadUInt32(pixelShaderAddress + ShaderNumInputSemanticsOffset, out _)))
+        if (inputSemanticsCount == 0)
         {
-            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+            return WriteIdentityInterpolantMapping(ctx, registersAddress, 0);
         }
 
-        for (uint i = 0; i < 32; i++)
+        if (geometryShaderAddress == 0 || inputSemanticsAddress == 0 ||
+            !ctx.TryReadUInt64(
+                geometryShaderAddress + ShaderOutputSemanticsOffset,
+                out var outputSemanticsAddress) ||
+            !ctx.TryReadUInt32(
+                geometryShaderAddress + ShaderNumOutputSemanticsOffset,
+                out var packedOutputSemanticsCount))
         {
-            uint value = 0;
-            if (i < outputSemanticsCount && outputSemanticsAddress != 0)
+            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        // num_output_semantics is a uint16 followed by other packed header
+        // fields. Reading the enclosing dword is safe, but only the low half
+        // belongs to the count.
+        var outputSemanticsCount = packedOutputSemanticsCount & 0xFFFFu;
+        var mappedCount = Math.Min(inputSemanticsCount, 32u);
+        for (uint pixelIndex = 0; pixelIndex < mappedCount; pixelIndex++)
+        {
+            if (!ctx.TryReadUInt32(
+                    inputSemanticsAddress + (pixelIndex * sizeof(uint)),
+                    out var pixelSemantic))
             {
-                var flat = false;
-                if (pixelShaderAddress != 0 && inputSemanticsAddress != 0 &&
-                    ctx.TryReadUInt32(inputSemanticsAddress + (i * sizeof(uint)), out var inputSemantic))
-                {
-                    flat = ((inputSemantic >> 22) & 0x1) != 0;
-                }
-
-                value = i | (flat ? 0x400u : 0u);
+                return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
             }
 
-            var destination = registersAddress + (i * 8);
-            if (!ctx.TryWriteUInt32(destination, SpiPsInputCntl0 + i) ||
-                !ctx.TryWriteUInt32(destination + sizeof(uint), value))
+            uint? geometrySemantic = null;
+            if (outputSemanticsAddress != 0)
+            {
+                for (uint geometryIndex = 0;
+                     geometryIndex < outputSemanticsCount;
+                     geometryIndex++)
+                {
+                    if (!ctx.TryReadUInt32(
+                            outputSemanticsAddress + (geometryIndex * sizeof(uint)),
+                            out var candidate))
+                    {
+                        return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+                    }
+
+                    if ((candidate & 0xFFu) == (pixelSemantic & 0xFFu))
+                    {
+                        geometrySemantic = candidate;
+                        break;
+                    }
+                }
+            }
+
+            var value = CreateInterpolantMappingValue(pixelSemantic, geometrySemantic);
+            if (!WriteInterpolantMappingRegister(ctx, registersAddress, pixelIndex, value))
             {
                 return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
             }
         }
 
+        var identityResult = WriteIdentityInterpolantMapping(
+            ctx,
+            registersAddress,
+            mappedCount);
+        if (identityResult != (int)OrbisGen2Result.ORBIS_GEN2_OK)
+        {
+            return identityResult;
+        }
+
         TraceAgc($"agc.create_interpolant_mapping regs=0x{registersAddress:X16} gs=0x{geometryShaderAddress:X16} ps=0x{pixelShaderAddress:X16}");
-        ctx[CpuRegister.Rax] = 0;
-        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+        return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
+    }
+
+    /// <summary>
+    /// Encodes one SPI_PS_INPUT_CNTL value from the pixel-input semantic and
+    /// the matching geometry-output semantic. The bit manipulation mirrors the
+    /// shipped runtime and was validated against real titles; keep it verbatim.
+    /// </summary>
+    private static uint CreateInterpolantMappingValue(
+        uint pixelSemantic,
+        uint? geometrySemantic)
+    {
+        uint value;
+        if ((pixelSemantic & 0x0030_0000u) != 0)
+        {
+            value = (pixelSemantic << 4) & 0x0300_0000u;
+            if (geometrySemantic is { } geometry)
+            {
+                var common = pixelSemantic & geometry;
+                value &= 0xFFF7_FFDFu;
+                value |= (common >> 15) & 0x20u;
+                value ^= 0x0008_0020u;
+                value &= ~0x0010_0000u;
+                value |= (~common >> 1) & 0x0010_0000u;
+            }
+            else
+            {
+                value |= 0x0018_0020u;
+            }
+
+            value &= ~0x0060_0000u;
+            value |= ((pixelSemantic >> 30) & 0x3u) << 21;
+        }
+        else
+        {
+            value = (pixelSemantic & 0x0100_0000u) != 0 ||
+                geometrySemantic is null
+                    ? 0x20u
+                    : 0u;
+        }
+
+        value &= ~0x1Fu;
+        value |= geometrySemantic is { } mapped
+            ? (mapped >> 8) & 0x1Fu
+            : 0u;
+        value &= ~0x400u;
+        if (geometrySemantic is not null &&
+            (pixelSemantic & 0x0140_0000u) != 0)
+        {
+            value |= 0x400u;
+        }
+
+        value &= ~0x300u;
+        value |= ((pixelSemantic >> 28) & 0x3u) << 8;
+        return value;
+    }
+
+    private static int WriteIdentityInterpolantMapping(
+        CpuContext ctx,
+        ulong registersAddress,
+        uint firstIndex)
+    {
+        for (var index = firstIndex; index < 32u; index++)
+        {
+            if (!WriteInterpolantMappingRegister(ctx, registersAddress, index, index))
+            {
+                return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+            }
+        }
+
+        return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
+    }
+
+    private static bool WriteInterpolantMappingRegister(
+        CpuContext ctx,
+        ulong registersAddress,
+        uint index,
+        uint value)
+    {
+        var destination = registersAddress + (index * 8);
+        return ctx.TryWriteUInt32(destination, SpiPsInputCntl0 + index) &&
+            ctx.TryWriteUInt32(destination + sizeof(uint), value);
     }
 
     [SysAbiExport(
@@ -3857,6 +3983,9 @@ public static class AgcExports
             pixelOutputs.Select(output =>
                 $"{output.GuestSlot}:{output.HostLocation}:{(int)output.Kind}"));
         var attributeCount = GetInterpolatedAttributeCount(pixelState);
+        var pixelInputControls = GetPixelInputControls(state.CxRegisters, attributeCount);
+        var inputControlsFingerprint =
+            ComputePixelInputControlsFingerprint(pixelInputControls);
         var exportStateFingerprint = ComputeShaderStructureFingerprint(exportEvaluation);
         var pixelStateFingerprint = ComputeShaderStructureFingerprint(pixelEvaluation);
         var shaderKey = (
@@ -3865,7 +3994,8 @@ public static class AgcExports
             pixelShaderAddress,
             pixelStateFingerprint,
             outputLayout,
-            attributeCount);
+            attributeCount,
+            inputControlsFingerprint);
         var totalGlobalBuffers =
             pixelEvaluation.GlobalMemoryBindings.Count +
             exportEvaluation.GlobalMemoryBindings.Count;
@@ -3886,7 +4016,8 @@ public static class AgcExports
                     globalBufferBase: 0,
                     totalGlobalBufferCount: totalGlobalBuffers + 2,
                     imageBindingBase: 0,
-                    scalarRegisterBufferIndex: totalGlobalBuffers) ||
+                    scalarRegisterBufferIndex: totalGlobalBuffers,
+                    pixelInputControls: pixelInputControls) ||
                 !Gen5SpirvTranslator.TryCompileVertexShader(
                     exportState,
                     exportEvaluation,
@@ -3895,7 +4026,8 @@ public static class AgcExports
                     globalBufferBase: pixelEvaluation.GlobalMemoryBindings.Count,
                     totalGlobalBufferCount: totalGlobalBuffers + 2,
                     imageBindingBase: pixelEvaluation.ImageBindings.Count,
-                    scalarRegisterBufferIndex: totalGlobalBuffers + 1))
+                    scalarRegisterBufferIndex: totalGlobalBuffers + 1,
+                    pixelInputControls: pixelInputControls))
             {
                 return false;
             }
@@ -4071,6 +4203,41 @@ public static class AgcExports
         }
 
         return (uint)(maxAttribute + 1);
+    }
+
+    /// <summary>
+    /// Reads the SPI_PS_INPUT_CNTL value for every interpolated pixel
+    /// attribute, falling back to the identity mapping for registers the guest
+    /// never programmed.
+    /// </summary>
+    private static uint[] GetPixelInputControls(
+        IReadOnlyDictionary<uint, uint> contextRegisters,
+        uint attributeCount)
+    {
+        var controls = new uint[attributeCount];
+        for (uint attribute = 0; attribute < attributeCount; attribute++)
+        {
+            controls[attribute] = contextRegisters.TryGetValue(
+                SpiPsInputCntl0 + attribute,
+                out var control)
+                    ? control
+                    : attribute;
+        }
+
+        return controls;
+    }
+
+    private static ulong ComputePixelInputControlsFingerprint(
+        IReadOnlyList<uint> controls)
+    {
+        const ulong prime = 1099511628211UL;
+        var hash = 14695981039346656037UL;
+        foreach (var control in controls)
+        {
+            hash = (hash ^ control) * prime;
+        }
+
+        return hash;
     }
 
     private const int ShaderScalarRegisterCount = 256;
