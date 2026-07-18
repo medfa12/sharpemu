@@ -7,6 +7,7 @@ using System.Globalization;
 using System.Text;
 using SharpEmu.HLE;
 using SharpEmu.Libs.Kernel;
+using SharpEmu.Libs.VideoOut;
 
 namespace SharpEmu.Libs.AvPlayer;
 
@@ -811,6 +812,10 @@ public static class AvPlayerExports
         }
 
         Trace($"video_frame handle=0x{player.Handle:X16} ex={extended} ts={timestamp} data=0x{player.LastGuestBuffer:X16}");
+        if (ShouldDirectPresentVideoFrames())
+        {
+            PresentVideoFrameToSwapchain(player);
+        }
         return ctx.SetReturn(1);
     }
 
@@ -1178,6 +1183,114 @@ public static class AvPlayerExports
                 .CopyTo(destination.Slice(destinationChromaOffset + (row * destinationPitch), width));
         }
     }
+
+    // SHARPEMU_AVPLAYER_PRESENT: push each decoded video frame straight onto the
+    // swapchain, bypassing the guest's own texture-allocator blit. Default OFF
+    // so the normal delivery path is byte-identical.
+    internal static bool ShouldDirectPresentVideoFrames() =>
+        string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_AVPLAYER_PRESENT"),
+            "1",
+            StringComparison.Ordinal);
+
+    // Converts the just-decoded NV12 frame to BGRA8 and hands it to the presenter
+    // for a direct, deadlock-free swapchain present. RawFrame is the tightly
+    // packed FFmpeg output (luma stride == Width, chroma plane at Width*Height),
+    // so it is the cleanest conversion source. Never throws out to the guest
+    // caller: a bad frame is logged and skipped.
+    private static void PresentVideoFrameToSwapchain(PlayerState player)
+    {
+        var frame = player.RawFrame;
+        if (frame is null || player.Width <= 0 || player.Height <= 0)
+        {
+            return;
+        }
+
+        try
+        {
+            var bgra = ConvertNv12ToBgra(
+                frame,
+                player.Width,
+                player.Height,
+                player.Width,
+                checked(player.Width * player.Height));
+            if (bgra.Length == 0)
+            {
+                Trace($"present_skip handle=0x{player.Handle:X16} reason=convert_failed");
+                return;
+            }
+            if (!VulkanVideoPresenter.TryPresentVideoFrame(bgra, player.Width, player.Height))
+            {
+                Trace($"present_skip handle=0x{player.Handle:X16} reason=present_failed");
+                return;
+            }
+            Trace($"present handle=0x{player.Handle:X16} {player.Width}x{player.Height}");
+        }
+        catch (Exception exception)
+        {
+            Trace($"present_error handle=0x{player.Handle:X16}: {exception.Message}");
+        }
+    }
+
+    // NV12 -> tightly packed BGRA8 (width*height*4, matching the swapchain's
+    // B8G8R8A8 byte order). BT.709 limited-range coefficients in Q8 fixed point;
+    // correctness over speed. The Y plane has stride lumaPitch; the interleaved
+    // U/V plane starts at uvOffset with the same stride and half the height.
+    // Returns an empty array when the source is too small for that geometry.
+    internal static byte[] ConvertNv12ToBgra(
+        ReadOnlySpan<byte> nv12,
+        int width,
+        int height,
+        int lumaPitch,
+        int uvOffset)
+    {
+        if (width <= 0 ||
+            height <= 0 ||
+            (height & 1) != 0 ||
+            lumaPitch < width ||
+            uvOffset < lumaPitch * height)
+        {
+            return [];
+        }
+
+        var chromaRows = height / 2;
+        var lumaBytes = checked(lumaPitch * height);
+        var chromaBytes = checked(uvOffset + (chromaRows - 1) * lumaPitch + width);
+        if (nv12.Length < lumaBytes || nv12.Length < chromaBytes)
+        {
+            return [];
+        }
+
+        var bgra = new byte[checked(width * height * 4)];
+        for (var y = 0; y < height; y++)
+        {
+            var lumaRow = y * lumaPitch;
+            var chromaRow = uvOffset + ((y >> 1) * lumaPitch);
+            var outRow = y * width * 4;
+            for (var x = 0; x < width; x++)
+            {
+                var c = nv12[lumaRow + x] - 16;
+                var chromaColumn = (x >> 1) << 1;
+                var d = nv12[chromaRow + chromaColumn] - 128;
+                var e = nv12[chromaRow + chromaColumn + 1] - 128;
+
+                var r = ((298 * c) + (459 * e) + 128) >> 8;
+                var g = ((298 * c) - (55 * d) - (136 * e) + 128) >> 8;
+                var b = ((298 * c) + (541 * d) + 128) >> 8;
+
+                var o = outRow + (x * 4);
+                bgra[o] = ClampToByte(b);
+                bgra[o + 1] = ClampToByte(g);
+                bgra[o + 2] = ClampToByte(r);
+                bgra[o + 3] = 0xFF;
+            }
+        }
+
+        return bgra;
+    }
+
+    private static byte ClampToByte(int value) =>
+        (byte)(value < 0 ? 0 : value > 255 ? 255 : value);
 
     private static bool AllocateGuestVideoBuffers(CpuContext ctx, PlayerState player, int bufferSize)
     {

@@ -541,6 +541,73 @@ internal static unsafe class VulkanVideoPresenter
         }
     }
 
+    // Direct-present a CPU-decoded video frame (BGRA8, matching the swapchain's
+    // B8G8R8A8 order) straight onto the swapchain, bypassing the guest's own
+    // texture-allocator blit. Gated by the caller (sceAvPlayer, under
+    // SHARPEMU_AVPLAYER_PRESENT) so default runs never reach here. Reuses the
+    // same deadlock-free CPU-upload Presentation plumbing as Submit and the
+    // splash screen: the frame is latched as _latestPresentation.Pixels and the
+    // render thread maps it into the staging buffer and copies/scales it to the
+    // acquired swapchain image on its own loop. No QueueWaitIdle or other
+    // render-thread wait is taken on this (guest AvPlayer worker) thread, so it
+    // can never wedge the presenter. Oversized frames (e.g. 3840x2160) are
+    // downscaled to the window extent by the existing ScaleBgra path before the
+    // staging-size check, so they present rather than being dropped. Returns
+    // false (logged + skipped by the caller) on a malformed buffer or a closed
+    // presenter. Because it lands in the normal swapchain present path, the
+    // frame is captured by SHARPEMU_DUMP_SWAPCHAIN like any other.
+    public static bool TryPresentVideoFrame(byte[] bgra, int width, int height)
+    {
+        if (width <= 0 ||
+            height <= 0 ||
+            bgra.Length != checked(width * height * 4))
+        {
+            return false;
+        }
+
+        if (ShouldTracePresentedGuestImageContentsForDiagnostics())
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][TRACE] vk.submit_call kind=TryPresentVideoFrame {width}x{height}");
+        }
+
+        lock (_gate)
+        {
+            if (_closed)
+            {
+                return false;
+            }
+
+            var sequence = (_latestPresentation?.Sequence ?? 0) + 1;
+            _latestPresentation = new Presentation(
+                bgra,
+                (uint)width,
+                (uint)height,
+                sequence,
+                GuestDrawKind.None,
+                TranslatedDraw: null,
+                RequiredGuestWorkSequence: _enqueuedGuestWorkSequence,
+                IsSplash: false);
+            System.Threading.Monitor.PulseAll(_gate);
+            if (_thread is not null)
+            {
+                return true;
+            }
+
+            _windowWidth = (uint)width;
+            _windowHeight = (uint)height;
+            _closeRequested = false;
+            _thread = new Thread(Run)
+            {
+                IsBackground = true,
+                Name = "SharpEmu Vulkan VideoOut",
+            };
+            _thread.Start();
+        }
+
+        return true;
+    }
+
     private static readonly HashSet<ulong> _tracedNggAmplify = new();
 
     /// <summary>

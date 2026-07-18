@@ -73,4 +73,70 @@ public sealed class AvPlayerNv12LayoutTests
         }
         Assert.Equal(expected, destination);
     }
+
+    [Fact]
+    public void ConvertNv12ToBgra_MidGrayFrame_ProducesGrayBgraWithOpaqueAlpha()
+    {
+        // 2x2 luma at video mid, chroma at the neutral midpoint -> gray, no tint.
+        var nv12 = new byte[] { 126, 126, 126, 126, 128, 128 };
+
+        var bgra = AvPlayerExports.ConvertNv12ToBgra(nv12, 2, 2, 2, 4);
+
+        var expected = new byte[16];
+        for (var pixel = 0; pixel < 4; pixel++)
+        {
+            expected[(pixel * 4) + 0] = 128;
+            expected[(pixel * 4) + 1] = 128;
+            expected[(pixel * 4) + 2] = 128;
+            expected[(pixel * 4) + 3] = 0xFF;
+        }
+        Assert.Equal(expected, bgra);
+    }
+
+    [Fact]
+    public void ConvertNv12ToBgra_ColoredFrame_UsesBt709AndClampsToByte()
+    {
+        // Y=150 U=100 V=200 -> BT.709 limited-range: R saturates to 255.
+        var nv12 = new byte[] { 150, 150, 150, 150, 100, 200 };
+
+        var bgra = AvPlayerExports.ConvertNv12ToBgra(nv12, 2, 2, 2, 4);
+
+        // BGRA per pixel: B=97 G=124 R=255 A=255.
+        for (var pixel = 0; pixel < 4; pixel++)
+        {
+            Assert.Equal(97, bgra[(pixel * 4) + 0]);
+            Assert.Equal(124, bgra[(pixel * 4) + 1]);
+            Assert.Equal(255, bgra[(pixel * 4) + 2]);
+            Assert.Equal(255, bgra[(pixel * 4) + 3]);
+        }
+    }
+
+    [Fact]
+    public void ConvertNv12ToBgra_UndersizedSource_ReturnsEmpty()
+    {
+        var tooSmall = new byte[] { 126, 126, 126, 126, 128 };
+
+        Assert.Empty(AvPlayerExports.ConvertNv12ToBgra(tooSmall, 2, 2, 2, 4));
+    }
+
+    [Fact]
+    public void ShouldDirectPresentVideoFrames_DefaultsOff_AndFollowsEnvGate()
+    {
+        var original = Environment.GetEnvironmentVariable("SHARPEMU_AVPLAYER_PRESENT");
+        try
+        {
+            Environment.SetEnvironmentVariable("SHARPEMU_AVPLAYER_PRESENT", null);
+            Assert.False(AvPlayerExports.ShouldDirectPresentVideoFrames());
+
+            Environment.SetEnvironmentVariable("SHARPEMU_AVPLAYER_PRESENT", "0");
+            Assert.False(AvPlayerExports.ShouldDirectPresentVideoFrames());
+
+            Environment.SetEnvironmentVariable("SHARPEMU_AVPLAYER_PRESENT", "1");
+            Assert.True(AvPlayerExports.ShouldDirectPresentVideoFrames());
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("SHARPEMU_AVPLAYER_PRESENT", original);
+        }
+    }
 }
