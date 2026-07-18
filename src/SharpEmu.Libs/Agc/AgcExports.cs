@@ -4341,6 +4341,24 @@ public static class AgcExports
         !hasStorageTarget &&
         sampledTextureCount > 0;
 
+    // Cheap, readback-free routing trace: logs how each translated draw was
+    // dispatched (offscreen target / storage / retained targetless / dropped)
+    // so the title-composite routing can be inspected without the deadlock-prone
+    // guest-image content readback. Gated by SHARPEMU_TRACE_FLIP_DRAWS.
+    private static readonly bool _traceFlipDraws =
+        string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_TRACE_FLIP_DRAWS"),
+            "1",
+            StringComparison.Ordinal);
+
+    private static void TraceFlipDraw(string message)
+    {
+        if (_traceFlipDraws)
+        {
+            Console.Error.WriteLine($"[LOADER][TRACE] agc.flip_draw {message}");
+        }
+    }
+
     private static void TryTranslateGuestDraw(
         CpuContext ctx,
         SubmittedGpuState gpuState,
@@ -4446,6 +4464,13 @@ public static class AgcExports
         {
             state.TranslatedDraw = translatedDraw;
             var firstTarget = translatedDraw.RenderTargets.FirstOrDefault();
+            TraceFlipDraw(
+                $"seq={drawSequence} rt_count={translatedDraw.RenderTargets.Count} " +
+                $"target=0x{firstTarget.Address:X16} fmt={firstTarget.Format} " +
+                $"size={firstTarget.Width}x{firstTarget.Height} " +
+                $"textures={translatedDraw.Textures.Count} " +
+                $"storage={translatedDraw.Textures.Any(b => b.IsStorage)} " +
+                $"verts={translatedDraw.VertexCount}");
             if (firstTarget.Address != 0)
             {
                 var textures = CreateVulkanGuestDrawTextures(
