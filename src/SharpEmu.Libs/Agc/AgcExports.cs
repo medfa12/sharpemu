@@ -116,8 +116,8 @@ public static class AgcExports
     private const uint EsUserDataRegister = 0xCC;
     private const uint ComputeUserDataRegister = 0x240;
     private const uint NggUserDataScalarRegisterBase = 8;
-    private const uint Gen5TextureFormatR8G8B8A8Unorm = 56;
-    private const uint Gen5TextureFormatR16G16B16A16Float = 71;
+    private const uint Gen5TextureFormatR8G8B8A8Unorm = 10;
+    private const uint Gen5TextureFormatR16G16B16A16Float = 12;
     private const uint Gen5TextureType1D = 8;
     private const uint Gen5TextureType2D = 9;
     private const ulong MaxPresentedTextureBytes = 128UL * 1024UL * 1024UL;
@@ -6597,6 +6597,8 @@ public static class AgcExports
             : "unreadable";
     }
 
+    // Texture formats are the legacy dfmt namespace (unified IMG_FORMAT
+    // values are converted at descriptor decode by Gfx10UnifiedFormat).
     private static ulong GetTextureBytesPerTexel(uint format) =>
         format switch
         {
@@ -6613,16 +6615,11 @@ public static class AgcExports
             12 => 8UL,
             13 => 12UL,
             14 => 16UL,
+            16 => 2UL,
+            17 => 2UL,
+            19 => 2UL,
             20 => 4UL,
-            22 => 8UL,
-            29 => 4UL,
-            36 => 1UL,
-            49 => 1UL,
-            Gen5TextureFormatR8G8B8A8Unorm => 4UL,
-            62 => 4UL,
-            64 => 4UL,
-            Gen5TextureFormatR16G16B16A16Float => 8UL,
-            75 => 8UL,
+            34 => 4UL,
             _ => 0UL,
         };
 
@@ -7017,8 +7014,19 @@ public static class AgcExports
         var address = ((ulong)(uint)((((ulong)fields[1] << 32) | fields[0]) & 0x3F_FFFF_FFFFUL)) << 8;
         var width = (((fields[1] >> 30) & 0x3u) | ((fields[2] & 0xFFFu) << 2)) + 1;
         var height = ((fields[2] >> 14) & 0x3FFFu) + 1;
-        var format = (fields[1] >> 20) & 0x1FFu;
-        var numberType = (fields[1] >> 26) & 0xFu;
+        // The 9-bit field at word1[28:20] is the GFX10 unified IMG_FORMAT.
+        // Reading a separate NUMBER_TYPE from bits [29:26] overlaps the top
+        // bits of that same field and fabricates garbage for any unified
+        // value >= 64; convert to the legacy dfmt/nfmt pair instead.
+        var unifiedFormat = (fields[1] >> 20) & 0x1FFu;
+        if (unifiedFormat == 0 ||
+            !Gfx10UnifiedFormat.TryDecode(
+                unifiedFormat,
+                out var format,
+                out var numberType))
+        {
+            return false;
+        }
         var tileMode = (fields[3] >> 20) & 0x1Fu;
         var type = (fields[3] >> 28) & 0xFu;
         var baseLevel = (fields[3] >> 12) & 0xFu;
@@ -7058,8 +7066,15 @@ public static class AgcExports
         var tileMode = 0u;
         if (fields.Count >= 4)
         {
-            format = (fields[1] >> 20) & 0x1FFu;
-            numberType = (fields[1] >> 26) & 0xFu;
+            var unifiedFormat = (fields[1] >> 20) & 0x1FFu;
+            if (!Gfx10UnifiedFormat.TryDecode(
+                    unifiedFormat,
+                    out format,
+                    out numberType))
+            {
+                format = Gen5TextureFormatR8G8B8A8Unorm;
+                numberType = 0;
+            }
             tileMode = (fields[3] >> 20) & 0x1Fu;
             if (format == 0)
             {

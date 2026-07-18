@@ -704,8 +704,15 @@ internal static partial class Gen5SpirvTranslator
                 return (SpirvImageFormat.Unknown, ImageComponentKind.Float);
             }
 
-            var dataFormat = (descriptor[1] >> 20) & 0x1FFu;
-            var numberType = (descriptor[1] >> 26) & 0xFu;
+            var unifiedFormat = (descriptor[1] >> 20) & 0x1FFu;
+            if (!Gfx10UnifiedFormat.TryDecode(
+                    unifiedFormat,
+                    out var dataFormat,
+                    out var numberType))
+            {
+                return (SpirvImageFormat.Unknown, ImageComponentKind.Float);
+            }
+
             return (dataFormat, numberType) switch
             {
                 (1, _) => (SpirvImageFormat.R8, ImageComponentKind.Float),
