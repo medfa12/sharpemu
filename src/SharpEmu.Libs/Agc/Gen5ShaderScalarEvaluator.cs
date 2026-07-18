@@ -965,6 +965,40 @@ internal static class Gen5ShaderScalarEvaluator
             return true;
         }
 
+        if (TryExecuteSaveExec32ScalarAlu(
+                instruction,
+                registers,
+                ref execMask,
+                ref scalarConditionCode,
+                out error))
+        {
+            return true;
+        }
+
+        if (!string.IsNullOrEmpty(error))
+        {
+            return false;
+        }
+
+        if (instruction.Opcode == "SFF1I32B64")
+        {
+            if (!TryEvaluateScalarOperand64(
+                    instruction.Sources[0],
+                    registers,
+                    execMask,
+                    out var source))
+            {
+                error = $"scalar-source64 pc=0x{instruction.Pc:X} op={instruction.Opcode}";
+                return false;
+            }
+
+            // -1 when no bit is set; SCC is not written per the ISA.
+            registers[destination.Value] = source == 0
+                ? uint.MaxValue
+                : (uint)BitOperations.TrailingZeroCount(source);
+            return true;
+        }
+
         if (instruction.Opcode is "SMovB64" or "SWqmB64" or "SNotB64")
         {
             if (destination.Value >= ScalarRegisterCount - 1 ||
@@ -1416,6 +1450,68 @@ internal static class Gen5ShaderScalarEvaluator
         execMask = MaskWaveValue(newExec);
         WriteScalarPair(registers, 126, execMask, ref execMask);
         scalarConditionCode = execMask != 0;
+        return true;
+    }
+
+    private static bool TryExecuteSaveExec32ScalarAlu(
+        Gen5ShaderInstruction instruction,
+        uint[] registers,
+        ref ulong execMask,
+        ref bool scalarConditionCode,
+        out string error)
+    {
+        error = string.Empty;
+        if (instruction.Opcode is not (
+            "SAndSaveexecB32" or
+            "SOrSaveexecB32" or
+            "SXorSaveexecB32" or
+            "SAndn2SaveexecB32" or
+            "SOrn2SaveexecB32" or
+            "SNandSaveexecB32" or
+            "SNorSaveexecB32" or
+            "SXnorSaveexecB32" or
+            "SAndn1SaveexecB32" or
+            "SOrn1SaveexecB32"))
+        {
+            return false;
+        }
+
+        if (instruction.Destinations.Count != 1 ||
+            instruction.Destinations[0] is not
+            {
+                Kind: Gen5OperandKind.ScalarRegister,
+                Value: < ScalarRegisterCount,
+            } destination ||
+            instruction.Sources.Count == 0 ||
+            !TryEvaluateScalarOperand(
+                instruction.Sources[0],
+                registers,
+                out var source))
+        {
+            error = $"scalar-source32 pc=0x{instruction.Pc:X} op={instruction.Opcode}";
+            return false;
+        }
+
+        // GFX10 wave32 saveexec: D = EXEC_LO; EXEC_LO = op(S0, EXEC_LO).
+        var oldExec = (uint)execMask;
+        var newExec = instruction.Opcode switch
+        {
+            "SAndSaveexecB32" => source & oldExec,
+            "SOrSaveexecB32" => source | oldExec,
+            "SXorSaveexecB32" => source ^ oldExec,
+            "SAndn1SaveexecB32" => ~source & oldExec,
+            "SAndn2SaveexecB32" => source & ~oldExec,
+            "SOrn1SaveexecB32" => ~source | oldExec,
+            "SOrn2SaveexecB32" => source | ~oldExec,
+            "SNandSaveexecB32" => ~(source & oldExec),
+            "SNorSaveexecB32" => ~(source | oldExec),
+            _ => ~(source ^ oldExec),
+        };
+
+        registers[destination.Value] = oldExec;
+        execMask = MaskWaveValue((execMask & ~0xFFFF_FFFFUL) | newExec);
+        WriteScalarPair(registers, 126, execMask, ref execMask);
+        scalarConditionCode = (uint)execMask != 0;
         return true;
     }
 

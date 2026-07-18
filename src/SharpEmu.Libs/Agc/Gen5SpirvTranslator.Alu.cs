@@ -78,6 +78,16 @@ internal static partial class Gen5SpirvTranslator
                 return true;
             }
 
+            if (instruction.Opcode is "VMovrelsB32" or "VMovreldB32" or "VMovrelsdB32")
+            {
+                return TryEmitRelativeMove(instruction, out error);
+            }
+
+            if (instruction.Opcode == "VReadlaneB32")
+            {
+                return TryEmitReadlane(instruction, out error);
+            }
+
             if (!TryGetVectorDestination(instruction, out var destination))
             {
                 error = "missing vector destination";
@@ -88,9 +98,37 @@ internal static partial class Gen5SpirvTranslator
             switch (instruction.Opcode)
             {
                 case "VMovB32":
-                case "VReadlaneB32":
                     result = GetRawSource(instruction, 0);
                     break;
+                case "VWritelaneB32":
+                {
+                    // VDST[lane(SSRC1)] = SSRC0. Only the addressed lane takes
+                    // the new value, and the write ignores EXEC.
+                    var previous = LoadV(destination);
+                    var lane = BitwiseAnd(
+                        GetRawSource(instruction, 1),
+                        UInt(RdnaWaveLaneCount - 1));
+                    var currentLane = _subgroupInvocationIdInput != 0
+                        ? BitwiseAnd(
+                            Load(_uintType, _subgroupInvocationIdInput),
+                            UInt(RdnaWaveLaneCount - 1))
+                        : UInt(0);
+                    var isTargetLane = _module.AddInstruction(
+                        SpirvOp.IEqual,
+                        _boolType,
+                        currentLane,
+                        lane);
+                    StoreV(
+                        destination,
+                        _module.AddInstruction(
+                            SpirvOp.Select,
+                            _uintType,
+                            isTargetLane,
+                            GetRawSource(instruction, 0),
+                            previous),
+                        guardWithExec: false);
+                    return true;
+                }
                 case "VCndmaskB32":
                 {
                     var condition = instruction.Sources.Count > 2
@@ -845,6 +883,94 @@ internal static partial class Gen5SpirvTranslator
             return true;
         }
 
+        private bool TryEmitRelativeMove(
+            Gen5ShaderInstruction instruction,
+            out string error)
+        {
+            // v_movrels_b32:  VDST = VGPR[SRC0 + M0]
+            // v_movreld_b32:  VGPR[VDST + M0] = SRC0
+            // v_movrelsd_b32: VGPR[VDST + M0] = VGPR[SRC0 + M0]
+            // M0 is scalar register 124; the register file is a private array,
+            // so a runtime-indexed access chain implements the relative move
+            // per lane without any cross-lane traffic.
+            error = string.Empty;
+            if (instruction.Destinations.Count == 0 ||
+                instruction.Destinations[0].Kind != Gen5OperandKind.VectorRegister ||
+                instruction.Sources.Count == 0)
+            {
+                error = $"invalid relative-move operands for {instruction.Opcode}";
+                return false;
+            }
+
+            var relativeSource =
+                instruction.Opcode is "VMovrelsB32" or "VMovrelsdB32";
+            if (relativeSource &&
+                instruction.Sources[0].Kind != Gen5OperandKind.VectorRegister)
+            {
+                error = $"relative-move source must be a VGPR for {instruction.Opcode}";
+                return false;
+            }
+
+            var m0 = LoadS(124);
+            var value = relativeSource
+                ? Load(
+                    _uintType,
+                    VectorPointerAt(IAdd(UInt(instruction.Sources[0].Value), m0)))
+                : GetRawSource(instruction, 0);
+            var destination = instruction.Destinations[0].Value;
+            if (instruction.Opcode == "VMovrelsB32")
+            {
+                StoreV(destination, value);
+                return true;
+            }
+
+            var pointer = VectorPointerAt(IAdd(UInt(destination), m0));
+            var previous = Load(_uintType, pointer);
+            Store(
+                pointer,
+                _module.AddInstruction(
+                    SpirvOp.Select,
+                    _uintType,
+                    Load(_boolType, _exec),
+                    value,
+                    previous));
+            return true;
+        }
+
+        private bool TryEmitReadlane(
+            Gen5ShaderInstruction instruction,
+            out string error)
+        {
+            error = string.Empty;
+            if (instruction.Destinations.Count == 0 ||
+                instruction.Destinations[0].Kind != Gen5OperandKind.ScalarRegister ||
+                instruction.Sources.Count < 2)
+            {
+                error = "invalid read-lane operands";
+                return false;
+            }
+
+            // SDST = VSRC0[lane(SSRC1)], independent of EXEC. Broadcast needs
+            // a constant lane id before SPIR-V 1.5, so use the dynamic-id
+            // GroupNonUniformShuffle exactly like VReadfirstlaneB32.
+            var value = GetRawSource(instruction, 0);
+            if (_subgroupInvocationIdInput != 0)
+            {
+                var lane = BitwiseAnd(
+                    GetRawSource(instruction, 1),
+                    UInt(RdnaWaveLaneCount - 1));
+                value = _module.AddInstruction(
+                    SpirvOp.GroupNonUniformShuffle,
+                    _uintType,
+                    UInt(3),
+                    value,
+                    lane);
+            }
+
+            StoreS(instruction.Destinations[0].Value, value);
+            return true;
+        }
+
         private bool TryEmitVectorCompare(
             Gen5ShaderInstruction instruction,
             out string error)
@@ -1139,6 +1265,11 @@ internal static partial class Gen5SpirvTranslator
             }
 
             var left = GetRawSource(instruction, 0);
+            if (instruction.Opcode.EndsWith("SaveexecB32", StringComparison.Ordinal))
+            {
+                return TryEmitSaveexec32(instruction.Opcode, destination, left, out error);
+            }
+
             uint result;
             switch (instruction.Opcode)
             {
@@ -1698,6 +1829,57 @@ internal static partial class Gen5SpirvTranslator
             return true;
         }
 
+        private bool TryEmitSaveexec32(
+            string opcode,
+            uint destination,
+            uint source,
+            out string error)
+        {
+            // GFX10 wave32 saveexec: D = EXEC_LO; EXEC_LO = op(S0, EXEC_LO);
+            // SCC = (new EXEC_LO != 0). The 32-lane wave model keeps each
+            // lane's own bit in the low word, mirroring the B64 handling.
+            error = string.Empty;
+            var oldExec = _module.AddInstruction(
+                SpirvOp.UConvert,
+                _uintType,
+                BooleanToLaneMask(Load(_boolType, _exec)));
+            var notSource = _module.AddInstruction(SpirvOp.Not, _uintType, source);
+            var notOldExec = _module.AddInstruction(SpirvOp.Not, _uintType, oldExec);
+            var newExec = opcode switch
+            {
+                "SAndSaveexecB32" => BitwiseAnd(source, oldExec),
+                "SOrSaveexecB32" => BitwiseOr(source, oldExec),
+                "SXorSaveexecB32" => BitwiseXor(source, oldExec),
+                "SAndn2SaveexecB32" => BitwiseAnd(source, notOldExec),
+                "SOrn2SaveexecB32" => BitwiseOr(source, notOldExec),
+                "SNandSaveexecB32" => _module.AddInstruction(
+                    SpirvOp.Not,
+                    _uintType,
+                    BitwiseAnd(source, oldExec)),
+                "SNorSaveexecB32" => _module.AddInstruction(
+                    SpirvOp.Not,
+                    _uintType,
+                    BitwiseOr(source, oldExec)),
+                "SXnorSaveexecB32" => _module.AddInstruction(
+                    SpirvOp.Not,
+                    _uintType,
+                    BitwiseXor(source, oldExec)),
+                "SAndn1SaveexecB32" => BitwiseAnd(notSource, oldExec),
+                "SOrn1SaveexecB32" => BitwiseOr(notSource, oldExec),
+                _ => 0u,
+            };
+            if (newExec == 0)
+            {
+                error = $"unsupported scalar opcode {opcode}";
+                return false;
+            }
+
+            StoreS(destination, oldExec);
+            StoreS(126, newExec);
+            Store(_scc, IsNotZero(newExec));
+            return true;
+        }
+
         private bool TryEmitScalar64(
             Gen5ShaderInstruction instruction,
             uint destination,
@@ -1705,6 +1887,35 @@ internal static partial class Gen5SpirvTranslator
         {
             error = string.Empty;
             var left = GetRawSource64(instruction, 0);
+            if (instruction.Opcode == "SFF1I32B64")
+            {
+                // D = index of the lowest set bit of the 64-bit source, or -1
+                // when the source is zero. The destination is a single 32-bit
+                // SGPR; SCC is not written (matching the ISA, unlike the
+                // legacy SFF1I32B32 handling above).
+                var low = _module.AddInstruction(SpirvOp.UConvert, _uintType, left);
+                var high = _module.AddInstruction(
+                    SpirvOp.UConvert,
+                    _uintType,
+                    ShiftRightLogical64(left, _module.Constant64(_ulongType, 32)));
+                var lowLsb = Ext(73, _uintType, low);
+                var highLsb = IAdd(Ext(73, _uintType, high), UInt(32));
+                var highOrNone = _module.AddInstruction(
+                    SpirvOp.Select,
+                    _uintType,
+                    IsNotZero(high),
+                    highLsb,
+                    UInt(0xFFFF_FFFF));
+                var result = _module.AddInstruction(
+                    SpirvOp.Select,
+                    _uintType,
+                    IsNotZero(low),
+                    lowLsb,
+                    highOrNone);
+                StoreS(destination, result);
+                return true;
+            }
+
             if (instruction.Opcode.EndsWith("SaveexecB64", StringComparison.Ordinal))
             {
                 var oldExec = BooleanToLaneMask(Load(_boolType, _exec));
@@ -2404,7 +2615,7 @@ internal static partial class Gen5SpirvTranslator
             var carryIn = _module.AddInstruction(
                 SpirvOp.Select,
                 _uintType,
-                Load(_boolType, _vcc),
+                GetCarryInCondition(instruction),
                 UInt(1),
                 UInt(0));
             var partial = IAdd(left, right);
@@ -2414,9 +2625,17 @@ internal static partial class Gen5SpirvTranslator
                 _boolType,
                 _module.AddInstruction(SpirvOp.ULessThan, _boolType, partial, left),
                 _module.AddInstruction(SpirvOp.ULessThan, _boolType, result, partial));
-            StoreWaveMask(106, MaskWithExec(carry));
+            StoreCarryOut(instruction, carry);
             return result;
         }
+
+        // The VOP2 carry ops read/write VCC implicitly; the VOP3B forms name
+        // an explicit carry-in lane mask in src2 (the carry-out goes through
+        // StoreCarryOut's ScalarDestination handling).
+        private uint GetCarryInCondition(Gen5ShaderInstruction instruction) =>
+            instruction.Sources.Count > 2
+                ? IsCurrentLaneSet(GetRawSource64(instruction, 2))
+                : Load(_boolType, _vcc);
 
         private uint EmitSubtractWithBorrow(
             Gen5ShaderInstruction instruction,
@@ -2427,7 +2646,7 @@ internal static partial class Gen5SpirvTranslator
             var borrowIn = _module.AddInstruction(
                 SpirvOp.Select,
                 _uintType,
-                Load(_boolType, _vcc),
+                GetCarryInCondition(instruction),
                 UInt(1),
                 UInt(0));
             var partial = _module.AddInstruction(SpirvOp.ISub, _uintType, left, right);
@@ -2445,7 +2664,7 @@ internal static partial class Gen5SpirvTranslator
                     _boolType,
                     partial,
                     borrowIn));
-            StoreWaveMask(106, MaskWithExec(borrow));
+            StoreCarryOut(instruction, borrow);
             return result;
         }
 

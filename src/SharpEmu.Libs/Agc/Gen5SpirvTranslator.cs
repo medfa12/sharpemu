@@ -1498,10 +1498,7 @@ internal static partial class Gen5SpirvTranslator
             out string error)
         {
             error = string.Empty;
-            if (_stage != Gen5SpirvStage.Compute ||
-                _lds == 0 ||
-                _workgroupUintPointer == 0 ||
-                instruction.Control is not Gen5DataShareControl control)
+            if (instruction.Control is not Gen5DataShareControl control)
             {
                 error = "invalid LDS instruction";
                 return false;
@@ -1510,6 +1507,21 @@ internal static partial class Gen5SpirvTranslator
             if (control.Gds)
             {
                 error = "GDS data share is not implemented";
+                return false;
+            }
+
+            // The lane permutes are pure cross-lane moves: they never touch
+            // LDS storage, so they are valid in every stage.
+            if (instruction.Opcode is "DsPermuteB32" or "DsBpermuteB32")
+            {
+                return TryEmitDsLanePermute(instruction, control, out error);
+            }
+
+            if (_stage != Gen5SpirvStage.Compute ||
+                _lds == 0 ||
+                _workgroupUintPointer == 0)
+            {
+                error = "invalid LDS instruction";
                 return false;
             }
 
@@ -1614,6 +1626,109 @@ internal static partial class Gen5SpirvTranslator
                     error = $"unsupported LDS opcode {instruction.Opcode}";
                     return false;
             }
+        }
+
+        private bool TryEmitDsLanePermute(
+            Gen5ShaderInstruction instruction,
+            Gen5DataShareControl control,
+            out string error)
+        {
+            error = string.Empty;
+            if (instruction.Destinations.Count < 1 || instruction.Sources.Count < 2)
+            {
+                error = $"missing lane-permute operand for {instruction.Opcode}";
+                return false;
+            }
+
+            // ds_permute_b32 / ds_bpermute_b32 index lanes with a byte
+            // address: lane = ((addr + offset) >> 2) & (wave - 1). The
+            // 16-bit instruction offset spans both offset fields.
+            var data = GetRawSource(instruction, 1);
+            var destination = instruction.Destinations[0].Value;
+            if (_subgroupInvocationIdInput == 0)
+            {
+                // Single-lane fallback: every permutation is the identity.
+                StoreV(destination, data);
+                return true;
+            }
+
+            var address = GetRawSource(instruction, 0);
+            var offset = (control.Offset0 | (control.Offset1 << 8)) & 0xFFFFu;
+            if (offset != 0)
+            {
+                address = IAdd(address, UInt(offset));
+            }
+
+            var targetLane = BitwiseAnd(
+                ShiftRightLogical(address, UInt(2)),
+                UInt(RdnaWaveLaneCount - 1));
+            uint result;
+            if (instruction.Opcode == "DsBpermuteB32")
+            {
+                // Backward permute is a pull: D[i] = data[lane(addr_i)].
+                result = _module.AddInstruction(
+                    SpirvOp.GroupNonUniformShuffle,
+                    _uintType,
+                    UInt(3),
+                    data,
+                    targetLane);
+            }
+            else
+            {
+                // Forward permute is a push: D[lane(addr_j)] = data[j]. Invert
+                // it by scanning every wave lane with constant-id shuffles and
+                // keeping the value whose EXEC-active writer targets this
+                // lane. Lanes nobody targets read 0, matching hardware.
+                var myLane = BitwiseAnd(
+                    Load(_uintType, _subgroupInvocationIdInput),
+                    UInt(RdnaWaveLaneCount - 1));
+                var activeFlag = _module.AddInstruction(
+                    SpirvOp.Select,
+                    _uintType,
+                    Load(_boolType, _exec),
+                    UInt(1),
+                    UInt(0));
+                result = UInt(0);
+                for (uint lane = 0; lane < RdnaWaveLaneCount; lane++)
+                {
+                    var writerTarget = _module.AddInstruction(
+                        SpirvOp.GroupNonUniformShuffle,
+                        _uintType,
+                        UInt(3),
+                        targetLane,
+                        UInt(lane));
+                    var writerActive = _module.AddInstruction(
+                        SpirvOp.GroupNonUniformShuffle,
+                        _uintType,
+                        UInt(3),
+                        activeFlag,
+                        UInt(lane));
+                    var writerData = _module.AddInstruction(
+                        SpirvOp.GroupNonUniformShuffle,
+                        _uintType,
+                        UInt(3),
+                        data,
+                        UInt(lane));
+                    var writesHere = _module.AddInstruction(
+                        SpirvOp.LogicalAnd,
+                        _boolType,
+                        _module.AddInstruction(
+                            SpirvOp.IEqual,
+                            _boolType,
+                            writerTarget,
+                            myLane),
+                        IsNotZero(writerActive));
+                    result = _module.AddInstruction(
+                        SpirvOp.Select,
+                        _uintType,
+                        writesHere,
+                        writerData,
+                        result);
+                }
+            }
+
+            StoreV(destination, result);
+            return true;
         }
 
         private static uint EffectiveDsOffsetBytes(uint offset, bool st64 = false) =>
@@ -2011,6 +2126,32 @@ internal static partial class Gen5SpirvTranslator
                 byteAddress,
                 _module.AddInstruction(SpirvOp.IMul, _uintType, vectorIndex, stride));
             var dwordAddress = ShiftRightLogical(byteAddress, UInt(2));
+
+            if (instruction.Opcode is
+                "BufferLoadUbyte" or
+                "BufferLoadSbyte" or
+                "BufferLoadUshort" or
+                "BufferLoadSshort")
+            {
+                // Sub-dword loads read the containing word and extract the
+                // naturally aligned byte/short lane by byte offset.
+                var word = LoadBufferWord(bindingIndex, dwordAddress);
+                var bitOffset = ShiftLeftLogical(
+                    BitwiseAnd(byteAddress, UInt(3)),
+                    UInt(3));
+                var width = instruction.Opcode is "BufferLoadUbyte" or "BufferLoadSbyte"
+                    ? 8u
+                    : 16u;
+                var signed = instruction.Opcode is "BufferLoadSbyte" or "BufferLoadSshort";
+                var value = _module.AddInstruction(
+                    signed ? SpirvOp.BitFieldSExtract : SpirvOp.BitFieldUExtract,
+                    _uintType,
+                    word,
+                    bitOffset,
+                    UInt(width));
+                StoreV(control.VectorData, value);
+                return true;
+            }
 
             if (instruction.Opcode == "BufferAtomicAdd")
             {
@@ -2965,6 +3106,16 @@ internal static partial class Gen5SpirvTranslator
                 _vectorRegisters,
                 UInt(register));
 
+        // Runtime-indexed VGPR access for the v_movrel* family. The index is
+        // clamped to the 256-register guest file so a bad M0 cannot leave the
+        // register array.
+        private uint VectorPointerAt(uint index) =>
+            _module.AddInstruction(
+                SpirvOp.AccessChain,
+                _privateUintPointer,
+                _vectorRegisters,
+                BitwiseAnd(index, UInt(0xFF)));
+
         private uint LoadS(uint register) => Load(_uintType, ScalarPointer(register));
 
         private uint LoadV(uint register) => Load(_uintType, VectorPointer(register));
@@ -3187,11 +3338,13 @@ internal static partial class Gen5SpirvTranslator
 
         private bool UsesSubgroupShuffle() =>
             _state.Program.Instructions.Any(instruction =>
-                // VReadfirstlaneB32 reads from a computed first-active lane via
-                // GroupNonUniformShuffle (Broadcast requires a constant lane id
-                // before SPIR-V 1.5).
+                // VReadfirstlaneB32 and VReadlaneB32 read from a computed lane
+                // via GroupNonUniformShuffle (Broadcast requires a constant
+                // lane id before SPIR-V 1.5); the DS lane permutes shuffle
+                // wave-wide.
                 instruction.Opcode is "VPermlane16B32" or "VPermlanex16B32"
-                    or "VReadfirstlaneB32");
+                    or "VReadfirstlaneB32" or "VReadlaneB32"
+                    or "DsPermuteB32" or "DsBpermuteB32");
 
         private bool UsesWaveControl() =>
             _state.Program.Instructions.Any(instruction =>
@@ -3208,8 +3361,10 @@ internal static partial class Gen5SpirvTranslator
 
         private bool UsesSubgroupOperations() =>
             UsesSubgroupBroadcast() ||
-            (_stage == Gen5SpirvStage.Compute &&
-             (UsesSubgroupShuffle() || UsesWaveControl()));
+            // Lane shuffles (readlane, ds permutes) need the subgroup lane id
+            // in every stage; wave control alone only opts in for compute.
+            UsesSubgroupShuffle() ||
+            (_stage == Gen5SpirvStage.Compute && UsesWaveControl());
 
         private static bool IsWaveMaskOperand(Gen5Operand operand) =>
             operand.Kind == Gen5OperandKind.ScalarRegister &&

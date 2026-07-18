@@ -151,6 +151,94 @@ public sealed class Gen5ShaderTranslatorTests
     }
 
     [Fact]
+    public void Decode_SFf1I32B64_YieldsSingleScalarDestination()
+    {
+        // s_ff1_i32_b64 s2, exec: SOP1 op 0x14, sdst 2, ssrc0 0x7E.
+        var program = Decode(0xBE82_147E, SEndpgm);
+
+        var ff1 = program.Instructions[0];
+        Assert.Equal("SFF1I32B64", ff1.Opcode);
+        Assert.Equal(Gen5Operand.Scalar(2), Assert.Single(ff1.Destinations));
+        Assert.Equal(Gen5Operand.Scalar(126), Assert.Single(ff1.Sources));
+    }
+
+    [Fact]
+    public void Decode_SAndSaveexecB32_IsRecognized()
+    {
+        // s_and_saveexec_b32 s3, s2: GFX10 wave32 SOP1 op 0x3C.
+        var program = Decode(0xBE83_3C02, SEndpgm);
+
+        var saveexec = program.Instructions[0];
+        Assert.Equal("SAndSaveexecB32", saveexec.Opcode);
+        Assert.Equal(Gen5Operand.Scalar(3), Assert.Single(saveexec.Destinations));
+        Assert.Equal(Gen5Operand.Scalar(2), Assert.Single(saveexec.Sources));
+    }
+
+    [Fact]
+    public void Decode_VReadlaneB32_TargetsScalarDestination()
+    {
+        // v_readlane_b32 s4, v0, 0: GFX10 VOP3 op 0x360 with the SDST in the
+        // VDST field (bits 7:0), src0 v0, src1 inline constant zero.
+        var program = Decode(0xD760_0004, 0x0001_0100, SEndpgm);
+
+        var readlane = program.Instructions[0];
+        Assert.Equal("VReadlaneB32", readlane.Opcode);
+        Assert.Equal(Gen5Operand.Scalar(4), Assert.Single(readlane.Destinations));
+        Assert.Equal(Gen5Operand.Vector(0), readlane.Sources[0]);
+    }
+
+    [Fact]
+    public void Decode_VWritelaneB32_KeepsVectorDestination()
+    {
+        // v_writelane_b32 v5, s2, 1: GFX10 VOP3 op 0x361.
+        var program = Decode(0xD761_0005, 0x0001_0202, SEndpgm);
+
+        var writelane = program.Instructions[0];
+        Assert.Equal("VWritelaneB32", writelane.Opcode);
+        Assert.Equal(Gen5Operand.Vector(5), Assert.Single(writelane.Destinations));
+        Assert.Equal(Gen5Operand.Scalar(2), writelane.Sources[0]);
+    }
+
+    [Fact]
+    public void Decode_DsPermuteB32_YieldsLanePermuteOperands()
+    {
+        // ds_permute_b32 v3, v0, v1: DS op 0x3E, addr v0, data0 v1, vdst v3.
+        var program = Decode(0xD8F8_0000, 0x0300_0100, SEndpgm);
+
+        var permute = program.Instructions[0];
+        Assert.Equal("DsPermuteB32", permute.Opcode);
+        Assert.Equal(Gen5Operand.Vector(3), Assert.Single(permute.Destinations));
+        Assert.Equal(Gen5Operand.Vector(0), permute.Sources[0]);
+        Assert.Equal(Gen5Operand.Vector(1), permute.Sources[1]);
+    }
+
+    [Fact]
+    public void Decode_Vop3bAddc_CarriesExplicitScalarDestination()
+    {
+        // v_add_co_ci_u32_e64 v6, s6, v0, v1, vcc: GFX10 VOP3B op 0x128.
+        var program = Decode(0xD528_0606, 0x01AA_0300, SEndpgm);
+
+        var addc = program.Instructions[0];
+        Assert.Equal("VAddcU32", addc.Opcode);
+        Assert.Equal(Gen5Operand.Vector(6), Assert.Single(addc.Destinations));
+        Assert.Equal(3, addc.Sources.Count);
+        Assert.Equal(Gen5Operand.Scalar(106), addc.Sources[2]);
+        var control = Assert.IsType<Gen5Vop3Control>(addc.Control);
+        Assert.Equal(6u, control.ScalarDestination);
+    }
+
+    [Fact]
+    public void Decode_BufferLoadUbyte_IsSingleDwordLoad()
+    {
+        // buffer_load_ubyte v1, v0, s[4:7], 0: MUBUF op 0x08.
+        var program = Decode(0xE020_0000, 0x8001_0100, SEndpgm);
+
+        var load = program.Instructions[0];
+        Assert.Equal("BufferLoadUbyte", load.Opcode);
+        Assert.Equal(Gen5Operand.Vector(1), Assert.Single(load.Destinations));
+    }
+
+    [Fact]
     public void Decode_SBranch_IsRecognizedAsSopp()
     {
         // s_branch +1: SOPP op 0x02, simm16 1

@@ -724,6 +724,7 @@ internal static class Gen5ShaderTranslator
             0x0B => "SBrevB32",
             0x0F => "SBcnt1I32B32",
             0x13 => "SFF1I32B32",
+            0x14 => "SFF1I32B64",
             0x1D => "SBitset1B32",
             0x1F => "SGetpcB64",
             0x20 => "SSetpcB64",
@@ -738,6 +739,17 @@ internal static class Gen5ShaderTranslator
             0x2B => "SXnorSaveexecB64",
             0x37 => "SAndn1SaveexecB64",
             0x38 => "SOrn1SaveexecB64",
+            // GFX10 wave32 saveexec forms (LLVM SOP1_Real_gfx10 0x3C-0x45).
+            0x3C => "SAndSaveexecB32",
+            0x3D => "SOrSaveexecB32",
+            0x3E => "SXorSaveexecB32",
+            0x3F => "SAndn2SaveexecB32",
+            0x40 => "SOrn2SaveexecB32",
+            0x41 => "SNandSaveexecB32",
+            0x42 => "SNorSaveexecB32",
+            0x43 => "SXnorSaveexecB32",
+            0x44 => "SAndn1SaveexecB32",
+            0x45 => "SOrn1SaveexecB32",
             _ => string.Empty,
         };
 
@@ -1110,6 +1122,9 @@ internal static class Gen5ShaderTranslator
         name = isVop3B
             ? opcode switch
             {
+                0x128 => "VAddcU32",
+                0x129 => "VSubbU32",
+                0x12A => "VSubbrevU32",
                 0x30F => "VAddCoU32",
                 0x310 => "VSubCoU32",
                 0x319 => "VSubrevCoU32",
@@ -1154,8 +1169,11 @@ internal static class Gen5ShaderTranslator
             0x16A => "VMulHiU32",
             0x16B => "VMulLoI32",
             0x16C => "VMulHiI32",
-            0x360 => "VMadU32U16",
-            0x361 => "VMulLoU32",
+            // GFX10: 0x360/0x361 are the lane-access moves; v_mad_u32_u16
+            // lives at 0x373 (LLVM VOP3_Real_gfx10).
+            0x360 => "VReadlaneB32",
+            0x361 => "VWritelaneB32",
+            0x373 => "VMadU32U16",
             0x362 => "VLdexpF32",
             0x365 => "VMbcntLoU32B32",
             0x368 => "VCvtPknormI16F32",
@@ -1175,7 +1193,8 @@ internal static class Gen5ShaderTranslator
     }
 
     private static bool IsVop3BOpcode(uint opcode) =>
-        opcode is 0x16D or 0x16E or 0x176 or 0x177 or 0x30F or 0x310 or 0x319;
+        opcode is 0x128 or 0x129 or 0x12A or
+            0x16D or 0x16E or 0x176 or 0x177 or 0x30F or 0x310 or 0x319;
 
     private static bool DecodeRaw2(
         uint word,
@@ -1205,6 +1224,8 @@ internal static class Gen5ShaderTranslator
             0x0E => "DsWrite2B32",
             0x0F => "DsWrite2St64B32",
             0x35 => "DsSwizzleB32",
+            0x3E => "DsPermuteB32",
+            0x3F => "DsBpermuteB32",
             0x36 => "DsReadB32",
             0x37 => "DsRead2B32",
             0x38 => "DsRead2St64B32",
@@ -1275,6 +1296,10 @@ internal static class Gen5ShaderTranslator
             0x05 => "BufferStoreFormatXy",
             0x06 => "BufferStoreFormatXyz",
             0x07 => "BufferStoreFormatXyzw",
+            0x08 => "BufferLoadUbyte",
+            0x09 => "BufferLoadSbyte",
+            0x0A => "BufferLoadUshort",
+            0x0B => "BufferLoadSshort",
             0x0C => "BufferLoadDword",
             0x0D => "BufferLoadDwordx2",
             0x0E => "BufferLoadDwordx4",
@@ -1731,7 +1756,11 @@ internal static class Gen5ShaderTranslator
                     Gen5Operand.Source((extra >> 9) & 0x1FF, literal),
                     Gen5Operand.Source((extra >> 18) & 0x1FF, literal),
                 ];
-                destinations = [Gen5Operand.Vector(word & 0xFF)];
+                // v_readlane_b32 names an SGPR in the VDST field (VOP3A puts
+                // the SDST in bits 7:0, same as the VGPR destination).
+                destinations = opcode == "VReadlaneB32"
+                    ? [Gen5Operand.Scalar(word & 0xFF)]
+                    : [Gen5Operand.Vector(word & 0xFF)];
                 var isVop3B = IsVop3BOpcode((word >> 16) & 0x3FF);
                 control = new Gen5Vop3Control(
                     isVop3B ? 0 : (word >> 8) & 0x7,
@@ -1769,11 +1798,16 @@ internal static class Gen5ShaderTranslator
                         Gen5Operand.Vector(vectorData1),
                     ],
                     "DsSwizzleB32" => [Gen5Operand.Vector(vectorData0)],
+                    "DsPermuteB32" or "DsBpermuteB32" => [
+                        Gen5Operand.Vector(vectorAddress),
+                        Gen5Operand.Vector(vectorData0),
+                    ],
                     _ => [Gen5Operand.Vector(vectorAddress)],
                 };
                 destinations = opcode switch
                 {
-                    "DsReadB32" or "DsSwizzleB32" => [
+                    "DsReadB32" or "DsSwizzleB32" or
+                    "DsPermuteB32" or "DsBpermuteB32" => [
                         Gen5Operand.Vector(vectorDestination),
                     ],
                     "DsRead2B32" or "DsRead2St64B32" => [
@@ -1837,6 +1871,10 @@ internal static class Gen5ShaderTranslator
                     "BufferLoadFormatXy" => 2u,
                     "BufferLoadFormatXyz" => 3u,
                     "BufferLoadFormatXyzw" => 4u,
+                    "BufferLoadUbyte" => 1u,
+                    "BufferLoadSbyte" => 1u,
+                    "BufferLoadUshort" => 1u,
+                    "BufferLoadSshort" => 1u,
                     "BufferLoadDword" => 1u,
                     "BufferLoadDwordx2" => 2u,
                     "BufferLoadDwordx3" => 3u,

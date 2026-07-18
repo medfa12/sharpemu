@@ -78,6 +78,39 @@ public sealed class Gen5SpirvCompileTests
         0xBF810000,
     ];
 
+    // s_ff1_i32_b64 s2, exec; s_and_saveexec_b32 s3, exec_lo;
+    // v_movrels_b32 v1, v2; ds_permute_b32 v3, v0, v1;
+    // v_readlane_b32 s4, v0, 0; v_writelane_b32 v5, s2, 1;
+    // v_add_co_ci_u32_e64 v6, s6, v0, v1, vcc;
+    // exp mrt0 done compr vm v0, v1; s_endpgm.
+    // The GFX10 lane-access and wave32 tail Astro Bot's title-loop shaders
+    // hit (SOP1 0x14/0x3C, VOP1 0x43, DS 0x3E, VOP3 0x360/0x361, VOP3B 0x128).
+    private static readonly uint[] LaneAccessPs =
+    [
+        0xBE82147E,
+        0xBE833C7E,
+        0x7E028702,
+        0xD8F80000, 0x03000100,
+        0xD7600004, 0x00010100,
+        0xD7610005, 0x00010202,
+        0xD5280606, 0x01AA0300,
+        0xF8001C0F, 0x00000100,
+        0xBF810000,
+    ];
+
+    [Fact]
+    public void PixelShader_LaneAccessAndWave32Tail_CompilesToValidSpirv()
+    {
+        var (state, evaluation, _) = DecodeAndEvaluate(LaneAccessPs);
+
+        var ok = Gen5SpirvTranslator.TryCompilePixelShader(
+            state, evaluation, Gen5PixelOutputKind.Float, out var shader, out var error);
+        Assert.True(ok, $"TryCompilePixelShader failed: {error}");
+
+        var module = SpirvModuleAssert.Parse(shader.Spirv);
+        SpirvModuleAssert.AssertShaderModule(module, ExecutionModelFragment);
+    }
+
     [Fact]
     public void PixelShader_PackedNormAndMbcnt_CompilesToValidSpirv()
     {
