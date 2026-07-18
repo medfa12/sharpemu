@@ -1219,7 +1219,7 @@ public static class AvPlayerExports
                 Trace($"present_skip handle=0x{player.Handle:X16} reason=convert_failed");
                 return;
             }
-            DumpVideoFrameOnce(bgra, player.Width, player.Height);
+            DumpBrightestVideoFrameOnce(player, bgra);
             if (!VulkanVideoPresenter.TryPresentVideoFrame(bgra, player.Width, player.Height))
             {
                 Trace($"present_skip handle=0x{player.Handle:X16} reason=present_failed");
@@ -1233,16 +1233,74 @@ public static class AvPlayerExports
         }
     }
 
-    private static int _avFrameDumpCount;
+    private static int _avFrameDumpDone;
 
-    // One-shot forensic dump of a converted intro frame straight to the log,
-    // independent of the swapchain (which the game's own presents race). Emits a
-    // downscaled base64 RGB block the scratchpad decoder turns into a PNG, so we
-    // can confirm the decode+convert produced a real image even when the swapchain
-    // shows the game's loading frame. Bounded to the first few frames.
-    private static void DumpVideoFrameOnce(byte[] bgra, int width, int height)
+    // One-shot forensic dump of a RECOGNISABLE intro frame straight to the log,
+    // independent of the swapchain (which the game's own presents race). The
+    // first delivered frame is the fade-in from black, so we decode ahead through
+    // the ffmpeg stream and dump the brightest frame we find (the logo/title
+    // card). Draining the stream is fine here: the game's own blit already failed,
+    // so direct present is the only display path. Emits a downscaled base64 RGB
+    // block the scratchpad decoder turns into a PNG.
+    private static void DumpBrightestVideoFrameOnce(PlayerState player, byte[] firstBgra)
     {
-        if (Interlocked.Increment(ref _avFrameDumpCount) > 3 || width <= 0 || height <= 0)
+        if (Interlocked.Exchange(ref _avFrameDumpDone, 1) != 0)
+        {
+            return;
+        }
+
+        var bestBgra = firstBgra;
+        var bestScore = FrameBrightness(firstBgra);
+        var raw = player.RawFrame;
+        if (raw is not null && player.DecoderOutput is not null)
+        {
+            for (var i = 0; i < 200; i++)
+            {
+                if (!ReadFrame(player))
+                {
+                    break;
+                }
+                var candidate = ConvertNv12ToBgra(
+                    raw, player.Width, player.Height, player.Width, checked(player.Width * player.Height));
+                if (candidate.Length == 0)
+                {
+                    continue;
+                }
+                var score = FrameBrightness(candidate);
+                if (score > bestScore)
+                {
+                    bestScore = score;
+                    bestBgra = candidate;
+                }
+                // The logo card is much brighter than the fade-in; stop once we
+                // have a clearly bright frame so we do not drain the whole clip.
+                if (bestScore > 90)
+                {
+                    break;
+                }
+            }
+        }
+        DumpBgraFrame(bestBgra, player.Width, player.Height);
+    }
+
+    private static long FrameBrightness(byte[] bgra)
+    {
+        if (bgra.Length == 0)
+        {
+            return 0;
+        }
+        long sum = 0;
+        // Sample every 64th pixel's green channel as a cheap luma proxy.
+        for (var i = 1; i < bgra.Length; i += 256)
+        {
+            sum += bgra[i];
+        }
+        return sum / Math.Max(1, bgra.Length / 256);
+    }
+
+    private static void DumpBgraFrame(byte[] bgra, int width, int height)
+    {
+        if (width <= 0 || height <= 0)
         {
             return;
         }
