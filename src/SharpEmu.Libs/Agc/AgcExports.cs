@@ -596,6 +596,13 @@ public static class AgcExports
         // pass-through draw this is the pass-through vertex count.
         public uint IndirectInstanceCount { get; set; }
         public TranslatedGuestDraw? TranslatedDraw { get; set; }
+        // Stage 2 ordered-flip composite redirect (SHARPEMU_ORDERED_FLIP). The
+        // game's final title composite is a fullscreen pass that samples many
+        // inputs yet names no color render target; hardware relies on the AGC
+        // flip to name the scanout surface. Retain that draw here so the RFlip
+        // handler can render it into the flipped display buffer before the
+        // ordered capture snapshots it. Null (and untouched) on default runs.
+        public TranslatedGuestDraw? PendingTargetlessDraw { get; set; }
         public Dictionary<ulong, RenderTargetWriter> RenderTargetWriters { get; } = new();
         public ulong IndirectArgsAddress { get; set; }
         public bool SawIndexedDraw { get; set; }
@@ -3703,6 +3710,61 @@ public static class AgcExports
                 var flipArg = unchecked((long)(((ulong)flipArgHi << 32) | flipArgLo));
                 var displayBufferIndex = unchecked((int)displayBufferIndexRaw);
                 var handle = unchecked((int)videoOutHandle);
+
+                // Stage 2 ordered-flip composite redirect. The retained targetless
+                // composite named no scanout surface; render it directly into the
+                // flipped display buffer now, before TrySubmitGuestImage enqueues
+                // the ordered capture, so the capture snapshots a rendered buffer
+                // instead of the empty scanout memory. Gated on SHARPEMU_ORDERED_FLIP
+                // so default runs skip this entirely.
+                if (VulkanVideoPresenter.ShouldUseOrderedGuestFlip() &&
+                    state.PendingTargetlessDraw is { } pendingComposite &&
+                    VideoOutExports.TryGetDisplayBufferInfo(
+                        handle,
+                        displayBufferIndex,
+                        out var compositeDisplayBuffer) &&
+                    VideoOutExports.TryGetDisplayBufferRenderTargetFormat(
+                        compositeDisplayBuffer.PixelFormat,
+                        out var compositeFormat,
+                        out var compositeNumberType,
+                        out var compositeComponentSwap))
+                {
+                    var compositeTextures = CreateVulkanGuestDrawTextures(
+                        ctx,
+                        pendingComposite.Textures,
+                        out _);
+                    var compositeGlobalBuffers =
+                        CreateVulkanGuestMemoryBuffers(pendingComposite.GlobalMemoryBindings);
+                    var compositeVertexBuffers =
+                        CreateVulkanGuestVertexBuffers(pendingComposite.VertexInputs);
+                    var rendered = VulkanVideoPresenter.TrySubmitDisplayCompositeDraw(
+                        pendingComposite.PixelSpirv,
+                        compositeTextures,
+                        compositeGlobalBuffers,
+                        pendingComposite.AttributeCount,
+                        new VulkanGuestRenderTarget(
+                            compositeDisplayBuffer.Address,
+                            compositeDisplayBuffer.Width,
+                            compositeDisplayBuffer.Height,
+                            compositeFormat,
+                            compositeNumberType,
+                            ComponentSwap: compositeComponentSwap),
+                        pendingComposite.VertexSpirv,
+                        pendingComposite.VertexCount,
+                        pendingComposite.InstanceCount,
+                        pendingComposite.PrimitiveType,
+                        pendingComposite.IndexBuffer,
+                        compositeVertexBuffers,
+                        pendingComposite.RenderState);
+                    TraceAgcShader(
+                        $"agc.deferred_composite ps=0x{pendingComposite.PixelShaderAddress:X16} " +
+                        $"dst=0x{compositeDisplayBuffer.Address:X16} " +
+                        $"size={compositeDisplayBuffer.Width}x{compositeDisplayBuffer.Height} " +
+                        $"fmt={compositeFormat} swap={compositeComponentSwap} " +
+                        $"textures={compositeTextures.Count} rendered={rendered}");
+                    state.PendingTargetlessDraw = null;
+                }
+
                 if (VideoOutExports.TryGetDisplayBufferInfo(
                         handle,
                         displayBufferIndex,
@@ -3795,6 +3857,9 @@ public static class AgcExports
                 state.SawIndexedDraw = false;
                 state.GuestDrawKind = GuestDrawKind.None;
                 state.TranslatedDraw = null;
+                // Drop any retained composite that no flip consumed so it never
+                // leaks into the next frame's ordered-flip redirect.
+                state.PendingTargetlessDraw = null;
             }
 
             offset += length;
@@ -4260,6 +4325,22 @@ public static class AgcExports
             vertexCount);
     }
 
+    // Stage 2 ordered-flip composite redirect: decide whether a translated draw
+    // is the frame's final targetless composite that should be retained until
+    // RFlip. A draw qualifies when the ordered-flip capture is enabled and the
+    // draw names no color render target and no storage sink yet still samples at
+    // least one input (the fullscreen composite reads the frame's layers). Pure
+    // so it can be unit tested and so the gate keeps default runs byte-identical.
+    internal static bool ShouldRetainTargetlessComposite(
+        bool orderedFlipEnabled,
+        bool hasColorTarget,
+        bool hasStorageTarget,
+        int sampledTextureCount) =>
+        orderedFlipEnabled &&
+        !hasColorTarget &&
+        !hasStorageTarget &&
+        sampledTextureCount > 0;
+
     private static void TryTranslateGuestDraw(
         CpuContext ctx,
         SubmittedGpuState gpuState,
@@ -4431,6 +4512,17 @@ public static class AgcExports
                         translatedDraw.AttributeCount,
                         storageTarget.Descriptor.Width,
                         storageTarget.Descriptor.Height);
+                }
+                else if (ShouldRetainTargetlessComposite(
+                             VulkanVideoPresenter.ShouldUseOrderedGuestFlip(),
+                             hasColorTarget: false,
+                             hasStorageTarget: false,
+                             translatedDraw.Textures.Count))
+                {
+                    // No color target and no storage sink, but samples the frame's
+                    // layers: this is the deferred title composite. Retain it so
+                    // RFlip can render it into the flipped display buffer.
+                    state.PendingTargetlessDraw = translatedDraw;
                 }
             }
 

@@ -1562,6 +1562,48 @@ public static class VideoOutExports
             ? 4u
             : 0u;
 
+    // Stage 2 ordered-flip composite redirect: map a registered display buffer's
+    // sce pixel format to the AGC render-target (dataFormat, numberType,
+    // componentSwap) triple, so AgcExports can render the deferred title
+    // composite directly into the scanout surface with a matching Vulkan format.
+    // Returns false for formats the render-target path cannot decode.
+    internal static bool TryGetDisplayBufferRenderTargetFormat(
+        ulong pixelFormat,
+        out uint dataFormat,
+        out uint numberType,
+        out uint componentSwap)
+    {
+        dataFormat = 0;
+        numberType = 0;
+        componentSwap = 0;
+        switch (NormalizePixelFormat(pixelFormat))
+        {
+            case SceVideoOutPixelFormatA2R10G10B10:
+            case SceVideoOutPixelFormatA2R10G10B10Srgb:
+            case SceVideoOutPixelFormatA2R10G10B10Bt2020Pq:
+                // COLOR_2_10_10_10; COMP_SWAP=ALT exposes A2R10G10B10 (R high),
+                // matching the sceVideoOut scanout channel order.
+                dataFormat = 9;
+                numberType = 0;
+                componentSwap = 1;
+                return true;
+            case SceVideoOutPixelFormatB8G8R8A8Unorm:
+            case SceVideoOutPixelFormatA8R8G8B8Srgb:
+                dataFormat = 10;
+                numberType = 0;
+                componentSwap = 1;
+                return true;
+            case SceVideoOutPixelFormatR8G8B8A8Unorm:
+            case SceVideoOutPixelFormatA8B8G8R8Srgb:
+                dataFormat = 10;
+                numberType = 0;
+                componentSwap = 0;
+                return true;
+            default:
+                return false;
+        }
+    }
+
     // Maps the PS5 VideoOut pixel format space to the AGC "guest texture format" tags
     // VulkanVideoPresenter._availableGuestImages keys on (see VulkanVideoPresenter.
     // GetGuestTextureFormat: format=10 => 56 for 8-bit RGBA variants, format=9 => 9 for 10-bit).

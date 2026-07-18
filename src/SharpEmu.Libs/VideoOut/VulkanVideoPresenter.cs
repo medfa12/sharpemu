@@ -828,6 +828,75 @@ internal static unsafe class VulkanVideoPresenter
         }
     }
 
+    // Stage 2 ordered-flip composite redirect. Renders the frame's retained
+    // targetless composite draw directly into the flipped display buffer, then
+    // pre-registers that address as a GPU-produced image so the ordered-flip
+    // capture that follows (TrySubmitGuestImage -> BuildDisplayFlipPresentation)
+    // snapshots the freshly rendered scanout surface instead of resolving to an
+    // internal composite target. The offscreen draw is enqueued ahead of the
+    // ordered capture on the same guest-work FIFO, so it executes first and the
+    // capture reads its output. Only reachable from the SHARPEMU_ORDERED_FLIP
+    // gated RFlip path, so default runs never touch this. Returns false if the
+    // target is unusable (empty shader, zero extent, or an unmapped format).
+    public static bool TrySubmitDisplayCompositeDraw(
+        byte[] pixelSpirv,
+        IReadOnlyList<VulkanGuestDrawTexture> textures,
+        IReadOnlyList<VulkanGuestMemoryBuffer> globalMemoryBuffers,
+        uint attributeCount,
+        VulkanGuestRenderTarget target,
+        byte[]? vertexSpirv = null,
+        uint vertexCount = 3,
+        uint instanceCount = 1,
+        uint primitiveType = 4,
+        VulkanGuestIndexBuffer? indexBuffer = null,
+        IReadOnlyList<VulkanGuestVertexBuffer>? vertexBuffers = null,
+        VulkanGuestRenderState? renderState = null)
+    {
+        if (pixelSpirv.Length == 0 ||
+            target.Address == 0 ||
+            target.Width == 0 ||
+            target.Height == 0)
+        {
+            return false;
+        }
+
+        var guestTextureFormat = GetGuestTextureFormat(target.Format, target.NumberType);
+        if (guestTextureFormat == 0)
+        {
+            return false;
+        }
+
+        SubmitOffscreenTranslatedDraw(
+            pixelSpirv,
+            textures,
+            globalMemoryBuffers,
+            attributeCount,
+            target,
+            vertexSpirv,
+            vertexCount,
+            instanceCount,
+            primitiveType,
+            indexBuffer,
+            vertexBuffers,
+            renderState);
+
+        lock (_gate)
+        {
+            if (_closed)
+            {
+                return false;
+            }
+
+            // Pre-register the scanout address as a completed GPU image so the
+            // flip resolves known=true and captures this address directly. The
+            // offscreen draw enqueued above republishes the same address once it
+            // executes, so the ordered capture reads a rendered VkImage.
+            _gpuGuestImages[target.Address] = guestTextureFormat;
+        }
+
+        return true;
+    }
+
     public static void SubmitStorageTranslatedDraw(
         byte[] pixelSpirv,
         IReadOnlyList<VulkanGuestDrawTexture> textures,
@@ -1341,6 +1410,22 @@ internal static unsafe class VulkanVideoPresenter
             _gpuGuestImages.Remove(address);
             _renderTargetGuestImages.Remove(address);
             ForgetRenderedGuestImageLocked(address);
+        }
+    }
+
+    internal static bool IsGpuGuestImageForTests(ulong address)
+    {
+        lock (_gate)
+        {
+            return _gpuGuestImages.ContainsKey(address);
+        }
+    }
+
+    internal static int PendingGuestWorkCountForTests()
+    {
+        lock (_gate)
+        {
+            return _pendingGuestWork.Count;
         }
     }
 
