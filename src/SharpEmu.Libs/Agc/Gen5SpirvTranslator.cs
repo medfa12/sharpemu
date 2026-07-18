@@ -822,6 +822,15 @@ internal static partial class Gen5SpirvTranslator
                     _subgroupInvocationIdInput,
                     SpirvDecoration.BuiltIn,
                     (uint)SpirvBuiltIn.SubgroupLocalInvocationId);
+                if (_stage == Gen5SpirvStage.Pixel)
+                {
+                    // Fragment integer inputs must be Flat, built-ins included
+                    // (VUID-StandaloneSpirv-Flat-04744).
+                    _module.AddDecoration(
+                        _subgroupInvocationIdInput,
+                        SpirvDecoration.Flat);
+                }
+
                 _interfaces.Add(_subgroupInvocationIdInput);
             }
 
