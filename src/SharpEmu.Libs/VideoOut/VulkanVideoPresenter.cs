@@ -1795,10 +1795,12 @@ internal static unsafe class VulkanVideoPresenter
         uint sourceWidth,
         uint sourceHeight,
         uint sourceFormat,
+        uint sourceNumberType,
         ulong destinationAddress,
         uint destinationWidth,
         uint destinationHeight,
-        uint destinationFormat)
+        uint destinationFormat,
+        uint destinationNumberType)
     {
         if (sourceAddress == 0 ||
             destinationAddress == 0 ||
@@ -1815,7 +1817,7 @@ internal static unsafe class VulkanVideoPresenter
         {
             if (_closed ||
                 !_availableGuestImages.ContainsKey(sourceAddress) ||
-                GetGuestTextureFormat(destinationFormat, 0) == 0)
+                GetGuestTextureFormat(destinationFormat, destinationNumberType) == 0)
             {
                 return false;
             }
@@ -1829,7 +1831,7 @@ internal static unsafe class VulkanVideoPresenter
                     sourceWidth,
                     sourceHeight,
                     sourceFormat,
-                    NumberType: 0,
+                    sourceNumberType,
                     [],
                     IsFallback: false,
                     IsStorage: false),
@@ -1841,7 +1843,7 @@ internal static unsafe class VulkanVideoPresenter
                 destinationWidth,
                 destinationHeight,
                 destinationFormat,
-                NumberType: 0));
+                destinationNumberType));
         return true;
     }
 

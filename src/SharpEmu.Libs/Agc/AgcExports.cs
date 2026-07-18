@@ -6418,10 +6418,12 @@ public static class AgcExports
                         cachedSourceTexture.Width,
                         cachedSourceTexture.Height,
                         cachedSourceTexture.Format,
+                        cachedSourceTexture.NumberType,
                         texture.Address,
                         texture.Width,
                         texture.Height,
-                        texture.Format))
+                        texture.Format,
+                        texture.NumberType))
                 {
                     blits++;
                     TraceAgcShader(
