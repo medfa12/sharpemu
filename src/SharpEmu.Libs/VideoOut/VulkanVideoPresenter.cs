@@ -153,7 +153,10 @@ internal sealed record VulkanGuestDepthTarget(
     uint TileMode,
     bool TestEnable,
     bool WriteEnable,
-    uint CompareOp);
+    uint CompareOp,
+    bool ClearEnable = false,
+    float ClearDepth = 1f,
+    bool ReadOnly = false);
 
 internal readonly record struct VulkanRenderTargetFormat(
     Format Format,
@@ -7582,12 +7585,35 @@ internal static unsafe class VulkanVideoPresenter
                     if (repairedDepth.Width >= renderWidth &&
                         repairedDepth.Height >= renderHeight)
                     {
+                        // A read-only depth view must never be written even when
+                        // DB_DEPTH_CONTROL still carries Z_WRITE_ENABLE.
+                        if (repairedDepth.ReadOnly && repairedDepth.WriteEnable)
+                        {
+                            repairedDepth = repairedDepth with { WriteEnable = false };
+                        }
+
                         depthImage = GetOrCreateGuestDepthImage(repairedDepth);
                         effectiveDepth = repairedDepth;
                     }
                 }
 
-                var clearDepth = depthImage is { Initialized: false };
+                // DB_RENDER_CONTROL.DEPTH_CLEAR_ENABLE makes this a DB clear
+                // operation: clear the attachment to the guest clear value and
+                // run the draw itself without depth test/write (its interpolated
+                // vertex Z is not the guest clear value).
+                var clearDepthForDraw = effectiveDepth is { ClearEnable: true };
+                var clearDepth =
+                    depthImage is { Initialized: false } || clearDepthForDraw;
+                var clearDepthValue = effectiveDepth?.ClearDepth ?? 1.0f;
+                if (clearDepthForDraw && effectiveDepth is not null)
+                {
+                    effectiveDepth = effectiveDepth with
+                    {
+                        TestEnable = false,
+                        WriteEnable = false,
+                        ClearEnable = false,
+                    };
+                }
 
                 var renderPass = firstTarget.RenderPass;
                 var framebuffer = firstTarget.Framebuffer;
@@ -7674,7 +7700,8 @@ internal static unsafe class VulkanVideoPresenter
                     renderPass,
                     framebuffer,
                     extent,
-                    depthImage is not null);
+                    depthImage is not null,
+                    clearDepthValue);
                 RecordStorageImagesForRead(resources, PipelineStageFlags.FragmentShaderBit);
 
                 // NGG debug: copy the just-drawn target into a host buffer in THIS
@@ -10205,12 +10232,13 @@ internal static unsafe class VulkanVideoPresenter
             RenderPass renderPass,
             Framebuffer framebuffer,
             Extent2D extent,
-            bool hasDepth = false)
+            bool hasDepth = false,
+            float clearDepthValue = 1.0f)
         {
             // One clear value per attachment: the color attachments (LoadOp.Load)
             // ignore theirs, and the trailing depth attachment (index colorCount)
-            // clears to the far plane when its LoadOp is Clear. Providing the
-            // depth value unconditionally is harmless when the LoadOp is Load.
+            // clears to the guest clear value when its LoadOp is Clear. Providing
+            // the depth value unconditionally is harmless when the LoadOp is Load.
             var colorCount = Math.Max(resources.Blends.Length, 1);
             var clearCount = hasDepth ? colorCount + 1 : colorCount;
             var clearValues = stackalloc ClearValue[clearCount];
@@ -10223,7 +10251,7 @@ internal static unsafe class VulkanVideoPresenter
             {
                 clearValues[colorCount] = new ClearValue
                 {
-                    DepthStencil = new ClearDepthStencilValue(1.0f, 0),
+                    DepthStencil = new ClearDepthStencilValue(clearDepthValue, 0),
                 };
             }
 

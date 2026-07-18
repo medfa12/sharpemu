@@ -103,7 +103,10 @@ public static class AgcExports
     private const uint PaScModeCntl0 = 0x292;
     private const uint DbDepthControl = 0x200; // Z_ENABLE / Z_WRITE_ENABLE / ZFUNC
     // GFX10 DB context registers (register byte address minus 0x28000, / 4).
+    private const uint DbRenderControl = 0x000; // DEPTH_CLEAR_ENABLE bit0
+    private const uint DbDepthView = 0x002; // READ_ONLY (Z) bit24
     private const uint DbDepthSizeXy = 0x007; // X_MAX / Y_MAX
+    private const uint DbDepthClear = 0x00B; // depth clear value (float bits)
     private const uint DbZInfo = 0x010; // FORMAT / SW_MODE
     private const uint DbZReadBase = 0x012; // depth read address >> 8
     private const uint DbZWriteBase = 0x014; // depth write address >> 8
@@ -515,11 +518,14 @@ public static class AgcExports
         ulong Address,
         uint Width,
         uint Height,
-        uint Format,      // DB_Z_INFO.FORMAT: 1=Z16, 3=Z32_FLOAT
-        uint TileMode,    // DB_Z_INFO.SW_MODE
-        bool TestEnable,  // DB_DEPTH_CONTROL.Z_ENABLE
-        bool WriteEnable, // DB_DEPTH_CONTROL.Z_WRITE_ENABLE
-        uint CompareOp);  // DB_DEPTH_CONTROL.ZFUNC (0=NEVER..7=ALWAYS)
+        uint Format,       // DB_Z_INFO.FORMAT: 1=Z16, 3=Z32_FLOAT
+        uint TileMode,     // DB_Z_INFO.SW_MODE
+        bool TestEnable,   // DB_DEPTH_CONTROL.Z_ENABLE
+        bool WriteEnable,  // DB_DEPTH_CONTROL.Z_WRITE_ENABLE
+        uint CompareOp,    // DB_DEPTH_CONTROL.ZFUNC (0=NEVER..7=ALWAYS)
+        bool ClearEnable = false, // DB_RENDER_CONTROL.DEPTH_CLEAR_ENABLE
+        float ClearDepth = 1f,    // DB_DEPTH_CLEAR (clamped 0..1)
+        bool ReadOnly = false);   // DB_DEPTH_VIEW.Z_READ_ONLY or no write base
 
     private sealed record TranslatedGuestDraw(
         ulong ExportShaderAddress,
@@ -4580,7 +4586,10 @@ public static class AgcExports
                                 depth.TileMode,
                                 depth.TestEnable,
                                 depth.WriteEnable,
-                                depth.CompareOp)
+                                depth.CompareOp,
+                                depth.ClearEnable,
+                                depth.ClearDepth,
+                                depth.ReadOnly)
                             : null,
                         state.PendingIndirectArgs,
                         translatedDraw.ComputeCaptureSpirv,
@@ -5391,20 +5400,39 @@ public static class AgcExports
         var writeEnable = ((depthControl >> 2) & 1u) != 0; // Z_WRITE_ENABLE [2]
         var compareOp = (depthControl >> 4) & 0x7u;        // ZFUNC [6:4]
 
-        // Only report a depth target the game actually reads from or writes to;
-        // an address with neither test nor write is not a live depth surface.
-        if (!testEnable && !writeEnable)
+        // DB_RENDER_CONTROL.DEPTH_CLEAR_ENABLE turns a draw into a DB clear
+        // operation: the game clears its depth surface with a targetless
+        // fullscreen draw whose depth state has neither test nor write set.
+        registers.TryGetValue(DbRenderControl, out var renderControl);
+        var clearEnable = (renderControl & 0x1u) != 0;
+
+        // Only report a depth target the game actually reads from, writes to or
+        // clears; an address with none of those is not a live depth surface.
+        if (!testEnable && !writeEnable && !clearEnable)
         {
             return null;
         }
 
+        var clearDepth = registers.TryGetValue(DbDepthClear, out var clearBits)
+            ? BitConverter.UInt32BitsToSingle(clearBits)
+            : 1f;
+        if (!float.IsFinite(clearDepth) || clearDepth < 0f || clearDepth > 1f)
+        {
+            clearDepth = 1f;
+        }
+
+        registers.TryGetValue(DbDepthView, out var depthView);
+        var readOnly = (depthView & (1u << 24)) != 0 || writeAddress == 0;
+
         var descriptor = new DepthTargetDescriptor(
             address, width, height, format, tileMode,
-            testEnable, writeEnable, compareOp);
+            testEnable, writeEnable, compareOp,
+            clearEnable, clearDepth, readOnly);
 
         TraceAgc(
             $"agc.depth_target addr=0x{address:X16} fmt={format} tile={tileMode} " +
-            $"size={width}x{height} test={testEnable} write={writeEnable} zfunc={compareOp}");
+            $"size={width}x{height} test={testEnable} write={writeEnable} zfunc={compareOp} " +
+            $"clear={clearEnable}:{clearDepth:0.######} ro={readOnly}");
 
         return descriptor;
     }

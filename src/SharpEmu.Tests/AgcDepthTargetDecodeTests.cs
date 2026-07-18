@@ -106,4 +106,69 @@ public sealed class AgcDepthTargetDecodeTests
 
         Assert.Null(AgcExports.GetDepthTarget(registers));
     }
+
+    private const uint DbRenderControl = 0x000;
+    private const uint DbDepthView = 0x002;
+    private const uint DbDepthClear = 0x00B;
+
+    [Fact]
+    public void DepthClearEnableKeepsTargetWithoutTestOrWrite()
+    {
+        // The per-frame depth clear draw binds the depth surface with
+        // DB_RENDER_CONTROL.DEPTH_CLEAR_ENABLE set and test/write disabled;
+        // the decoder must surface it instead of discarding the clear.
+        var registers = Gfx10DepthRegisters();
+        registers[DbDepthControl] = 0;
+        registers[DbRenderControl] = 0x1u;
+        registers[DbDepthClear] = BitConverter.SingleToUInt32Bits(0.5f);
+
+        var depth = AgcExports.GetDepthTarget(registers);
+
+        Assert.NotNull(depth);
+        Assert.False(depth.Value.TestEnable);
+        Assert.False(depth.Value.WriteEnable);
+        Assert.True(depth.Value.ClearEnable);
+        Assert.Equal(0.5f, depth.Value.ClearDepth);
+    }
+
+    [Theory]
+    [InlineData(float.NaN)]
+    [InlineData(-1f)]
+    [InlineData(2f)]
+    public void OutOfRangeClearDepthClampsToFarPlane(float raw)
+    {
+        var registers = Gfx10DepthRegisters();
+        registers[DbDepthClear] = BitConverter.SingleToUInt32Bits(raw);
+
+        var depth = AgcExports.GetDepthTarget(registers);
+
+        Assert.NotNull(depth);
+        Assert.Equal(1f, depth.Value.ClearDepth);
+    }
+
+    [Fact]
+    public void ReadOnlyDepthViewDecodesAsReadOnly()
+    {
+        var registers = Gfx10DepthRegisters();
+        registers[DbDepthView] = 1u << 24;
+
+        var depth = AgcExports.GetDepthTarget(registers);
+
+        Assert.NotNull(depth);
+        Assert.True(depth.Value.ReadOnly);
+    }
+
+    [Fact]
+    public void MissingWriteBaseDecodesAsReadOnly()
+    {
+        var registers = Gfx10DepthRegisters();
+        registers.Remove(DbZWriteBase);
+        registers.Remove(DbZWriteBaseHi);
+        registers[DbDepthControl] = 0x2u | (3u << 4);
+
+        var depth = AgcExports.GetDepthTarget(registers);
+
+        Assert.NotNull(depth);
+        Assert.True(depth.Value.ReadOnly);
+    }
 }
