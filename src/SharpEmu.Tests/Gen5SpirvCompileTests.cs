@@ -316,11 +316,21 @@ public sealed class Gen5SpirvCompileTests
         OpAccessChain = 65, OpLogicalOr = 166, OpLogicalAnd = 167,
         OpSelect = 169, OpULessThan = 176, OpFOrdLessThan = 184;
 
-    private static SpirvModuleAssert.ParsedModule CompilePixelShader(params uint[] words)
+    private static SpirvModuleAssert.ParsedModule CompilePixelShader(params uint[] words) =>
+        CompilePixelShader(words, pixelInputControls: null);
+
+    private static SpirvModuleAssert.ParsedModule CompilePixelShader(
+        uint[] words,
+        IReadOnlyList<uint>? pixelInputControls)
     {
         var (state, evaluation, _) = DecodeAndEvaluate(words);
         var ok = Gen5SpirvTranslator.TryCompilePixelShader(
-            state, evaluation, Gen5PixelOutputKind.Float, out var shader, out var error);
+            state,
+            evaluation,
+            Gen5PixelOutputKind.Float,
+            out var shader,
+            out var error,
+            pixelInputControls: pixelInputControls);
         Assert.True(ok, $"TryCompilePixelShader failed: {error}");
         return SpirvModuleAssert.Parse(shader.Spirv);
     }
@@ -402,6 +412,44 @@ public sealed class Gen5SpirvCompileTests
             i => i.Opcode == OpGroupNonUniformBroadcast);
         var stores = ScalarRegisterStoreCounts(module);
         Assert.Equal(1, stores.GetValueOrDefault(5u));
+    }
+
+    private const ushort OpCapability = 17;
+    private const ushort OpDPdx = 207;
+    private const uint CapabilityFragmentBarycentricKhr = 5284;
+    // v_interp_mov_f32 v0, p0, attr0.x: VINTRP op 2, dst v0, attr 0, chan x,
+    // selector 2 (P0).
+    private const uint InterpMovP0Attr0X = 0xC8020002;
+
+    [Fact]
+    public void PixelShader_CustomInterpMov_ReplaysProvokingVertexWord()
+    {
+        // SPI_PS_INPUT_CNTL 0x423 marks a custom/flat attribute carrying a
+        // packed payload (Astro Bot's packed normals). The mov must replay the
+        // exact provoking-vertex word: no barycentric builtin, no derivatives.
+        var module = CompilePixelShader(
+            [InterpMovP0Attr0X, ExportV0Rgba, 0x00000000, SEndpgm],
+            [0x423u]);
+
+        Assert.DoesNotContain(
+            module.Instructions,
+            i => i.Opcode == OpCapability && i.Words[1] == CapabilityFragmentBarycentricKhr);
+        Assert.DoesNotContain(module.Instructions, i => i.Opcode == OpDPdx);
+    }
+
+    [Fact]
+    public void PixelShader_InterpMovOnPlainInput_ReconstructsCoefficients()
+    {
+        // A non-custom attribute touched by v_interp_mov reconstructs the
+        // P0/P10/P20 hardware coefficients from BaryCoordKHR derivatives.
+        var module = CompilePixelShader(
+            [InterpMovP0Attr0X, ExportV0Rgba, 0x00000000, SEndpgm],
+            [0x000u]);
+
+        Assert.Contains(
+            module.Instructions,
+            i => i.Opcode == OpCapability && i.Words[1] == CapabilityFragmentBarycentricKhr);
+        Assert.Contains(module.Instructions, i => i.Opcode == OpDPdx);
     }
 
     [Fact]

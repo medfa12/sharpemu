@@ -3389,9 +3389,14 @@ internal static unsafe class VulkanVideoPresenter
                     "translated shaders using unformatted storage image load/store will fail.");
             }
 
+            var barycentricFeatures = new PhysicalDeviceFragmentShaderBarycentricFeaturesKHR
+            {
+                SType = StructureType.PhysicalDeviceFragmentShaderBarycentricFeaturesKhr,
+            };
             var maintenance8Features = new PhysicalDeviceMaintenance8FeaturesKHR
             {
                 SType = StructureType.PhysicalDeviceMaintenance8FeaturesKhr,
+                PNext = &barycentricFeatures,
             };
             var robustness2Features = new PhysicalDeviceRobustness2FeaturesEXT
             {
@@ -3405,9 +3410,16 @@ internal static unsafe class VulkanVideoPresenter
             };
             _vk.GetPhysicalDeviceFeatures2(_physicalDevice, &featuresQuery);
             var supportsMaintenance8 = maintenance8Features.Maintenance8;
+            var supportsBarycentric = barycentricFeatures.FragmentShaderBarycentric;
             var supportsRobustImageAccess2 = robustness2Features.RobustImageAccess2;
             var supportsNullDescriptor = robustness2Features.NullDescriptor;
             var supportsRobustness2 = supportsRobustImageAccess2 || supportsNullDescriptor;
+            if (!supportsBarycentric)
+            {
+                Console.Error.WriteLine(
+                    "[LOADER][WARN] GPU does not support VK_KHR_fragment_shader_barycentric " +
+                    "translated shaders reconstructing V_INTERP_MOV_F32 coefficients will fail.");
+            }
             if (!supportsMaintenance8)
             {
                 Console.Error.WriteLine(
@@ -3425,9 +3437,11 @@ internal static unsafe class VulkanVideoPresenter
             var swapchainExtension = (byte*)SilkMarshal.StringToPtr("VK_KHR_swapchain");
             var maintenance8Extension = (byte*)SilkMarshal.StringToPtr("VK_KHR_maintenance8");
             var robustness2Extension = (byte*)SilkMarshal.StringToPtr("VK_EXT_robustness2");
+            var barycentricExtension =
+                (byte*)SilkMarshal.StringToPtr("VK_KHR_fragment_shader_barycentric");
             try
             {
-                var extensions = stackalloc byte*[3];
+                var extensions = stackalloc byte*[4];
                 var extensionCount = 0u;
                 extensions[extensionCount++] = swapchainExtension;
                 if (supportsMaintenance8)
@@ -3440,19 +3454,30 @@ internal static unsafe class VulkanVideoPresenter
                     extensions[extensionCount++] = robustness2Extension;
                 }
 
+                if (supportsBarycentric)
+                {
+                    extensions[extensionCount++] = barycentricExtension;
+                }
+
+                barycentricFeatures.FragmentShaderBarycentric = supportsBarycentric;
+                barycentricFeatures.PNext = null;
                 maintenance8Features.Maintenance8 = supportsMaintenance8;
-                maintenance8Features.PNext = null;
+                maintenance8Features.PNext = supportsBarycentric ? &barycentricFeatures : null;
                 robustness2Features.RobustBufferAccess2 =
                     supportsRobustImageAccess2 && supportedFeatures.RobustBufferAccess;
                 robustness2Features.RobustImageAccess2 = supportsRobustImageAccess2;
                 robustness2Features.NullDescriptor = supportsNullDescriptor;
-                robustness2Features.PNext = supportsMaintenance8 ? &maintenance8Features : null;
+                robustness2Features.PNext = supportsMaintenance8
+                    ? &maintenance8Features
+                    : (supportsBarycentric ? &barycentricFeatures : null);
                 var features2 = new PhysicalDeviceFeatures2
                 {
                     SType = StructureType.PhysicalDeviceFeatures2,
                     PNext = supportsRobustness2
                         ? &robustness2Features
-                        : (supportsMaintenance8 ? &maintenance8Features : null),
+                        : (supportsMaintenance8
+                            ? &maintenance8Features
+                            : (supportsBarycentric ? &barycentricFeatures : null)),
                     Features = enabledFeatures,
                 };
                 var createInfo = new DeviceCreateInfo
@@ -3472,6 +3497,7 @@ internal static unsafe class VulkanVideoPresenter
                 SilkMarshal.Free((nint)swapchainExtension);
                 SilkMarshal.Free((nint)maintenance8Extension);
                 SilkMarshal.Free((nint)robustness2Extension);
+                SilkMarshal.Free((nint)barycentricExtension);
             }
 
             _vk.GetDeviceQueue(_device, _queueFamilyIndex, 0, out _queue);

@@ -213,6 +213,13 @@ internal static partial class Gen5SpirvTranslator
         private readonly List<SpirvImageResource> _imageResources = [];
         private readonly Dictionary<uint, int> _imageBindingByPc = [];
         private readonly Dictionary<uint, int> _bufferBindingByPc = [];
+        // Attributes touched by V_INTERP_MOV_F32: their P0/P10/P20 hardware
+        // interpolation coefficients are reconstructed in the entry block and
+        // the guest's manual interpolation sequence replays them.
+        private readonly HashSet<uint> _interpolationMoveAttributes = [];
+        private readonly Dictionary<
+            (uint Attribute, uint Channel),
+            SpirvInterpolationCoefficients> _interpolationCoefficients = [];
         private uint _voidType;
         private uint _boolType;
         private uint _uintType;
@@ -243,6 +250,7 @@ internal static partial class Gen5SpirvTranslator
         private uint _vertexIndexInput;
         private uint _instanceIndexInput;
         private uint _fragCoordInput;
+        private uint _baryCoordInput;
         private uint _localInvocationIdInput;
         private uint _workGroupIdInput;
         private uint _globalInvocationIdInput;
@@ -274,6 +282,11 @@ internal static partial class Gen5SpirvTranslator
             uint Variable,
             uint Type,
             Gen5PixelOutputKind Kind);
+
+        private readonly record struct SpirvInterpolationCoefficients(
+            uint P0,
+            uint P10,
+            uint P20);
 
         public CompilationContext(
             Gen5SpirvStage stage,
@@ -315,6 +328,14 @@ internal static partial class Gen5SpirvTranslator
             _imageBindingBase = imageBindingBase;
             _scalarRegisterBufferIndex = scalarRegisterBufferIndex;
             _instanceIdFromVertexIndex = instanceIdFromVertexIndex;
+            foreach (var instruction in state.Program.Instructions)
+            {
+                if (instruction.Opcode == "VInterpMovF32" &&
+                    instruction.Control is Gen5InterpolationControl move)
+                {
+                    _interpolationMoveAttributes.Add(move.Attribute);
+                }
+            }
         }
 
         public bool TryCompile(out Gen5SpirvShader shader, out string error)
@@ -336,6 +357,10 @@ internal static partial class Gen5SpirvTranslator
                 _module.AddName(main, "main");
                 _module.AddLabel();
                 EmitInitialState();
+                if (!TryEmitInterpolationCoefficientState(out error))
+                {
+                    return false;
+                }
                 EmitPaddedVertexOutputStores();
 
                 var loopHeader = _module.AllocateId();
@@ -468,6 +493,11 @@ internal static partial class Gen5SpirvTranslator
             _module.AddCapability(SpirvCapability.Shader);
             _module.AddCapability(SpirvCapability.Int64);
             _module.AddCapability(SpirvCapability.ImageQuery);
+            if (RequiresBarycentricCoefficients())
+            {
+                _module.AddExtension("SPV_KHR_fragment_shader_barycentric");
+                _module.AddCapability(SpirvCapability.FragmentBarycentricKhr);
+            }
             if (_evaluation.ImageBindings.Any(
                     static binding =>
                         (binding.Opcode.StartsWith(
@@ -899,6 +929,20 @@ internal static partial class Gen5SpirvTranslator
                     _interfaces.Add(variable);
                 }
 
+                if (RequiresBarycentricCoefficients())
+                {
+                    var inputVec3Pointer =
+                        _module.TypePointer(SpirvStorageClass.Input, _vec3Type);
+                    _baryCoordInput = _module.AddGlobalVariable(
+                        inputVec3Pointer,
+                        SpirvStorageClass.Input);
+                    _module.AddDecoration(
+                        _baryCoordInput,
+                        SpirvDecoration.BuiltIn,
+                        (uint)SpirvBuiltIn.BaryCoordKhr);
+                    _interfaces.Add(_baryCoordInput);
+                }
+
                 _fragCoordInput = _module.AddGlobalVariable(
                     inputVec4Pointer,
                     SpirvStorageClass.Input);
@@ -990,6 +1034,21 @@ internal static partial class Gen5SpirvTranslator
             attribute < (uint)_pixelInputControls.Count
                 ? _pixelInputControls[(int)attribute]
                 : attribute;
+
+        // SPI_PS_INPUT_CNTL: FLAT_SHADE (bit 10) together with a nonzero
+        // PT_SPRITE/custom select (bit 5) marks a custom-interpolated
+        // attribute whose provoking-vertex word carries a packed payload.
+        private static bool IsCustomInterpolation(uint control) =>
+            (control & 0x420u) == 0x420u;
+
+        // Coefficient reconstruction (and therefore the barycentric builtin)
+        // is only needed when an interpolation move touches an attribute that
+        // is NOT custom/flat; custom attributes replay the exact
+        // provoking-vertex word without any derivative math.
+        private bool RequiresBarycentricCoefficients() =>
+            _stage == Gen5SpirvStage.Pixel &&
+            _interpolationMoveAttributes.Any(attribute =>
+                !IsCustomInterpolation(GetPixelInputControl(attribute)));
 
         private void DeclareVertexInputs()
         {
@@ -1088,6 +1147,24 @@ internal static partial class Gen5SpirvTranslator
             }
             else if (_stage == Gen5SpirvStage.Pixel)
             {
+                if (_baryCoordInput != 0)
+                {
+                    // Under the fixed PERSP_CENTER + POS_X/Y input layout the
+                    // barycentric I/J weights occupy v0/v1. Seed them so the
+                    // guest's manual interpolation (v_interp_p1/p2 against the
+                    // reconstructed P0/P10/P20 coefficients) sees real weights.
+                    var barycentrics = Load(_vec3Type, _baryCoordInput);
+                    for (uint component = 0; component < 2; component++)
+                    {
+                        var weight = _module.AddInstruction(
+                            SpirvOp.CompositeExtract,
+                            _floatType,
+                            barycentrics,
+                            component + 1);
+                        StoreV(component, Bitcast(_uintType, weight), guardWithExec: false);
+                    }
+                }
+
                 var fragCoord = Load(_vec4Type, _fragCoordInput);
                 var x = _module.AddInstruction(
                     SpirvOp.CompositeExtract,
@@ -1344,8 +1421,7 @@ internal static partial class Gen5SpirvTranslator
                 "SNop" or
                 "SWaitcnt" or
                 "SInstPrefetch" or
-                "STtraceData" or
-                "VInterpMovF32")
+                "STtraceData")
             {
                 return true;
             }
@@ -1589,7 +1665,232 @@ internal static partial class Gen5SpirvTranslator
                 _floatType,
                 vector,
                 interpolation.Channel);
-            StoreV(destination, Bitcast(_uintType, component));
+            if (!_interpolationMoveAttributes.Contains(interpolation.Attribute))
+            {
+                StoreV(destination, Bitcast(_uintType, component));
+                return true;
+            }
+
+            if (instruction.Opcode == "VInterpMovF32" &&
+                IsCustomInterpolation(GetPixelInputControl(interpolation.Attribute)))
+            {
+                // Custom interpolation carries packed payloads whose bits must
+                // not be reconstructed through floating-point derivatives.
+                // Until the backend exposes all three per-vertex parameters,
+                // use the exact provoking-vertex word for every selector. The
+                // guest's manual interpolation then collapses to a stable,
+                // faceted value instead of unpacking derivative noise.
+                StoreV(destination, Bitcast(_uintType, component));
+                return true;
+            }
+
+            if (!_interpolationCoefficients.TryGetValue(
+                    (interpolation.Attribute, interpolation.Channel),
+                    out var coefficients))
+            {
+                error =
+                    $"missing interpolation coefficients for attribute " +
+                    $"{interpolation.Attribute} channel {interpolation.Channel}";
+                return false;
+            }
+
+            uint result;
+            if (instruction.Opcode == "VInterpMovF32")
+            {
+                if (instruction.Sources.Count == 0)
+                {
+                    error = "interpolation move is missing its P10/P20/P0 selector";
+                    return false;
+                }
+
+                result = instruction.Sources[0].Value switch
+                {
+                    0 => coefficients.P10,
+                    1 => coefficients.P20,
+                    2 => coefficients.P0,
+                    _ => 0,
+                };
+                if (result == 0)
+                {
+                    error =
+                        $"invalid interpolation move selector {instruction.Sources[0].Value}";
+                    return false;
+                }
+            }
+            else
+            {
+                if (instruction.Sources.Count == 0 ||
+                    instruction.Sources[0].Kind != Gen5OperandKind.VectorRegister)
+                {
+                    error = "interpolation instruction is missing its barycentric source";
+                    return false;
+                }
+
+                var barycentric = Bitcast(
+                    _floatType,
+                    LoadV(instruction.Sources[0].Value));
+                if (instruction.Opcode == "VInterpP1F32")
+                {
+                    result = _module.AddInstruction(
+                        SpirvOp.FAdd,
+                        _floatType,
+                        coefficients.P0,
+                        _module.AddInstruction(
+                            SpirvOp.FMul,
+                            _floatType,
+                            coefficients.P10,
+                            barycentric));
+                }
+                else if (instruction.Opcode == "VInterpP2F32")
+                {
+                    result = _module.AddInstruction(
+                        SpirvOp.FAdd,
+                        _floatType,
+                        Bitcast(_floatType, LoadV(destination)),
+                        _module.AddInstruction(
+                            SpirvOp.FMul,
+                            _floatType,
+                            coefficients.P20,
+                            barycentric));
+                }
+                else
+                {
+                    error = $"unsupported interpolation opcode {instruction.Opcode}";
+                    return false;
+                }
+            }
+
+            StoreV(destination, Bitcast(_uintType, result));
+            return true;
+        }
+
+        private bool TryEmitInterpolationCoefficientState(out string error)
+        {
+            error = string.Empty;
+            if (_stage != Gen5SpirvStage.Pixel ||
+                _interpolationMoveAttributes.Count == 0)
+            {
+                return true;
+            }
+
+            // Derivatives are only defined in uniform control flow. The guest
+            // shader body runs inside a PC dispatcher whose cases can diverge,
+            // so reconstruct every coefficient once in the entry block and
+            // let V_INTERP instructions read the dominating SSA values.
+            var controls = _state.Program.Instructions
+                .Where(static instruction => instruction.Opcode == "VInterpMovF32")
+                .Select(static instruction =>
+                    (Gen5InterpolationControl)instruction.Control!)
+                .Select(static control => (control.Attribute, control.Channel))
+                .Distinct()
+                .OrderBy(static control => control.Attribute)
+                .ThenBy(static control => control.Channel);
+            foreach (var (attribute, channel) in controls)
+            {
+                if (IsCustomInterpolation(GetPixelInputControl(attribute)))
+                {
+                    continue;
+                }
+
+                if (!TryCreateInterpolationCoefficients(
+                        attribute,
+                        channel,
+                        out var coefficients,
+                        out error))
+                {
+                    return false;
+                }
+
+                _interpolationCoefficients.Add((attribute, channel), coefficients);
+            }
+
+            return true;
+        }
+
+        private bool TryCreateInterpolationCoefficients(
+            uint attribute,
+            uint channel,
+            out SpirvInterpolationCoefficients coefficients,
+            out string error)
+        {
+            coefficients = default;
+            error = string.Empty;
+            if (!_pixelInputs.TryGetValue(attribute, out var input))
+            {
+                error = $"invalid interpolated attribute {attribute}";
+                return false;
+            }
+
+            if (_baryCoordInput == 0)
+            {
+                error = "interpolation move requires a barycentric pixel input";
+                return false;
+            }
+
+            // MoltenVK exposes VK_KHR_fragment_shader_barycentric but its
+            // SPIR-V-to-MSL path cannot consume PerVertexKHR inputs. Rebuild
+            // the hardware interpolation coefficients from the ordinary
+            // interpolant and the derivatives of its barycentric weights:
+            //
+            //   F = P0 + P10*I + P20*J
+            //
+            // Differentiating in screen X/Y yields a 2x2 system for P10/P20;
+            // P0 then follows from F. Native Vulkan drivers use the same
+            // standard SPIR-V path.
+            var vector = Load(_vec4Type, input);
+            var component = _module.AddInstruction(
+                SpirvOp.CompositeExtract,
+                _floatType,
+                vector,
+                channel);
+            var barycentrics = Load(_vec3Type, _baryCoordInput);
+            var i = _module.AddInstruction(
+                SpirvOp.CompositeExtract,
+                _floatType,
+                barycentrics,
+                1);
+            var j = _module.AddInstruction(
+                SpirvOp.CompositeExtract,
+                _floatType,
+                barycentrics,
+                2);
+            uint Binary(SpirvOp op, uint left, uint right) =>
+                _module.AddInstruction(op, _floatType, left, right);
+            uint Derivative(SpirvOp op, uint value) =>
+                _module.AddInstruction(op, _floatType, value);
+
+            var dFdx = Derivative(SpirvOp.DPdx, component);
+            var dFdy = Derivative(SpirvOp.DPdy, component);
+            var dIdx = Derivative(SpirvOp.DPdx, i);
+            var dIdy = Derivative(SpirvOp.DPdy, i);
+            var dJdx = Derivative(SpirvOp.DPdx, j);
+            var dJdy = Derivative(SpirvOp.DPdy, j);
+            var determinant = Binary(
+                SpirvOp.FSub,
+                Binary(SpirvOp.FMul, dIdx, dJdy),
+                Binary(SpirvOp.FMul, dIdy, dJdx));
+            var p10 = Binary(
+                SpirvOp.FDiv,
+                Binary(
+                    SpirvOp.FSub,
+                    Binary(SpirvOp.FMul, dFdx, dJdy),
+                    Binary(SpirvOp.FMul, dFdy, dJdx)),
+                determinant);
+            var p20 = Binary(
+                SpirvOp.FDiv,
+                Binary(
+                    SpirvOp.FSub,
+                    Binary(SpirvOp.FMul, dIdx, dFdy),
+                    Binary(SpirvOp.FMul, dIdy, dFdx)),
+                determinant);
+            var p0 = Binary(
+                SpirvOp.FSub,
+                Binary(
+                    SpirvOp.FSub,
+                    component,
+                    Binary(SpirvOp.FMul, p10, i)),
+                Binary(SpirvOp.FMul, p20, j));
+            coefficients = new SpirvInterpolationCoefficients(p0, p10, p20);
             return true;
         }
 

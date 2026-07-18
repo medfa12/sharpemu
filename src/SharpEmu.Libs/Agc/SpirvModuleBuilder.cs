@@ -140,6 +140,8 @@ internal enum SpirvOp : ushort
     BitFieldUExtract = 203,
     BitReverse = 204,
     BitCount = 205,
+    DPdx = 207,
+    DPdy = 208,
     ControlBarrier = 224,
     MemoryBarrier = 225,
     AtomicIAdd = 234,
@@ -183,6 +185,7 @@ internal enum SpirvCapability : uint
     GroupNonUniformVote = 62,
     GroupNonUniformBallot = 64,
     GroupNonUniformShuffle = 65,
+    FragmentBarycentricKhr = 5284,
     RuntimeDescriptorArray = 5302,
 }
 
@@ -239,6 +242,8 @@ internal enum SpirvBuiltIn : uint
     GlobalInvocationId = 28,
     LocalInvocationIndex = 29,
     SubgroupLocalInvocationId = 41,
+    BaryCoordKhr = 5286,
+    BaryCoordNoPerspKhr = 5287,
 }
 
 internal enum SpirvImageDim : uint
