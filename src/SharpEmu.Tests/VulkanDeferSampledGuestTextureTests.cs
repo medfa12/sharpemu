@@ -86,15 +86,27 @@ public sealed class VulkanDeferSampledGuestTextureTests
     }
 
     [Fact]
-    public void StrictGateRejectsZeroSampledFormat()
+    public void StrictGateDefersToUnmappedFormatProducer()
     {
-        Assert.False(VulkanVideoPresenter.DeferSampledGuestTextureDecision(
+        // A producer registered with format 0 rendered through a target whose
+        // guest format has no canonical mapping; a mismatch cannot be proven,
+        // and its VkImage is still authoritative over guest memory the GPU
+        // never wrote -- presence alone defers, whatever the sampled format.
+        Assert.True(VulkanVideoPresenter.DeferSampledGuestTextureDecision(
             flipCompositeFix: true,
             gpuFormatKnown: true,
             gpuFormat: 0,
             renderTargetFormatKnown: false,
             renderTargetFormat: 0,
             sampledGuestFormat: 0));
+
+        Assert.True(VulkanVideoPresenter.DeferSampledGuestTextureDecision(
+            flipCompositeFix: true,
+            gpuFormatKnown: false,
+            gpuFormat: 0,
+            renderTargetFormatKnown: true,
+            renderTargetFormat: 0,
+            sampledGuestFormat: 56));
     }
 
     [Fact]

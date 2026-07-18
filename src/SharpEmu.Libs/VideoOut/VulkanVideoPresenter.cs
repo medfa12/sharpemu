@@ -894,10 +894,16 @@ internal static unsafe class VulkanVideoPresenter
                 var guestTextureFormat = GetGuestTextureFormat(
                     target.Format,
                     target.NumberType);
+                // Pre-register the target as a GPU producer even when its guest
+                // format has no canonical mapping (stored as 0): a consumer
+                // translated between this enqueue and the draw's execution must
+                // defer to the rendered image instead of uploading never-written
+                // guest memory. _availableGuestImages keeps format semantics for
+                // the flip election, so only known formats enter it.
+                _renderTargetGuestImages[target.Address] = guestTextureFormat;
                 if (guestTextureFormat != 0)
                 {
                     _availableGuestImages[target.Address] = guestTextureFormat;
-                    _renderTargetGuestImages[target.Address] = guestTextureFormat;
                 }
             }
 
@@ -1708,6 +1714,16 @@ internal static unsafe class VulkanVideoPresenter
         }
 
         if (!flipCompositeFix)
+        {
+            return true;
+        }
+
+        // A producer registered with format 0 rendered through a target whose
+        // guest format has no canonical mapping; a format mismatch cannot be
+        // proven, and the rendered image is still authoritative over guest
+        // memory the GPU never wrote. Defer on presence.
+        if ((gpuFormatKnown && gpuFormat == 0) ||
+            (renderTargetFormatKnown && renderTargetFormat == 0))
         {
             return true;
         }
@@ -6071,13 +6087,20 @@ internal static unsafe class VulkanVideoPresenter
                     var guestFormat = VulkanVideoPresenter.GetGuestTextureFormat(
                         texture.Format,
                         texture.NumberType);
-                    if (guestFormat != 0)
+                    // Re-check under the registry lock: a producer draw may have
+                    // pre-registered this address between the live-render-target
+                    // probe above and this takeover. De-registering it here would
+                    // permanently strand every later consumer on zeroed guest
+                    // uploads, so the CPU upload only claims addresses that still
+                    // have no GPU producer.
+                    var producerRegistered =
+                        _renderTargetGuestImages.ContainsKey(texture.Address) ||
+                        _gpuGuestImages.ContainsKey(texture.Address);
+                    if (guestFormat != 0 && !producerRegistered)
                     {
                         _availableGuestImages[texture.Address] = guestFormat;
                         // A genuine CPU upload owns this address now; it must
                         // never be captured as an address-referencing texture.
-                        _gpuGuestImages.Remove(texture.Address);
-                        _renderTargetGuestImages.Remove(texture.Address);
                         ForgetRenderedGuestImageLocked(texture.Address);
                     }
                 }
@@ -7859,21 +7882,25 @@ internal static unsafe class VulkanVideoPresenter
                         var guestTextureFormat = VulkanVideoPresenter.GetGuestTextureFormat(
                             work.Targets[index].Format,
                             work.Targets[index].NumberType);
-                        if (guestTextureFormat == 0)
-                        {
-                            continue;
-                        }
-
                         lock (_gate)
                         {
-                            _availableGuestImages[targets[index].Address] = guestTextureFormat;
+                            // Always publish producer presence -- a target whose
+                            // guest format has no canonical mapping (0) still
+                            // holds real rendered content that later consumers
+                            // must defer to instead of uploading empty guest
+                            // memory. Format-keyed registries (flip election)
+                            // stay limited to known formats.
                             _gpuGuestImages[targets[index].Address] = guestTextureFormat;
                             _renderTargetGuestImages[targets[index].Address] = guestTextureFormat;
-                            NoteRenderedGuestImageLocked(
-                                targets[index].Address,
-                                targets[index].Width,
-                                targets[index].Height,
-                                work.Draw.Textures.Count);
+                            if (guestTextureFormat != 0)
+                            {
+                                _availableGuestImages[targets[index].Address] = guestTextureFormat;
+                                NoteRenderedGuestImageLocked(
+                                    targets[index].Address,
+                                    targets[index].Width,
+                                    targets[index].Height,
+                                    work.Draw.Textures.Count);
+                            }
                         }
                     }
                 }
