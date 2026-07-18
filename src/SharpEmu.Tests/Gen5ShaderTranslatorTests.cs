@@ -417,6 +417,29 @@ public sealed class Gen5ShaderTranslatorTests
     }
 
     [Fact]
+    public void Decode_PackedNormMbcntAndU64Compare_DecodesByName()
+    {
+        // v_cvt_pknorm_u16_f32 v0, v0, v1; v_cvt_pknorm_i16_f32 v2, v0, v1;
+        // v_mbcnt_lo_u32_b32 v1, -1, 0; s_cmp_lg_u64 s[0:1], s[2:3]; s_endpgm
+        var program = Decode(
+            0xD769_0000, 0x0002_0300,
+            0xD768_0002, 0x0002_0300,
+            0xD765_0001, 0x0001_00C1,
+            0xBF13_0200,
+            SEndpgm);
+
+        Assert.Equal(
+            [
+                "VCvtPknormU16F32",
+                "VCvtPknormI16F32",
+                "VMbcntLoU32B32",
+                "SCmpLgU64",
+                "SEndpgm",
+            ],
+            program.Instructions.Select(instruction => instruction.Opcode));
+    }
+
+    [Fact]
     public void Decode_VCmpSdwa_ExplicitScalarDestination_RoutesSdst()
     {
         // v_cmp_lt_f32_sdwa s[38:39], v0, v1 with dword selects. VOPC uses

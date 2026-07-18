@@ -835,6 +835,8 @@ internal static class Gen5ShaderTranslator
             0x0D => "SBitcmp1B32",
             0x0E => "SBitcmp0B64",
             0x0F => "SBitcmp1B64",
+            0x12 => "SCmpEqU64",
+            0x13 => "SCmpLgU64",
             _ => string.Empty,
         };
 
@@ -1155,6 +1157,9 @@ internal static class Gen5ShaderTranslator
             0x360 => "VMadU32U16",
             0x361 => "VMulLoU32",
             0x362 => "VLdexpF32",
+            0x365 => "VMbcntLoU32B32",
+            0x368 => "VCvtPknormI16F32",
+            0x369 => "VCvtPknormU16F32",
             0x346 => "VLshlAddU32",
             0x347 => "VAddLshlU32",
             0x36D => "VAdd3U32",

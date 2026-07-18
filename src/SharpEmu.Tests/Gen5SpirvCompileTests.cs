@@ -66,6 +66,31 @@ public sealed class Gen5SpirvCompileTests
         return (state, evaluation, ctx);
     }
 
+    // v_cvt_pknorm_u16_f32 v0, v0, v1; v_cvt_pknorm_i16_f32 v1, v0, v1;
+    // v_mbcnt_lo_u32_b32 v2, -1, 0; exp mrt0 done compr vm v0, v1; s_endpgm.
+    // The packed-norm export pattern Astro Bot's title-scene shaders use.
+    private static readonly uint[] PackedNormExportPs =
+    [
+        0xD769_0000, 0x0002_0300,
+        0xD768_0001, 0x0002_0300,
+        0xD765_0002, 0x0001_00C1,
+        0xF8001C0F, 0x00000100,
+        0xBF810000,
+    ];
+
+    [Fact]
+    public void PixelShader_PackedNormAndMbcnt_CompilesToValidSpirv()
+    {
+        var (state, evaluation, _) = DecodeAndEvaluate(PackedNormExportPs);
+
+        var ok = Gen5SpirvTranslator.TryCompilePixelShader(
+            state, evaluation, Gen5PixelOutputKind.Float, out var shader, out var error);
+        Assert.True(ok, $"TryCompilePixelShader failed: {error}");
+
+        var module = SpirvModuleAssert.Parse(shader.Spirv);
+        SpirvModuleAssert.AssertShaderModule(module, ExecutionModelFragment);
+    }
+
     [Fact]
     public void PixelShader_CompilesToStructurallyValidSpirv()
     {

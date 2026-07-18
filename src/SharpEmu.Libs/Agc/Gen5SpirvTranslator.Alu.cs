@@ -791,6 +791,43 @@ internal static partial class Gen5SpirvTranslator
                     result = Ext(58, _uintType, vector);
                     break;
                 }
+                case "VCvtPknormI16F32":
+                case "VCvtPknormU16F32":
+                {
+                    // Pack two floats into snorm16/unorm16 halves; the
+                    // GLSL.std.450 pack ops match the ISA clamp+round-ne.
+                    var vector = _module.AddInstruction(
+                        SpirvOp.CompositeConstruct,
+                        _vec2Type,
+                        GetFloatSource(instruction, 0),
+                        GetFloatSource(instruction, 1));
+                    result = Ext(
+                        instruction.Opcode == "VCvtPknormI16F32" ? 56u : 57u,
+                        _uintType,
+                        vector);
+                    break;
+                }
+                case "VMbcntLoU32B32":
+                {
+                    // D = popcount(S0 & lanes-below-me) + S1; a wave32 keeps
+                    // every lane in the low half, so this covers the wave.
+                    var lane = _subgroupInvocationIdInput != 0
+                        ? BitwiseAnd(
+                            Load(_uintType, _subgroupInvocationIdInput),
+                            UInt(RdnaWaveLaneCount - 1))
+                        : UInt(0);
+                    var below = _module.AddInstruction(
+                        SpirvOp.ISub,
+                        _uintType,
+                        ShiftLeftLogical(UInt(1), lane),
+                        UInt(1));
+                    var count = _module.AddInstruction(
+                        SpirvOp.BitCount,
+                        _uintType,
+                        BitwiseAnd(GetRawSource(instruction, 0), below));
+                    result = IAdd(count, GetRawSource(instruction, 1));
+                    break;
+                }
                 case "VCvtPkU16U32":
                 case "VCvtPkI16I32":
                     result = BitwiseOr(
@@ -1575,6 +1612,20 @@ internal static partial class Gen5SpirvTranslator
                             SpirvOp.LogicalNot,
                             _boolType,
                             isSet));
+                return true;
+            }
+
+            if (instruction.Opcode is "SCmpEqU64" or "SCmpLgU64")
+            {
+                Store(
+                    _scc,
+                    _module.AddInstruction(
+                        instruction.Opcode == "SCmpEqU64"
+                            ? SpirvOp.IEqual
+                            : SpirvOp.INotEqual,
+                        _boolType,
+                        GetRawSource64(instruction, 0),
+                        GetRawSource64(instruction, 1)));
                 return true;
             }
 
