@@ -294,6 +294,17 @@ internal static unsafe class VulkanVideoPresenter
     private static long _vkAllocCount;
     private static Thread? _thread;
     private static Presentation? _latestPresentation;
+
+    // Timestamp of the most recent AvPlayer video-frame present. While this is
+    // fresh, the game's own display-buffer flips are suppressed so an actively
+    // playing video (intro) owns the swapchain instead of the game's concurrent
+    // loading frames. Gated by SHARPEMU_AVPLAYER_PRESENT via TryPresentVideoFrame.
+    private static long _lastVideoPresentTicks;
+
+    private static bool VideoPresentIsActive() =>
+        _lastVideoPresentTicks != 0 &&
+        System.Diagnostics.Stopwatch.GetTimestamp() - _lastVideoPresentTicks
+            < System.Diagnostics.Stopwatch.Frequency / 2;
     private static byte[]? _copyFragmentSpirv;
     private static uint _windowWidth;
     private static uint _windowHeight;
@@ -588,6 +599,10 @@ internal static unsafe class VulkanVideoPresenter
                 TranslatedDraw: null,
                 RequiredGuestWorkSequence: _enqueuedGuestWorkSequence,
                 IsSplash: false);
+            // Mark the video active so the game's own flips do not overwrite the
+            // playing clip on the swapchain (they otherwise race and win). The
+            // window lapses shortly after the last delivered frame (end of clip).
+            _lastVideoPresentTicks = System.Diagnostics.Stopwatch.GetTimestamp();
             System.Threading.Monitor.PulseAll(_gate);
             if (_thread is not null)
             {
@@ -7983,19 +7998,26 @@ internal static unsafe class VulkanVideoPresenter
 
                 lock (_gate)
                 {
-                    var sequence = (_latestPresentation?.Sequence ?? 0) + 1;
-                    _latestPresentation = new Presentation(
-                        null,
-                        work.Width,
-                        work.Height,
-                        sequence,
-                        GuestDrawKind.None,
-                        TranslatedDraw: null,
-                        RequiredGuestWorkSequence: requiredWorkSequence,
-                        IsSplash: false,
-                        GuestImageAddress: work.Address,
-                        GuestImageVersion: work.Version);
-                    System.Threading.Monitor.PulseAll(_gate);
+                    // An actively playing AvPlayer video owns the swapchain; skip
+                    // the game's concurrent flip so the clip is not overwritten.
+                    // The captured snapshot is reclaimed below as an abandoned
+                    // version, so nothing leaks when we do not present it.
+                    if (!VideoPresentIsActive())
+                    {
+                        var sequence = (_latestPresentation?.Sequence ?? 0) + 1;
+                        _latestPresentation = new Presentation(
+                            null,
+                            work.Width,
+                            work.Height,
+                            sequence,
+                            GuestDrawKind.None,
+                            TranslatedDraw: null,
+                            RequiredGuestWorkSequence: requiredWorkSequence,
+                            IsSplash: false,
+                            GuestImageAddress: work.Address,
+                            GuestImageVersion: work.Version);
+                        System.Threading.Monitor.PulseAll(_gate);
+                    }
                 }
 
                 CollectAbandonedGuestImageVersions();
