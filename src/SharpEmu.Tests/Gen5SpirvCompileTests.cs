@@ -385,6 +385,26 @@ public sealed class Gen5SpirvCompileTests
     }
 
     [Fact]
+    public void PixelShader_ReadFirstLane_StoresScalarBroadcastFromGuestActiveLane()
+    {
+        // v_readfirstlane_b32 s5, v0: the value must land in the SGPR file
+        // (never a VGPR) and come from the first guest-EXEC-active lane via a
+        // ballot + broadcast, not a per-lane move.
+        const ushort OpGroupNonUniformBroadcast = 337;
+        const ushort OpGroupNonUniformBallot = 339;
+        var module = CompilePixelShader(0x7E0A0500, ExportV0Rgba, 0x00000000, SEndpgm);
+
+        Assert.Contains(
+            module.Instructions,
+            i => i.Opcode == OpGroupNonUniformBallot);
+        Assert.Contains(
+            module.Instructions,
+            i => i.Opcode == OpGroupNonUniformBroadcast);
+        var stores = ScalarRegisterStoreCounts(module);
+        Assert.Equal(1, stores.GetValueOrDefault(5u));
+    }
+
+    [Fact]
     public void PixelShader_VectorCompare_BallotIsMaskedWithExec()
     {
         // v_cmp_lt_f32 vcc, v1, v2: the VCC ballot must be EXEC & condition;

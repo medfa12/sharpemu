@@ -113,6 +113,31 @@ public sealed class Gen5ShaderTranslatorTests
     }
 
     [Fact]
+    public void Decode_VReadfirstlaneB32_TargetsScalarDestination()
+    {
+        // v_readfirstlane_b32 s5, v3: VOP1 op 0x02, dst field 5, src0 v3.
+        // The VOP1 destination field names an SGPR for this opcode; decoding
+        // it as a VGPR leaves the scalar register stale and clobbers v5.
+        var program = Decode(0x7E0A_0503, SEndpgm);
+
+        var lane = program.Instructions[0];
+        Assert.Equal("VReadfirstlaneB32", lane.Opcode);
+        Assert.Equal(Gen5Operand.Scalar(5), Assert.Single(lane.Destinations));
+        Assert.Equal(Gen5Operand.Vector(3), Assert.Single(lane.Sources));
+    }
+
+    [Fact]
+    public void Decode_VMovB32_KeepsVectorDestination()
+    {
+        // v_mov_b32 v5, v3: VOP1 op 0x01 destinations stay vector registers.
+        var program = Decode(0x7E0A_0303, SEndpgm);
+
+        var mov = program.Instructions[0];
+        Assert.Equal("VMovB32", mov.Opcode);
+        Assert.Equal(Gen5Operand.Vector(5), Assert.Single(mov.Destinations));
+    }
+
+    [Fact]
     public void Decode_SBranch_IsRecognizedAsSopp()
     {
         // s_branch +1: SOPP op 0x02, simm16 1

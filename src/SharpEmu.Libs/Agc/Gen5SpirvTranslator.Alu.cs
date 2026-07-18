@@ -22,6 +22,48 @@ internal static partial class Gen5SpirvTranslator
                 return TryEmitVectorCompare(instruction, out error);
             }
 
+            if (instruction.Opcode == "VReadfirstlaneB32")
+            {
+                if (instruction.Destinations.Count == 0 ||
+                    instruction.Destinations[0].Kind != Gen5OperandKind.ScalarRegister ||
+                    instruction.Sources.Count == 0)
+                {
+                    error = "invalid read-first-lane operands";
+                    return false;
+                }
+
+                var laneValue = GetRawSource(instruction, 0);
+                if (_subgroupInvocationIdInput != 0)
+                {
+                    // SPIR-V's BroadcastFirst uses the first host-active
+                    // invocation. Guest EXEC is modeled as data, so obtain the
+                    // guest-active mask explicitly and broadcast from its first
+                    // set lane instead. This also updates the private SGPR copy
+                    // for lanes that are currently disabled and may be restored
+                    // by a later saveexec sequence.
+                    var activeLanes = _module.AddInstruction(
+                        SpirvOp.GroupNonUniformBallot,
+                        _uvec4Type,
+                        UInt(3),
+                        Load(_boolType, _exec));
+                    var activeLow = _module.AddInstruction(
+                        SpirvOp.CompositeExtract,
+                        _uintType,
+                        activeLanes,
+                        0);
+                    var firstActiveLane = Ext(73, _uintType, activeLow);
+                    laneValue = _module.AddInstruction(
+                        SpirvOp.GroupNonUniformBroadcast,
+                        _uintType,
+                        UInt(3),
+                        laneValue,
+                        firstActiveLane);
+                }
+
+                StoreS(instruction.Destinations[0].Value, laneValue);
+                return true;
+            }
+
             if (!TryGetVectorDestination(instruction, out var destination))
             {
                 error = "missing vector destination";
@@ -33,7 +75,6 @@ internal static partial class Gen5SpirvTranslator
             {
                 case "VMovB32":
                 case "VReadlaneB32":
-                case "VReadfirstlaneB32":
                     result = GetRawSource(instruction, 0);
                     break;
                 case "VCndmaskB32":
