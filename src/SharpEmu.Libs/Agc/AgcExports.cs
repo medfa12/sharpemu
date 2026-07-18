@@ -501,7 +501,7 @@ public static class AgcExports
         }
     }
 
-    private readonly record struct RenderTargetDescriptor(
+    internal readonly record struct RenderTargetDescriptor(
         uint Slot,
         ulong Address,
         uint Width,
@@ -4463,6 +4463,48 @@ public static class AgcExports
                 out translationError))
         {
             state.TranslatedDraw = translatedDraw;
+            if (TryGetHardwareColorResolveTargets(
+                    state.CxRegisters,
+                    out var resolveSource,
+                    out var resolveDestination))
+            {
+                if (VulkanVideoPresenter.TrySubmitGuestImageBlit(
+                        resolveSource.Address,
+                        resolveSource.Width,
+                        resolveSource.Height,
+                        resolveSource.Format,
+                        resolveSource.NumberType,
+                        resolveDestination.Address,
+                        resolveDestination.Width,
+                        resolveDestination.Height,
+                        resolveDestination.Format,
+                        resolveDestination.NumberType))
+                {
+                    state.RenderTargetWriters[resolveDestination.Address] =
+                        new RenderTargetWriter(
+                            drawSequence,
+                            exportShaderAddress,
+                            pixelShaderAddress,
+                            vertexCount,
+                            primitiveType);
+                    TraceAgcShader(
+                        $"agc.hardware_color_resolve seq={drawSequence} " +
+                        $"src=0x{resolveSource.Address:X16}:" +
+                        $"{resolveSource.Width}x{resolveSource.Height}:" +
+                        $"fmt{resolveSource.Format}/num{resolveSource.NumberType} " +
+                        $"dst=0x{resolveDestination.Address:X16}:" +
+                        $"{resolveDestination.Width}x{resolveDestination.Height}:" +
+                        $"fmt{resolveDestination.Format}/num{resolveDestination.NumberType}");
+                    state.TranslatedDraw = null;
+                    return;
+                }
+
+                TraceAgcShader(
+                    $"agc.hardware_color_resolve_unavailable seq={drawSequence} " +
+                    $"src=0x{resolveSource.Address:X16} " +
+                    $"dst=0x{resolveDestination.Address:X16}");
+            }
+
             var firstTarget = translatedDraw.RenderTargets.FirstOrDefault();
             TraceFlipDraw(
                 $"seq={drawSequence} rt_count={translatedDraw.RenderTargets.Count} " +
@@ -5232,8 +5274,36 @@ public static class AgcExports
         return hash;
     }
 
+    internal static bool TryGetHardwareColorResolveTargets(
+        IReadOnlyDictionary<uint, uint> registers,
+        out RenderTargetDescriptor source,
+        out RenderTargetDescriptor destination)
+    {
+        source = default;
+        destination = default;
+        if (!registers.TryGetValue(CbColorControl, out var colorControl) ||
+            ((colorControl >> 4) & 0x7u) != 3u)
+        {
+            return false;
+        }
+
+        // CB_COLOR_CONTROL.MODE=RESOLVE uses color slot 0 as the multisampled
+        // source and slot 1 as the single-sample destination. CB_TARGET_MASK
+        // still enables only slot 0, so treating this like a normal MRT draw
+        // rewrites the source and leaves the following composite's input blank.
+        var boundTargets = GetRenderTargets(registers, includeMaskedTargets: true);
+        source = boundTargets.FirstOrDefault(target => target.Slot == 0);
+        destination = boundTargets.FirstOrDefault(target => target.Slot == 1);
+        return source.Address != 0 &&
+            destination.Address != 0 &&
+            source.Width == destination.Width &&
+            source.Height == destination.Height &&
+            source.Format == destination.Format;
+    }
+
     private static IReadOnlyList<RenderTargetDescriptor> GetRenderTargets(
-        IReadOnlyDictionary<uint, uint> registers)
+        IReadOnlyDictionary<uint, uint> registers,
+        bool includeMaskedTargets = false)
     {
         var hasTargetMask = registers.TryGetValue(CbTargetMask, out var targetMask);
         var targets = new List<RenderTargetDescriptor>(ColorTargetCount);
@@ -5251,7 +5321,8 @@ public static class AgcExports
 
             var address = ((ulong)(baseHigh & 0xFFu) << 40) | ((ulong)baseLow << 8);
             var writeMask = (targetMask >> ((int)slot * 4)) & 0xFu;
-            if (address == 0 || (hasTargetMask && writeMask == 0))
+            if (address == 0 ||
+                (!includeMaskedTargets && hasTargetMask && writeMask == 0))
             {
                 continue;
             }
