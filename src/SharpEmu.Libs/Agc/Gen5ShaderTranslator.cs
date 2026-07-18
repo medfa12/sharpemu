@@ -719,6 +719,7 @@ internal static class Gen5ShaderTranslator
             0x04 => "SMovB64",
             0x07 => "SNotB32",
             0x08 => "SNotB64",
+            0x09 => "SWqmB32",
             0x0A => "SWqmB64",
             0x0B => "SBrevB32",
             0x0F => "SBcnt1I32B32",

@@ -1113,6 +1113,12 @@ internal static partial class Gen5SpirvTranslator
                     StoreS(destination, result);
                     Store(_scc, IsNotZero(result));
                     return true;
+                case "SWqmB32":
+                    // Whole-quad-mode approximated as a move, matching the
+                    // SWqmB64 handling in TryEmitScalar64; SCC is exact.
+                    StoreS(destination, left);
+                    Store(_scc, IsNotZero(left));
+                    return true;
                 case "SBrevB32":
                     result = _module.AddInstruction(SpirvOp.BitReverse, _uintType, left);
                     StoreS(destination, result);
@@ -1949,6 +1955,14 @@ internal static partial class Gen5SpirvTranslator
                 Gen5OperandKind.VectorRegister => LoadV(operand.Value),
                 Gen5OperandKind.ScalarRegister => LoadS(operand.Value),
                 Gen5OperandKind.LiteralConstant => UInt(operand.Value),
+                // Encoded source 253 reads SCC as a 0/1 value.
+                Gen5OperandKind.EncodedConstant when operand.Value == 253 =>
+                    _module.AddInstruction(
+                        SpirvOp.Select,
+                        _uintType,
+                        Load(_boolType, _scc),
+                        UInt(1),
+                        UInt(0)),
                 Gen5OperandKind.EncodedConstant when TryDecodeInlineConstant(
                     operand.Value,
                     out var inline) => UInt(inline),

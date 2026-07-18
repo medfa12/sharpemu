@@ -194,6 +194,45 @@ public sealed class Gen5ShaderScalarEvaluatorTests
     }
 
     [Fact]
+    public void SOrB32_ReadsSccAsSourceOperand()
+    {
+        // Encoded source 253 reads SCC as 0/1: compilers materialize condition
+        // bits with s_or_b32 dst, scc, sN (seen in title ES/PS preambles).
+        var scc = new Gen5Operand(Gen5OperandKind.EncodedConstant, 253);
+        var evaluation = Evaluate(
+            [1, 2, 4],
+            0,
+            Sop2(0, "SSubU32", dest: 3, Gen5Operand.Scalar(0), Gen5Operand.Scalar(1)), // 1-2 borrows: SCC=1
+            Sop2(4, "SOrB32", dest: 4, scc, Gen5Operand.Scalar(2)),                    // 1|4
+            Sop2(8, "SSubU32", dest: 5, Gen5Operand.Scalar(1), Gen5Operand.Scalar(0)), // 2-1: SCC=0
+            Sop2(12, "SOrB32", dest: 6, Gen5Operand.Scalar(2), scc),                   // 4|0
+            EndPgm(16));
+
+        Assert.Equal(5u, evaluation.ScalarRegisters[4]);
+        Assert.Equal(4u, evaluation.ScalarRegisters[6]);
+    }
+
+    [Fact]
+    public void SWqmB32_KeepsValueAndSetsScc()
+    {
+        // Whole-quad-mode is approximated as a move (matching SWqmB64); SCC
+        // (result != 0) is exact because WQM(x) != 0 iff x != 0.
+        var evaluation = Evaluate(
+            [0x12, 0xAAAA, 0xBBBB],
+            0,
+            Sop1(0, "SWqmB32", dest: 3, Gen5Operand.Scalar(0)),
+            Sop2(4, "SCselectB32", dest: 4, Gen5Operand.Scalar(1), Gen5Operand.Scalar(2)),
+            Sop1(8, "SWqmB32", dest: 5, Literal(0)),
+            Sop2(12, "SCselectB32", dest: 6, Gen5Operand.Scalar(1), Gen5Operand.Scalar(2)),
+            EndPgm(16));
+
+        Assert.Equal(0x12u, evaluation.ScalarRegisters[3]);
+        Assert.Equal(0xAAAAu, evaluation.ScalarRegisters[4]); // SCC=1 selects first
+        Assert.Equal(0u, evaluation.ScalarRegisters[5]);
+        Assert.Equal(0xBBBBu, evaluation.ScalarRegisters[6]); // SCC=0 selects second
+    }
+
+    [Fact]
     public void SBcnt1I32B32_CountsBits()
     {
         var evaluation = Evaluate(

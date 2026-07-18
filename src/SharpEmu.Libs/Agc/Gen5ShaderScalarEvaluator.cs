@@ -1102,7 +1102,11 @@ internal static class Gen5ShaderScalarEvaluator
         }
 
         if (instruction.Sources.Count == 0 ||
-            !TryEvaluateScalarOperand(instruction.Sources[0], registers, out var left))
+            !TryEvaluateScalarOperandWithScc(
+                instruction.Sources[0],
+                registers,
+                scalarConditionCode,
+                out var left))
         {
             var source = instruction.Sources.Count == 0
                 ? "<missing>"
@@ -1114,6 +1118,21 @@ internal static class Gen5ShaderScalarEvaluator
         if (instruction.Opcode == "SMovB32")
         {
             registers[destination.Value] = left;
+            return true;
+        }
+
+        // s_wqm_b32 expands each active quad's bits; approximated as a move
+        // exactly like the SWqmB64 handling above. SCC (result != 0) is exact
+        // either way since WQM(x) != 0 iff x != 0.
+        if (instruction.Opcode == "SWqmB32")
+        {
+            registers[destination.Value] = left;
+            if (destination.Value == 126)
+            {
+                execMask = MaskWaveValue((execMask & ~0xFFFF_FFFFUL) | left);
+            }
+
+            scalarConditionCode = left != 0;
             return true;
         }
 
@@ -1141,7 +1160,11 @@ internal static class Gen5ShaderScalarEvaluator
         }
 
         if (instruction.Sources.Count < 2 ||
-            !TryEvaluateScalarOperand(instruction.Sources[1], registers, out var right))
+            !TryEvaluateScalarOperandWithScc(
+                instruction.Sources[1],
+                registers,
+                scalarConditionCode,
+                out var right))
         {
             var source = instruction.Sources.Count < 2
                 ? "<missing>"
@@ -1943,6 +1966,24 @@ internal static class Gen5ShaderScalarEvaluator
             $"desc=[{descriptor}] " +
             $"base_addr=0x{baseAddress:X16} imm={control.ImmediateOffsetBytes}" +
             $"{dynamic} address=0x{address:X16}";
+    }
+
+    // SCC as a scalar source (encoded operand 253): compilers materialize a
+    // condition bit with s_or_b32/s_cselect-style reads of SCC. The evaluator
+    // tracks SCC exactly, so resolve it to 0/1 here.
+    private static bool TryEvaluateScalarOperandWithScc(
+        Gen5Operand operand,
+        uint[] scalarRegisters,
+        bool scalarConditionCode,
+        out uint value)
+    {
+        if (operand is { Kind: Gen5OperandKind.EncodedConstant, Value: 253 })
+        {
+            value = scalarConditionCode ? 1u : 0u;
+            return true;
+        }
+
+        return TryEvaluateScalarOperand(operand, scalarRegisters, out value);
     }
 
     private static bool TryEvaluateScalarOperand(

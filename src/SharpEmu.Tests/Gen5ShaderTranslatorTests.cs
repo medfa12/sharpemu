@@ -172,6 +172,20 @@ public sealed class Gen5ShaderTranslatorTests
     }
 
     [Fact]
+    public void Decode_SWqmB32_YieldsSop1Operands()
+    {
+        // s_wqm_b32 exec_lo, exec_lo: SOP1 op 0x09, sdst 126, ssrc0 126
+        // (exact word from the Astro Bot boot stream).
+        var program = Decode(0xBEFE_097E, SEndpgm);
+
+        var wqm = program.Instructions[0];
+        Assert.Equal(Gen5ShaderEncoding.Sop1, wqm.Encoding);
+        Assert.Equal("SWqmB32", wqm.Opcode);
+        Assert.Equal(Gen5Operand.Scalar(126), Assert.Single(wqm.Sources));
+        Assert.Equal(Gen5Operand.Scalar(126), Assert.Single(wqm.Destinations));
+    }
+
+    [Fact]
     public void Decode_UnknownSop1Opcode_Fails()
     {
         // SOP1 op 0x50 is not in the decode table.
