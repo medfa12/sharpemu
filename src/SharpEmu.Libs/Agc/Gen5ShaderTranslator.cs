@@ -24,6 +24,9 @@ internal static class Gen5ShaderTranslator
     private const uint ComputeUserDataRegister = 0x240;
     private const uint ComputePgmRsrc2Register = 0x213;
     private const int MaximumHardwareUserSgprs = 64;
+    private const int MinimumUserDataDwords = 16;
+    private const int MaximumUserDataDwords = 256;
+    private static int _tracedUserSgprHeuristicFallback;
     private static readonly ConditionalWeakTable<object, ShaderDecodeCache> _decodeCaches = new();
 
     private sealed class ShaderDecodeCache
@@ -211,10 +214,28 @@ internal static class Gen5ShaderTranslator
                 out var rsrc2Register,
                 out _))
         {
-            error =
-                $"missing-user-sgpr-count ud_reg=0x{userDataBaseRegister:X} " +
-                $"rsrc2_reg=0x{rsrc2Register:X}";
-            return false;
+            if (!IsSupportedUserDataBaseRegister(userDataBaseRegister))
+            {
+                error =
+                    $"missing-user-sgpr-count ud_reg=0x{userDataBaseRegister:X} " +
+                    $"rsrc2_reg=0x{rsrc2Register:X}";
+                return false;
+            }
+
+            // The stage's PGM_RSRC2 is absent from this register snapshot (the
+            // first submission's early draws are recorded before the title
+            // programs it). Seed the user-data window from the metadata
+            // heuristic instead of dropping the draw; the hardware USER_SGPR
+            // count stays the primary path whenever RSRC2 is present.
+            userSgprCount = GetUserDataDwordCount(metadata);
+            if (System.Threading.Interlocked.Exchange(
+                    ref _tracedUserSgprHeuristicFallback, 1) == 0)
+            {
+                Console.Error.WriteLine(
+                    "[LOADER][TRACE] agc.user_sgpr_heuristic_fallback " +
+                    $"ud_reg=0x{userDataBaseRegister:X} " +
+                    $"rsrc2_reg=0x{rsrc2Register:X} dwords={userSgprCount}");
+            }
         }
 
         var userData = new uint[userSgprCount];
@@ -264,11 +285,7 @@ internal static class Gen5ShaderTranslator
             count |= 0x20;
         }
 
-        if (userDataBaseRegister is not (PsUserDataRegister or
-                VsUserDataRegister or
-                GsUserDataRegister or
-                EsUserDataRegister or
-                ComputeUserDataRegister) ||
+        if (!IsSupportedUserDataBaseRegister(userDataBaseRegister) ||
             count > MaximumHardwareUserSgprs)
         {
             count = 0;
@@ -276,6 +293,48 @@ internal static class Gen5ShaderTranslator
         }
 
         return true;
+    }
+
+    private static bool IsSupportedUserDataBaseRegister(uint userDataBaseRegister) =>
+        userDataBaseRegister is PsUserDataRegister or
+            VsUserDataRegister or
+            GsUserDataRegister or
+            EsUserDataRegister or
+            ComputeUserDataRegister;
+
+    // Pre-RSRC2 sizing: how many user-data dwords the shader's metadata implies.
+    // Only used when the stage's PGM_RSRC2 register is absent from the snapshot,
+    // so a draw recorded before the register is first programmed still seeds a
+    // plausible window instead of failing translation.
+    private static int GetUserDataDwordCount(Gen5ShaderMetadata? metadata)
+    {
+        var count = MinimumUserDataDwords;
+        if (metadata is null)
+        {
+            return count;
+        }
+
+        count = Math.Max(count, checked((int)Math.Min(metadata.ExtendedUserDataSizeDwords, MaximumUserDataDwords)));
+        count = Math.Max(count, checked((int)Math.Min(metadata.ShaderResourceTableSizeDwords, MaximumUserDataDwords)));
+
+        foreach (var offset in metadata.DirectResources.Values)
+        {
+            count = Math.Max(count, checked((int)Math.Min(offset + 1u, MaximumUserDataDwords)));
+        }
+
+        foreach (var resource in metadata.Resources)
+        {
+            var size = resource.Kind switch
+            {
+                Gen5ShaderResourceKind.ReadOnlyTexture or Gen5ShaderResourceKind.ReadWriteTexture => 8u,
+                Gen5ShaderResourceKind.Sampler => 4u,
+                Gen5ShaderResourceKind.ConstantBuffer => 4u,
+                _ => 1u,
+            };
+            count = Math.Max(count, checked((int)Math.Min(resource.OffsetDwords + size, MaximumUserDataDwords)));
+        }
+
+        return count;
     }
 
     [Conditional("DEBUG")]

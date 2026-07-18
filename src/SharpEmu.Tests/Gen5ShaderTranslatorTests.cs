@@ -285,8 +285,11 @@ public sealed class Gen5ShaderTranslatorTests
     }
 
     [Fact]
-    public void TryCreateState_MissingRsrc2_FailsWithUserSgprCountError()
+    public void TryCreateState_MissingRsrc2_FallsBackToMetadataHeuristic()
     {
+        // A draw recorded before the stage's PGM_RSRC2 is first programmed must
+        // still translate: without metadata the heuristic seeds the minimum
+        // 16-dword user-data window instead of failing.
         var memory = new SparseGuestMemory();
         memory.WriteWords(ShaderAddress, SEndpgm);
 
@@ -296,11 +299,41 @@ public sealed class Gen5ShaderTranslatorTests
             shaderHeaderAddress: 0,
             shaderRegisters: new Dictionary<uint, uint>(),
             userDataBaseRegister: PsUserData,
-            out _,
+            out var state,
             out var error);
 
-        Assert.False(ok);
-        Assert.StartsWith("missing-user-sgpr-count", error);
+        Assert.True(ok, error);
+        Assert.Equal(16, state.UserData.Count);
+    }
+
+    [Fact]
+    public void TryCreateState_EsMissingRsrc2_SeedsUserDataFromRegisters()
+    {
+        // Regression shape from Astro Bot's first submission: the ES stage's
+        // user-data registers are programmed but SPI_SHADER_PGM_RSRC2_ES (0xCB)
+        // has not been written yet. The fallback window must still pick up the
+        // user data that is present.
+        var memory = new SparseGuestMemory();
+        memory.WriteWords(ShaderAddress, SEndpgm);
+        var registers = new Dictionary<uint, uint>
+        {
+            [EsUserData] = 0xAAA,
+            [EsUserData + 3] = 0xBBB,
+        };
+
+        var ok = Gen5ShaderTranslator.TryCreateState(
+            new CpuContext(memory, Generation.Gen5),
+            ShaderAddress,
+            shaderHeaderAddress: 0,
+            registers,
+            userDataBaseRegister: EsUserData,
+            out var state,
+            out var error);
+
+        Assert.True(ok, error);
+        Assert.Equal(16, state.UserData.Count);
+        Assert.Equal(0xAAAu, state.UserData[0]);
+        Assert.Equal(0xBBBu, state.UserData[3]);
     }
 
     [Fact]
