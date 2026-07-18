@@ -6752,6 +6752,8 @@ internal static unsafe class VulkanVideoPresenter
             return new byte[checked((int)expectedSize)];
         }
 
+        // Texture formats are the legacy dfmt namespace (unified IMG_FORMAT
+        // values are converted at descriptor decode by Gfx10UnifiedFormat).
         private static ulong GetTextureBytesPerPixel(uint format) =>
             format switch
             {
@@ -6768,15 +6770,11 @@ internal static unsafe class VulkanVideoPresenter
                 12 => 8UL,
                 13 => 12UL,
                 14 => 16UL,
+                16 => 2UL,
+                17 => 2UL,
+                19 => 2UL,
                 20 => 4UL,
-                22 => 8UL,
-                29 => 4UL,
-                36 => 1UL,
-                49 => 1UL,
-                56 => 4UL,
-                62 => 4UL,
-                64 => 4UL,
-                71 => 8UL,
+                34 => 4UL,
                 _ => 4UL,
             };
 
@@ -6784,8 +6782,10 @@ internal static unsafe class VulkanVideoPresenter
         {
             var blockBytes = format switch
             {
-                169 or 170 => 8UL,
-                171 or 172 or 173 or 174 or 175 or 176 or
+                // BC1 (169/170) and BC4 (175/176) are 8 bytes per 4x4 block;
+                // BC2/BC3/BC5/BC6H/BC7 are 16 bytes per block.
+                169 or 170 or 175 or 176 => 8UL,
+                171 or 172 or 173 or 174 or
                 177 or 178 or 179 or 180 or 181 or 182 => 16UL,
                 _ => 0UL,
             };
@@ -6806,6 +6806,10 @@ internal static unsafe class VulkanVideoPresenter
             return (properties.OptimalTilingFeatures & FormatFeatureFlags.DepthStencilAttachmentBit) != 0;
         }
 
+        // Sampled-texture formats arrive as the legacy dfmt/nfmt pair (the
+        // GFX10 unified IMG_FORMAT is normalized by Gfx10UnifiedFormat at
+        // descriptor decode). Canonical guest codes (GuestFormatXxx) are also
+        // accepted for deferred/aliased bindings.
         private static Format GetTextureFormat(uint format, uint numberType) =>
             (format, numberType) switch
             {
@@ -6820,49 +6824,63 @@ internal static unsafe class VulkanVideoPresenter
                 (GuestFormatR8G8B8A8Sint, _) => Format.R8G8B8A8Sint,
                 (GuestFormatR16G16B16A16Uint, _) => Format.R16G16B16A16Uint,
                 (GuestFormatR16G16B16A16Sint, _) => Format.R16G16B16A16Sint,
-                (1, 0) => Format.R8Unorm,
-                (2, 7) => Format.R16Sfloat,
-                (3, 0) => Format.R8G8Unorm,
+                (1, 9) => Format.R8Srgb,
+                (1, 4) => Format.R8Uint,
+                (1, 5) => Format.R8Sint,
+                (1, _) => Format.R8Unorm,
+                (2, 0) => Format.R16Unorm,
+                (2, 4) => Format.R16Uint,
+                (2, 5) => Format.R16Sint,
+                (2, _) => Format.R16Sfloat,
+                (3, 9) => Format.R8G8Srgb,
+                (3, 4) => Format.R8G8Uint,
+                (3, 5) => Format.R8G8Sint,
+                (3, _) => Format.R8G8Unorm,
                 (4, 4) => Format.R32Uint,
                 (4, 5) => Format.R32Sint,
-                (4, 7) => Format.R32Sfloat,
+                (4, _) => Format.R32Sfloat,
                 (5, 0) => Format.R16G16Unorm,
                 (5, 4) => Format.R16G16Uint,
                 (5, 5) => Format.R16G16Sint,
-                (5, 7) => Format.R16G16Sfloat,
-                (6, 7) => Format.B10G11R11UfloatPack32,
-                (10, 0) => Format.R8G8B8A8Unorm,
+                (5, _) => Format.R16G16Sfloat,
+                (6, _) => Format.B10G11R11UfloatPack32,
+                (7, _) => Format.B10G11R11UfloatPack32,
                 (10, 4) => Format.R8G8B8A8Uint,
                 (10, 5) => Format.R8G8B8A8Sint,
+                (10, 9) => Format.R8G8B8A8Srgb,
+                (10, _) => Format.R8G8B8A8Unorm,
                 (11, 4) => Format.R32G32Uint,
                 (11, 5) => Format.R32G32Sint,
-                (11, 7) => Format.R32G32Sfloat,
+                (11, _) => Format.R32G32Sfloat,
                 (12, 0) => Format.R16G16B16A16Unorm,
                 (12, 4) => Format.R16G16B16A16Uint,
                 (12, 5) => Format.R16G16B16A16Sint,
-                (12, 7) => Format.R16G16B16A16Sfloat,
+                (12, _) => Format.R16G16B16A16Sfloat,
                 (13, 4) => Format.R32G32B32A32Uint,
                 (13, 5) => Format.R32G32B32A32Sint,
                 (13, _) => Format.R32G32B32A32Sfloat,
                 (14, 4) => Format.R32G32B32A32Uint,
                 (14, 5) => Format.R32G32B32A32Sint,
-                (14, 7) => Format.R32G32B32A32Sfloat,
-                (20, _) => Format.R32Uint,
-                (4, _) => Format.R32Sfloat,
-                (5, _) => Format.R16G16Sfloat,
-                (7, _) => Format.B10G11R11UfloatPack32,
                 (14, _) => Format.R32G32B32A32Sfloat,
-                (22, _) => Format.R16G16B16A16Sfloat,
-                (29, _) => Format.R32Sfloat,
-                (36, _) => Format.R8Unorm,
-                (49, _) => Format.R8Uint,
-                (56, _) => Format.R8G8B8A8Unorm,
-                (62, _) => Format.R8G8B8A8Unorm,
-                (64, _) => Format.R8G8B8A8Unorm,
-                (71, _) => Format.R16G16B16A16Sfloat,
-                (75, _) => Format.R32G32Sfloat,
+                (16, 0) => Format.B5G6R5UnormPack16,
+                (17, 0) => Format.R5G5B5A1UnormPack16,
+                (19, 0) => Format.R4G4B4A4UnormPack16,
+                (20, _) => Format.R32Uint,
+                (34, 7) => Format.E5B9G9R9UfloatPack32,
                 (169, _) => Format.BC1RgbaUnormBlock,
                 (170, _) => Format.BC1RgbaSrgbBlock,
+                (171, _) => Format.BC2UnormBlock,
+                (172, _) => Format.BC2SrgbBlock,
+                (173, _) => Format.BC3UnormBlock,
+                (174, _) => Format.BC3SrgbBlock,
+                (175, 1) => Format.BC4SNormBlock,
+                (175, _) => Format.BC4UnormBlock,
+                (176, _) => Format.BC4SNormBlock,
+                (177, 1) => Format.BC5SNormBlock,
+                (177, _) => Format.BC5UnormBlock,
+                (178, _) => Format.BC5SNormBlock,
+                (179, _) => Format.BC6HUfloatBlock,
+                (180, _) => Format.BC6HSfloatBlock,
                 (181, _) => Format.BC7UnormBlock,
                 (182, _) => Format.BC7SrgbBlock,
                 _ => Format.R8G8B8A8Unorm,
@@ -6871,6 +6889,16 @@ internal static unsafe class VulkanVideoPresenter
         private static bool IsBlockCompressedFormat(Format format) =>
             format is Format.BC1RgbaUnormBlock or
                 Format.BC1RgbaSrgbBlock or
+                Format.BC2UnormBlock or
+                Format.BC2SrgbBlock or
+                Format.BC3UnormBlock or
+                Format.BC3SrgbBlock or
+                Format.BC4UnormBlock or
+                Format.BC4SNormBlock or
+                Format.BC5UnormBlock or
+                Format.BC5SNormBlock or
+                Format.BC6HUfloatBlock or
+                Format.BC6HSfloatBlock or
                 Format.BC7UnormBlock or
                 Format.BC7SrgbBlock;
 
