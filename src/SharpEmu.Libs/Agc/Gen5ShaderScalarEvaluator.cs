@@ -27,6 +27,19 @@ internal static class Gen5ShaderScalarEvaluator
     internal static long GlobalMemoryReadLibcBytes;
     internal static long GlobalMemoryReadReuses;
 
+    // Scalar loads whose pointer never resolved (a null base register, or an
+    // EUD/SRT page the guest has not mapped at translation time) used to abort
+    // the whole draw, or worse, get silently answered from the SH-register
+    // window. Degrade to reading zero instead and trace once per (shader, pc)
+    // so unmapped scalar memory surfaces in logs. STRICT restores the abort.
+    private static readonly bool _strictScalarLoad =
+        string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_STRICT_SCALAR_LOAD"),
+            "1",
+            StringComparison.Ordinal);
+    private static readonly object _scalarFallbackTraceGate = new();
+    private static readonly HashSet<(ulong Shader, uint Pc)> _tracedScalarFallbacks = [];
+
     private const long CrossFrameReadCacheMaxBytes = 1024L * 1024 * 1024;
     private static readonly object _crossFrameReadGate = new();
     private static readonly Dictionary<(ulong BaseAddress, int SizeBytes), byte[]> _crossFrameReadCache = new();
@@ -1612,6 +1625,23 @@ internal static class Gen5ShaderScalarEvaluator
               scalarBase.Value + 3 < ScalarRegisterCount &&
               scalarRegisters[scalarBase.Value + 2] == 0 &&
               scalarRegisters[scalarBase.Value + 3] == 0));
+        var scalarPointerUnbound = ShouldTreatScalarPointerAsUnbound(
+            isBufferLoad,
+            address,
+            _strictScalarLoad);
+        if (scalarPointerUnbound)
+        {
+            TraceScalarPointerFallback(
+                "null-pointer",
+                state,
+                instruction,
+                scalarBase.Value,
+                scalarRegisters,
+                control,
+                baseAddress,
+                dynamicOffset);
+        }
+
         var bufferSize = ulong.MaxValue;
         if (isBufferLoad)
         {
@@ -1670,7 +1700,7 @@ internal static class Gen5ShaderScalarEvaluator
             }
         }
 
-        if (!bufferUnbound && address == 0)
+        if (!bufferUnbound && !scalarPointerUnbound && address == 0)
         {
             error = FormatScalarLoadError(
                 "invalid-load-address",
@@ -1704,6 +1734,7 @@ internal static class Gen5ShaderScalarEvaluator
 
             var componentOffset = unchecked(byteOffset + (ulong)(index * sizeof(uint)));
             if (bufferUnbound ||
+                scalarPointerUnbound ||
                 isBufferLoad &&
                 (componentOffset >= bufferSize ||
                  bufferSize - componentOffset < sizeof(uint)))
@@ -1714,17 +1745,22 @@ internal static class Gen5ShaderScalarEvaluator
 
             if (!ctx.TryReadUInt32(
                     address + (ulong)(index * sizeof(uint)),
-                    out var value) &&
-                !TryReadUserDataScalarLoad(
-                    state,
-                    instruction,
-                    control,
-                    byteOffset,
-                    index,
-                    out value))
+                    out var value))
             {
-                if (isBufferLoad)
+                if (isBufferLoad || !_strictScalarLoad)
                 {
+                    // The pointer names guest memory that is not mapped (an
+                    // EUD/SRT page written later, or never). Feeding zero keeps
+                    // the pass alive; the trace names the page to chase.
+                    TraceScalarPointerFallback(
+                        "read-failed",
+                        state,
+                        instruction,
+                        scalarBase.Value,
+                        scalarRegisters,
+                        control,
+                        baseAddress,
+                        dynamicOffset);
                     scalarRegisters[destination.Value] = 0;
                     continue;
                 }
@@ -1838,67 +1874,44 @@ internal static class Gen5ShaderScalarEvaluator
             _ => 7,
         };
 
-    private static bool TryReadUserDataScalarLoad(
+    private static bool ShouldTreatScalarPointerAsUnbound(
+        bool isBufferLoad,
+        ulong address,
+        bool strictScalarLoad) =>
+        !isBufferLoad && address == 0 && !strictScalarLoad;
+
+    private static void TraceScalarPointerFallback(
+        string reason,
         Gen5ShaderState state,
         Gen5ShaderInstruction instruction,
+        uint scalarBase,
+        IReadOnlyList<uint> scalarRegisters,
         Gen5ScalarMemoryControl control,
-        ulong byteOffset,
-        int componentIndex,
-        out uint value)
+        ulong baseAddress,
+        ulong dynamicOffset)
     {
-        value = 0;
-        if (!instruction.Opcode.StartsWith("SLoadDword", StringComparison.Ordinal) ||
-            state.Metadata is not { } metadata ||
-            (byteOffset & 3) != 0)
+        lock (_scalarFallbackTraceGate)
         {
-            return false;
-        }
-
-        var baseDwordOffset = byteOffset >> 2;
-        if (baseDwordOffset > int.MaxValue)
-        {
-            return false;
-        }
-
-        var dwordOffset = (long)baseDwordOffset + componentIndex;
-        if (dwordOffset < 0 ||
-            dwordOffset >= state.UserData.Count ||
-            !IsShaderUserDataResourceOffset(metadata, (uint)dwordOffset))
-        {
-            return false;
-        }
-
-        value = state.UserData[(int)dwordOffset];
-        return true;
-    }
-
-    private static bool IsShaderUserDataResourceOffset(
-        Gen5ShaderMetadata metadata,
-        uint dwordOffset)
-    {
-        if (dwordOffset < metadata.ShaderResourceTableSizeDwords)
-        {
-            return true;
-        }
-
-        foreach (var resource in metadata.Resources)
-        {
-            var dwordCount = resource.Kind switch
+            if (!_tracedScalarFallbacks.Add((state.Program.Address, instruction.Pc)))
             {
-                Gen5ShaderResourceKind.ReadOnlyTexture or
-                    Gen5ShaderResourceKind.ReadWriteTexture => 8u,
-                Gen5ShaderResourceKind.Sampler or
-                    Gen5ShaderResourceKind.ConstantBuffer => 4u,
-                _ => 1u,
-            };
-            if (dwordOffset >= resource.OffsetDwords &&
-                dwordOffset < resource.OffsetDwords + dwordCount)
-            {
-                return true;
+                return;
             }
         }
 
-        return metadata.DirectResources.Values.Any(offset => offset == dwordOffset);
+        var userData = string.Join(
+            ',',
+            state.UserData.Take(32).Select((value, index) => $"s{index}=0x{value:X8}"));
+        var high = scalarBase + 1 < scalarRegisters.Count
+            ? scalarRegisters[(int)scalarBase + 1]
+            : 0;
+        Console.Error.WriteLine(
+            $"[LOADER][WARN] agc.scalar_pointer_fallback reason={reason} " +
+            $"shader=0x{state.Program.Address:X16} pc=0x{instruction.Pc:X} " +
+            $"op={instruction.Opcode} base=s{scalarBase}" +
+            $"[0x{scalarRegisters[(int)scalarBase]:X8}:0x{high:X8}] " +
+            $"base_addr=0x{baseAddress:X16} imm={control.ImmediateOffsetBytes} " +
+            $"dynamic={dynamicOffset} user_data=[{userData}] metadata=" +
+            $"{(state.Metadata is null ? "missing" : $"srt={state.Metadata.ShaderResourceTableSizeDwords},eud={state.Metadata.ExtendedUserDataSizeDwords}")}");
     }
 
     private static string FormatScalarLoadError(

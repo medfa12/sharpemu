@@ -333,4 +333,43 @@ public sealed class Gen5ShaderScalarEvaluatorTests
             evaluation.ImageBindings[1].ResourceDescriptor);
         Assert.Equal(new uint[] { 9, 10, 11, 12 }, evaluation.ImageBindings[1].SamplerDescriptor);
     }
+
+    private static Gen5ShaderInstruction SLoadDword(uint pc, uint baseRegister, uint dest)
+        => new(pc, Gen5ShaderEncoding.Smem, "SLoadDword", [0u],
+            [Gen5Operand.Scalar(baseRegister)],
+            [Gen5Operand.Scalar(dest)],
+            new Gen5ScalarMemoryControl(
+                DestinationCount: 1,
+                ImmediateOffsetBytes: 0,
+                DynamicOffsetRegister: null));
+
+    [Fact]
+    public void SLoadDword_NullPointer_ReadsZeroInsteadOfDroppingThePass()
+    {
+        // s[0:1] is a null EUD/SRT pointer. The load must degrade to zero and
+        // keep the pass alive, not abort the whole translation.
+        var evaluation = Evaluate(
+            [0, 0, 0xDEAD],
+            userDataBase: 0,
+            SLoadDword(0, baseRegister: 0, dest: 2),
+            EndPgm(4));
+
+        Assert.Equal(0u, evaluation.ScalarRegisters[2]);
+    }
+
+    [Fact]
+    public void SLoadDword_UnmappedPointer_ReadsZeroWithoutRegisterFallback()
+    {
+        // The pointer names guest memory that is not mapped. The stale
+        // destination value must be replaced by zero; it must NOT be answered
+        // from the SH-register user-data window (the old fallback served the
+        // wrong stage's registers for EUD offsets).
+        var evaluation = Evaluate(
+            [0x1000, 0, 0xDEAD],
+            userDataBase: 0,
+            SLoadDword(0, baseRegister: 0, dest: 2),
+            EndPgm(4));
+
+        Assert.Equal(0u, evaluation.ScalarRegisters[2]);
+    }
 }
