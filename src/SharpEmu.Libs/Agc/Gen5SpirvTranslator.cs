@@ -394,6 +394,31 @@ internal static partial class Gen5SpirvTranslator
                     loopHeader,
                     loopMerge);
                 _module.AddLabel(loopMerge);
+                if (_stage == Gen5SpirvStage.Pixel)
+                {
+                    // A fragment lane removed from EXEC is not a request to
+                    // write the output variable's zero initializer. It is a
+                    // killed fragment and must not participate in color,
+                    // depth, or blend operations. Keep EXEC masking during
+                    // translation, then terminate lanes that remain inactive
+                    // when the guest pixel shader exits.
+                    var returnLabel = _module.AllocateId();
+                    var killLabel = _module.AllocateId();
+                    // Materialize the condition before SelectionMerge: SPIR-V
+                    // requires the merge instruction to be immediately followed
+                    // by its structured branch terminator.
+                    var laneActive = Load(_boolType, _exec);
+                    _module.AddStatement(SpirvOp.SelectionMerge, returnLabel, 0);
+                    _module.AddStatement(
+                        SpirvOp.BranchConditional,
+                        laneActive,
+                        returnLabel,
+                        killLabel);
+                    _module.AddLabel(killLabel);
+                    _module.AddStatement(SpirvOp.Kill);
+                    _module.AddLabel(returnLabel);
+                }
+
                 _module.AddStatement(SpirvOp.Return);
                 _module.EndFunction();
 

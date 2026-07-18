@@ -405,6 +405,18 @@ public sealed class Gen5SpirvCompileTests
     }
 
     [Fact]
+    public void PixelShader_ExecInactiveLaneAtExit_IsKilledNotZeroExported()
+    {
+        // A lane whose EXEC bit is still clear when the guest program exits is
+        // a killed fragment; returning normally would store the zero-seeded
+        // outputs and paint the attachment black.
+        const ushort OpKill = 252;
+        var module = CompilePixelShader(FullscreenBarycentricPs);
+
+        Assert.Contains(module.Instructions, i => i.Opcode == OpKill);
+    }
+
+    [Fact]
     public void PixelShader_VectorCompare_BallotIsMaskedWithExec()
     {
         // v_cmp_lt_f32 vcc, v1, v2: the VCC ballot must be EXEC & condition;
