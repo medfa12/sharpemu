@@ -64,4 +64,26 @@ public sealed class Gfx10UnifiedFormatTests
         Assert.Equal(0u, numberFormat);
     }
 
+    [Theory]
+    // A texture sampling a surface rendered through CB registers must land on
+    // the producer's exact VkFormat, or the produce/consume gate rejects the
+    // alias and the pass samples never-written guest memory (black).
+    [InlineData(71u, 12u, 7u, (int)Format.R16G16B16A16Sfloat)]
+    [InlineData(36u, 6u, 7u, (int)Format.B10G11R11UfloatPack32)]
+    [InlineData(22u, 4u, 7u, (int)Format.R32Sfloat)]
+    [InlineData(77u, 14u, 7u, (int)Format.R32G32B32A32Sfloat)]
+    public void SampledUnifiedFormat_MatchesCbProducerVkFormat(
+        uint unified,
+        uint cbDataFormat,
+        uint cbNumberType,
+        int expectedVkFormat)
+    {
+        Assert.True(Gfx10UnifiedFormat.TryDecode(unified, out var dataFormat, out var numberFormat));
+        Assert.True(VulkanVideoPresenter.TryDecodeRenderTargetFormat(
+            dataFormat, numberFormat, out var sampled));
+        Assert.True(VulkanVideoPresenter.TryDecodeRenderTargetFormat(
+            cbDataFormat, cbNumberType, out var produced));
+        Assert.Equal((Format)expectedVkFormat, sampled.Format);
+        Assert.Equal(produced.Format, sampled.Format);
+    }
 }
