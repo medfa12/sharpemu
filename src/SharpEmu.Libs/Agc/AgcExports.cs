@@ -5588,7 +5588,7 @@ public static class AgcExports
         var zAddrProbe = ((ulong)zWriteBase << 8);
         if (_tracedDepthProbe.Add((zWriteBase, zInfo, depthControlProbe)))
         {
-            TraceAgc(
+            TraceAgcShader(
                 $"agc.depth_probe hasZWrite={hasZWrite} hasZInfo={hasZInfo} " +
                 $"zWriteBase=0x{zWriteBase:X8}(->0x{zAddrProbe:X}) zReadBase=0x{zReadBaseProbe:X8} " +
                 $"zInfo=0x{zInfo:X8} fmt={zInfo & 0x3u} depthControl=0x{depthControlProbe:X8} " +
@@ -5657,7 +5657,7 @@ public static class AgcExports
             testEnable, writeEnable, compareOp,
             clearEnable, clearDepth, readOnly);
 
-        TraceAgc(
+        TraceAgcShader(
             $"agc.depth_target addr=0x{address:X16} fmt={format} tile={tileMode} " +
             $"size={width}x{height} test={testEnable} write={writeEnable} zfunc={compareOp} " +
             $"clear={clearEnable}:{clearDepth:0.######} ro={readOnly}");
