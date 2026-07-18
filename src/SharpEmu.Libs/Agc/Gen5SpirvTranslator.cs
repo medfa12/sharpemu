@@ -3187,7 +3187,11 @@ internal static partial class Gen5SpirvTranslator
 
         private bool UsesSubgroupShuffle() =>
             _state.Program.Instructions.Any(instruction =>
-                instruction.Opcode is "VPermlane16B32" or "VPermlanex16B32");
+                // VReadfirstlaneB32 reads from a computed first-active lane via
+                // GroupNonUniformShuffle (Broadcast requires a constant lane id
+                // before SPIR-V 1.5).
+                instruction.Opcode is "VPermlane16B32" or "VPermlanex16B32"
+                    or "VReadfirstlaneB32");
 
         private bool UsesWaveControl() =>
             _state.Program.Instructions.Any(instruction =>

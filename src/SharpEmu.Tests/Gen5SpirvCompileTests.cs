@@ -399,15 +399,21 @@ public sealed class Gen5SpirvCompileTests
     {
         // v_readfirstlane_b32 s5, v0: the value must land in the SGPR file
         // (never a VGPR) and come from the first guest-EXEC-active lane via a
-        // ballot + broadcast, not a per-lane move.
+        // ballot + shuffle, not a per-lane move. Shuffle, not Broadcast: the
+        // lane id is computed, and Broadcast requires a constant id before
+        // SPIR-V 1.5 (silent undefined behavior on NVIDIA otherwise).
         const ushort OpGroupNonUniformBroadcast = 337;
         const ushort OpGroupNonUniformBallot = 339;
+        const ushort OpGroupNonUniformShuffle = 345;
         var module = CompilePixelShader(0x7E0A0500, ExportV0Rgba, 0x00000000, SEndpgm);
 
         Assert.Contains(
             module.Instructions,
             i => i.Opcode == OpGroupNonUniformBallot);
         Assert.Contains(
+            module.Instructions,
+            i => i.Opcode == OpGroupNonUniformShuffle);
+        Assert.DoesNotContain(
             module.Instructions,
             i => i.Opcode == OpGroupNonUniformBroadcast);
         var stores = ScalarRegisterStoreCounts(module);

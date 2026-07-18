@@ -37,10 +37,13 @@ internal static partial class Gen5SpirvTranslator
                 {
                     // SPIR-V's BroadcastFirst uses the first host-active
                     // invocation. Guest EXEC is modeled as data, so obtain the
-                    // guest-active mask explicitly and broadcast from its first
-                    // set lane instead. This also updates the private SGPR copy
-                    // for lanes that are currently disabled and may be restored
-                    // by a later saveexec sequence.
+                    // guest-active mask explicitly and read the value from its
+                    // first set lane. GroupNonUniformBroadcast is illegal here
+                    // (its lane id must be constant before SPIR-V 1.5; a computed
+                    // id is silent undefined behavior on NVIDIA), so use
+                    // GroupNonUniformShuffle, which accepts a dynamic id. When
+                    // EXEC is 0, FindILsb yields 0xFFFFFFFF; hardware
+                    // readfirstlane reads lane 0 in that case, so clamp.
                     var activeLanes = _module.AddInstruction(
                         SpirvOp.GroupNonUniformBallot,
                         _uvec4Type,
@@ -52,12 +55,23 @@ internal static partial class Gen5SpirvTranslator
                         activeLanes,
                         0);
                     var firstActiveLane = Ext(73, _uintType, activeLow);
+                    var noActiveLanes = _module.AddInstruction(
+                        SpirvOp.IEqual,
+                        _boolType,
+                        activeLow,
+                        UInt(0));
+                    var sourceLane = _module.AddInstruction(
+                        SpirvOp.Select,
+                        _uintType,
+                        noActiveLanes,
+                        UInt(0),
+                        firstActiveLane);
                     laneValue = _module.AddInstruction(
-                        SpirvOp.GroupNonUniformBroadcast,
+                        SpirvOp.GroupNonUniformShuffle,
                         _uintType,
                         UInt(3),
                         laneValue,
-                        firstActiveLane);
+                        sourceLane);
                 }
 
                 StoreS(instruction.Destinations[0].Value, laneValue);
