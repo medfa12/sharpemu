@@ -147,9 +147,11 @@ var describe = shaderTranslator.GetMethod(
     "Describe",
     BindingFlags.Public | BindingFlags.Static)
     ?? throw new InvalidOperationException("Gen5ShaderTranslator.Describe not found");
-var tryDecode = shaderTranslator.GetMethod(
-    "TryDecodeProgram",
-    BindingFlags.NonPublic | BindingFlags.Static)
+var tryDecode = shaderTranslator
+    .GetMethods(BindingFlags.NonPublic | BindingFlags.Static)
+    .SingleOrDefault(method =>
+        method.Name == "TryDecodeProgram" &&
+        method.GetParameters().Length == 4)
     ?? throw new InvalidOperationException("Gen5ShaderTranslator.TryDecodeProgram not found");
 var stateType = assembly.GetType("SharpEmu.Libs.Agc.Gen5ShaderState")
     ?? throw new InvalidOperationException("Gen5ShaderState not found");
@@ -171,9 +173,11 @@ var tryCompilePixel = spirvTranslator.GetMethods(BindingFlags.Public | BindingFl
     .Single(method =>
         method.Name == "TryCompilePixelShader" &&
         method.GetParameters()[2].ParameterType.IsGenericType);
-var tryCompileCompute = spirvTranslator.GetMethod(
-    "TryCompileComputeShader",
-    BindingFlags.Public | BindingFlags.Static)
+var tryCompileCompute = spirvTranslator
+    .GetMethods(BindingFlags.Public | BindingFlags.Static)
+    .SingleOrDefault(method =>
+        method.Name == "TryCompileComputeShader" &&
+        method.GetParameters().Length == 7)
     ?? throw new InvalidOperationException("Gen5SpirvTranslator.TryCompileComputeShader not found");
 
 var outputDirectory = args.Length > 0
@@ -254,6 +258,7 @@ foreach (var (name, expectTranslate, words) in testPrograms)
         new uint[16],
         null,
         null,
+        0u,
         0u)!;
     var evaluation = Activator.CreateInstance(
         evaluationType,
