@@ -1219,6 +1219,7 @@ public static class AvPlayerExports
                 Trace($"present_skip handle=0x{player.Handle:X16} reason=convert_failed");
                 return;
             }
+            DumpVideoFrameOnce(bgra, player.Width, player.Height);
             if (!VulkanVideoPresenter.TryPresentVideoFrame(bgra, player.Width, player.Height))
             {
                 Trace($"present_skip handle=0x{player.Handle:X16} reason=present_failed");
@@ -1230,6 +1231,41 @@ public static class AvPlayerExports
         {
             Trace($"present_error handle=0x{player.Handle:X16}: {exception.Message}");
         }
+    }
+
+    private static int _avFrameDumpCount;
+
+    // One-shot forensic dump of a converted intro frame straight to the log,
+    // independent of the swapchain (which the game's own presents race). Emits a
+    // downscaled base64 RGB block the scratchpad decoder turns into a PNG, so we
+    // can confirm the decode+convert produced a real image even when the swapchain
+    // shows the game's loading frame. Bounded to the first few frames.
+    private static void DumpVideoFrameOnce(byte[] bgra, int width, int height)
+    {
+        if (Interlocked.Increment(ref _avFrameDumpCount) > 3 || width <= 0 || height <= 0)
+        {
+            return;
+        }
+
+        const int targetWidth = 480;
+        var scale = Math.Max(1, width / targetWidth);
+        var outWidth = width / scale;
+        var outHeight = height / scale;
+        var rgb = new byte[checked(outWidth * outHeight * 3)];
+        var o = 0;
+        for (var y = 0; y < outHeight; y++)
+        {
+            var sy = y * scale;
+            for (var x = 0; x < outWidth; x++)
+            {
+                var si = checked(((sy * width) + (x * scale)) * 4);
+                rgb[o++] = bgra[si + 2]; // R
+                rgb[o++] = bgra[si + 1]; // G
+                rgb[o++] = bgra[si];     // B
+            }
+        }
+        Console.Error.WriteLine(
+            $"[LOADER][AVFRAMEDUMP] w={outWidth} h={outHeight} {Convert.ToBase64String(rgb)}");
     }
 
     // NV12 -> tightly packed BGRA8 (width*height*4, matching the swapchain's
