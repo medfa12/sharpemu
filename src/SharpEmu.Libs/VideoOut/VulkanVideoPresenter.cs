@@ -200,6 +200,18 @@ internal sealed record VulkanComputeGuestDispatch(
     uint GroupCountY,
     uint GroupCountZ);
 
+// Ordered-flip capture work item (SHARPEMU_ORDERED_FLIP). Enqueued into the
+// guest-work FIFO on a display-buffer flip so that the resolved source render
+// target is frozen into an immutable snapshot IN GUEST-QUEUE ORDER, before the
+// next frame overwrites the double-buffered contents. Version is a monotonic id
+// that the resulting Presentation carries so the present path binds the exact
+// captured snapshot.
+internal sealed record VulkanOrderedGuestFlip(
+    long Version,
+    ulong Address,
+    uint Width,
+    uint Height);
+
 internal static unsafe class VulkanVideoPresenter
 {
     private const uint DefaultWindowWidth = 1280;
@@ -317,6 +329,64 @@ internal static unsafe class VulkanVideoPresenter
         var mode = Environment.GetEnvironmentVariable("SHARPEMU_TRACE_GUEST_IMAGES");
         return string.Equals(mode, "1", StringComparison.Ordinal) ||
                string.Equals(mode, "present", StringComparison.OrdinalIgnoreCase);
+    }
+
+    // Ordered-flip capture is OFF by default; "1" enables it. When off, the
+    // present path is byte-for-byte the existing composite-heuristic behaviour.
+    internal static bool ShouldUseOrderedGuestFlip() =>
+        string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_ORDERED_FLIP"),
+            "1",
+            StringComparison.Ordinal);
+
+    // Monotonic id for ordered-flip snapshots. Assigned under _gate at enqueue.
+    private static long _orderedGuestFlipVersionSequence;
+
+    // Caller must hold _gate. Enqueues an ordered-flip capture of sourceAddress
+    // into the guest-work FIFO and returns its version. The Presentation is
+    // built later by ExecuteOrderedGuestFlip on the render thread, once the
+    // no-wait snapshot copy has been recorded and submitted in queue order.
+    private static long TryEnqueueOrderedGuestFlipLocked(
+        ulong sourceAddress,
+        uint width,
+        uint height)
+    {
+        var version = ++_orderedGuestFlipVersionSequence;
+        EnqueueGuestWorkLocked(
+            new VulkanOrderedGuestFlip(version, sourceAddress, width, height));
+        return version;
+    }
+
+    // Caller must hold _gate. On a display-buffer flip, either enqueues an
+    // ordered-flip capture (SHARPEMU_ORDERED_FLIP on -- the capture publishes its
+    // own version-tagged Presentation on the render thread once the no-wait copy
+    // is recorded), or, when off, builds the composite-heuristic Presentation
+    // immediately with the current byte-for-byte shape (GuestImageVersion == 0).
+    // Returns the enqueued ordered-flip version, or 0 when off.
+    private static long BuildDisplayFlipPresentationLocked(
+        ulong presentAddress,
+        uint width,
+        uint height)
+    {
+        if (ShouldUseOrderedGuestFlip())
+        {
+            return TryEnqueueOrderedGuestFlipLocked(presentAddress, width, height);
+        }
+
+        var sequence = (_latestPresentation?.Sequence ?? 0) + 1;
+        _latestPresentation = new Presentation(
+            null,
+            width,
+            height,
+            sequence,
+            GuestDrawKind.None,
+            TranslatedDraw: null,
+            // The blit must run after the frame's draws; without this the flip
+            // samples the source image mid-render.
+            RequiredGuestWorkSequence: _enqueuedGuestWorkSequence,
+            IsSplash: false,
+            GuestImageAddress: presentAddress);
+        return 0;
     }
 
     public static void EnsureStarted(uint width, uint height)
@@ -932,19 +1002,7 @@ internal static unsafe class VulkanVideoPresenter
 
             traceSubmission =
                 _tracedGuestImageSubmissions.Add((address, width, height));
-            var sequence = (_latestPresentation?.Sequence ?? 0) + 1;
-            _latestPresentation = new Presentation(
-                null,
-                width,
-                height,
-                sequence,
-                GuestDrawKind.None,
-                TranslatedDraw: null,
-                // The blit must run after the frame's draws; without this the
-                // flip samples the source image mid-render.
-                RequiredGuestWorkSequence: _enqueuedGuestWorkSequence,
-                IsSplash: false,
-                GuestImageAddress: presentAddress);
+            _ = BuildDisplayFlipPresentationLocked(presentAddress, width, height);
             System.Threading.Monitor.PulseAll(_gate);
             if (_thread is not null)
             {
@@ -1296,6 +1354,81 @@ internal static unsafe class VulkanVideoPresenter
                 flipAddress,
                 out sourceAddress,
                 out _);
+        }
+    }
+
+    // Ordered-flip capture test hooks. These drive the real enqueue/present-shape
+    // code paths without a Vulkan device (no render thread is started).
+    internal static void ResetOrderedFlipStateForTests()
+    {
+        lock (_gate)
+        {
+            _pendingGuestWork.Clear();
+            _enqueuedGuestWorkSequence = 0;
+            _completedGuestWorkSequence = 0;
+            _orderedGuestFlipVersionSequence = 0;
+            _latestPresentation = null;
+        }
+    }
+
+    // Runs the exact flip-presentation branch used by TrySubmitGuestImage.
+    // Returns the enqueued ordered-flip version (0 when the gate is off).
+    internal static long BuildDisplayFlipPresentationForTests(
+        ulong presentAddress,
+        uint width,
+        uint height)
+    {
+        lock (_gate)
+        {
+            return BuildDisplayFlipPresentationLocked(presentAddress, width, height);
+        }
+    }
+
+    internal static bool TryDequeueOrderedGuestFlipForTests(
+        out long version,
+        out ulong address,
+        out uint width,
+        out uint height)
+    {
+        lock (_gate)
+        {
+            if (_pendingGuestWork.TryDequeue(out var work) &&
+                work is VulkanOrderedGuestFlip flip)
+            {
+                version = flip.Version;
+                address = flip.Address;
+                width = flip.Width;
+                height = flip.Height;
+                return true;
+            }
+
+            version = 0;
+            address = 0;
+            width = 0;
+            height = 0;
+            return false;
+        }
+    }
+
+    // Reports the current latched presentation's flip identity, or (0, 0) with a
+    // false return when no presentation has been built (e.g. the ordered-flip
+    // path defers Presentation creation to the render thread).
+    internal static bool TryGetLatestFlipPresentationForTests(
+        out ulong guestImageAddress,
+        out long guestImageVersion)
+    {
+        lock (_gate)
+        {
+            if (_latestPresentation is { } latest)
+            {
+                guestImageAddress = latest.GuestImageAddress;
+                guestImageVersion = latest.GuestImageVersion;
+                return true;
+            }
+
+            guestImageAddress = 0;
+            guestImageVersion = 0;
+            return false;
         }
     }
 
@@ -1767,7 +1900,11 @@ internal static unsafe class VulkanVideoPresenter
         VulkanTranslatedGuestDraw? TranslatedDraw,
         long RequiredGuestWorkSequence,
         bool IsSplash,
-        ulong GuestImageAddress = 0);
+        ulong GuestImageAddress = 0,
+        // Non-zero only for an ordered-flip capture: identifies the frozen
+        // snapshot in _guestImageVersions to present instead of lazily sampling
+        // the (now-overwritten) live render target at GuestImageAddress.
+        long GuestImageVersion = 0);
 
     internal sealed class GuestImageResource
     {
@@ -2270,6 +2407,20 @@ internal static unsafe class VulkanVideoPresenter
         // additionally bounded by MaxInFlightGuestSubmissions.
         private const ulong MaxPooledHostBufferBytes = 768UL * 1024 * 1024;
         private readonly Queue<PendingGuestSubmission> _pendingGuestSubmissions = new();
+
+        // Ordered-flip capture (SHARPEMU_ORDERED_FLIP). Render-thread-owned:
+        // ExecuteOrderedGuestFlip and the present path both run on the render
+        // thread, so these need no lock. A snapshot is owned by exactly ONE of
+        // _guestImageVersions (captured, awaiting present) or
+        // _retiringGuestFlipSnapshots (presented or abandoned, awaiting a queue
+        // drain before it is freed) -- never both, so nothing double-frees.
+        // Snapshots are ~33MB at 4K, so MaxPendingGuestFlipVersions bounds the
+        // dict and CollectAbandonedGuestImageVersions sheds the surplus.
+        private const int MaxPendingGuestFlipVersions = 3;
+        private readonly Dictionary<long, GuestImageResource> _guestImageVersions = new();
+        private readonly HashSet<long> _capturedGuestFlipVersions = new();
+        private readonly List<GuestImageResource> _retiringGuestFlipSnapshots = new();
+        private long _guestFlipCaptureTraceCount;
 
         private readonly record struct GraphicsPipelineKey(
             string VertexShader,
@@ -7506,6 +7657,268 @@ internal static unsafe class VulkanVideoPresenter
             }
         }
 
+        // Ordered-flip capture. Runs on the render thread in guest-queue order:
+        // freezes the resolved source render target into an immutable snapshot
+        // with a NO-WAIT guest-queue submit (never QueueWaitIdle / submit-and-
+        // wait), then publishes a Presentation carrying the snapshot's version.
+        private void ExecuteOrderedGuestFlip(VulkanOrderedGuestFlip work)
+        {
+            GuestImageResource? source;
+            long requiredWorkSequence;
+            lock (_gate)
+            {
+                _guestImages.TryFindPresentable(work.Address, out source!);
+                requiredWorkSequence = _enqueuedGuestWorkSequence;
+            }
+
+            if (_deviceLost || source is null || !source.Initialized)
+            {
+                Console.Error.WriteLine(
+                    $"[LOADER][WARN] vk.flip_capture_failed version={work.Version} " +
+                    $"addr=0x{work.Address:X16} found={(source is not null)} " +
+                    $"initialized={(source?.Initialized ?? false)}");
+                return;
+            }
+
+            EnsureGuestSubmissionCapacity();
+            var snapshot = CreateGuestFlipSnapshot(source, work.Version);
+            var commandBuffer = AllocateGuestCommandBuffer();
+            var submitted = false;
+            // Barrier OldLayout must be the source's ACTUAL tracked layout (it may
+            // rest in ColorAttachmentOptimal or ShaderReadOnlyOptimal), never a
+            // hardcoded guess; TransitionGuestImage reads CurrentLayout, and we
+            // restore exactly so later recorded work sees consistent tracking.
+            var originalLayout = source.CurrentLayout;
+            var originalStage = source.LastStageMask;
+            var originalAccess = source.LastAccessMask;
+            try
+            {
+                _commandBuffer = commandBuffer;
+                var beginInfo = new CommandBufferBeginInfo
+                {
+                    SType = StructureType.CommandBufferBeginInfo,
+                    Flags = CommandBufferUsageFlags.OneTimeSubmitBit,
+                };
+                Check(
+                    _vk.BeginCommandBuffer(commandBuffer, &beginInfo),
+                    "vkBeginCommandBuffer(flip capture)");
+
+                TransitionGuestImage(
+                    source,
+                    ImageLayout.TransferSrcOptimal,
+                    PipelineStageFlags.TransferBit,
+                    AccessFlags.TransferReadBit);
+                TransitionGuestImage(
+                    snapshot,
+                    ImageLayout.TransferDstOptimal,
+                    PipelineStageFlags.TransferBit,
+                    AccessFlags.TransferWriteBit);
+
+                var copy = new ImageCopy
+                {
+                    SrcSubresource = new ImageSubresourceLayers(
+                        ImageAspectFlags.ColorBit, 0, 0, 1),
+                    DstSubresource = new ImageSubresourceLayers(
+                        ImageAspectFlags.ColorBit, 0, 0, 1),
+                    Extent = new Extent3D(source.Width, source.Height, 1),
+                };
+                _vk.CmdCopyImage(
+                    commandBuffer,
+                    source.Image,
+                    ImageLayout.TransferSrcOptimal,
+                    snapshot.Image,
+                    ImageLayout.TransferDstOptimal,
+                    1,
+                    &copy);
+
+                // Restore the live target and make the snapshot presentable.
+                TransitionGuestImage(source, originalLayout, originalStage, originalAccess);
+                TransitionGuestImage(
+                    snapshot,
+                    ImageLayout.ShaderReadOnlyOptimal,
+                    PipelineStageFlags.FragmentShaderBit |
+                        PipelineStageFlags.ComputeShaderBit,
+                    AccessFlags.ShaderReadBit);
+
+                Check(
+                    _vk.EndCommandBuffer(commandBuffer),
+                    "vkEndCommandBuffer(flip capture)");
+                // NO-WAIT submit: the snapshot copy and the later present blit run
+                // on the same queue, so submission order alone guarantees the copy
+                // completes first -- no QueueWaitIdle / SubmitAndWait on this path.
+                SubmitGuestCommandBuffer(commandBuffer, new TranslatedDrawResources(), []);
+                submitted = true;
+                snapshot.Initialized = true;
+                _guestImageVersions.Add(work.Version, snapshot);
+                _capturedGuestFlipVersions.Add(work.Version);
+
+                lock (_gate)
+                {
+                    var sequence = (_latestPresentation?.Sequence ?? 0) + 1;
+                    _latestPresentation = new Presentation(
+                        null,
+                        work.Width,
+                        work.Height,
+                        sequence,
+                        GuestDrawKind.None,
+                        TranslatedDraw: null,
+                        RequiredGuestWorkSequence: requiredWorkSequence,
+                        IsSplash: false,
+                        GuestImageAddress: work.Address,
+                        GuestImageVersion: work.Version);
+                    System.Threading.Monitor.PulseAll(_gate);
+                }
+
+                CollectAbandonedGuestImageVersions();
+
+                if (_guestFlipCaptureTraceCount < 200)
+                {
+                    _guestFlipCaptureTraceCount++;
+                    Console.Error.WriteLine(
+                        $"[LOADER][TRACE] vk.flip_capture version={work.Version} " +
+                        $"addr=0x{work.Address:X16} layout={originalLayout} " +
+                        $"size={source.Width}x{source.Height} fmt={source.Format}");
+                }
+            }
+            finally
+            {
+                _commandBuffer = _presentationCommandBuffer;
+                if (!submitted)
+                {
+                    if (commandBuffer.Handle != 0)
+                    {
+                        _vk.FreeCommandBuffers(_device, _commandPool, 1, &commandBuffer);
+                    }
+
+                    DestroyGuestImage(snapshot);
+                }
+            }
+        }
+
+        // DEVICE_LOCAL TransferSrc|TransferDst|Sampled image matching the source
+        // render target's format and extent. Owns its own image + memory; not
+        // registered in _guestImages, so only the ordered-flip lifecycle frees it.
+        private GuestImageResource CreateGuestFlipSnapshot(
+            GuestImageResource source,
+            long version)
+        {
+            var imageInfo = new ImageCreateInfo
+            {
+                SType = StructureType.ImageCreateInfo,
+                ImageType = ImageType.Type2D,
+                Format = source.Format,
+                Extent = new Extent3D(source.Width, source.Height, 1),
+                MipLevels = 1,
+                ArrayLayers = 1,
+                Samples = SampleCountFlags.Count1Bit,
+                Tiling = ImageTiling.Optimal,
+                Usage = ImageUsageFlags.TransferSrcBit |
+                        ImageUsageFlags.TransferDstBit |
+                        ImageUsageFlags.SampledBit,
+                SharingMode = SharingMode.Exclusive,
+                InitialLayout = ImageLayout.Undefined,
+            };
+            Check(
+                _vk.CreateImage(_device, &imageInfo, null, out var image),
+                "vkCreateImage(flip snapshot)");
+            _vk.GetImageMemoryRequirements(_device, image, out var requirements);
+            var allocationInfo = new MemoryAllocateInfo
+            {
+                SType = StructureType.MemoryAllocateInfo,
+                AllocationSize = requirements.Size,
+                MemoryTypeIndex = FindMemoryType(
+                    requirements.MemoryTypeBits,
+                    MemoryPropertyFlags.DeviceLocalBit),
+            };
+            DeviceMemory memory = default;
+            try
+            {
+                memory = AllocateDeviceMemory(allocationInfo, "flip snapshot");
+                Check(
+                    _vk.BindImageMemory(_device, image, memory, 0),
+                    "vkBindImageMemory(flip snapshot)");
+            }
+            catch
+            {
+                if (memory.Handle != 0)
+                {
+                    FreeDeviceMemory(memory);
+                }
+
+                _vk.DestroyImage(_device, image, null);
+                throw;
+            }
+
+            SetDebugName(
+                ObjectType.Image,
+                image.Handle,
+                $"guest flip v{version} source 0x{source.Address:X16}");
+            return new GuestImageResource
+            {
+                Address = source.Address,
+                Width = source.Width,
+                Height = source.Height,
+                MipLevels = 1,
+                Format = source.Format,
+                Image = image,
+                Memory = memory,
+                MemorySize = allocationInfo.AllocationSize,
+                CurrentLayout = ImageLayout.Undefined,
+                LastUseStamp = _useStamp,
+            };
+        }
+
+        // Only the newest captured version becomes _latestPresentation; when the
+        // guest flips faster than we present, older captured versions strand in
+        // the dict. Retire all but the newest MaxPendingGuestFlipVersions so 4K
+        // snapshots cannot leak. Ownership transfers to the retire list, which is
+        // freed only after a queue drain (RetireGuestFlipSnapshotLater).
+        private void CollectAbandonedGuestImageVersions()
+        {
+            if (_guestImageVersions.Count <= MaxPendingGuestFlipVersions)
+            {
+                return;
+            }
+
+            var versions = _guestImageVersions.Keys.ToArray();
+            Array.Sort(versions);
+            var removeCount = versions.Length - MaxPendingGuestFlipVersions;
+            for (var i = 0; i < removeCount; i++)
+            {
+                var version = versions[i];
+                if (_guestImageVersions.Remove(version, out var abandoned))
+                {
+                    _capturedGuestFlipVersions.Remove(version);
+                    RetireGuestFlipSnapshotLater(abandoned);
+                }
+            }
+        }
+
+        // Defers a snapshot's destruction until the next queue drain: its copy
+        // (and, if it was presented, its blit) were submitted on _queue, so it
+        // must not be freed until a vkQueueWaitIdle has retired that GPU work.
+        private void RetireGuestFlipSnapshotLater(GuestImageResource snapshot)
+        {
+            _retiringGuestFlipSnapshots.Add(snapshot);
+        }
+
+        // Must be called only when the queue is known idle (immediately after a
+        // vkQueueWaitIdle, or after a device-wait-idle on teardown).
+        private void DrainRetiredGuestFlipSnapshots()
+        {
+            if (_retiringGuestFlipSnapshots.Count == 0)
+            {
+                return;
+            }
+
+            foreach (var snapshot in _retiringGuestFlipSnapshots)
+            {
+                DestroyGuestImage(snapshot);
+            }
+
+            _retiringGuestFlipSnapshots.Clear();
+        }
+
         [MethodImpl(MethodImplOptions.NoInlining)]
         private GuestImageResource GetOrCreateGuestImage(
             VulkanGuestRenderTarget target,
@@ -8298,6 +8711,9 @@ internal static unsafe class VulkanVideoPresenter
                         case VulkanComputeGuestDispatch computeDispatch:
                             ExecuteComputeDispatch(computeDispatch);
                             break;
+                        case VulkanOrderedGuestFlip orderedFlip:
+                            ExecuteOrderedGuestFlip(orderedFlip);
+                            break;
                     }
                 }
                 finally
@@ -8343,7 +8759,20 @@ internal static unsafe class VulkanVideoPresenter
 
             TranslatedDrawResources? translatedResources = null;
             GuestImageResource? presentedGuestImage = null;
-            if (presentation.GuestImageAddress != 0)
+            if (presentation.GuestImageVersion != 0 &&
+                _guestImageVersions.Remove(presentation.GuestImageVersion, out var snapshot))
+            {
+                // Ordered-flip capture: present the frozen snapshot, not the live
+                // (now-overwritten) render target at GuestImageAddress. Ownership
+                // moves out of the dict into the retire list right now, so every
+                // early return below still frees it exactly once; the retire list
+                // is only drained after this frame's vkQueueWaitIdle, keeping the
+                // snapshot alive for the blit that reads it.
+                _capturedGuestFlipVersions.Remove(presentation.GuestImageVersion);
+                presentedGuestImage = snapshot;
+                RetireGuestFlipSnapshotLater(snapshot);
+            }
+            else if (presentation.GuestImageAddress != 0)
             {
                 if (!_guestImages.TryFindPresentable(
                         presentation.GuestImageAddress,
@@ -8546,6 +8975,9 @@ internal static unsafe class VulkanVideoPresenter
             CheckSwapchainResult(presentResult, "vkQueuePresentKHR");
             recreateAfterPresent |= presentResult == Result.SuboptimalKhr;
             Check(_vk.QueueWaitIdle(_queue), "vkQueueWaitIdle");
+            // Queue is now idle: any ordered-flip snapshot whose copy/blit just
+            // completed (or that was abandoned this frame) is safe to free.
+            DrainRetiredGuestFlipSnapshots();
             Interlocked.Increment(ref _presentedFrameTotal);
             VideoOutExports.ReportPresentedFrame();
             _performanceHudPresentedFrames++;
@@ -10335,6 +10767,16 @@ internal static unsafe class VulkanVideoPresenter
                 DestroyGuestImage(guestImage);
             }
             _guestImages.Clear();
+            // Ordered-flip snapshots are not registered in _guestImages; free the
+            // captured-but-unpresented ones and the retire list. The device is
+            // idle here (DeviceWaitIdle above), so this is safe.
+            foreach (var snapshot in _guestImageVersions.Values)
+            {
+                DestroyGuestImage(snapshot);
+            }
+            _guestImageVersions.Clear();
+            _capturedGuestFlipVersions.Clear();
+            DrainRetiredGuestFlipSnapshots();
             lock (_gate)
             {
                 _availableGuestImages.Clear();
