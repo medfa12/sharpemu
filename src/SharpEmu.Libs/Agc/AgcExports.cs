@@ -4471,6 +4471,34 @@ public static class AgcExports
                 $"textures={translatedDraw.Textures.Count} " +
                 $"storage={translatedDraw.Textures.Any(b => b.IsStorage)} " +
                 $"verts={translatedDraw.VertexCount}");
+            if (_traceFlipDraws)
+            {
+                // Readback-free per-input provenance: the source address, format
+                // and size of every sampled texture, whether it is the storage
+                // sink, and -- crucially -- whether a GPU producer is registered
+                // at that address (produced=1) or the address was never rendered
+                // to (produced=0). This distinguishes an input that an earlier
+                // pass produced but our binding failed to alias (cascade break)
+                // from one that no pass ever wrote. Metadata only, no GPU
+                // readback, so it cannot deadlock the flip path.
+                for (var inputIndex = 0; inputIndex < translatedDraw.Textures.Count; inputIndex++)
+                {
+                    var binding = translatedDraw.Textures[inputIndex];
+                    var inputDescriptor = binding.Descriptor;
+                    var produced = inputDescriptor.Address != 0 &&
+                        VulkanVideoPresenter.IsGpuGuestImageAvailable(
+                            inputDescriptor.Address,
+                            inputDescriptor.Format,
+                            inputDescriptor.NumberType);
+                    TraceFlipDraw(
+                        $"seq={drawSequence} input={inputIndex} " +
+                        $"src=0x{inputDescriptor.Address:X16} fmt={inputDescriptor.Format} " +
+                        $"num={inputDescriptor.NumberType} " +
+                        $"size={inputDescriptor.Width}x{inputDescriptor.Height} " +
+                        $"tile={inputDescriptor.TileMode} " +
+                        $"storage={binding.IsStorage} produced={(produced ? 1 : 0)}");
+                }
+            }
             if (firstTarget.Address != 0)
             {
                 var textures = CreateVulkanGuestDrawTextures(
@@ -5804,7 +5832,7 @@ public static class AgcExports
 
         if (!isStorage &&
             descriptor.Address != 0 &&
-            VulkanVideoPresenter.IsGpuGuestImageAvailable(
+            VulkanVideoPresenter.ShouldDeferSampledGuestTexture(
                 descriptor.Address,
                 descriptor.Format,
                 descriptor.NumberType))

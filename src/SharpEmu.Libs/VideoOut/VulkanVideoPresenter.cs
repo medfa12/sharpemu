@@ -339,6 +339,19 @@ internal static unsafe class VulkanVideoPresenter
             "1",
             StringComparison.Ordinal);
 
+    // Focused, default-off gate for the title-composite black-output fix. When
+    // set, the sampled-input binding gate becomes format-strict (mirroring the
+    // acelogic fork's IsGuestImageAvailable) so a composite input whose sampled
+    // guest format does not match any GPU producer registered at its address
+    // reads real guest memory instead of deferring to an alias that resolves
+    // black, and the native-format alias may still bind a genuine GPU producer
+    // even after guest memory was read. Default runs are byte-identical.
+    internal static bool ShouldUseFlipCompositeFix() =>
+        string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_FLIP_COMPOSITE_FIX"),
+            "1",
+            StringComparison.Ordinal);
+
     // Monotonic id for ordered-flip snapshots. Assigned under _gate at enqueue.
     private static long _orderedGuestFlipVersionSequence;
 
@@ -1541,6 +1554,66 @@ internal static unsafe class VulkanVideoPresenter
             return _gpuGuestImages.ContainsKey(address) ||
                 _renderTargetGuestImages.ContainsKey(address);
         }
+    }
+
+    // Binding-time decision for a sampled (non-storage) guest input: should it
+    // be deferred to its GPU-produced VkImage (bound with empty pixels, resolved
+    // at execution against the rendered surface) instead of uploading guest
+    // memory? Default (loose) mirrors IsGpuGuestImageAvailable: any address the
+    // GPU has ever produced defers, regardless of the sampled format. Under
+    // SHARPEMU_FLIP_COMPOSITE_FIX the fork's strict rule applies: defer only when
+    // a producer registered at the address matches the sampled guest format, so a
+    // format-mismatched or never-produced input reads real guest memory rather
+    // than deferring empty and cascading to black.
+    internal static bool ShouldDeferSampledGuestTexture(
+        ulong address,
+        uint format,
+        uint numberType)
+    {
+        if (address == 0)
+        {
+            return false;
+        }
+
+        var flipCompositeFix = ShouldUseFlipCompositeFix();
+        var sampledGuestFormat = GetGuestTextureFormat(format, numberType);
+        lock (_gate)
+        {
+            var gpuKnown = _gpuGuestImages.TryGetValue(address, out var gpuFormat);
+            var renderTargetKnown =
+                _renderTargetGuestImages.TryGetValue(address, out var renderTargetFormat);
+            return DeferSampledGuestTextureDecision(
+                flipCompositeFix,
+                gpuKnown,
+                gpuFormat,
+                renderTargetKnown,
+                renderTargetFormat,
+                sampledGuestFormat);
+        }
+    }
+
+    // Pure decision extracted for unit testing. See ShouldDeferSampledGuestTexture.
+    internal static bool DeferSampledGuestTextureDecision(
+        bool flipCompositeFix,
+        bool gpuFormatKnown,
+        uint gpuFormat,
+        bool renderTargetFormatKnown,
+        uint renderTargetFormat,
+        uint sampledGuestFormat)
+    {
+        if (!gpuFormatKnown && !renderTargetFormatKnown)
+        {
+            return false;
+        }
+
+        if (!flipCompositeFix)
+        {
+            return true;
+        }
+
+        return sampledGuestFormat != 0 &&
+            ((gpuFormatKnown && gpuFormat == sampledGuestFormat) ||
+             (renderTargetFormatKnown && renderTargetFormat == sampledGuestFormat));
     }
 
     private static readonly HashSet<ulong> _tracedGateRejects = new();
@@ -5283,9 +5356,13 @@ internal static unsafe class VulkanVideoPresenter
             // OWN format so the sampler reads real pixels (possibly reinterpreted)
             // instead of an empty upload. Only for non-fallback address textures
             // that carry no CPU pixels (i.e. deferred render-target references).
+            // The strict-gate fix may read guest memory for a cross-format input
+            // (populated RgbaPixels), but a genuine GPU producer surface still
+            // holds the real content -- prefer its native-format view over the
+            // guest-memory upload rather than regressing to a black readback.
             if (texture.Address != 0 &&
                 !texture.IsFallback &&
-                texture.RgbaPixels.Length == 0 &&
+                (texture.RgbaPixels.Length == 0 || ShouldUseFlipCompositeFix()) &&
                 _guestImages.TryFindNativeAlias(texture, out var renderedImage) &&
                 TryGetOrCreateGuestImageView(
                     renderedImage,
