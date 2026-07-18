@@ -145,6 +145,108 @@ public sealed class Gen5ShaderTranslatorTests
     }
 
     [Fact]
+    public void Decode_SAbsI32_DecodesWithScalarOperands()
+    {
+        // s_abs_i32 s13, s24 (SOP1 0x34): the exact word Astro Bot's
+        // title-time compute shaders hit.
+        var program = Decode(0xBE8D3418, SEndpgm);
+
+        var abs = program.Instructions[0];
+        Assert.Equal(Gen5ShaderEncoding.Sop1, abs.Encoding);
+        Assert.Equal("SAbsI32", abs.Opcode);
+        Assert.Equal(Gen5Operand.Scalar(13), Assert.Single(abs.Destinations));
+        Assert.Equal(Gen5Operand.Scalar(24), Assert.Single(abs.Sources));
+    }
+
+    [Fact]
+    public void Decode_VXnorB32_DecodesAsVop2()
+    {
+        // v_xnor_b32 v2, v0, v1 (VOP2 0x1E, new on GFX10); Astro Bot's
+        // particle-emitter compute shader 0x555F4F500 uses it.
+        var program = Decode(0x3C040300, SEndpgm);
+
+        var xnor = program.Instructions[0];
+        Assert.Equal(Gen5ShaderEncoding.Vop2, xnor.Encoding);
+        Assert.Equal("VXnorB32", xnor.Opcode);
+        Assert.Equal(Gen5Operand.Vector(2), Assert.Single(xnor.Destinations));
+    }
+
+    [Fact]
+    public void Decode_VMbcntHiU32B32_DecodesAsVop3()
+    {
+        // v_mbcnt_hi_u32_b32 v2, v0, v1 through the VOP3 encoding (0x366).
+        var program = Decode(0xD766_0002, 0x0002_0300, SEndpgm);
+
+        var mbcnt = program.Instructions[0];
+        Assert.Equal("VMbcntHiU32B32", mbcnt.Opcode);
+        Assert.Equal(Gen5Operand.Vector(2), Assert.Single(mbcnt.Destinations));
+    }
+
+    [Fact]
+    public void Decode_DsReadB64_YieldsPairedDestinations()
+    {
+        // ds_read_b64 v[4:5], v1 offset:16 - word 0xD9D80010 from Astro Bot's
+        // title compute shader 0x500698B00.
+        var program = Decode(0xD9D80010, 0x04000001, SEndpgm);
+
+        var read = program.Instructions[0];
+        Assert.Equal(Gen5ShaderEncoding.Ds, read.Encoding);
+        Assert.Equal("DsReadB64", read.Opcode);
+        Assert.Equal(2, read.Destinations.Count);
+        Assert.Equal(Gen5Operand.Vector(4), read.Destinations[0]);
+        Assert.Equal(Gen5Operand.Vector(5), read.Destinations[1]);
+        var control = Assert.IsType<Gen5DataShareControl>(read.Control);
+        Assert.Equal(0x10u, control.Offset0);
+    }
+
+    [Fact]
+    public void Decode_DsWriteB96_ConsumesThreeDataRegisters()
+    {
+        // ds_write_b96 v1, v[8:10] offset0:0x10 offset1:0x05 - word
+        // 0xDB780510 from Astro Bot's title compute shader 0x5006E7A00 family.
+        var program = Decode(0xDB780510, 0x00000801, SEndpgm);
+
+        var write = program.Instructions[0];
+        Assert.Equal("DsWriteB96", write.Opcode);
+        Assert.Equal(4, write.Sources.Count);
+        Assert.Equal(Gen5Operand.Vector(1), write.Sources[0]);
+        Assert.Equal(Gen5Operand.Vector(8), write.Sources[1]);
+        Assert.Equal(Gen5Operand.Vector(10), write.Sources[3]);
+        Assert.Empty(write.Destinations);
+    }
+
+    [Fact]
+    public void Decode_DsWriteB128_ConsumesFourDataRegisters()
+    {
+        // ds_write_b128 v0, v[4:7] - word 0xDB7C0000 from Astro Bot's title
+        // compute shaders 0x5006F9600/0x5006FA200.
+        var program = Decode(0xDB7C0000, 0x00000400, SEndpgm);
+
+        var write = program.Instructions[0];
+        Assert.Equal("DsWriteB128", write.Opcode);
+        Assert.Equal(5, write.Sources.Count);
+        Assert.Equal(Gen5Operand.Vector(0), write.Sources[0]);
+        Assert.Equal(Gen5Operand.Vector(4), write.Sources[1]);
+        Assert.Equal(Gen5Operand.Vector(7), write.Sources[4]);
+    }
+
+    [Fact]
+    public void Decode_DsWriteAddtidB32_HasNoAddressOperand()
+    {
+        // ds_write_addtid_b32 v3 offset1:0x07 - word 0xDAC00700 from Astro
+        // Bot's emitter-side compute shader 0x555F41F00; the LDS address is
+        // offset + 4 * thread id, so only the data register is consumed.
+        var program = Decode(0xDAC00700, 0x00000300, SEndpgm);
+
+        var write = program.Instructions[0];
+        Assert.Equal("DsWriteAddtidB32", write.Opcode);
+        Assert.Equal(Gen5Operand.Vector(3), Assert.Single(write.Sources));
+        Assert.Empty(write.Destinations);
+        var control = Assert.IsType<Gen5DataShareControl>(write.Control);
+        Assert.Equal(0x07u, control.Offset1);
+    }
+
+    [Fact]
     public void Decode_SMovB32WithLiteral_YieldsLiteralOperand()
     {
         // s_mov_b32 s0, 0xDEADBEEF: SOP1 op 0x03, sdst 0, ssrc0 0xFF (literal follows)

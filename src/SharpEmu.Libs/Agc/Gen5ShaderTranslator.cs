@@ -765,6 +765,8 @@ internal static class Gen5ShaderTranslator
             0x29 => "SNandSaveexecB64",
             0x2A => "SNorSaveexecB64",
             0x2B => "SXnorSaveexecB64",
+            // s_abs_i32 keeps its SI/CI encoding on GFX10 (LLVM SOP1 0x034).
+            0x34 => "SAbsI32",
             0x37 => "SAndn1SaveexecB64",
             0x38 => "SOrn1SaveexecB64",
             // GFX10 wave32 saveexec forms (LLVM SOP1_Real_gfx10 0x3C-0x45).
@@ -1062,6 +1064,7 @@ internal static class Gen5ShaderTranslator
             0x1B => "VAndB32",
             0x1C => "VOrB32",
             0x1D => "VXorB32",
+            0x1E => "VXnorB32",
             0x1F => "VMacF32",
             0x20 => "VMadMkF32",
             0x21 => "VMadAkF32",
@@ -1198,6 +1201,7 @@ internal static class Gen5ShaderTranslator
             0x108 => "VMulF32",
             0x10F => "VMinF32",
             0x110 => "VMaxF32",
+            0x11E => "VXnorB32",
             0x11F => "VMacF32",
             0x12B => "VFmacF32",
             0x12F => "VCvtPkrtzF16F32",
@@ -1236,6 +1240,7 @@ internal static class Gen5ShaderTranslator
             0x373 => "VMadU32U16",
             0x362 => "VLdexpF32",
             0x365 => "VMbcntLoU32B32",
+            0x366 => "VMbcntHiU32B32",
             0x368 => "VCvtPknormI16F32",
             0x369 => "VCvtPknormU16F32",
             0x346 => "VLshlAddU32",
@@ -1290,6 +1295,15 @@ internal static class Gen5ShaderTranslator
             0x37 => "DsRead2B32",
             0x38 => "DsRead2St64B32",
             0x4D => "DsWriteB64",
+            // GFX10 keeps the SI/CI DS numbering: wide reads/writes and the
+            // thread-indexed write live at their original slots (LLVM
+            // DSInstructions.td DS_Real_gfx10).
+            0x76 => "DsReadB64",
+            0xB0 => "DsWriteAddtidB32",
+            0xDE => "DsWriteB96",
+            0xDF => "DsWriteB128",
+            0xFE => "DsReadB96",
+            0xFF => "DsReadB128",
             _ => string.Empty,
         };
 
@@ -1863,6 +1877,22 @@ internal static class Gen5ShaderTranslator
                         Gen5Operand.Vector(vectorData0),
                         Gen5Operand.Vector(vectorData0 + 1),
                     ],
+                    "DsWriteB96" => [
+                        Gen5Operand.Vector(vectorAddress),
+                        Gen5Operand.Vector(vectorData0),
+                        Gen5Operand.Vector(vectorData0 + 1),
+                        Gen5Operand.Vector(vectorData0 + 2),
+                    ],
+                    "DsWriteB128" => [
+                        Gen5Operand.Vector(vectorAddress),
+                        Gen5Operand.Vector(vectorData0),
+                        Gen5Operand.Vector(vectorData0 + 1),
+                        Gen5Operand.Vector(vectorData0 + 2),
+                        Gen5Operand.Vector(vectorData0 + 3),
+                    ],
+                    // ds_write_addtid_b32 has no address operand: the LDS
+                    // address is offset + 4 * thread id.
+                    "DsWriteAddtidB32" => [Gen5Operand.Vector(vectorData0)],
                     "DsWrite2B32" or "DsWrite2St64B32" => [
                         Gen5Operand.Vector(vectorAddress),
                         Gen5Operand.Vector(vectorData0),
@@ -1881,9 +1911,20 @@ internal static class Gen5ShaderTranslator
                     "DsPermuteB32" or "DsBpermuteB32" => [
                         Gen5Operand.Vector(vectorDestination),
                     ],
-                    "DsRead2B32" or "DsRead2St64B32" => [
+                    "DsRead2B32" or "DsRead2St64B32" or "DsReadB64" => [
                         Gen5Operand.Vector(vectorDestination),
                         Gen5Operand.Vector(vectorDestination + 1),
+                    ],
+                    "DsReadB96" => [
+                        Gen5Operand.Vector(vectorDestination),
+                        Gen5Operand.Vector(vectorDestination + 1),
+                        Gen5Operand.Vector(vectorDestination + 2),
+                    ],
+                    "DsReadB128" => [
+                        Gen5Operand.Vector(vectorDestination),
+                        Gen5Operand.Vector(vectorDestination + 1),
+                        Gen5Operand.Vector(vectorDestination + 2),
+                        Gen5Operand.Vector(vectorDestination + 3),
                     ],
                     _ => [],
                 };

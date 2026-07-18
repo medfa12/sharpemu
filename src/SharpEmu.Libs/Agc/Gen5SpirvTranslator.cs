@@ -1599,24 +1599,47 @@ internal static partial class Gen5SpirvTranslator
 
                     var address = GetRawSource(instruction, 0);
                     StoreLds(
-                        LdsPointer(address, EffectiveDsOffsetBytes(control.Offset0)),
+                        LdsPointer(address, DsByteOffset(control)),
                         GetRawSource(instruction, 1));
                     return true;
                 }
                 case "DsWriteB64":
+                case "DsWriteB96":
+                case "DsWriteB128":
                 {
-                    if (instruction.Sources.Count < 3)
+                    var dwords = instruction.Sources.Count - 1;
+                    if (dwords < 2)
                     {
-                        error = "missing LDS write64 source";
+                        error = "missing LDS wide write source";
                         return false;
                     }
 
                     var address = GetRawSource(instruction, 0);
-                    var offset = EffectiveDsOffsetBytes(control.Offset0);
-                    StoreLds(LdsPointer(address, offset), GetRawSource(instruction, 1));
+                    var offset = DsByteOffset(control);
+                    for (var index = 0; index < dwords; index++)
+                    {
+                        StoreLds(
+                            LdsPointer(address, offset + (uint)index * sizeof(uint)),
+                            GetRawSource(instruction, index + 1));
+                    }
+
+                    return true;
+                }
+                case "DsWriteAddtidB32":
+                {
+                    if (instruction.Sources.Count < 1)
+                    {
+                        error = "missing LDS addtid write source";
+                        return false;
+                    }
+
+                    // ds_write_addtid_b32 carries no address operand: the LDS
+                    // address is offset + 4 * flattened thread id.
                     StoreLds(
-                        LdsPointer(address, offset + sizeof(uint)),
-                        GetRawSource(instruction, 2));
+                        LdsPointer(
+                            ShiftLeftLogical(FlattenedLocalInvocationIndex(), UInt(2)),
+                            DsByteOffset(control)),
+                        GetRawSource(instruction, 0));
                     return true;
                 }
                 case "DsWrite2B32":
@@ -1643,6 +1666,9 @@ internal static partial class Gen5SpirvTranslator
                     return true;
                 }
                 case "DsReadB32":
+                case "DsReadB64":
+                case "DsReadB96":
+                case "DsReadB128":
                 {
                     if (instruction.Destinations.Count < 1 ||
                         instruction.Sources.Count < 1)
@@ -1652,10 +1678,15 @@ internal static partial class Gen5SpirvTranslator
                     }
 
                     var address = GetRawSource(instruction, 0);
-                    var value = Load(
-                        _uintType,
-                        LdsPointer(address, EffectiveDsOffsetBytes(control.Offset0)));
-                    StoreV(instruction.Destinations[0].Value, value);
+                    var offset = DsByteOffset(control);
+                    for (var index = 0; index < instruction.Destinations.Count; index++)
+                    {
+                        var value = Load(
+                            _uintType,
+                            LdsPointer(address, offset + (uint)index * sizeof(uint)));
+                        StoreV(instruction.Destinations[index].Value, value);
+                    }
+
                     return true;
                 }
                 case "DsRead2B32":
@@ -1795,6 +1826,32 @@ internal static partial class Gen5SpirvTranslator
 
         private static uint EffectiveDsOffsetBytes(uint offset, bool st64 = false) =>
             offset * (st64 ? 256u : sizeof(uint));
+
+        // Single-address DS operations use {offset1, offset0} as one unsigned
+        // 16-bit byte offset; only the two-address read2/write2 forms scale
+        // their per-slot offsets by the element size.
+        private static uint DsByteOffset(Gen5DataShareControl control) =>
+            control.Offset0 | (control.Offset1 << 8);
+
+        // The wave-relative thread id used by the addtid LDS addressing mode,
+        // reconstructed as the flattened local invocation index.
+        private uint FlattenedLocalInvocationIndex()
+        {
+            var localId = Load(_uvec3Type, _localInvocationIdInput);
+            var x = _module.AddInstruction(
+                SpirvOp.CompositeExtract, _uintType, localId, 0);
+            var y = _module.AddInstruction(
+                SpirvOp.CompositeExtract, _uintType, localId, 1);
+            var z = _module.AddInstruction(
+                SpirvOp.CompositeExtract, _uintType, localId, 2);
+            var rows = _module.AddInstruction(
+                SpirvOp.IMul,
+                _uintType,
+                IAdd(y, _module.AddInstruction(
+                    SpirvOp.IMul, _uintType, z, UInt(_localSizeY))),
+                UInt(_localSizeX));
+            return IAdd(x, rows);
+        }
 
         private uint LdsPointer(uint address, uint offsetBytes)
         {

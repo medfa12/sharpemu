@@ -388,6 +388,12 @@ internal static partial class Gen5SpirvTranslator
                 case "VXorB32":
                     result = EmitIntegerBinary(instruction, SpirvOp.BitwiseXor);
                     break;
+                case "VXnorB32":
+                    result = _module.AddInstruction(
+                        SpirvOp.Not,
+                        _uintType,
+                        EmitIntegerBinary(instruction, SpirvOp.BitwiseXor));
+                    break;
                 case "VNotB32":
                     result = _module.AddInstruction(
                         SpirvOp.Not,
@@ -1304,6 +1310,14 @@ internal static partial class Gen5SpirvTranslator
                     break;
                 case "SNotB32":
                     result = _module.AddInstruction(SpirvOp.Not, _uintType, left);
+                    StoreS(destination, result);
+                    Store(_scc, IsNotZero(result));
+                    return true;
+                case "SAbsI32":
+                    // GLSLstd450 SAbs(5); SCC reports a nonzero result.
+                    result = Bitcast(
+                        _uintType,
+                        Ext(5, _intType, Bitcast(_intType, left)));
                     StoreS(destination, result);
                     Store(_scc, IsNotZero(result));
                     return true;

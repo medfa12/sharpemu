@@ -603,6 +603,87 @@ public sealed class Gen5SpirvCompileTests
         Assert.NotEmpty(module.Instructions);
     }
 
+    private const ushort OpExtInst = 12;
+    private const ushort OpNot = 200;
+    private const ushort OpBitwiseXor = 198;
+    private const ushort OpIMul = 132;
+    private const uint StorageClassWorkgroup = 4;
+    private const uint GlslSAbs = 5;
+
+    private static SpirvModuleAssert.ParsedModule CompileComputeShader(
+        params uint[] words)
+    {
+        var (state, evaluation, _) = DecodeAndEvaluate(words);
+        var ok = Gen5SpirvTranslator.TryCompileComputeShader(
+            state,
+            evaluation,
+            8,
+            8,
+            1,
+            out var shader,
+            out var error);
+        Assert.True(ok, $"TryCompileComputeShader failed: {error}");
+        return SpirvModuleAssert.Parse(shader.Spirv);
+    }
+
+    [Fact]
+    public void PixelShader_VXnorB32_LowersToNotOfXor()
+    {
+        // v_xnor_b32 v0, v0, v1: the GFX10 opcode Astro Bot's particle
+        // emitter needs; must lower to Not(Xor).
+        var module = CompilePixelShader(
+            0x3C000300, ExportV0Rgba, 0x00000000, SEndpgm);
+
+        Assert.Contains(module.Instructions, i => i.Opcode == OpBitwiseXor);
+        Assert.Contains(module.Instructions, i => i.Opcode == OpNot);
+    }
+
+    [Fact]
+    public void PixelShader_SAbsI32_LowersToSignedAbs()
+    {
+        // s_abs_i32 s8, s8 must go through GLSLstd450 SAbs.
+        var module = CompilePixelShader(
+            0xBE883408, ExportV0Rgba, 0x00000000, SEndpgm);
+
+        Assert.Contains(
+            module.Instructions,
+            i => i.Opcode == OpExtInst && i.Words.Length > 4 && i.Words[4] == GlslSAbs);
+    }
+
+    [Fact]
+    public void ComputeShader_WideLdsAccess_CompilesToWorkgroupTraffic()
+    {
+        // ds_write_b128 v0, v[4:7] then ds_read_b64 v[8:9], v0 offset:16 -
+        // the wide LDS forms Astro Bot's title compute shaders use; both must
+        // route through the shared Workgroup lds array.
+        var module = CompileComputeShader(
+            0x7E000280,
+            0xDB7C0000, 0x00000400,
+            0xD9D80010, 0x08000000,
+            SEndpgm);
+
+        Assert.Contains(
+            module.Instructions,
+            i => i.Opcode == OpVariable && i.Words[3] == StorageClassWorkgroup);
+    }
+
+    [Fact]
+    public void ComputeShader_DsWriteAddtid_AddressesByThreadIndex()
+    {
+        // ds_write_addtid_b32 v3 offset1:0x07 has no address operand; the
+        // store lands at offset + 4 * flattened local invocation index, so
+        // the module must compute that index (an IMul over the local id).
+        var module = CompileComputeShader(
+            0x7E060280,
+            0xDAC00700, 0x00000300,
+            SEndpgm);
+
+        Assert.Contains(
+            module.Instructions,
+            i => i.Opcode == OpVariable && i.Words[3] == StorageClassWorkgroup);
+        Assert.Contains(module.Instructions, i => i.Opcode == OpIMul);
+    }
+
     [Fact]
     public void PixelShader_ExecInactiveLaneAtExit_IsKilledNotZeroExported()
     {

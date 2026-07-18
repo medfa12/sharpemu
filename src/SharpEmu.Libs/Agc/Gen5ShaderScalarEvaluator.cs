@@ -1183,6 +1183,7 @@ internal static class Gen5ShaderScalarEvaluator
             "SBrevB32" or
             "SBcnt1I32B32" or
             "SFF1I32B32" or
+            "SAbsI32" or
             "SBitset1B32")
         {
             registers[destination.Value] = instruction.Opcode switch
@@ -1191,6 +1192,9 @@ internal static class Gen5ShaderScalarEvaluator
                 "SBrevB32" => ReverseBits(left),
                 "SBcnt1I32B32" => (uint)BitOperations.PopCount(left),
                 "SFF1I32B32" => left == 0 ? uint.MaxValue : (uint)BitOperations.TrailingZeroCount(left),
+                // long-widened so |int.MinValue| wraps like hardware instead
+                // of throwing.
+                "SAbsI32" => (uint)Math.Abs((long)(int)left),
                 _ => registers[destination.Value] | (1u << ((int)left & 31)),
             };
             if (instruction.Opcode != "SBitset1B32")
