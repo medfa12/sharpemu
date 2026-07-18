@@ -15,6 +15,19 @@ public sealed class Gen5ShaderTranslatorTests
 {
     private const ulong ShaderAddress = 0x8000;
     private const uint SEndpgm = 0xBF81_0000;
+    private const uint PsUserData = 0x0C;
+    private const uint PsPgmRsrc2 = 0x0B;
+    private const uint VsUserData = 0x4C;
+    private const uint VsPgmRsrc2 = 0x4B;
+    private const uint EsUserData = 0xCC;
+    private const uint EsPgmRsrc2 = 0xCB;
+    private const uint ComputeUserData = 0x240;
+    private const uint ComputePgmRsrc2 = 0x213;
+
+    private static Dictionary<uint, uint> ComputeRegisters(uint userSgprCount = 0) => new()
+    {
+        [ComputePgmRsrc2] = userSgprCount << 1,
+    };
 
     private static Gen5ShaderProgram Decode(params uint[] words)
     {
@@ -24,8 +37,8 @@ public sealed class Gen5ShaderTranslatorTests
             new CpuContext(memory, Generation.Gen5),
             ShaderAddress,
             shaderHeaderAddress: 0,
-            shaderRegisters: new Dictionary<uint, uint>(),
-            userDataBaseRegister: 0,
+            shaderRegisters: ComputeRegisters(),
+            userDataBaseRegister: ComputeUserData,
             out var state,
             out var error);
         Assert.True(ok, $"TryCreateState failed: {error}");
@@ -40,8 +53,8 @@ public sealed class Gen5ShaderTranslatorTests
             new CpuContext(memory, Generation.Gen5),
             ShaderAddress,
             shaderHeaderAddress: 0,
-            shaderRegisters: new Dictionary<uint, uint>(),
-            userDataBaseRegister: 0,
+            shaderRegisters: ComputeRegisters(),
+            userDataBaseRegister: ComputeUserData,
             out _,
             out var error);
         Assert.False(ok);
@@ -183,8 +196,8 @@ public sealed class Gen5ShaderTranslatorTests
             new CpuContext(memory, Generation.Gen5),
             shaderAddress: 0,
             shaderHeaderAddress: 0,
-            shaderRegisters: new Dictionary<uint, uint>(),
-            userDataBaseRegister: 0,
+            shaderRegisters: ComputeRegisters(),
+            userDataBaseRegister: ComputeUserData,
             out _,
             out var error);
 
@@ -197,20 +210,140 @@ public sealed class Gen5ShaderTranslatorTests
     {
         var memory = new SparseGuestMemory();
         memory.WriteWords(ShaderAddress, SEndpgm);
-        var registers = new Dictionary<uint, uint> { [0x40] = 111, [0x41] = 222 };
+        var registers = new Dictionary<uint, uint>
+        {
+            [VsPgmRsrc2] = 2u << 1, // USER_SGPR=2
+            [VsUserData] = 111,
+            [VsUserData + 1] = 222,
+        };
 
         Assert.True(Gen5ShaderTranslator.TryCreateState(
             new CpuContext(memory, Generation.Gen5),
             ShaderAddress,
             shaderHeaderAddress: 0,
             registers,
-            userDataBaseRegister: 0x40,
+            userDataBaseRegister: VsUserData,
             out var state,
             out _));
 
         Assert.Equal(111u, state.UserData[0]);
         Assert.Equal(222u, state.UserData[1]);
-        Assert.Equal(16, state.UserData.Count); // MinimumUserDataDwords without metadata
+        // The seed window is the hardware USER_SGPR count from RSRC2, not a
+        // metadata heuristic.
+        Assert.Equal(2, state.UserData.Count);
+    }
+
+    [Fact]
+    public void TryCreateState_PsSixthUserSgprBit_WidensRegisterWindow()
+    {
+        var memory = new SparseGuestMemory();
+        memory.WriteWords(ShaderAddress, SEndpgm);
+        var registers = new Dictionary<uint, uint>
+        {
+            // USER_SGPR=3 plus the GFX10 USER_SGPR_MSB bit => 35 registers.
+            [PsPgmRsrc2] = (3u << 1) | (1u << 27),
+        };
+        for (var index = 0u; index < 35; index++)
+        {
+            registers[PsUserData + index] = 0x100 + index;
+        }
+
+        Assert.True(Gen5ShaderTranslator.TryCreateState(
+            new CpuContext(memory, Generation.Gen5),
+            ShaderAddress,
+            shaderHeaderAddress: 0,
+            registers,
+            userDataBaseRegister: PsUserData,
+            out var state,
+            out var error), error);
+
+        Assert.Equal(35, state.UserData.Count);
+        Assert.Equal(0x100u, state.UserData[0]);
+        Assert.Equal(0x100u + 34, state.UserData[34]);
+    }
+
+    [Fact]
+    public void TryCreateState_EsIgnoresSixthUserSgprBit()
+    {
+        var memory = new SparseGuestMemory();
+        memory.WriteWords(ShaderAddress, SEndpgm);
+        var registers = new Dictionary<uint, uint>
+        {
+            [EsPgmRsrc2] = (7u << 1) | (1u << 27), // ES has no USER_SGPR_MSB
+        };
+
+        Assert.True(Gen5ShaderTranslator.TryCreateState(
+            new CpuContext(memory, Generation.Gen5),
+            ShaderAddress,
+            shaderHeaderAddress: 0,
+            registers,
+            userDataBaseRegister: EsUserData,
+            out var state,
+            out var error), error);
+
+        Assert.Equal(7, state.UserData.Count);
+    }
+
+    [Fact]
+    public void TryCreateState_MissingRsrc2_FailsWithUserSgprCountError()
+    {
+        var memory = new SparseGuestMemory();
+        memory.WriteWords(ShaderAddress, SEndpgm);
+
+        var ok = Gen5ShaderTranslator.TryCreateState(
+            new CpuContext(memory, Generation.Gen5),
+            ShaderAddress,
+            shaderHeaderAddress: 0,
+            shaderRegisters: new Dictionary<uint, uint>(),
+            userDataBaseRegister: PsUserData,
+            out _,
+            out var error);
+
+        Assert.False(ok);
+        Assert.StartsWith("missing-user-sgpr-count", error);
+    }
+
+    [Fact]
+    public void TryCreateState_UnknownUserDataBase_Fails()
+    {
+        var memory = new SparseGuestMemory();
+        memory.WriteWords(ShaderAddress, SEndpgm);
+        var registers = new Dictionary<uint, uint> { [0x3F] = 2u << 1 };
+
+        var ok = Gen5ShaderTranslator.TryCreateState(
+            new CpuContext(memory, Generation.Gen5),
+            ShaderAddress,
+            shaderHeaderAddress: 0,
+            registers,
+            userDataBaseRegister: 0x40,
+            out _,
+            out var error);
+
+        Assert.False(ok);
+        Assert.StartsWith("missing-user-sgpr-count", error);
+    }
+
+    [Fact]
+    public void TryCreateState_CapturesProgramResource1()
+    {
+        var memory = new SparseGuestMemory();
+        memory.WriteWords(ShaderAddress, SEndpgm);
+        var registers = new Dictionary<uint, uint>
+        {
+            [PsPgmRsrc2] = 1u << 1,
+            [PsPgmRsrc2 - 1] = 0xDEAD_0001,
+        };
+
+        Assert.True(Gen5ShaderTranslator.TryCreateState(
+            new CpuContext(memory, Generation.Gen5),
+            ShaderAddress,
+            shaderHeaderAddress: 0,
+            registers,
+            userDataBaseRegister: PsUserData,
+            out var state,
+            out var error), error);
+
+        Assert.Equal(0xDEAD_0001u, state.ProgramResource1);
     }
 
     [Fact]
@@ -228,7 +361,7 @@ public sealed class Gen5ShaderTranslatorTests
         var ctx = new CpuContext(memory, Generation.Gen5);
 
         Assert.True(Gen5ShaderTranslator.TryCreateState(
-            ctx, ShaderAddress, 0, new Dictionary<uint, uint>(), 0, out var state, out var stateError), stateError);
+            ctx, ShaderAddress, 0, ComputeRegisters(), ComputeUserData, out var state, out var stateError), stateError);
         Assert.True(Gen5ShaderScalarEvaluator.TryEvaluate(ctx, state, out var evaluation, out var evalError), evalError);
 
         Assert.Equal(0x1111_0000u, evaluation.ScalarRegisters[0]);
@@ -307,8 +440,8 @@ public sealed class Gen5ShaderTranslatorTests
             new CpuContext(memory, Generation.Gen5),
             ShaderAddress,
             HeaderAddress,
-            shaderRegisters: new Dictionary<uint, uint>(),
-            userDataBaseRegister: 0,
+            shaderRegisters: ComputeRegisters(),
+            userDataBaseRegister: ComputeUserData,
             out var state,
             out var error);
 
@@ -330,8 +463,8 @@ public sealed class Gen5ShaderTranslatorTests
             new CpuContext(memory, Generation.Gen5),
             ShaderAddress,
             HeaderAddress,
-            shaderRegisters: new Dictionary<uint, uint>(),
-            userDataBaseRegister: 0,
+            shaderRegisters: ComputeRegisters(),
+            userDataBaseRegister: ComputeUserData,
             out _,
             out var error);
 
@@ -351,8 +484,8 @@ public sealed class Gen5ShaderTranslatorTests
             new CpuContext(memory, Generation.Gen5),
             ShaderAddress,
             HeaderAddress,
-            shaderRegisters: new Dictionary<uint, uint>(),
-            userDataBaseRegister: 0,
+            shaderRegisters: ComputeRegisters(),
+            userDataBaseRegister: ComputeUserData,
             out _,
             out var error);
 
@@ -367,23 +500,23 @@ public sealed class Gen5ShaderTranslatorTests
         var memory = new SparseGuestMemory();
         memory.WriteWords(ShaderAddress, SNop, SEndpgm);
         var ctx = new CpuContext(memory, Generation.Gen5);
-        var registers = new Dictionary<uint, uint>();
+        var registers = ComputeRegisters();
 
         // Headerless decode succeeds and is cached under (address, 0).
         Assert.True(Gen5ShaderTranslator.TryCreateState(
-            ctx, ShaderAddress, 0, registers, 0, out _, out var error), error);
+            ctx, ShaderAddress, 0, registers, ComputeUserData, out _, out var error), error);
 
         // A header declaring 4 bytes truncates before SEndpgm; an address-only
         // cache would wrongly return the cached full decode here.
         memory.WriteUInt32(HeaderAddress + ShaderSizeOffset, 4);
         Assert.False(Gen5ShaderTranslator.TryCreateState(
-            ctx, ShaderAddress, HeaderAddress, registers, 0, out _, out error));
+            ctx, ShaderAddress, HeaderAddress, registers, ComputeUserData, out _, out error));
         Assert.Contains("unterminated", error);
 
         // The full declared size still decodes independently.
         memory.WriteUInt32(HeaderAddress + ShaderSizeOffset, 8);
         Assert.True(Gen5ShaderTranslator.TryCreateState(
-            ctx, ShaderAddress, HeaderAddress, registers, 0, out var state, out error), error);
+            ctx, ShaderAddress, HeaderAddress, registers, ComputeUserData, out var state, out error), error);
         Assert.Equal(2, state.Program.Instructions.Count);
     }
 }

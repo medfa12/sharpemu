@@ -37,7 +37,13 @@ public sealed class Gen5VertexInstanceRemapTests
         var ctx = new CpuContext(memory, Generation.Gen5);
 
         Assert.True(Gen5ShaderTranslator.TryCreateState(
-            ctx, ShaderAddress, 0, new Dictionary<uint, uint>(), 0, out var state, out var stateError), stateError);
+            ctx,
+            ShaderAddress,
+            0,
+            new Dictionary<uint, uint> { [0x213] = 0 }, // COMPUTE_PGM_RSRC2, USER_SGPR=0
+            0x240,
+            out var state,
+            out var stateError), stateError);
         Assert.True(Gen5ShaderScalarEvaluator.TryEvaluate(
             ctx, state, out var evaluation, out var evalError), evalError);
         return (state, evaluation);
