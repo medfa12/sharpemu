@@ -1615,6 +1615,22 @@ internal static unsafe class VulkanVideoPresenter
         }
     }
 
+    // First-use initialization value for a depth surface the guest never
+    // explicitly cleared: the compare-neutral value for the draw's ZFUNC.
+    // Reverse-Z Greater/GreaterOrEqual tests must start at the 0.0 far plane
+    // (a 1.0 fill rejects every fragment); Less/LessOrEqual start at 1.0.
+    // Every other compare (Never/Equal/NotEqual/Always) has no neutral value,
+    // so the guest's DB_DEPTH_CLEAR register value is the best initializer.
+    internal static float SelectFirstUseDepthClearValue(
+        uint compareOp,
+        float guestClearDepth) =>
+        compareOp switch
+        {
+            1 or 3 => 1.0f, // Less / LessOrEqual
+            4 or 6 => 0.0f, // Greater / GreaterOrEqual (reverse-Z)
+            _ => guestClearDepth,
+        };
+
     internal static bool IsGpuGuestImageAvailable(
         ulong address,
         uint format,
@@ -7605,6 +7621,18 @@ internal static unsafe class VulkanVideoPresenter
                 var clearDepth =
                     depthImage is { Initialized: false } || clearDepthForDraw;
                 var clearDepthValue = effectiveDepth?.ClearDepth ?? 1.0f;
+                if (depthImage is { Initialized: false } &&
+                    !clearDepthForDraw &&
+                    effectiveDepth is { } firstUseDepth)
+                {
+                    // First use without an explicit guest clear: initialize the
+                    // surface to the compare-neutral value for the draw's ZFUNC
+                    // so the depth test does not reject every fragment (1.0
+                    // rejects everything under reverse-Z Greater tests).
+                    clearDepthValue = SelectFirstUseDepthClearValue(
+                        firstUseDepth.CompareOp,
+                        firstUseDepth.ClearDepth);
+                }
                 if (clearDepthForDraw && effectiveDepth is not null)
                 {
                     effectiveDepth = effectiveDepth with
