@@ -220,6 +220,20 @@ internal static partial class Gen5SpirvTranslator
         private readonly Dictionary<
             (uint Attribute, uint Channel),
             SpirvInterpolationCoefficients> _interpolationCoefficients = [];
+        // Translation-time diagnostics for the black-title investigation
+        // (ported from the ASTRO journal probes E15/E16): force the packed
+        // half export components to one to separate export routing from value
+        // computation, and replace pack results with an EXEC indicator (1.0
+        // active / 0.5 inactive) to expose pack-time EXEC suppression.
+        private static readonly bool _tracePackedExport =
+            Environment.GetEnvironmentVariable(
+                "SHARPEMU_TRACE_PACKED_EXPORT") == "1";
+        private static readonly bool _forcePackedExportOne =
+            Environment.GetEnvironmentVariable(
+                "SHARPEMU_FORCE_PACKED_EXPORT_ONE") == "1";
+        private static readonly bool _forcePackedStoreExecValues =
+            Environment.GetEnvironmentVariable(
+                "SHARPEMU_FORCE_PACKED_STORE_EXEC_VALUES") == "1";
         private uint _voidType;
         private uint _boolType;
         private uint _uintType;
@@ -3054,6 +3068,20 @@ internal static partial class Gen5SpirvTranslator
             Gen5ShaderInstruction instruction,
             int component)
         {
+            if (_tracePackedExport)
+            {
+                var source = instruction.Sources[component >> 1];
+                Console.Error.WriteLine(
+                    $"[AGC][PACKED-EXPORT] shader=0x{_state.Program.Address:X16} " +
+                    $"exp_pc=0x{instruction.Pc:X} component={component} " +
+                    $"source={source.Kind}:{source.Value}");
+            }
+
+            if (_forcePackedExportOne)
+            {
+                return Float(1f);
+            }
+
             var packed = LoadV(instruction.Sources[component >> 1].Value);
             var unpacked = Ext(62, _vec2Type, packed);
             return _module.AddInstruction(

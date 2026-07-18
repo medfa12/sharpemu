@@ -821,6 +821,32 @@ internal static partial class Gen5SpirvTranslator
                 {
                     var first = TruncateFloat32ForPack(GetFloatSource(instruction, 0));
                     var second = TruncateFloat32ForPack(GetFloatSource(instruction, 1));
+                    if (_forcePackedStoreExecValues)
+                    {
+                        // Journal probe E16: pack an EXEC indicator instead of
+                        // the computed halves so a readback shows whether the
+                        // pack executed with an active lane (1.0) or a
+                        // suppressed one (0.5). The store bypasses the EXEC
+                        // guard on purpose; a guarded store would erase the
+                        // very signal this probe measures.
+                        var probe = _module.AddInstruction(
+                            SpirvOp.Select,
+                            _floatType,
+                            Load(_boolType, _exec),
+                            Float(1f),
+                            Float(0.5f));
+                        var probeVector = _module.AddInstruction(
+                            SpirvOp.CompositeConstruct,
+                            _vec2Type,
+                            probe,
+                            probe);
+                        StoreV(
+                            destination,
+                            Ext(58, _uintType, probeVector),
+                            guardWithExec: false);
+                        return true;
+                    }
+
                     var vector = _module.AddInstruction(
                         SpirvOp.CompositeConstruct,
                         _vec2Type,
