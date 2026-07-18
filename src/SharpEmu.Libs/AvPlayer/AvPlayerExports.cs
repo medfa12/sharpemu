@@ -1193,11 +1193,16 @@ public static class AvPlayerExports
             "1",
             StringComparison.Ordinal);
 
-    // Converts the just-decoded NV12 frame to BGRA8 and hands it to the presenter
-    // for a direct, deadlock-free swapchain present. RawFrame is the tightly
-    // packed FFmpeg output (luma stride == Width, chroma plane at Width*Height),
-    // so it is the cleanest conversion source. Never throws out to the guest
-    // caller: a bad frame is logged and skipped.
+    private static int _presentInFlight;
+
+    // Hands the just-decoded NV12 frame to a worker for BGRA conversion and a
+    // direct swapchain present. The 4K conversion (~33MB) must NOT run on the
+    // guest delivery thread: doing it inline inside the player lock stalled the
+    // game's A/V pacing so it only ever pulled one frame (runs intro2..6 = 1
+    // frame vs intro1 = 6 without the inline present). The frame bytes are
+    // copied so the decoder can reuse RawFrame immediately; at most one convert
+    // is in flight and newer frames simply skip while busy (the presenter shows
+    // the latest converted frame anyway). Never throws out to the guest caller.
     private static void PresentVideoFrameToSwapchain(PlayerState player)
     {
         var frame = player.RawFrame;
@@ -1205,32 +1210,47 @@ public static class AvPlayerExports
         {
             return;
         }
+        if (Interlocked.CompareExchange(ref _presentInFlight, 1, 0) != 0)
+        {
+            return;
+        }
 
-        try
+        var copy = (byte[])frame.Clone();
+        var width = player.Width;
+        var height = player.Height;
+        var handle = player.Handle;
+        System.Threading.Tasks.Task.Run(() =>
         {
-            var bgra = ConvertNv12ToBgra(
-                frame,
-                player.Width,
-                player.Height,
-                player.Width,
-                checked(player.Width * player.Height));
-            if (bgra.Length == 0)
+            try
             {
-                Trace($"present_skip handle=0x{player.Handle:X16} reason=convert_failed");
-                return;
+                var bgra = ConvertNv12ToBgra(
+                    copy,
+                    width,
+                    height,
+                    width,
+                    checked(width * height));
+                if (bgra.Length == 0)
+                {
+                    Trace($"present_skip handle=0x{handle:X16} reason=convert_failed");
+                    return;
+                }
+                DumpDeliveredVideoFrame(bgra, width, height);
+                if (!VulkanVideoPresenter.TryPresentVideoFrame(bgra, width, height))
+                {
+                    Trace($"present_skip handle=0x{handle:X16} reason=present_failed");
+                    return;
+                }
+                Trace($"present handle=0x{handle:X16} {width}x{height}");
             }
-            DumpDeliveredVideoFrame(bgra, player.Width, player.Height);
-            if (!VulkanVideoPresenter.TryPresentVideoFrame(bgra, player.Width, player.Height))
+            catch (Exception exception)
             {
-                Trace($"present_skip handle=0x{player.Handle:X16} reason=present_failed");
-                return;
+                Trace($"present_error handle=0x{handle:X16}: {exception.Message}");
             }
-            Trace($"present handle=0x{player.Handle:X16} {player.Width}x{player.Height}");
-        }
-        catch (Exception exception)
-        {
-            Trace($"present_error handle=0x{player.Handle:X16}: {exception.Message}");
-        }
+            finally
+            {
+                Interlocked.Exchange(ref _presentInFlight, 0);
+            }
+        });
     }
 
     private static int _avFrameDumpCount;
