@@ -7183,6 +7183,9 @@ public static class AgcExports
                 TraceAgcShader(
                     $"agc.shader_words es=0x{exportShaderAddress:X16} " +
                     Gen5ShaderTranslator.DescribeWords(ctx, exportShaderAddress));
+                TraceAgcShader(
+                    $"agc.shader_words ps=0x{pixelShaderAddress:X16} " +
+                    Gen5ShaderTranslator.DescribeWords(ctx, pixelShaderAddress));
                 if (Gen5ShaderTranslator.TryCreateState(
                         ctx,
                         exportShaderAddress,

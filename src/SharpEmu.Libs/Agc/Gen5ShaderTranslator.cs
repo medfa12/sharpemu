@@ -125,7 +125,35 @@ internal static class Gen5ShaderTranslator
         TryDecodeProgram(ctx, shaderAddress, out var program, out var error)
             ? string.Join(',', program.Instructions.SelectMany(instruction => instruction.Words)
                 .Select(word => $"{word:X8}"))
-            : $"error={error}";
+            : $"error={error} raw={DescribeRawWords(ctx, shaderAddress)}";
+
+    /// <summary>
+    /// Raw dword dump used when decoding fails: without instruction sizes the
+    /// program end is unknown, so dump through the first s_endpgm word (which
+    /// can be a false positive inside a literal) up to a fixed cap. This keeps
+    /// the words of a shader with one unknown opcode diagnosable from a trace.
+    /// </summary>
+    private static string DescribeRawWords(CpuContext ctx, ulong shaderAddress)
+    {
+        const uint maxDwords = 1024;
+        const uint sEndpgm = 0xBF81_0000;
+        var words = new List<string>();
+        for (uint index = 0; index < maxDwords; index++)
+        {
+            if (!ctx.TryReadUInt32(shaderAddress + index * sizeof(uint), out var word))
+            {
+                break;
+            }
+
+            words.Add($"{word:X8}");
+            if (word == sEndpgm)
+            {
+                break;
+            }
+        }
+
+        return string.Join(',', words);
+    }
 
     public static bool TryCreateState(
         CpuContext ctx,
