@@ -1430,6 +1430,12 @@ internal static partial class Gen5SpirvTranslator
                 "SCbranchVccnz" => SubgroupAny(Load(_boolType, _vcc)),
                 "SCbranchExecz" => LogicalNot(SubgroupAny(Load(_boolType, _exec))),
                 "SCbranchExecnz" => SubgroupAny(Load(_boolType, _exec)),
+                // Conditional-debug branches test the COND_DBG_SYS/USER mode
+                // flags a debugger sets; retail hardware never takes them.
+                "SCbranchCdbgsys" or
+                "SCbranchCdbguser" or
+                "SCbranchCdbgsysOrUser" or
+                "SCbranchCdbgsysAndUser" => _module.ConstantBool(false),
                 _ => 0,
             };
             return condition != 0;
@@ -1444,7 +1450,13 @@ internal static partial class Gen5SpirvTranslator
                 "SNop" or
                 "SWaitcnt" or
                 "SInstPrefetch" or
-                "STtraceData")
+                "STtraceData" or
+                // GFX10 split waitcnt ops are SOPK-encoded scheduling hints;
+                // they must not reach the scalar-ALU emitter.
+                "SWaitcntVscnt" or
+                "SWaitcntVmcnt" or
+                "SWaitcntExpcnt" or
+                "SWaitcntLgkmcnt")
             {
                 return true;
             }
@@ -1503,6 +1515,33 @@ internal static partial class Gen5SpirvTranslator
                 Gen5ShaderEncoding.Sopk)
             {
                 return TryEmitScalarAlu(instruction, out error);
+            }
+
+            if (instruction.Opcode == "SRoundMode")
+            {
+                // FP_ROUND: [1:0] single / [3:2] double+half; 0 is round to
+                // nearest even, which is what the emitted SPIR-V already runs
+                // under in Vulkan. Anything else changes later arithmetic and
+                // must stay a loud failure (see #108's review thread).
+                var mode = instruction.Words[0] & 0xFFFF;
+                if ((mode & 0xF) == 0)
+                {
+                    return true;
+                }
+
+                error = $"s_round_mode 0x{mode:X} requests non-default rounding";
+                return false;
+            }
+
+            if (instruction.Opcode == "SDenormMode")
+            {
+                // The translator declares no SPIR-V denormal execution modes,
+                // so denorm behavior is host-defined and no immediate provably
+                // matches the request; keep the FP MODE write a loud failure.
+                error =
+                    $"s_denorm_mode 0x{instruction.Words[0] & 0xFFFF:X} " +
+                    "FP MODE write is not modeled";
+                return false;
             }
 
             if (instruction.Encoding is
@@ -2407,6 +2446,58 @@ internal static partial class Gen5SpirvTranslator
                 return true;
             }
 
+            if (instruction.Opcode.StartsWith("ImageAtomic", StringComparison.Ordinal))
+            {
+                if (!resource.IsStorage)
+                {
+                    error = "image atomic is not bound as storage";
+                    return false;
+                }
+
+                if (resource.ComponentKind == ImageComponentKind.Float ||
+                    !TryGetAtomicOp(instruction.Opcode["ImageAtomic".Length..], out var atomicOp))
+                {
+                    error = $"unsupported image atomic opcode {instruction.Opcode}";
+                    return false;
+                }
+
+                var signed = resource.ComponentKind == ImageComponentKind.Sint;
+                var atomicCoordinates = TryGetImageBounds(
+                        _evaluation.ImageBindings[bindingIndex].ResourceDescriptor,
+                        out var atomicWidth,
+                        out var atomicHeight)
+                    ? BuildClampedIntegerCoordinates(image, 0, atomicWidth, atomicHeight)
+                    : BuildIntegerCoordinates(image, 0);
+                EmitExecConditional(() =>
+                {
+                    var pointer = _module.AddInstruction(
+                        SpirvOp.ImageTexelPointer,
+                        _module.TypePointer(SpirvStorageClass.Image, resource.ComponentType),
+                        resource.Variable,
+                        atomicCoordinates,
+                        UInt(0));
+                    uint LoadData(uint register) => signed
+                        ? Bitcast(_intType, LoadV(register))
+                        : LoadV(register);
+                    var original = EmitImageAtomic(
+                        atomicOp,
+                        resource.ComponentType,
+                        pointer,
+                        value: () => LoadData(image.VectorData),
+                        // image_atomic_cmpswap packs src into vdata[0] and the
+                        // comparand into vdata[1].
+                        comparator: () => LoadData(image.VectorData + 1));
+                    if (image.Glc)
+                    {
+                        StoreV(
+                            image.VectorData,
+                            signed ? Bitcast(_uintType, original) : original);
+                    }
+                });
+
+                return true;
+            }
+
             if (resource.IsStorage &&
                 instruction.Opcode is not ("ImageLoad" or "ImageLoadMip"))
             {
@@ -2676,6 +2767,61 @@ internal static partial class Gen5SpirvTranslator
                 _vec2Type,
                 x,
                 y);
+        }
+
+        private static bool TryGetAtomicOp(string name, out SpirvOp op)
+        {
+            op = name switch
+            {
+                "Swap" => SpirvOp.AtomicExchange,
+                "Cmpswap" => SpirvOp.AtomicCompareExchange,
+                "Add" => SpirvOp.AtomicIAdd,
+                "Sub" => SpirvOp.AtomicISub,
+                "Smin" => SpirvOp.AtomicSMin,
+                "Umin" => SpirvOp.AtomicUMin,
+                "Smax" => SpirvOp.AtomicSMax,
+                "Umax" => SpirvOp.AtomicUMax,
+                "And" => SpirvOp.AtomicAnd,
+                "Or" => SpirvOp.AtomicOr,
+                "Xor" => SpirvOp.AtomicXor,
+                "Inc" => SpirvOp.AtomicIIncrement,
+                "Dec" => SpirvOp.AtomicIDecrement,
+                _ => SpirvOp.Nop,
+            };
+            return op != SpirvOp.Nop;
+        }
+
+        private uint EmitImageAtomic(
+            SpirvOp op,
+            uint type,
+            uint pointer,
+            Func<uint> value,
+            Func<uint> comparator)
+        {
+            var scope = UInt(1);                       // Device
+            var semantics = UInt(0x808);               // AcquireRelease | ImageMemory
+            if (op is SpirvOp.AtomicIIncrement or SpirvOp.AtomicIDecrement)
+            {
+                return _module.AddInstruction(op, type, pointer, scope, semantics);
+            }
+
+            if (op == SpirvOp.AtomicCompareExchange)
+            {
+                // The unequal semantics must not be stronger than the equal
+                // semantics and cannot include Release.
+                var unequal = UInt(0x802);             // Acquire | ImageMemory
+                return _module.AddInstruction(
+                    op,
+                    type,
+                    pointer,
+                    scope,
+                    semantics,
+                    unequal,
+                    value(),
+                    comparator());
+            }
+
+            return _module.AddInstruction(op, type, pointer, scope, semantics, value());
         }
 
         private uint BuildIntegerCoordinates(Gen5ImageControl image, int start)

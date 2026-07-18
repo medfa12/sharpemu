@@ -865,6 +865,7 @@ internal static class Gen5ShaderTranslator
             0x00 => "SNop",
             0x01 => "SEndpgm",
             0x02 => "SBranch",
+            0x03 => "SWakeup",
             0x04 => "SCbranchScc0",
             0x05 => "SCbranchScc1",
             0x06 => "SCbranchVccz",
@@ -872,12 +873,37 @@ internal static class Gen5ShaderTranslator
             0x08 => "SCbranchExecz",
             0x09 => "SCbranchExecnz",
             0x0A => "SBarrier",
+            0x0B => "SSetkill",
             0x0C => "SWaitcnt",
+            0x0D => "SSethalt",
+            0x0E => "SSleep",
+            0x0F => "SSetprio",
             0x10 => "SSendmsg",
+            0x11 => "SSendmsghalt",
+            0x12 => "STrap",
+            0x13 => "SIcacheInv",
+            0x14 => "SIncperflevel",
+            0x15 => "SDecperflevel",
             0x16 => "STtraceData",
+            // The conditional-debug branches take their branch only when the
+            // COND_DBG_SYS/USER mode flags are set by an attached debugger;
+            // retail hardware always falls through.
+            0x17 => "SCbranchCdbgsys",
+            0x18 => "SCbranchCdbguser",
+            0x19 => "SCbranchCdbgsysOrUser",
+            0x1A => "SCbranchCdbgsysAndUser",
+            // s_endpgm_saved / s_endpgm_ordered_ps_done both terminate the
+            // program exactly like s_endpgm for translation purposes.
+            0x1B => "SEndpgm",
+            0x1E => "SEndpgm",
+            0x1F => "SCodeEnd",
             0x20 => "SInstPrefetch",
             0x21 => "SClause",
+            0x22 => "SWaitIdle",
             0x23 => "SWaitcntDepctr",
+            0x24 => "SRoundMode",
+            0x25 => "SDenormMode",
+            0x28 => "STtracedataImm",
             _ => string.Empty,
         };
 
@@ -906,6 +932,12 @@ internal static class Gen5ShaderTranslator
             0x0E => "SCmpkLeU32",
             0x0F => "SAddkI32",
             0x10 => "SMulkI32",
+            // GFX10 split waitcnt: the SDST field encodes NULL and the
+            // immediate is a plain counter threshold; scheduling hints only.
+            0x17 => "SWaitcntVscnt",
+            0x18 => "SWaitcntVmcnt",
+            0x19 => "SWaitcntExpcnt",
+            0x1A => "SWaitcntLgkmcnt",
             _ => string.Empty,
         };
 
@@ -1403,7 +1435,18 @@ internal static class Gen5ShaderTranslator
             0x08 => "ImageStore",
             0x09 => "ImageStoreMip",
             0x0E => "ImageGetResinfo",
+            0x0F => "ImageAtomicSwap",
             0x10 => "ImageAtomicCmpswap",
+            0x11 => "ImageAtomicAdd",
+            0x12 => "ImageAtomicSub",
+            0x14 => "ImageAtomicSmin",
+            0x15 => "ImageAtomicUmin",
+            0x16 => "ImageAtomicSmax",
+            0x17 => "ImageAtomicUmax",
+            0x18 => "ImageAtomicAnd",
+            0x19 => "ImageAtomicOr",
+            0x1A => "ImageAtomicXor",
+            0x1B => "ImageAtomicInc",
             0x1C => "ImageAtomicDec",
             0x20 => "ImageSample",
             0x24 => "ImageSampleL",

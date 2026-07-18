@@ -190,6 +190,14 @@ internal static class Gen5ShaderScalarEvaluator
                 continue;
             }
 
+            if (instruction.Encoding == Gen5ShaderEncoding.Sopk &&
+                instruction.Opcode.StartsWith("SWaitcnt", StringComparison.Ordinal))
+            {
+                // GFX10 split waitcnt (s_waitcnt_vscnt & co) encodes NULL in
+                // the SDST field; it is a scheduling hint, not a register write.
+                continue;
+            }
+
             if (instruction.Encoding is
                 Gen5ShaderEncoding.Sop1 or
                 Gen5ShaderEncoding.Sop2 or

@@ -14,9 +14,9 @@
 // guestBuffers[0] (descriptor set 0, binding 0).
 //
 // Each program carries an expectation: ExpectTranslate=true programs must
-// decode and emit the requested stages; ExpectTranslate=false programs pin a decode
-// failure that must stay loud. Any unexpected outcome makes the tool exit
-// non-zero, so it can gate scripts/CI.
+// decode and emit the requested stages; ExpectTranslate=false programs pin a
+// translation failure (at decode or emission) that must stay loud. Any
+// unexpected outcome makes the tool exit non-zero, so it can gate scripts/CI.
 //
 // Usage: SharpEmu.Tools.ShaderDump [output-directory]
 
@@ -105,11 +105,30 @@ const ulong ProgramAddress = 0x100000;
         0xBFA30000,             // s_waitcnt_depctr 0x0
         0xBF810000,             // s_endpgm
     ]),
-    // s_round_mode / s_denorm_mode write the FP MODE state and must keep
-    // failing decode loudly until their semantics are modeled (see #108);
-    // this program pins that behavior.
-    ("sopp-mode", false, [
+    // The conditional-debug branch (SOPP 0x17) only fires when a debugger
+    // sets COND_DBG_SYS, so the skipped-over slot must still execute; the
+    // split waitcnt (SOPK 0x17) is a pure scheduling hint.
+    ("sopp-debug-branch", true, [
+        0xBF970001,             // s_cbranch_cdbgsys +1 (never taken at retail)
+        0x7E0002F2,             // v_mov_b32 v0, 1.0 (the branched-over slot)
+        0xBBFD0000,             // s_waitcnt_vscnt null, 0x0
+        0xBF810000,             // s_endpgm
+    ]),
+    // s_round_mode 0x0 is nearest-even for every width, which matches the
+    // rounding the emitted SPIR-V already runs under in Vulkan, so it is a
+    // provable no-op (the #108 review thread's follow-up plan).
+    ("sopp-round-default", true, [
         0xBFA40000,             // s_round_mode 0x0
+        0xBF810000,             // s_endpgm
+    ]),
+    // Directed rounding and denormal-mode writes change FP MODE state the
+    // translator does not model; they must keep failing translation loudly
+    // (see #108) — these programs pin that behavior.
+    ("sopp-round-directed", false, [
+        0xBFA40001,             // s_round_mode 0x1 (round toward +inf for f32)
+        0xBF810000,             // s_endpgm
+    ]),
+    ("sopp-denorm", false, [
         0xBFA50000,             // s_denorm_mode 0x0
         0xBF810000,             // s_endpgm
     ]),
@@ -214,10 +233,41 @@ foreach (var (name, expectTranslate, words) in testPrograms)
 
     if (!expectTranslate)
     {
-        failures++;
-        Console.WriteLine(
-            $"[{name}] FAILED: decoded successfully but is pinned as a decode failure — " +
-            "if the new decode support is intentional, its semantics need verifying here first");
+        // Decode succeeded, so the pin now rests on emission failing loudly.
+        var pinnedState = Activator.CreateInstance(
+            stateType,
+            decodeArgs[2]!,
+            new uint[16],
+            null,
+            null,
+            0u,
+            0u)!;
+        var pinnedEvaluation = Activator.CreateInstance(
+            evaluationType,
+            new uint[256],
+            new uint[256],
+            new Dictionary<uint, IReadOnlyList<uint>>(),
+            Array.CreateInstance(imageBindingType, 0),
+            Array.CreateInstance(globalBindingType, 0),
+            null,
+            null,
+            null)!;
+        var pinnedArgs = PadWithDefaults(
+            tryCompile,
+            [pinnedState, pinnedEvaluation, null, null]);
+        if ((bool)tryCompile.Invoke(
+                null, BindingFlags.OptionalParamBinding, null, pinnedArgs, null)!)
+        {
+            failures++;
+            Console.WriteLine(
+                $"[{name}] FAILED: translated successfully but is pinned as a translation failure — " +
+                "if the new support is intentional, its semantics need verifying here first");
+        }
+        else
+        {
+            Console.WriteLine($"[{name}] emit failed as expected ({pinnedArgs[3]})");
+        }
+
         continue;
     }
 

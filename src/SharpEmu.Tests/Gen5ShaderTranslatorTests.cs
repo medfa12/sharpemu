@@ -78,6 +78,72 @@ public sealed class Gen5ShaderTranslatorTests
         Assert.Equal(expected, Gen5ShaderTranslator.IsStorageImageOperation(opcode));
     }
 
+    [Theory]
+    [InlineData(0xBF97_0001u, "SCbranchCdbgsys")]
+    [InlineData(0xBF98_0001u, "SCbranchCdbguser")]
+    [InlineData(0xBF99_0001u, "SCbranchCdbgsysOrUser")]
+    [InlineData(0xBF9A_0001u, "SCbranchCdbgsysAndUser")]
+    public void Decode_ConditionalDebugBranch_DecodesAsSoppBranch(uint word, string expected)
+    {
+        // GFX10 SOPP 0x17-0x1A branch on the COND_DBG_SYS/USER mode flags a
+        // debugger sets; retail hardware always falls through.
+        var program = Decode(word, 0x7E000280, SEndpgm);
+
+        var branch = program.Instructions[0];
+        Assert.Equal(Gen5ShaderEncoding.Sopp, branch.Encoding);
+        Assert.Equal(expected, branch.Opcode);
+    }
+
+    [Theory]
+    [InlineData(0xBF9B_0000u)] // s_endpgm_saved
+    [InlineData(0xBF9E_0000u)] // s_endpgm_ordered_ps_done
+    public void Decode_EndpgmVariant_TerminatesProgram(uint word)
+    {
+        var program = Decode(word);
+
+        var end = Assert.Single(program.Instructions);
+        Assert.Equal("SEndpgm", end.Opcode);
+    }
+
+    [Fact]
+    public void Decode_SWaitcntVscnt_IsRecognizedAsSopk()
+    {
+        // s_waitcnt_vscnt null, 0: SOPK op 0x17 with NULL (125) in SDST.
+        var program = Decode(0xBBFD_0000, SEndpgm);
+
+        var wait = program.Instructions[0];
+        Assert.Equal(Gen5ShaderEncoding.Sopk, wait.Encoding);
+        Assert.Equal("SWaitcntVscnt", wait.Opcode);
+    }
+
+    [Theory]
+    [InlineData(0x0Fu, "ImageAtomicSwap")]
+    [InlineData(0x11u, "ImageAtomicAdd")]
+    [InlineData(0x12u, "ImageAtomicSub")]
+    [InlineData(0x14u, "ImageAtomicSmin")]
+    [InlineData(0x15u, "ImageAtomicUmin")]
+    [InlineData(0x16u, "ImageAtomicSmax")]
+    [InlineData(0x17u, "ImageAtomicUmax")]
+    [InlineData(0x18u, "ImageAtomicAnd")]
+    [InlineData(0x19u, "ImageAtomicOr")]
+    [InlineData(0x1Au, "ImageAtomicXor")]
+    [InlineData(0x1Bu, "ImageAtomicInc")]
+    public void Decode_ImageAtomic_DecodesAsMimgWithVectorDestination(uint op, string expected)
+    {
+        // image_atomic_* v2, v[0:1], s[8:15] dmask:0x1 dim:2D glc:
+        // MIMG op in bits 24:18, vdata v2, srsrc s[8:15].
+        var word0 = 0xF000_2108u | (op << 18);
+        var program = Decode(word0, 0x0002_0200, SEndpgm);
+
+        var atomic = program.Instructions[0];
+        Assert.Equal(Gen5ShaderEncoding.Mimg, atomic.Encoding);
+        Assert.Equal(expected, atomic.Opcode);
+        Assert.Equal(Gen5Operand.Vector(2), Assert.Single(atomic.Destinations));
+        var control = Assert.IsType<Gen5ImageControl>(atomic.Control);
+        Assert.Equal(8u, control.ScalarResource);
+        Assert.True(control.Glc);
+    }
+
     [Fact]
     public void Decode_SMovB32WithLiteral_YieldsLiteralOperand()
     {

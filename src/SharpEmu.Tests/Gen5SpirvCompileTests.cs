@@ -522,6 +522,87 @@ public sealed class Gen5SpirvCompileTests
         Assert.Contains(module.Instructions, i => i.Opcode == OpDPdx);
     }
 
+    private const ushort OpConstantFalse = 42;
+    private const ushort OpImageTexelPointer = 60;
+    private const ushort OpAtomicExchange = 229;
+    private const ushort OpAtomicIAdd = 234;
+
+    // s_mov_b32 s8..s15: an R32ui image descriptor (dword1 img_format=20)
+    // seeded straight from SALU moves so the evaluator resolves the binding.
+    private static readonly uint[] R32UiImageDescriptorPreamble =
+    [
+        0xBE880380,
+        0xBE8903FF, 0x01400000,
+        0xBE8A0380,
+        0xBE8B0380,
+        0xBE8C0380,
+        0xBE8D0380,
+        0xBE8E0380,
+        0xBE8F0380,
+    ];
+
+    [Fact]
+    public void PixelShader_ConditionalDebugBranch_CompilesAsNeverTakenBranch()
+    {
+        // s_cbranch_cdbgsys +1 skips v_mov_b32 v0, 1.0 only when a debugger
+        // sets COND_DBG_SYS; retail falls through, so the branch selects its
+        // target off a constant-false condition.
+        var module = CompilePixelShader(
+            0xBF970001, 0x7E0002F2, ExportV0Rgba, 0x00000000, SEndpgm);
+
+        var constantFalse = Assert.Single(
+            module.Instructions, i => i.Opcode == OpConstantFalse).Words[2];
+        Assert.Contains(
+            module.Instructions,
+            i => i.Opcode == OpSelect && i.Words[3] == constantFalse);
+    }
+
+    [Fact]
+    public void PixelShader_ImageAtomicAddWithReturn_EmitsTexelPointerAtomic()
+    {
+        // image_atomic_add v2, v[0:1], s[8:15] dmask:0x1 dim:SQ_RSRC_IMG_2D
+        // glc: the atomic must go through OpImageTexelPointer + OpAtomicIAdd
+        // (never ImageRead/Write), and GLC returns the pre-op value.
+        var module = CompilePixelShader(
+        [
+            .. R32UiImageDescriptorPreamble,
+            0xF0442108, 0x00020200,
+            ExportV0Rgba, 0x00000000,
+            SEndpgm,
+        ]);
+
+        Assert.Contains(module.Instructions, i => i.Opcode == OpImageTexelPointer);
+        Assert.Contains(module.Instructions, i => i.Opcode == OpAtomicIAdd);
+    }
+
+    [Fact]
+    public void PixelShader_ImageAtomicSwap_EmitsAtomicExchange()
+    {
+        // image_atomic_swap (MIMG 0x0F): the signature Astro Bot's menu pixel
+        // shader hits; must lower to OpAtomicExchange on the texel pointer.
+        var module = CompilePixelShader(
+        [
+            .. R32UiImageDescriptorPreamble,
+            0xF03C2108, 0x00020200,
+            ExportV0Rgba, 0x00000000,
+            SEndpgm,
+        ]);
+
+        Assert.Contains(module.Instructions, i => i.Opcode == OpImageTexelPointer);
+        Assert.Contains(module.Instructions, i => i.Opcode == OpAtomicExchange);
+    }
+
+    [Fact]
+    public void PixelShader_SplitWaitcnt_CompilesAsNop()
+    {
+        // s_waitcnt_vscnt null, 0x0 (SOPK 0x17) is a scheduling hint; it must
+        // not reach the scalar-ALU emitter or the evaluator's register file.
+        var module = CompilePixelShader(
+            0xBBFD0000, ExportV0Rgba, 0x00000000, SEndpgm);
+
+        Assert.NotEmpty(module.Instructions);
+    }
+
     [Fact]
     public void PixelShader_ExecInactiveLaneAtExit_IsKilledNotZeroExported()
     {
