@@ -4452,6 +4452,58 @@ public static class AgcExports
         }
 
         var translationError = string.Empty;
+        // A depth prepass (or DB clear) draw runs with no pixel shader bound:
+        // only the export shader executes and the result lives entirely in the
+        // depth surface. Translate the export stage alone and pair it with the
+        // fixed output-free fragment stage so the depth address gets written.
+        if (hasExportShader &&
+            !hasPixelShader &&
+            depthTarget is { } depthOnlyDescriptor &&
+            TryCreateTranslatedDepthOnlyGuestDraw(
+                ctx,
+                state,
+                exportShaderAddress,
+                vertexCount,
+                indexed,
+                ref depthOnlyDescriptor,
+                out var depthOnlyDraw,
+                out translationError))
+        {
+            var depthOnlyTextures = CreateVulkanGuestDrawTextures(
+                ctx,
+                depthOnlyDraw.Textures,
+                out _);
+            var depthOnlyGlobals =
+                CreateVulkanGuestMemoryBuffers(depthOnlyDraw.GlobalMemoryBindings);
+            var depthOnlyVertexBuffers =
+                CreateVulkanGuestVertexBuffers(depthOnlyDraw.VertexInputs);
+            VulkanVideoPresenter.SubmitDepthOnlyTranslatedDraw(
+                depthOnlyDraw.PixelSpirv,
+                depthOnlyTextures,
+                depthOnlyGlobals,
+                depthOnlyDraw.AttributeCount,
+                ToVulkanGuestDepthTarget(depthOnlyDescriptor),
+                depthOnlyDraw.VertexSpirv,
+                depthOnlyDraw.VertexCount,
+                depthOnlyDraw.InstanceCount,
+                depthOnlyDraw.PrimitiveType,
+                depthOnlyDraw.IndexBuffer,
+                depthOnlyVertexBuffers,
+                depthOnlyDraw.RenderState,
+                state.PendingIndirectArgs);
+            TraceAgcShader(
+                $"agc.depth_only_draw seq={drawSequence} " +
+                $"es=0x{exportShaderAddress:X16} ps=none " +
+                $"depth=0x{depthOnlyDescriptor.Address:X16}:" +
+                $"{depthOnlyDescriptor.Width}x{depthOnlyDescriptor.Height}:" +
+                $"fmt{depthOnlyDescriptor.Format} " +
+                $"test={depthOnlyDescriptor.TestEnable} " +
+                $"write={depthOnlyDescriptor.WriteEnable} " +
+                $"clear={depthOnlyDescriptor.ClearEnable} " +
+                $"zfunc={depthOnlyDescriptor.CompareOp} verts={vertexCount}");
+            return;
+        }
+
         if (hasExportShader &&
             hasPixelShader &&
             hasPsInputEna &&
@@ -4578,24 +4630,54 @@ public static class AgcExports
                         vertexBuffers,
                         translatedDraw.RenderState,
                         depthTarget is { } depth
-                            ? new VulkanGuestDepthTarget(
-                                depth.Address,
-                                depth.Width,
-                                depth.Height,
-                                depth.Format,
-                                depth.TileMode,
-                                depth.TestEnable,
-                                depth.WriteEnable,
-                                depth.CompareOp,
-                                depth.ClearEnable,
-                                depth.ClearDepth,
-                                depth.ReadOnly)
+                            ? ToVulkanGuestDepthTarget(depth)
                             : null,
                         state.PendingIndirectArgs,
                         translatedDraw.ComputeCaptureSpirv,
                         translatedDraw.ComputeCapture,
                         translatedDraw.ComputeInvocationCount,
                         translatedDraw.ComputeCaptureInputs);
+            }
+            else if (depthTarget is { } boundDepthTarget)
+            {
+                // No color exports but a live depth surface: a depth prepass or
+                // a DB clear draw. Submit it as a depth-only pass so the depth
+                // address gains real content instead of the draw being dropped.
+                var depthOnlyTarget =
+                    RepairDepthOnlyExtent(state.CxRegisters, boundDepthTarget);
+                var textures = CreateVulkanGuestDrawTextures(
+                    ctx,
+                    translatedDraw.Textures,
+                    out _);
+                var globalMemoryBuffers =
+                    CreateVulkanGuestMemoryBuffers(translatedDraw.GlobalMemoryBindings);
+                var vertexBuffers =
+                    CreateVulkanGuestVertexBuffers(translatedDraw.VertexInputs);
+                VulkanVideoPresenter.SubmitDepthOnlyTranslatedDraw(
+                    translatedDraw.PixelSpirv,
+                    textures,
+                    globalMemoryBuffers,
+                    translatedDraw.AttributeCount,
+                    ToVulkanGuestDepthTarget(depthOnlyTarget),
+                    translatedDraw.VertexSpirv,
+                    translatedDraw.VertexCount,
+                    translatedDraw.InstanceCount,
+                    translatedDraw.PrimitiveType,
+                    translatedDraw.IndexBuffer,
+                    vertexBuffers,
+                    CreateDepthOnlyRenderState(
+                        state.CxRegisters,
+                        depthOnlyTarget.Width,
+                        depthOnlyTarget.Height),
+                    state.PendingIndirectArgs);
+                TraceAgcShader(
+                    $"agc.depth_only_draw seq={drawSequence} " +
+                    $"es=0x{exportShaderAddress:X16} ps=0x{pixelShaderAddress:X16} " +
+                    $"depth=0x{depthOnlyTarget.Address:X16}:" +
+                    $"{depthOnlyTarget.Width}x{depthOnlyTarget.Height}:fmt{depthOnlyTarget.Format} " +
+                    $"test={depthOnlyTarget.TestEnable} write={depthOnlyTarget.WriteEnable} " +
+                    $"clear={depthOnlyTarget.ClearEnable} zfunc={depthOnlyTarget.CompareOp} " +
+                    $"verts={translatedDraw.VertexCount}");
             }
             else
             {
@@ -4896,6 +4978,151 @@ public static class AgcExports
                 ref draw);
         }
 
+        return true;
+    }
+
+    private static byte[]? _depthOnlyFragmentSpirvCache;
+
+    private static byte[] GetDepthOnlyFragmentSpirv() =>
+        _depthOnlyFragmentSpirvCache ??= SpirvFixedShaders.CreateDepthOnlyFragment();
+
+    /// <summary>
+    /// Translates a draw that binds an export shader but no pixel shader: a
+    /// depth prepass or DB clear pass whose only persistent result is the
+    /// depth surface. The export stage compiles as a standalone vertex shader
+    /// with no varying outputs and is paired with the fixed output-free
+    /// fragment stage; the caller submits it against the depth attachment
+    /// with color writes masked. May widen a stale 1x1 depth extent from the
+    /// bound viewport (the pass has no color target to borrow one from).
+    /// </summary>
+    private static bool TryCreateTranslatedDepthOnlyGuestDraw(
+        CpuContext ctx,
+        SubmittedDcbState state,
+        ulong exportShaderAddress,
+        uint vertexCount,
+        bool indexed,
+        ref DepthTargetDescriptor depthTarget,
+        out TranslatedGuestDraw draw,
+        out string error)
+    {
+        draw = default!;
+        error = string.Empty;
+        ulong exportShaderHeader;
+        lock (_submitTraceGate)
+        {
+            _shaderHeadersByCode.TryGetValue(exportShaderAddress, out exportShaderHeader);
+        }
+
+        if (!Gen5ShaderTranslator.TryCreateState(
+                ctx,
+                exportShaderAddress,
+                exportShaderHeader,
+                state.ShRegisters,
+                SelectExportUserDataRegister(state.ShRegisters),
+                out var exportState,
+                out error,
+                userDataScalarRegisterBase: NggUserDataScalarRegisterBase) ||
+            !Gen5ShaderScalarEvaluator.TryEvaluate(
+                ctx,
+                exportState,
+                out var exportEvaluation,
+                out error,
+                resolveVertexInputs: true,
+                vertexRecordLimit: indexed ? null : vertexCount))
+        {
+            return false;
+        }
+
+        depthTarget = RepairDepthOnlyExtent(state.CxRegisters, depthTarget);
+
+        var exportStateFingerprint = ComputeShaderStructureFingerprint(exportEvaluation);
+        var shaderKey = (
+            exportShaderAddress,
+            exportStateFingerprint,
+            0UL,
+            0UL,
+            "depth-only",
+            0u,
+            false,
+            0UL);
+        (byte[] Vertex, byte[] Pixel) compiled;
+        lock (_submitTraceGate)
+        {
+            _graphicsSpirvCache.TryGetValue(shaderKey, out compiled);
+        }
+
+        if (compiled.Vertex is null || compiled.Pixel is null)
+        {
+            var exportGlobalCount = exportEvaluation.GlobalMemoryBindings.Count;
+            if (!Gen5SpirvTranslator.TryCompileVertexShader(
+                    exportState,
+                    exportEvaluation,
+                    out var vertexShader,
+                    out error,
+                    globalBufferBase: 0,
+                    totalGlobalBufferCount: exportGlobalCount + 1,
+                    imageBindingBase: 0,
+                    scalarRegisterBufferIndex: exportGlobalCount,
+                    requiredVertexOutputLocations: []))
+            {
+                return false;
+            }
+
+            compiled = (vertexShader.Spirv, GetDepthOnlyFragmentSpirv());
+            DumpSpirv(
+                "vs.depth",
+                exportShaderAddress,
+                exportStateFingerprint,
+                compiled.Vertex,
+                exportState.Program);
+            lock (_submitTraceGate)
+            {
+                _graphicsSpirvCache.TryAdd(shaderKey, compiled);
+            }
+        }
+
+        var textures = new List<TranslatedImageBinding>(
+            exportEvaluation.ImageBindings.Count);
+        foreach (var binding in exportEvaluation.ImageBindings)
+        {
+            var descriptorValid =
+                TryDecodeTextureDescriptor(binding.ResourceDescriptor, out var texture);
+            if (!descriptorValid)
+            {
+                texture = CreateFallbackTextureDescriptor(binding.ResourceDescriptor);
+            }
+
+            textures.Add(new TranslatedImageBinding(
+                texture,
+                Gen5ShaderTranslator.IsStorageImageOperation(binding.Opcode),
+                binding.MipLevel ?? 0,
+                binding.SamplerDescriptor));
+        }
+
+        var globalMemoryBindings = exportEvaluation.GlobalMemoryBindings
+            .Append(CreateScalarRegisterBinding(exportEvaluation))
+            .ToArray();
+        IReadOnlyList<Gen5VertexInputBinding> vertexInputs =
+            exportEvaluation.VertexInputs ?? [];
+        state.UcRegisters.TryGetValue(VgtPrimitiveType, out var primitiveType);
+        draw = new TranslatedGuestDraw(
+            exportShaderAddress,
+            PixelShaderAddress: 0,
+            primitiveType,
+            compiled.Vertex,
+            compiled.Pixel,
+            AttributeCount: 0,
+            vertexCount,
+            state.InstanceCount,
+            indexed ? CreateVulkanIndexBuffer(ctx, state, vertexCount) : null,
+            textures,
+            globalMemoryBindings,
+            vertexInputs,
+            RenderTargets: [],
+            CreateDepthOnlyRenderState(
+                state.CxRegisters,
+                depthTarget.Width,
+                depthTarget.Height));
         return true;
     }
 
@@ -5435,6 +5662,67 @@ public static class AgcExports
             $"clear={clearEnable}:{clearDepth:0.######} ro={readOnly}");
 
         return descriptor;
+    }
+
+    private static VulkanGuestDepthTarget ToVulkanGuestDepthTarget(
+        DepthTargetDescriptor depth) =>
+        new(
+            depth.Address,
+            depth.Width,
+            depth.Height,
+            depth.Format,
+            depth.TileMode,
+            depth.TestEnable,
+            depth.WriteEnable,
+            depth.CompareOp,
+            depth.ClearEnable,
+            depth.ClearDepth,
+            depth.ReadOnly);
+
+    // Some Gen5 streams leave DB_DEPTH_SIZE_XY at its clear-state value (1x1)
+    // while binding a full-size DB surface. A depth-only pass has no color
+    // target to borrow an extent from, so recover it from the bound viewport;
+    // taking the stale 1x1 literally shrinks the whole pass to a single pixel.
+    private static DepthTargetDescriptor RepairDepthOnlyExtent(
+        IReadOnlyDictionary<uint, uint> registers,
+        DepthTargetDescriptor depthTarget)
+    {
+        if (depthTarget.Width != 1 || depthTarget.Height != 1)
+        {
+            return depthTarget;
+        }
+
+        var scissor = DecodeScissor(registers, 16384, 16384);
+        if (DecodeViewport(registers, 16384, 16384, scissor) is not { } viewport)
+        {
+            return depthTarget;
+        }
+
+        var inferredWidth = (uint)Math.Clamp(
+            MathF.Ceiling(MathF.Abs(viewport.Width)), 1f, 16384f);
+        var inferredHeight = (uint)Math.Clamp(
+            MathF.Ceiling(MathF.Abs(viewport.Height)), 1f, 16384f);
+        if (inferredWidth <= 1 && inferredHeight <= 1)
+        {
+            return depthTarget;
+        }
+
+        return depthTarget with { Width = inferredWidth, Height = inferredHeight };
+    }
+
+    // Render state for a pass with no color exports: scissor/viewport decode
+    // against the depth extent and all color writes masked off (the presenter
+    // binds a don't-care scratch color attachment).
+    private static VulkanGuestRenderState CreateDepthOnlyRenderState(
+        IReadOnlyDictionary<uint, uint> registers,
+        uint width,
+        uint height)
+    {
+        var scissor = DecodeScissor(registers, width, height);
+        return new VulkanGuestRenderState(
+            [VulkanGuestBlendState.Default with { WriteMask = 0 }],
+            scissor,
+            DecodeViewport(registers, width, height, scissor));
     }
 
     private static VulkanGuestRenderState CreateRenderState(

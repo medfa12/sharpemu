@@ -932,6 +932,68 @@ internal static unsafe class VulkanVideoPresenter
         }
     }
 
+    // Depth-only guest pass: a draw with no color exports (depth prepass or a
+    // DB clear draw) still writes/clears its depth surface. The work item binds
+    // a synthetic address-0 color target that execution redirects to a cached
+    // scratch surface (color writes are masked off by the caller's render
+    // state), so the shared offscreen path renders it and publishes the depth
+    // address as a GPU producer for later deferred-lighting reads.
+    public static void SubmitDepthOnlyTranslatedDraw(
+        byte[] pixelSpirv,
+        IReadOnlyList<VulkanGuestDrawTexture> textures,
+        IReadOnlyList<VulkanGuestMemoryBuffer> globalMemoryBuffers,
+        uint attributeCount,
+        VulkanGuestDepthTarget depthTarget,
+        byte[]? vertexSpirv = null,
+        uint vertexCount = 3,
+        uint instanceCount = 1,
+        uint primitiveType = 4,
+        VulkanGuestIndexBuffer? indexBuffer = null,
+        IReadOnlyList<VulkanGuestVertexBuffer>? vertexBuffers = null,
+        VulkanGuestRenderState? renderState = null,
+        VulkanGuestIndirectArgs? indirectArgs = null)
+    {
+        if (pixelSpirv.Length == 0 ||
+            depthTarget.Address == 0 ||
+            depthTarget.Width == 0 ||
+            depthTarget.Height == 0)
+        {
+            return;
+        }
+
+        lock (_gate)
+        {
+            if (_closed)
+            {
+                return;
+            }
+
+            EnqueueGuestWorkLocked(
+                new VulkanOffscreenGuestDraw(
+                    new VulkanTranslatedGuestDraw(
+                        vertexSpirv ?? [],
+                        pixelSpirv,
+                        textures.ToArray(),
+                        globalMemoryBuffers.ToArray(),
+                        vertexBuffers?.ToArray() ?? [],
+                        attributeCount,
+                        vertexCount,
+                        instanceCount,
+                        primitiveType,
+                        indexBuffer,
+                        renderState ?? VulkanGuestRenderState.Default,
+                        indexBuffer is not null ? indirectArgs : null),
+                    [new VulkanGuestRenderTarget(
+                        Address: 0,
+                        depthTarget.Width,
+                        depthTarget.Height,
+                        Format: 10,
+                        NumberType: 0)],
+                    PublishTarget: false,
+                    Depth: depthTarget));
+        }
+    }
+
     // Stage 2 ordered-flip composite redirect. Renders the frame's retained
     // targetless composite draw directly into the flipped display buffer, then
     // pre-registers that address as a GPU-produced image so the ordered-flip
@@ -7539,7 +7601,18 @@ internal static unsafe class VulkanVideoPresenter
             for (var index = 0; index < targets.Length; index++)
             {
                 var slotTarget = work.Targets[index];
-                if (aliasedColorSlots is not null && aliasedColorSlots[index])
+                if (slotTarget.Address == 0 && work.Depth is not null)
+                {
+                    // Depth-only pass: no real color target is bound. Render
+                    // the (write-masked) color into a cached scratch surface so
+                    // the shared offscreen path can drive the depth attachment.
+                    slotTarget = slotTarget with
+                    {
+                        Address = AliasedSlotScratchAddress(
+                            0xFF, slotTarget.Width, slotTarget.Height),
+                    };
+                }
+                else if (aliasedColorSlots is not null && aliasedColorSlots[index])
                 {
                     // A duplicate-address slot is a don't-care binding on real
                     // hardware. Its writes land in a cached scratch surface so
