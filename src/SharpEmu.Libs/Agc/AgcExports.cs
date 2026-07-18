@@ -4135,10 +4135,11 @@ public static class AgcExports
                 return;
             }
 
-            if (registerOffset != 0)
-            {
-                destination[registerOffset] = value;
-            }
+            // Offset 0 is a real register, not padding: context register
+            // 0x000 is DB_RENDER_CONTROL (the defaults table group 0/9 binds
+            // it), and skipping it drops every DEPTH_CLEAR_ENABLE write the
+            // guest submits through sceAgcDcbSet*RegistersIndirect.
+            destination[registerOffset] = value;
         }
     }
 
