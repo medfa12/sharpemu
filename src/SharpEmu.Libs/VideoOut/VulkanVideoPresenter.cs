@@ -5757,11 +5757,21 @@ internal static unsafe class VulkanVideoPresenter
             out TextureResource resource)
         {
             resource = default!;
-            if (!guestImage.IsCpuBacked ||
-                guestImage.Width != texture.Width ||
+            if (guestImage.Width != texture.Width ||
                 guestImage.Height != texture.Height ||
                 guestImage.MipLevels != 1 ||
                 texture.RgbaPixels.Length == 0)
+            {
+                return false;
+            }
+
+            // A promoted (GPU-rendered) image also accepts dirty CPU refreshes:
+            // the game overwrites the surface's guest memory with real texture
+            // data after the GPU last touched it, and sampling the stale render
+            // would show the old frame. Never-written (all-zero) guest bytes do
+            // not count as dirt -- the rendered content stays authoritative.
+            if (!guestImage.IsCpuBacked &&
+                texture.RgbaPixels.AsSpan().IndexOfAnyExcept((byte)0) < 0)
             {
                 return false;
             }
@@ -5844,26 +5854,42 @@ internal static unsafe class VulkanVideoPresenter
                 GuestImage = guestImage,
             };
 
-            if (!guestImage.Initialized &&
-                !guestImage.InitialUploadPending &&
-                texture.MipLevel == 0)
+            if (texture.MipLevel == 0 && texture.RgbaPixels.Length != 0)
             {
                 var expectedSize = GetTextureByteCount(
                     texture.Format,
                     texture.Width,
                     texture.Height);
-                if ((ulong)texture.RgbaPixels.Length == expectedSize &&
-                    texture.RgbaPixels.AsSpan().IndexOfAnyExcept((byte)0) >= 0)
+                if ((ulong)texture.RgbaPixels.Length == expectedSize)
                 {
-                    resource.StagingBuffer = CreateHostBuffer(
-                        texture.RgbaPixels,
-                        BufferUsageFlags.TransferSrcBit,
-                        out resource.StagingMemory);
-                    resource.NeedsUpload = true;
-                    guestImage.InitialUploadPending = true;
-                    TraceVulkanShader(
-                        $"vk.storage_upload addr=0x{texture.Address:X16} " +
-                        $"size={texture.Width}x{texture.Height} bytes={expectedSize}");
+                    // First use uploads the guest bytes unconditionally (an
+                    // all-zero image is still the guest's real content). An
+                    // initialized image accepts dirty refreshes when the CPU
+                    // overwrote its guest memory with different, nonzero data;
+                    // zeroed guest memory behind a GPU-written storage image
+                    // stays untouched -- the GPU content is authoritative.
+                    var firstUse =
+                        !guestImage.Initialized && !guestImage.InitialUploadPending;
+                    var fingerprint =
+                        ComputeTextureContentFingerprint(texture.RgbaPixels);
+                    var dirtyRefresh = !firstUse &&
+                        guestImage.CpuContentFingerprint != fingerprint &&
+                        texture.RgbaPixels.AsSpan().IndexOfAnyExcept((byte)0) >= 0;
+                    if (firstUse || dirtyRefresh)
+                    {
+                        resource.StagingBuffer = CreateHostBuffer(
+                            texture.RgbaPixels,
+                            BufferUsageFlags.TransferSrcBit,
+                            out resource.StagingMemory);
+                        resource.NeedsUpload = true;
+                        resource.CpuContentFingerprint = fingerprint;
+                        resource.UpdatesCpuContent = true;
+                        guestImage.InitialUploadPending = true;
+                        TraceVulkanShader(
+                            $"vk.storage_upload addr=0x{texture.Address:X16} " +
+                            $"size={texture.Width}x{texture.Height} " +
+                            $"bytes={expectedSize} refresh={(dirtyRefresh ? 1 : 0)}");
+                    }
                 }
             }
 
@@ -7785,8 +7811,17 @@ internal static unsafe class VulkanVideoPresenter
                     "vkBeginCommandBuffer(offscreen)");
 
                 BeginDebugLabel(_commandBuffer, resources.DebugName);
-                RecordTextureUploads(resources, PipelineStageFlags.FragmentShaderBit);
-                RecordSampledImageTransitions(resources, PipelineStageFlags.FragmentShaderBit);
+                // Translated draws sample textures from the vertex (export)
+                // stage as well as the fragment stage; a depth-only pass may
+                // sample exclusively from the vertex stage.
+                RecordTextureUploads(
+                    resources,
+                    PipelineStageFlags.VertexShaderBit |
+                        PipelineStageFlags.FragmentShaderBit);
+                RecordSampledImageTransitions(
+                    resources,
+                    PipelineStageFlags.VertexShaderBit |
+                        PipelineStageFlags.FragmentShaderBit);
                 RecordStorageImagesForWrite(resources, PipelineStageFlags.FragmentShaderBit);
 
                 foreach (var target in targets)
@@ -8195,7 +8230,8 @@ internal static unsafe class VulkanVideoPresenter
                 TransitionGuestImage(
                     snapshot,
                     ImageLayout.ShaderReadOnlyOptimal,
-                    PipelineStageFlags.FragmentShaderBit |
+                    PipelineStageFlags.VertexShaderBit |
+                        PipelineStageFlags.FragmentShaderBit |
                         PipelineStageFlags.ComputeShaderBit,
                     AccessFlags.ShaderReadBit);
 
@@ -9565,6 +9601,7 @@ internal static unsafe class VulkanVideoPresenter
                 TransitionGuestImage(
                     image,
                     ImageLayout.ShaderReadOnlyOptimal,
+                    PipelineStageFlags.VertexShaderBit |
                     PipelineStageFlags.FragmentShaderBit |
                     PipelineStageFlags.ComputeShaderBit,
                     AccessFlags.ShaderReadBit);
@@ -10200,6 +10237,11 @@ internal static unsafe class VulkanVideoPresenter
 
                     guestImage.Initialized = true;
                     guestImage.InitialUploadPending = false;
+                    if (texture.UpdatesCpuContent)
+                    {
+                        guestImage.CpuContentFingerprint = texture.CpuContentFingerprint;
+                    }
+
                     var format = GetGuestTextureFormat(guestImage.Format);
                     if (format != 0)
                     {
@@ -10939,6 +10981,7 @@ internal static unsafe class VulkanVideoPresenter
             TransitionGuestImage(
                 source,
                 ImageLayout.ShaderReadOnlyOptimal,
+                PipelineStageFlags.VertexShaderBit |
                 PipelineStageFlags.FragmentShaderBit |
                 PipelineStageFlags.ComputeShaderBit,
                 AccessFlags.ShaderReadBit);
