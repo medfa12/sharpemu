@@ -4386,6 +4386,17 @@ public static class AgcExports
             out var pixelShaderAddress);
         var hasPsInputEna = state.CxRegisters.TryGetValue(SpiPsInputEna, out var psInputEna);
         var hasPsInputAddr = state.CxRegisters.TryGetValue(SpiPsInputAddr, out var psInputAddr);
+        // Targeted one-shot disassembly (SHARPEMU_DUMP_SHADER_ADDR) must fire on
+        // the normal translate path, not only the translate-miss trace, so it
+        // covers shaders that compile cleanly (e.g. the present pixel shader).
+        if (hasExportShader)
+        {
+            DumpRequestedShaderDisassembly(ctx, exportShaderAddress);
+        }
+        if (hasPixelShader)
+        {
+            DumpRequestedShaderDisassembly(ctx, pixelShaderAddress);
+        }
         state.UcRegisters.TryGetValue(VgtPrimitiveType, out var primitiveType);
         var renderTargets = GetRenderTargets(state.CxRegisters);
         var depthTarget = GetDepthTarget(state.CxRegisters);
