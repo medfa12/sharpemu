@@ -136,10 +136,13 @@ public sealed partial class DirectExecutionBackend
 		// Leaf imports take a scalar-only fast path that reads its own operands and
 		// intentionally bypasses the SysV variadic XMM marshalling below. This is safe
 		// only while the leaf set contains no float-variadic or float-returning function.
-		// The constraint and the audited list live on IsLeafImport — do not add a
+		// The constraint and the audited list live on IsLeafImportNid — do not add a
 		// function that consumes xmm0-7 args or returns in xmm0 to the leaf set;
 		// such functions must stay on the full gateway path below.
-		if (IsLeafImport(importStubEntry.Nid) &&
+		// Classification is precomputed on the stub entry; sceKernelUsleep is the one
+		// leaf that additionally drops back to the full path when usleep logging is on.
+		if (importStubEntry.IsLeaf &&
+			(!importStubEntry.IsUsleepLeaf || !_logUsleep) &&
 			TryDispatchLeafImport(cpuContext, importStubEntry, argPackPtr, num, out var leafResult))
 		{
 			return leafResult;
@@ -671,7 +674,7 @@ public sealed partial class DirectExecutionBackend
 		}
 
 		int returnValue;
-		if (IsNoBlockLeafImport(importStubEntry.Nid))
+		if (importStubEntry.IsNoBlockLeaf)
 		{
 			cpuContext.ClearRaxWriteFlag();
 			returnValue = export.Function(cpuContext);
@@ -745,9 +748,9 @@ public sealed partial class DirectExecutionBackend
 
 	// Subset of the leaf set that additionally skips the import-call-frame
 	// bookkeeping. The same scalar-only (no XMM args, no XMM return) constraint
-	// as IsLeafImport applies — see the note there before adding entries.
-	// NOTE: this filter is only consulted after IsLeafImport accepts the NID;
-	// entries listed here but not in IsLeafImport (scePadRead, scePadOpen,
+	// as IsLeafImportNid applies — see the note there before adding entries.
+	// NOTE: this filter is only consulted after IsLeafImportNid accepts the NID;
+	// entries listed here but not in IsLeafImportNid (scePadRead, scePadOpen,
 	// sceUserServiceGetEvent, sceUserServiceGetPlatformPrivacySetting,
 	// pthread_mutex_trylock) currently take the full gateway path.
 	private static bool IsNoBlockLeafImport(string nid) =>
@@ -874,15 +877,16 @@ public sealed partial class DirectExecutionBackend
 	// Audited 2026-07-11 (PR #59): every NID below maps to a registered
 	// SysAbiExport whose handler neither reads nor writes CpuContext XMM state
 	// and whose known guest signature is integer/pointer only.
-	private bool IsLeafImport(string nid)
+	//
+	// Classification runs once at stub setup (ImportStubEntry ctor); the
+	// dispatch hot path reads the precomputed IsLeaf flag. sceKernelUsleep's
+	// runtime _logUsleep opt-out is applied at the call site in DispatchImport
+	// via the IsUsleepLeaf flag, so usleep is a plain leaf NID here.
+	private static bool IsLeafImportNid(string nid)
 	{
-		if (nid == "1jfXLRVzisc") // sceKernelUsleep
-		{
-			return !_logUsleep;
-		}
-
 		// Mutex lock uses this block-capable leaf path. Keep it out of the no-block subset.
 		return nid is
+			"1jfXLRVzisc" or // sceKernelUsleep (leaf only while !_logUsleep; gated in DispatchImport)
 			"9UK1vLZQft4" or // scePthreadMutexLock
 			"7H0iTOciTLo" or // pthread_mutex_lock
 			"tn3VlD0hG60" or // scePthreadMutexUnlock

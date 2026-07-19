@@ -59,6 +59,16 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 		public ImportStubTraceFlags TraceFlags { get; }
 
+		// Leaf/no-block classification hoisted to stub-setup time so the dispatch
+		// hot path reads precomputed flags instead of re-matching the NID string
+		// on every import call. IsUsleepLeaf marks the one leaf whose eligibility
+		// additionally depends on the runtime _logUsleep flag (see DispatchImport).
+		public bool IsLeaf { get; }
+
+		public bool IsUsleepLeaf { get; }
+
+		public bool IsNoBlockLeaf { get; }
+
 		public ImportStubEntry(ulong address, string nid, ExportedFunction? export)
 		{
 			Address = address;
@@ -66,6 +76,9 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			Export = export;
 			Kind = ClassifyKind(nid);
 			TraceFlags = ClassifyTraceFlags(nid);
+			IsLeaf = IsLeafImportNid(nid);
+			IsUsleepLeaf = string.Equals(nid, "1jfXLRVzisc", StringComparison.Ordinal);
+			IsNoBlockLeaf = IsNoBlockLeafImport(nid);
 		}
 
 		private static ImportStubKind ClassifyKind(string nid) => nid switch
