@@ -223,6 +223,18 @@ public static class AgcExports
     private static long _shaderTranslationMissTraceCount;
     private static long _translatedDrawTraceCount;
     private static long _standardDmaTraceCount;
+    private static readonly string? _traceCbWriteRegion =
+        Environment.GetEnvironmentVariable("SHARPEMU_TRACE_CB_WRITE");
+    // SHARPEMU_REREAD_CBUF=1: at Vulkan draw-submission time, rebuild constant/
+    // global buffers by RE-READING guest memory instead of using the snapshot
+    // captured during shader translation. The game writes per-frame constants
+    // AFTER we parse the draw but before the Vulkan draw records, so the
+    // translate-time snapshot is stale; re-reading at submit picks up the real
+    // values (the tonemap's color-grade/exposure constant is the suspect).
+    private static readonly bool _rereadCbuf = string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_REREAD_CBUF"),
+        "1",
+        StringComparison.Ordinal);
     private static readonly object _softwarePresenterGate = new();
     private static readonly Dictionary<(ulong Source, ulong Destination), ulong> _softwarePresenterFingerprints = new();
     private static readonly Dictionary<(ulong Shader, ulong Source, ulong Destination), ulong> _softwareComputeBlitFingerprints = new();
@@ -3741,7 +3753,7 @@ public static class AgcExports
                         pendingComposite.Textures,
                         out _);
                     var compositeGlobalBuffers =
-                        CreateVulkanGuestMemoryBuffers(pendingComposite.GlobalMemoryBindings);
+                        CreateVulkanGuestMemoryBuffers(pendingComposite.GlobalMemoryBindings, ctx);
                     var compositeVertexBuffers =
                         CreateVulkanGuestVertexBuffers(pendingComposite.VertexInputs);
                     var rendered = VulkanVideoPresenter.TrySubmitDisplayCompositeDraw(
@@ -3802,7 +3814,7 @@ public static class AgcExports
                         "draw-fallback");
                     var textures = CreateVulkanGuestDrawTextures(ctx, translatedDraw.Textures, out var fallbackTextureCount);
                     var globalMemoryBuffers =
-                        CreateVulkanGuestMemoryBuffers(translatedDraw.GlobalMemoryBindings);
+                        CreateVulkanGuestMemoryBuffers(translatedDraw.GlobalMemoryBindings, ctx);
                     VulkanVideoPresenter.SubmitTranslatedDraw(
                         translatedDraw.PixelSpirv,
                         textures,
@@ -4487,7 +4499,7 @@ public static class AgcExports
                 depthOnlyDraw.Textures,
                 out _);
             var depthOnlyGlobals =
-                CreateVulkanGuestMemoryBuffers(depthOnlyDraw.GlobalMemoryBindings);
+                CreateVulkanGuestMemoryBuffers(depthOnlyDraw.GlobalMemoryBindings, ctx);
             var depthOnlyVertexBuffers =
                 CreateVulkanGuestVertexBuffers(depthOnlyDraw.VertexInputs);
             VulkanVideoPresenter.SubmitDepthOnlyTranslatedDraw(
@@ -4621,7 +4633,7 @@ public static class AgcExports
                     translatedDraw.Textures,
                     out _);
                 var globalMemoryBuffers =
-                    CreateVulkanGuestMemoryBuffers(translatedDraw.GlobalMemoryBindings);
+                    CreateVulkanGuestMemoryBuffers(translatedDraw.GlobalMemoryBindings, ctx);
                 var vertexBuffers =
                     CreateVulkanGuestVertexBuffers(translatedDraw.VertexInputs);
                 VulkanVideoPresenter.SubmitOffscreenTranslatedDraw(
@@ -4666,7 +4678,7 @@ public static class AgcExports
                     translatedDraw.Textures,
                     out _);
                 var globalMemoryBuffers =
-                    CreateVulkanGuestMemoryBuffers(translatedDraw.GlobalMemoryBindings);
+                    CreateVulkanGuestMemoryBuffers(translatedDraw.GlobalMemoryBindings, ctx);
                 var vertexBuffers =
                     CreateVulkanGuestVertexBuffers(translatedDraw.VertexInputs);
                 VulkanVideoPresenter.SubmitDepthOnlyTranslatedDraw(
@@ -4706,7 +4718,7 @@ public static class AgcExports
                         translatedDraw.Textures,
                         out _);
                     var globalMemoryBuffers =
-                        CreateVulkanGuestMemoryBuffers(translatedDraw.GlobalMemoryBindings);
+                        CreateVulkanGuestMemoryBuffers(translatedDraw.GlobalMemoryBindings, ctx);
                     VulkanVideoPresenter.SubmitStorageTranslatedDraw(
                         translatedDraw.PixelSpirv,
                         textures,
@@ -5236,7 +5248,7 @@ public static class AgcExports
             ComputeCapture = capture,
             ComputeInvocationCount = invocationCount,
             ComputeCaptureInputs =
-                CreateVulkanGuestMemoryBuffers(computeEvaluation.GlobalMemoryBindings),
+                CreateVulkanGuestMemoryBuffers(computeEvaluation.GlobalMemoryBindings, ctx),
         };
         var inputAddrs = string.Join(
             ",",
@@ -6150,14 +6162,29 @@ public static class AgcExports
     }
 
     private static IReadOnlyList<VulkanGuestMemoryBuffer> CreateVulkanGuestMemoryBuffers(
-        IReadOnlyList<Gen5GlobalMemoryBinding> bindings)
+        IReadOnlyList<Gen5GlobalMemoryBinding> bindings,
+        CpuContext? ctx = null)
     {
         var buffers = new VulkanGuestMemoryBuffer[bindings.Count];
         for (var index = 0; index < bindings.Count; index++)
         {
+            var binding = bindings[index];
+            var data = binding.Data;
+            if (_rereadCbuf &&
+                ctx is not null &&
+                binding.BaseAddress != 0 &&
+                data.Length > 0)
+            {
+                var fresh = new byte[data.Length];
+                if (ctx.Memory.TryRead(binding.BaseAddress, fresh))
+                {
+                    data = fresh;
+                }
+            }
+
             buffers[index] = new VulkanGuestMemoryBuffer(
-                bindings[index].BaseAddress,
-                bindings[index].Data);
+                binding.BaseAddress,
+                data);
         }
 
         return buffers;
@@ -6653,7 +6680,7 @@ public static class AgcExports
                     translatedBindings,
                     out _);
                 var globalMemoryBuffers =
-                    CreateVulkanGuestMemoryBuffers(evaluation.GlobalMemoryBindings);
+                    CreateVulkanGuestMemoryBuffers(evaluation.GlobalMemoryBindings, ctx);
                 VulkanVideoPresenter.SubmitComputeDispatch(
                     shaderAddress,
                     computeSpirv,
