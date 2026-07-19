@@ -2282,6 +2282,13 @@ internal static unsafe class VulkanVideoPresenter
         public ulong MemorySize;
         public ulong LastUseStamp;
 
+        // Monotonic stamp of the last COMPLETED content write (render-target
+        // resolve, storage write, or upload) into this image. Distinct from
+        // LastUseStamp, which advances merely on binding. Alias selection ranks
+        // by this first so a freshly re-bound but stale variant cannot hide the
+        // sibling that actually holds the guest allocation's current contents.
+        public long ContentGeneration;
+
         // The layout of every mip of Image as of the most recently RECORDED
         // command, plus the stage/access scope of the last barrier (or the
         // readers absorbed into it since). Guest work is recorded on the one
@@ -2477,7 +2484,14 @@ internal static unsafe class VulkanVideoPresenter
                     continue;
                 }
 
-                if (best is null || candidate.LastUseStamp > best.LastUseStamp)
+                // Rank by last-completed content write first: a target switch
+                // re-binds a same-address variant before its draw resolves, so a
+                // freshly bound but stale image must not outrank the sibling that
+                // actually holds the current contents. Recency breaks ties.
+                if (best is null ||
+                    candidate.ContentGeneration > best.ContentGeneration ||
+                    (candidate.ContentGeneration == best.ContentGeneration &&
+                     candidate.LastUseStamp > best.LastUseStamp))
                 {
                     best = candidate;
                 }
@@ -2535,7 +2549,9 @@ internal static unsafe class VulkanVideoPresenter
                 if (best is null ||
                     (best.IsCpuBacked && !candidate.IsCpuBacked) ||
                     (best.IsCpuBacked == candidate.IsCpuBacked &&
-                     candidate.LastUseStamp > best.LastUseStamp))
+                     (candidate.ContentGeneration > best.ContentGeneration ||
+                      (candidate.ContentGeneration == best.ContentGeneration &&
+                       candidate.LastUseStamp > best.LastUseStamp))))
                 {
                     best = candidate;
                 }
@@ -2613,8 +2629,12 @@ internal static unsafe class VulkanVideoPresenter
                 return false;
             }
 
-            return texture.Width <= guestImage.Width &&
-                texture.Height <= guestImage.Height;
+            // Tiled render targets are rebound through descriptors whose logical
+            // extent differs from the current dynamic-resolution surface. Vulkan
+            // samples normalized coordinates from whichever variant is bound, so
+            // either direction is usable; content-generation ranking (not the
+            // extent) decides which cached variant holds the live contents.
+            return true;
         }
     }
 
@@ -2716,6 +2736,7 @@ internal static unsafe class VulkanVideoPresenter
         private int _hostVisibleHeapIndex = -1;
         private bool _supportsMemoryBudget;
         private ulong _useStamp;
+        private long _guestImageContentGeneration;
         private bool _reclaimInProgress;
         private bool _memoryPanic;
         private readonly HashSet<(ulong Address, uint Width, uint Height, Format Format)> _tracedTextureCacheHits = new();
@@ -7951,6 +7972,7 @@ internal static unsafe class VulkanVideoPresenter
                 foreach (var target in targets)
                 {
                     target.Initialized = true;
+                    MarkGuestImageContentWritten(target);
                 }
 
                 if (depthImage is not null)
@@ -10219,6 +10241,15 @@ internal static unsafe class VulkanVideoPresenter
             }
         }
 
+        // Stamp an image as holding freshly written content. Alias selection
+        // ranks candidates by this generation first, so the most recently
+        // produced sibling wins over a re-bound but stale same-address variant.
+        private void MarkGuestImageContentWritten(GuestImageResource image)
+        {
+            image.ContentGeneration =
+                Interlocked.Increment(ref _guestImageContentGeneration);
+        }
+
         private void MarkStorageImagesInitialized(
             TranslatedDrawResources resources,
             bool traceContents = true)
@@ -10236,6 +10267,7 @@ internal static unsafe class VulkanVideoPresenter
                     }
 
                     guestImage.Initialized = true;
+                    MarkGuestImageContentWritten(guestImage);
                     guestImage.InitialUploadPending = false;
                     if (texture.UpdatesCpuContent)
                     {
@@ -10274,7 +10306,7 @@ internal static unsafe class VulkanVideoPresenter
             }
         }
 
-        private static void MarkSampledImagesInitialized(
+        private void MarkSampledImagesInitialized(
             TranslatedDrawResources resources)
         {
             lock (_gate)
@@ -10290,6 +10322,7 @@ internal static unsafe class VulkanVideoPresenter
                     }
 
                     guestImage.Initialized = true;
+                    MarkGuestImageContentWritten(guestImage);
                     guestImage.InitialUploadPending = false;
                     if (texture.UpdatesCpuContent)
                     {
