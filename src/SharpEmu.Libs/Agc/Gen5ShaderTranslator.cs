@@ -128,6 +128,44 @@ internal static class Gen5ShaderTranslator
             : $"error={error} raw={DescribeRawWords(ctx, shaderAddress)}";
 
     /// <summary>
+    /// Full decoded listing (pc, encoding, opcode, operands, raw words) for one
+    /// shader. Used by the SHARPEMU_DUMP_SHADER_ADDR boot probe to capture the
+    /// exact instruction stream of a shader of interest -- e.g. a present pixel
+    /// shader whose color pack ships black -- so the defective step (the origin
+    /// of the pack-time EXEC mask) can be read straight from a boot trace.
+    /// </summary>
+    public static string DescribeDisassembly(CpuContext ctx, ulong shaderAddress)
+    {
+        if (!TryDecodeProgram(ctx, shaderAddress, out var program, out var error))
+        {
+            return $"error={error} raw={DescribeRawWords(ctx, shaderAddress)}";
+        }
+
+        var lines = new List<string>(program.Instructions.Count);
+        foreach (var instruction in program.Instructions)
+        {
+            var words = string.Join(
+                ' ',
+                instruction.Words.Select(word => $"{word:X8}"));
+            var destinations = string.Join(
+                ",",
+                instruction.Destinations.Select(operand => operand.ToString()));
+            var sources = string.Join(
+                ",",
+                instruction.Sources.Select(operand => operand.ToString()));
+            var control = instruction.Control is null
+                ? string.Empty
+                : $" ctrl={instruction.Control}";
+            lines.Add(
+                $"0x{instruction.Pc:X4} {instruction.Encoding} " +
+                $"{instruction.Opcode} dst=[{destinations}] src=[{sources}]" +
+                $"{control} [{words}]");
+        }
+
+        return string.Join(" | ", lines);
+    }
+
+    /// <summary>
     /// Raw dword dump used when decoding fails: without instruction sizes the
     /// program end is unknown, so dump through the first s_endpgm word (which
     /// can be a false positive inside a literal) up to a fixed cap. This keeps

@@ -163,6 +163,7 @@ public static class AgcExports
     private static readonly HashSet<uint> _tracedDcbSizes = new();
     private static readonly HashSet<(ulong Es, ulong Ps, GuestDrawKind Kind)> _tracedShaderTranslations = new();
     private static readonly HashSet<(ulong Es, ulong Ps)> _tracedShaderDecodePairs = new();
+    private static readonly HashSet<ulong> _tracedShaderDisassembly = new();
     private static readonly HashSet<(ulong Es, ulong Ps, ulong Target, ulong Texture, uint VertexCount)> _tracedShaderDraws = new();
     private static readonly HashSet<(ulong Ps, string Error)> _tracedShaderFailures = new();
     private static readonly HashSet<(int Handle, int Index, ulong Address, string Path)> _tracedDisplayBuffers = new();
@@ -7203,6 +7204,8 @@ public static class AgcExports
                 TraceAgcShader(
                     $"agc.shader_words ps=0x{pixelShaderAddress:X16} " +
                     Gen5ShaderTranslator.DescribeWords(ctx, pixelShaderAddress));
+                DumpRequestedShaderDisassembly(ctx, exportShaderAddress);
+                DumpRequestedShaderDisassembly(ctx, pixelShaderAddress);
                 if (Gen5ShaderTranslator.TryCreateState(
                         ctx,
                         exportShaderAddress,
@@ -8172,6 +8175,49 @@ public static class AgcExports
         }
 
         Console.Error.WriteLine($"[LOADER][TRACE] {message}");
+    }
+
+    // SHARPEMU_DUMP_SHADER_ADDR=0x<addr> asks for a one-shot full decoded
+    // listing of one shader (e.g. the present pixel shader whose color pack
+    // ships black), so the exact instruction stream -- and the origin of the
+    // pack-time EXEC mask -- can be read straight from a boot trace. Emitted
+    // directly (not gated by SHARPEMU_TRACE_AGC_SHADER) because it is an
+    // explicit, targeted opt-in.
+    private static void DumpRequestedShaderDisassembly(CpuContext ctx, ulong shaderAddress)
+    {
+        var request = Environment.GetEnvironmentVariable("SHARPEMU_DUMP_SHADER_ADDR");
+        if (string.IsNullOrEmpty(request))
+        {
+            return;
+        }
+
+        var text = request.Trim();
+        if (text.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+        {
+            text = text[2..];
+        }
+
+        if (!ulong.TryParse(
+                text,
+                System.Globalization.NumberStyles.HexNumber,
+                System.Globalization.CultureInfo.InvariantCulture,
+                out var requestedAddress) ||
+            requestedAddress != shaderAddress)
+        {
+            return;
+        }
+
+        lock (_submitTraceGate)
+        {
+            if (!_tracedShaderDisassembly.Add(shaderAddress))
+            {
+                return;
+            }
+        }
+
+        Console.Error.WriteLine(
+            $"[LOADER][TRACE] agc.shader_disasm addr=0x{shaderAddress:X16} " +
+            Gen5ShaderTranslator.DescribeDisassembly(ctx, shaderAddress));
     }
 
     private static string FormatShaderDwords(IReadOnlyList<uint> values) =>
