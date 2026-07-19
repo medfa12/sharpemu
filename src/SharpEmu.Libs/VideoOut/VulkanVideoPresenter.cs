@@ -405,6 +405,16 @@ internal static unsafe class VulkanVideoPresenter
             return TryEnqueueOrderedGuestFlipLocked(presentAddress, width, height);
         }
 
+        // An actively playing AvPlayer video owns the swapchain; skip the game's
+        // concurrent display-buffer flip so the intro clip is not overwritten by
+        // its loading frames. Mirrors the same VideoPresentIsActive guard in the
+        // ordered-flip publish path (ExecuteOrderedGuestFlip). The video's own
+        // frames arrive via TryPresentVideoFrame and are never suppressed.
+        if (VideoPresentIsActive())
+        {
+            return 0;
+        }
+
         var sequence = (_latestPresentation?.Sequence ?? 0) + 1;
         _latestPresentation = new Presentation(
             null,
@@ -683,6 +693,13 @@ internal static unsafe class VulkanVideoPresenter
                 return;
             }
 
+            // An actively playing AvPlayer video owns the swapchain; the game's
+            // concurrent loading draws must not overwrite the intro clip.
+            if (VideoPresentIsActive())
+            {
+                return;
+            }
+
             var sequence = (_latestPresentation?.Sequence ?? 0) + 1;
             _latestPresentation = new Presentation(
                 null,
@@ -739,6 +756,13 @@ internal static unsafe class VulkanVideoPresenter
         lock (_gate)
         {
             if (_closed)
+            {
+                return;
+            }
+
+            // An actively playing AvPlayer video owns the swapchain; the game's
+            // concurrent translated composite must not overwrite the intro clip.
+            if (VideoPresentIsActive())
             {
                 return;
             }
@@ -1636,6 +1660,35 @@ internal static unsafe class VulkanVideoPresenter
             _completedGuestWorkSequence = 0;
             _orderedGuestFlipVersionSequence = 0;
             _latestPresentation = null;
+            _lastVideoPresentTicks = 0;
+        }
+    }
+
+    // Present-arbitration test hooks. Drive the VideoPresentIsActive gate that
+    // suppresses the game's concurrent flips/draws while an AvPlayer intro clip
+    // is presenting, without a Vulkan device or a real TryPresentVideoFrame call.
+    internal static void MarkVideoPresentActiveForTests()
+    {
+        lock (_gate)
+        {
+            _lastVideoPresentTicks =
+                System.Diagnostics.Stopwatch.GetTimestamp();
+        }
+    }
+
+    internal static void ClearVideoPresentActiveForTests()
+    {
+        lock (_gate)
+        {
+            _lastVideoPresentTicks = 0;
+        }
+    }
+
+    internal static bool VideoPresentIsActiveForTests()
+    {
+        lock (_gate)
+        {
+            return VideoPresentIsActive();
         }
     }
 
