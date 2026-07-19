@@ -898,6 +898,15 @@ internal static partial class Gen5SpirvTranslator
                     result = IAdd(count, GetRawSource(instruction, 1));
                     break;
                 }
+                case "VMbcntHiU32B32":
+                {
+                    // D = popcount(S0 & EXEC_HI-lanes-below-me) + S1. A wave32
+                    // keeps every lane in the low half, so EXEC_HI is empty and
+                    // the high popcount is always zero: the op just forwards S1
+                    // (the running mbcnt accumulator seeded by v_mbcnt_lo).
+                    result = GetRawSource(instruction, 1);
+                    break;
+                }
                 case "VCvtPkU16U32":
                 case "VCvtPkI16I32":
                     result = BitwiseOr(
