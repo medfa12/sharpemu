@@ -82,9 +82,14 @@ public static class AudioPropagationExports
         return tag | (ulong)Interlocked.Increment(ref _nextHandle);
     }
 
+    // Cached once; a per-call Environment.GetEnvironmentVariable is a P/Invoke
+    // plus a transient string on paths the audio threads hit continuously.
+    private static readonly bool _traceAudio =
+        string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_AUDIO"), "1", StringComparison.Ordinal);
+
     private static void Trace(string message)
     {
-        if (string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_AUDIO"), "1", StringComparison.Ordinal))
+        if (_traceAudio)
         {
             Console.Error.WriteLine($"[LOADER][TRACE] audioprop.{message}");
         }

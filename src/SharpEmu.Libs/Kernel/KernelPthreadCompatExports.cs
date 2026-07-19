@@ -1723,14 +1723,16 @@ public static class KernelPthreadCompatExports
             : TimeSpan.FromTicks((long)timeoutUsec * 10L);
     }
 
+    // Cached once; cond waits consult this per wait and a per-call
+    // Environment.GetEnvironmentVariable is a P/Invoke plus a transient string.
+    private static readonly TimeSpan _condSpuriousWakeTimeout =
+        int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_PTHREAD_COND_SPURIOUS_WAKE_MS"), out var _condSpuriousWakeMilliseconds)
+            ? TimeSpan.FromMilliseconds(Math.Max(1, _condSpuriousWakeMilliseconds))
+            : TimeSpan.FromMilliseconds(DefaultSpuriousCondWakeMilliseconds);
+
     private static TimeSpan GetCondSpuriousWakeTimeout()
     {
-        if (int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_PTHREAD_COND_SPURIOUS_WAKE_MS"), out var milliseconds))
-        {
-            return TimeSpan.FromMilliseconds(Math.Max(1, milliseconds));
-        }
-
-        return TimeSpan.FromMilliseconds(DefaultSpuriousCondWakeMilliseconds);
+        return _condSpuriousWakeTimeout;
     }
 
     private static int NormalizeMutexType(int type)

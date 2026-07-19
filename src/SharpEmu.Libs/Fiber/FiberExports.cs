@@ -953,9 +953,14 @@ public static class FiberExports
         return true;
     }
 
+    // Cached once; a per-call Environment.GetEnvironmentVariable is a P/Invoke
+    // plus a transient string on the fiber switch path.
+    private static readonly bool _traceFiber =
+        string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_FIBER"), "1", StringComparison.Ordinal);
+
     private static void TraceFiber(string message)
     {
-        if (string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_FIBER"), "1", StringComparison.Ordinal))
+        if (_traceFiber)
         {
             Console.Error.WriteLine($"[LOADER][TRACE] fiber.{message}");
         }
