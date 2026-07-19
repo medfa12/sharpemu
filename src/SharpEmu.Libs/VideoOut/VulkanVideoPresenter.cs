@@ -186,7 +186,12 @@ internal sealed record VulkanTranslatedGuestDraw(
     byte[]? ComputeCaptureSpirv = null,
     NggComputeCapture? ComputeCapture = null,
     uint ComputeInvocationCount = 0,
-    IReadOnlyList<VulkanGuestMemoryBuffer>? ComputeCaptureInputs = null);
+    IReadOnlyList<VulkanGuestMemoryBuffer>? ComputeCaptureInputs = null,
+    // Guest address of the pixel shader that produced PixelSpirv. Diagnostic
+    // only (SHARPEMU_CAPTURE_DRAWS): lets a per-draw capture line be correlated
+    // with the agc.shader_draw ps=... trace. 0 when the submitter did not
+    // supply it.
+    ulong PixelShaderAddress = 0);
 
 internal sealed record VulkanOffscreenGuestDraw(
     VulkanTranslatedGuestDraw Draw,
@@ -790,7 +795,8 @@ internal static unsafe class VulkanVideoPresenter
         IReadOnlyList<VulkanGuestVertexBuffer>? vertexBuffers = null,
         VulkanGuestRenderState? renderState = null,
         VulkanGuestDepthTarget? depthTarget = null,
-        VulkanGuestIndirectArgs? indirectArgs = null)
+        VulkanGuestIndirectArgs? indirectArgs = null,
+        ulong pixelShaderAddress = 0)
     {
         SubmitOffscreenTranslatedDraw(
             pixelSpirv,
@@ -806,7 +812,8 @@ internal static unsafe class VulkanVideoPresenter
             vertexBuffers,
             renderState,
             depthTarget,
-            indirectArgs);
+            indirectArgs,
+            pixelShaderAddress: pixelShaderAddress);
     }
 
     public static void SubmitOffscreenTranslatedDraw(
@@ -827,7 +834,8 @@ internal static unsafe class VulkanVideoPresenter
         byte[]? computeCaptureSpirv = null,
         NggComputeCapture? computeCapture = null,
         uint computeInvocationCount = 0,
-        IReadOnlyList<VulkanGuestMemoryBuffer>? computeCaptureInputs = null)
+        IReadOnlyList<VulkanGuestMemoryBuffer>? computeCaptureInputs = null,
+        ulong pixelShaderAddress = 0)
     {
         if (pixelSpirv.Length == 0 ||
             targets.Count == 0 ||
@@ -925,7 +933,8 @@ internal static unsafe class VulkanVideoPresenter
                         computeCaptureSpirv,
                         computeCapture,
                         computeInvocationCount,
-                        computeCaptureInputs),
+                        computeCaptureInputs,
+                        pixelShaderAddress),
                     targets.ToArray(),
                     PublishTarget: true,
                     Depth: depthTarget));
@@ -2784,6 +2793,15 @@ internal static unsafe class VulkanVideoPresenter
                 ? d
                 : 60;
         private static readonly System.Diagnostics.Stopwatch RenderDocClock = new();
+        // SHARPEMU_CAPTURE_DRAWS=1 emits one authoritative capture.draw line per
+        // offscreen graphics draw whose output render target(s) and sampled input
+        // texture(s) carry nonblack_pixels read from the real bound VkImage (via
+        // the same readback as vk.guest_image / TraceGuestImageContents), never
+        // from guest memory.
+        private static readonly bool CaptureDrawsEnabled = string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_CAPTURE_DRAWS"),
+            "1",
+            StringComparison.Ordinal);
         private int _frameDumpBudget = 24;
         private bool _swapchainReadbackPending;
         private bool _deviceLost;
@@ -2797,6 +2815,10 @@ internal static unsafe class VulkanVideoPresenter
         private bool _supportsMemoryBudget;
         private ulong _useStamp;
         private long _guestImageContentGeneration;
+        // Monotonic id assigned to each offscreen draw when SHARPEMU_CAPTURE_DRAWS
+        // is set, so a capture.draw line can be pinned to a specific draw in
+        // execution order on the single render thread.
+        private long _captureDrawSeq;
         private bool _reclaimInProgress;
         private bool _memoryPanic;
         private readonly HashSet<(ulong Address, uint Width, uint Height, Format Format)> _tracedTextureCacheHits = new();
@@ -8057,6 +8079,11 @@ internal static unsafe class VulkanVideoPresenter
                 MarkSampledImagesInitialized(resources);
                 MarkStorageImagesInitialized(resources, traceContents: false);
 
+                if (CaptureDrawsEnabled)
+                {
+                    CaptureDrawContents(work, targets, resources);
+                }
+
                 if (work.PublishTarget)
                 {
                     for (var index = 0; index < targets.Length; index++)
@@ -9822,6 +9849,240 @@ internal static unsafe class VulkanVideoPresenter
                 _vk.DestroyBuffer(_device, buffer, null);
                 FreeDeviceMemory(memory);
             }
+        }
+
+        // SHARPEMU_CAPTURE_DRAWS: emit ONE authoritative line per offscreen draw
+        // whose output target(s) and sampled input texture(s) report
+        // nonblack_pixels read from the REAL bound VkImage. This is what makes it
+        // trustworthy where the old shader_draw probe was not: the numbers come
+        // from CmdCopyImageToBuffer against the VkImage (same readback as
+        // TraceGuestImageContents), never from guest memory (which is 0 for a
+        // GPU-rendered render target).
+        //
+        // Timing/layout safety: the draw's command buffer was already submitted
+        // by the caller. We rebind _commandBuffer to the presentation command
+        // buffer and QueueWaitIdle once, draining THIS draw and every earlier
+        // queued draw (single graphics queue). After that the output targets hold
+        // their final content and every sampled input's producing pass has
+        // completed, so each per-image readback (which re-records, submits, and
+        // waits on the presentation command buffer) reads a settled VkImage. This
+        // mirrors the established vk.guest_write_sample readback pattern, which
+        // likewise sets _commandBuffer = _presentationCommandBuffer + QueueWaitIdle
+        // before calling TraceGuestImageContents mid-frame.
+        private void CaptureDrawContents(
+            VulkanOffscreenGuestDraw work,
+            GuestImageResource[] targets,
+            TranslatedDrawResources resources)
+        {
+            if (_reclaimInProgress || _memoryPanic)
+            {
+                return;
+            }
+
+            var seq = ++_captureDrawSeq;
+            // Drain this draw (and all earlier queued work) so the readbacks below
+            // observe settled VkImages. The presentation command buffer is the
+            // safe scratch buffer for out-of-band readback; the draw's own command
+            // buffer is already submitted and pending free.
+            _commandBuffer = _presentationCommandBuffer;
+            Check(
+                _vk.QueueWaitIdle(_queue),
+                "vkQueueWaitIdle(capture draws)");
+
+            var line = new System.Text.StringBuilder();
+            line.Append("capture.draw seq=").Append(seq)
+                .Append(" ps=0x").Append(work.Draw.PixelShaderAddress.ToString("X16"))
+                .Append(" vtx=").Append(work.Draw.VertexCount)
+                .Append(" mrt=").Append(targets.Length)
+                .Append(" inputs=").Append(resources.Textures.Count(t => !t.IsStorage));
+
+            for (var index = 0; index < targets.Length; index++)
+            {
+                line.Append(' ');
+                AppendCapturedImage(line, "out" + index, targets[index]);
+            }
+
+            var inputIndex = 0;
+            foreach (var texture in resources.Textures)
+            {
+                if (texture.IsStorage)
+                {
+                    continue;
+                }
+
+                line.Append(' ');
+                var label = "in" + inputIndex;
+                inputIndex++;
+
+                // The sampler reads a real VkImage in one of two GPU-content
+                // cases: a native-format alias binds the guest-image cache
+                // surface directly (GuestImage), or a copy-on-sample bridge copies
+                // a producer image into this texture (CopySource is the producer).
+                // Both are GuestImageResources the VkImage readback understands.
+                // A pure CPU upload (no GuestImage/CopySource) genuinely sources
+                // guest memory, so it is reported as src=cpu_upload without a
+                // VkImage count -- the very ambiguity this capture exists to avoid
+                // conflating with GPU content.
+                var source = texture.GuestImage ?? texture.CopySource;
+                if (source is { } image)
+                {
+                    var src = texture.CopySource is not null && texture.GuestImage is null
+                        ? "copy"
+                        : "alias";
+                    AppendCapturedImage(line, label, image, src, texture.Address);
+                }
+                else
+                {
+                    line.Append(label)
+                        .Append("=[addr=0x").Append(texture.Address.ToString("X16"))
+                        .Append(" src=cpu_upload]");
+                }
+            }
+
+            Console.Error.WriteLine("[LOADER][CAPTURE] " + line);
+        }
+
+        private void AppendCapturedImage(
+            System.Text.StringBuilder line,
+            string label,
+            GuestImageResource image,
+            string? src = null,
+            ulong bindAddress = 0)
+        {
+            line.Append(label).Append("=[addr=0x").Append(image.Address.ToString("X16"));
+            if (src is not null && bindAddress != image.Address)
+            {
+                line.Append(" bind=0x").Append(bindAddress.ToString("X16"));
+            }
+
+            line.Append(" fmt=").Append(image.Format)
+                .Append(" size=").Append(image.Width).Append('x').Append(image.Height);
+            if (TryReadbackGuestImageNonblack(image, out var nonblack, out var pixels))
+            {
+                line.Append(" nonblack=").Append(nonblack).Append('/').Append(pixels);
+            }
+            else
+            {
+                line.Append(" nonblack=unsupported");
+            }
+
+            if (src is not null)
+            {
+                line.Append(" src=").Append(src);
+            }
+
+            line.Append(']');
+        }
+
+        // Reuses the vk.guest_image readback machinery (GetReadbackBytesPerPixel +
+        // CmdCopyImageToBuffer against image.Image + CountNonblackPixels) exactly
+        // as TraceGuestImageContents does, but returns the counts instead of
+        // logging so a single capture line can combine several images. The caller
+        // must have rebound _commandBuffer to a resettable buffer and drained the
+        // queue first (see CaptureDrawContents). Returns false only when the
+        // format has no readback layout (bytesPerPixel == 0).
+        private bool TryReadbackGuestImageNonblack(
+            GuestImageResource image,
+            out long nonblackPixels,
+            out ulong pixelCount)
+        {
+            pixelCount = (ulong)image.Width * image.Height;
+            nonblackPixels = 0;
+            var bytesPerPixel = GetReadbackBytesPerPixel(image.Format);
+            if (bytesPerPixel == 0)
+            {
+                return false;
+            }
+
+            var byteCount = checked((ulong)image.Width * image.Height * bytesPerPixel);
+            var buffer = CreateBuffer(
+                byteCount,
+                BufferUsageFlags.TransferDstBit,
+                MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit,
+                out var memory);
+            try
+            {
+                Check(
+                    _vk.ResetCommandBuffer(_commandBuffer, 0),
+                    "vkResetCommandBuffer(capture readback)");
+                var beginInfo = new CommandBufferBeginInfo
+                {
+                    SType = StructureType.CommandBufferBeginInfo,
+                    Flags = CommandBufferUsageFlags.OneTimeSubmitBit,
+                };
+                Check(
+                    _vk.BeginCommandBuffer(_commandBuffer, &beginInfo),
+                    "vkBeginCommandBuffer(capture readback)");
+
+                TransitionGuestImage(
+                    image,
+                    ImageLayout.TransferSrcOptimal,
+                    PipelineStageFlags.TransferBit,
+                    AccessFlags.TransferReadBit);
+
+                var region = new BufferImageCopy
+                {
+                    ImageSubresource = new ImageSubresourceLayers
+                    {
+                        AspectMask = ImageAspectFlags.ColorBit,
+                        LayerCount = 1,
+                    },
+                    ImageExtent = new Extent3D(image.Width, image.Height, 1),
+                };
+                _vk.CmdCopyImageToBuffer(
+                    _commandBuffer,
+                    image.Image,
+                    ImageLayout.TransferSrcOptimal,
+                    buffer,
+                    1,
+                    &region);
+
+                TransitionGuestImage(
+                    image,
+                    ImageLayout.ShaderReadOnlyOptimal,
+                    PipelineStageFlags.VertexShaderBit |
+                    PipelineStageFlags.FragmentShaderBit |
+                    PipelineStageFlags.ComputeShaderBit,
+                    AccessFlags.ShaderReadBit);
+
+                Check(
+                    _vk.EndCommandBuffer(_commandBuffer),
+                    "vkEndCommandBuffer(capture readback)");
+                var commandBuffer = _commandBuffer;
+                var submitInfo = new SubmitInfo
+                {
+                    SType = StructureType.SubmitInfo,
+                    CommandBufferCount = 1,
+                    PCommandBuffers = &commandBuffer,
+                };
+                Check(
+                    _vk.QueueSubmit(_queue, 1, &submitInfo, default),
+                    "vkQueueSubmit(capture readback)");
+                Check(
+                    _vk.QueueWaitIdle(_queue),
+                    "vkQueueWaitIdle(capture readback)");
+
+                void* mapped;
+                Check(
+                    _vk.MapMemory(_device, memory, 0, byteCount, 0, &mapped),
+                    "vkMapMemory(capture readback)");
+                try
+                {
+                    var bytes = new ReadOnlySpan<byte>(mapped, checked((int)byteCount));
+                    nonblackPixels = CountNonblackPixels(bytes, image.Format, bytesPerPixel);
+                }
+                finally
+                {
+                    _vk.UnmapMemory(_device, memory);
+                }
+            }
+            finally
+            {
+                _vk.DestroyBuffer(_device, buffer, null);
+                FreeDeviceMemory(memory);
+            }
+
+            return true;
         }
 
         private static void DumpGuestImageBytes(

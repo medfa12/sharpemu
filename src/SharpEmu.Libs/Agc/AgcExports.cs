@@ -4651,7 +4651,8 @@ public static class AgcExports
                         translatedDraw.ComputeCaptureSpirv,
                         translatedDraw.ComputeCapture,
                         translatedDraw.ComputeInvocationCount,
-                        translatedDraw.ComputeCaptureInputs);
+                        translatedDraw.ComputeCaptureInputs,
+                        translatedDraw.PixelShaderAddress);
             }
             else if (depthTarget is { } boundDepthTarget)
             {
