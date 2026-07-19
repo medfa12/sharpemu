@@ -1595,6 +1595,14 @@ internal static unsafe class VulkanVideoPresenter
         }
     }
 
+    // Sampled-texture (T#) format decode, exposed so a regression test can pin
+    // that it agrees with the render-target (CB) decode of the same dfmt/num
+    // pair. A divergence would make the present sampler search a VkFormat the
+    // scene render target was never registered under -- e.g. Astro Bot's title
+    // present sampling the R16G16B16A16Sfloat scene as dfmt 12 / num 7.
+    internal static Format GetSampledTextureFormatForTests(uint format, uint numberType) =>
+        Presenter.GetTextureFormat(format, numberType);
+
     internal static bool TryResolveDisplayBufferSourceForTests(
         ulong flipAddress,
         out ulong sourceAddress)
@@ -7045,7 +7053,7 @@ internal static unsafe class VulkanVideoPresenter
         // GFX10 unified IMG_FORMAT is normalized by Gfx10UnifiedFormat at
         // descriptor decode). Canonical guest codes (GuestFormatXxx) are also
         // accepted for deferred/aliased bindings.
-        private static Format GetTextureFormat(uint format, uint numberType) =>
+        internal static Format GetTextureFormat(uint format, uint numberType) =>
             (format, numberType) switch
             {
                 (9, _) => Format.A2R10G10B10UnormPack32,

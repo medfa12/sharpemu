@@ -518,3 +518,84 @@ public sealed class VulkanRenderTargetFormatDecodeTests
         Assert.Equal(Format.R8G8B8A8Unorm, decoded.Format);
     }
 }
+
+/// <summary>
+/// The sampled-texture (T#) format decode and the render-target (CB) format
+/// decode must agree on the same VkFormat for a shared dfmt/numberType pair.
+/// If they diverged, a pass sampling an address would look up the surface
+/// cache under a VkFormat the render target that produced the content was
+/// never keyed under, so the exact-format sample alias would never match --
+/// Astro Bot's title present samples its R16G16B16A16Sfloat scene as
+/// dfmt 12 / num 7, the same pair the scene render target is registered under.
+/// </summary>
+public sealed class VulkanSampledFormatDecodeConsistencyTests
+{
+    [Theory]
+    // The Astro Bot title case: HDR scene rendered and sampled as 16_16_16_16
+    // float.
+    [InlineData(12u, 7u, Format.R16G16B16A16Sfloat)]
+    [InlineData(10u, 0u, Format.R8G8B8A8Unorm)]
+    [InlineData(5u, 7u, Format.R16G16Sfloat)]
+    [InlineData(4u, 7u, Format.R32Sfloat)]
+    public void SampleDecodeMatchesRenderTargetDecode(
+        uint dataFormat, uint numberType, Format expected)
+    {
+        var sampled = VulkanVideoPresenter.GetSampledTextureFormatForTests(
+            dataFormat, numberType);
+        Assert.Equal(expected, sampled);
+
+        Assert.True(VulkanVideoPresenter.TryDecodeRenderTargetFormat(
+            dataFormat, numberType, out var renderTarget));
+        Assert.Equal(expected, renderTarget.Format);
+
+        // The whole point: both decode paths land on the identical VkFormat, so
+        // a sample request keys the surface cache under the format its producing
+        // render target was registered with.
+        Assert.Equal(renderTarget.Format, sampled);
+    }
+}
+
+/// <summary>
+/// The concrete Astro Bot registration case: a render target published at an
+/// address under its true VkFormat must be found by a sample request of that
+/// same format, even when an empty different-format sibling was written to the
+/// same address more recently. Guards the sample cache against binding the
+/// empty sibling and presenting black.
+/// </summary>
+public sealed class VulkanRenderTargetSampleFindableTests
+{
+    private const ulong Scene = 0x000000053B9F0000;
+
+    private static VulkanVideoPresenter.GuestImageResource Surface(
+        Format format, uint width, uint height, ulong stamp, long contentGen) => new()
+    {
+        Address = Scene,
+        Width = width,
+        Height = height,
+        MipLevels = 1,
+        Format = format,
+        Initialized = true,
+        LastUseStamp = stamp,
+        ContentGeneration = contentGen,
+    };
+
+    [Fact]
+    public void SfloatSceneFoundOverEmptyR8G8SiblingByItsSampleFormat()
+    {
+        var cache = new VulkanVideoPresenter.GuestSurfaceCache();
+        // The colored HDR scene the title actually rendered.
+        var scene = Surface(Format.R16G16B16A16Sfloat, 2432, 1368, stamp: 1, contentGen: 3);
+        // An empty R8G8 surface the game touched at the same address afterwards.
+        var emptySibling = Surface(Format.R8G8Unorm, 1920, 1080, stamp: 9, contentGen: 40);
+        cache.Add(emptySibling);
+        cache.Add(scene);
+
+        var texture = new VulkanGuestDrawTexture(
+            Scene, 2432, 1368, Format: 12, NumberType: 7, [],
+            IsFallback: false, IsStorage: false);
+        var sampleFormat = VulkanVideoPresenter.GetSampledTextureFormatForTests(12, 7);
+
+        Assert.True(cache.TryFindSampleAlias(texture, sampleFormat, out var chosen));
+        Assert.Same(scene, chosen);
+    }
+}
