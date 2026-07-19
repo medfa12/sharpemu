@@ -4518,6 +4518,8 @@ public static class AgcExports
                 indexed,
                 flattenInstanceToVertex,
                 passthroughCompute,
+                psInputEna,
+                psInputAddr,
                 out var translatedDraw,
                 out translationError))
         {
@@ -4765,6 +4767,8 @@ public static class AgcExports
         bool indexed,
         bool flattenInstanceToVertex,
         bool passthroughCompute,
+        uint psInputEna,
+        uint psInputAddr,
         out TranslatedGuestDraw draw,
         out string error)
     {
@@ -4877,7 +4881,9 @@ public static class AgcExports
                     totalGlobalBufferCount: totalGlobalBuffers + 2,
                     imageBindingBase: 0,
                     scalarRegisterBufferIndex: totalGlobalBuffers,
-                    pixelInputControls: pixelInputControls) ||
+                    pixelInputControls: pixelInputControls,
+                    pixelInputEnable: psInputEna,
+                    pixelInputAddress: psInputAddr) ||
                 !Gen5SpirvTranslator.TryCompileVertexShader(
                     exportState,
                     exportEvaluation,
@@ -7250,7 +7256,9 @@ public static class AgcExports
                                  evaluation,
                                  [new(0, 0, Gen5PixelOutputKind.Float)],
                                  out var compiledPixel,
-                                 out var compileError))
+                                 out var compileError,
+                                 pixelInputEnable: psInputEna,
+                                 pixelInputAddress: psInputAddr))
                         {
                             TraceAgcShader(
                                 $"agc.shader_spirv ps=0x{pixelShaderAddress:X16} " +

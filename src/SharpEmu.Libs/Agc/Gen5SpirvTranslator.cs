@@ -20,7 +20,9 @@ internal static partial class Gen5SpirvTranslator
         int totalGlobalBufferCount = -1,
         int imageBindingBase = 0,
         int scalarRegisterBufferIndex = -1,
-        IReadOnlyList<uint>? pixelInputControls = null) =>
+        IReadOnlyList<uint>? pixelInputControls = null,
+        uint pixelInputEnable = 0,
+        uint pixelInputAddress = 0) =>
         TryCompilePixelShader(
             state,
             evaluation,
@@ -31,7 +33,9 @@ internal static partial class Gen5SpirvTranslator
             totalGlobalBufferCount,
             imageBindingBase,
             scalarRegisterBufferIndex,
-            pixelInputControls);
+            pixelInputControls,
+            pixelInputEnable,
+            pixelInputAddress);
 
     public static bool TryCompilePixelShader(
         Gen5ShaderState state,
@@ -43,7 +47,9 @@ internal static partial class Gen5SpirvTranslator
         int totalGlobalBufferCount = -1,
         int imageBindingBase = 0,
         int scalarRegisterBufferIndex = -1,
-        IReadOnlyList<uint>? pixelInputControls = null)
+        IReadOnlyList<uint>? pixelInputControls = null,
+        uint pixelInputEnable = 0,
+        uint pixelInputAddress = 0)
     {
         if (outputs.Count > 8 || outputs.Any(output => output.GuestSlot > 7))
         {
@@ -82,7 +88,9 @@ internal static partial class Gen5SpirvTranslator
             totalGlobalBufferCount,
             imageBindingBase,
             scalarRegisterBufferIndex,
-            pixelInputControls: pixelInputControls);
+            pixelInputControls: pixelInputControls,
+            pixelInputEnable: pixelInputEnable,
+            pixelInputAddress: pixelInputAddress);
         return context.TryCompile(out shader, out error);
     }
 
@@ -194,6 +202,11 @@ internal static partial class Gen5SpirvTranslator
         private readonly bool _instanceIdFromVertexIndex;
         private readonly NggComputeCapture? _computeCapture;
         private readonly IReadOnlyList<uint> _pixelInputControls;
+        // SPI_PS_INPUT_ENA / SPI_PS_INPUT_ADDR from the draw's context registers.
+        // ADDR selects which pixel-input VGPR slots the hardware allocates (in a
+        // fixed order); ENA selects which of those slots actually receive data.
+        private readonly uint _pixelInputEnable;
+        private readonly uint _pixelInputAddress;
         private readonly List<uint> _interfaces = [];
         private readonly Dictionary<uint, uint> _pixelInputs = [];
         private readonly Dictionary<uint, SpirvPixelOutput> _pixelOutputs = [];
@@ -265,6 +278,7 @@ internal static partial class Gen5SpirvTranslator
         private uint _instanceIndexInput;
         private uint _fragCoordInput;
         private uint _baryCoordInput;
+        private uint _baryCoordNoPerspInput;
         private uint _localInvocationIdInput;
         private uint _workGroupIdInput;
         private uint _globalInvocationIdInput;
@@ -326,7 +340,9 @@ internal static partial class Gen5SpirvTranslator
             bool instanceIdFromVertexIndex = false,
             NggComputeCapture? computeCapture = null,
             IReadOnlyCollection<uint>? requiredVertexOutputLocations = null,
-            IReadOnlyList<uint>? pixelInputControls = null)
+            IReadOnlyList<uint>? pixelInputControls = null,
+            uint pixelInputEnable = 0,
+            uint pixelInputAddress = 0)
         {
             _stage = stage;
             _state = state;
@@ -334,6 +350,8 @@ internal static partial class Gen5SpirvTranslator
             _evaluation = evaluation;
             _pixelOutputBindings = pixelOutputBindings;
             _pixelInputControls = pixelInputControls ?? [];
+            _pixelInputEnable = pixelInputEnable;
+            _pixelInputAddress = pixelInputAddress;
             _localSizeX = localSizeX;
             _localSizeY = localSizeY;
             _localSizeZ = localSizeZ;
@@ -516,7 +534,7 @@ internal static partial class Gen5SpirvTranslator
             _module.AddCapability(SpirvCapability.Shader);
             _module.AddCapability(SpirvCapability.Int64);
             _module.AddCapability(SpirvCapability.ImageQuery);
-            if (RequiresBarycentricCoefficients())
+            if (ShouldDeclarePerspBarycentric() || ShouldDeclareNoPerspBarycentric())
             {
                 _module.AddExtension("SPV_KHR_fragment_shader_barycentric");
                 _module.AddCapability(SpirvCapability.FragmentBarycentricKhr);
@@ -961,18 +979,33 @@ internal static partial class Gen5SpirvTranslator
                     _interfaces.Add(variable);
                 }
 
-                if (RequiresBarycentricCoefficients())
+                if (ShouldDeclarePerspBarycentric() || ShouldDeclareNoPerspBarycentric())
                 {
                     var inputVec3Pointer =
                         _module.TypePointer(SpirvStorageClass.Input, _vec3Type);
-                    _baryCoordInput = _module.AddGlobalVariable(
-                        inputVec3Pointer,
-                        SpirvStorageClass.Input);
-                    _module.AddDecoration(
-                        _baryCoordInput,
-                        SpirvDecoration.BuiltIn,
-                        (uint)SpirvBuiltIn.BaryCoordKhr);
-                    _interfaces.Add(_baryCoordInput);
+                    if (ShouldDeclarePerspBarycentric())
+                    {
+                        _baryCoordInput = _module.AddGlobalVariable(
+                            inputVec3Pointer,
+                            SpirvStorageClass.Input);
+                        _module.AddDecoration(
+                            _baryCoordInput,
+                            SpirvDecoration.BuiltIn,
+                            (uint)SpirvBuiltIn.BaryCoordKhr);
+                        _interfaces.Add(_baryCoordInput);
+                    }
+
+                    if (ShouldDeclareNoPerspBarycentric())
+                    {
+                        _baryCoordNoPerspInput = _module.AddGlobalVariable(
+                            inputVec3Pointer,
+                            SpirvStorageClass.Input);
+                        _module.AddDecoration(
+                            _baryCoordNoPerspInput,
+                            SpirvDecoration.BuiltIn,
+                            (uint)SpirvBuiltIn.BaryCoordNoPerspKhr);
+                        _interfaces.Add(_baryCoordNoPerspInput);
+                    }
                 }
 
                 _fragCoordInput = _module.AddGlobalVariable(
@@ -1081,6 +1114,21 @@ internal static partial class Gen5SpirvTranslator
             _stage == Gen5SpirvStage.Pixel &&
             _interpolationMoveAttributes.Any(attribute =>
                 !IsCustomInterpolation(GetPixelInputControl(attribute)));
+
+        // A perspective barycentric input (BaryCoordKHR) is declared when the
+        // guest reconstructs V_INTERP coefficients (which need I/J) or when any
+        // perspective ADDR bit -- PERSP_SAMPLE/CENTER/CENTROID/PULL_MODEL
+        // (bits 0..3) -- requests one, so its weights can be seeded into the
+        // hardware-selected VGPR slot.
+        private bool ShouldDeclarePerspBarycentric() =>
+            _stage == Gen5SpirvStage.Pixel &&
+            (RequiresBarycentricCoefficients() || (_pixelInputAddress & 0xFu) != 0);
+
+        // A linear barycentric input (BaryCoordNoPerspKHR) is declared when any
+        // linear ADDR bit -- LINEAR_SAMPLE/CENTER/CENTROID (bits 4..6) -- is set.
+        private bool ShouldDeclareNoPerspBarycentric() =>
+            _stage == Gen5SpirvStage.Pixel &&
+            (_pixelInputAddress & 0x70u) != 0;
 
         private void DeclareVertexInputs()
         {
@@ -1195,37 +1243,22 @@ internal static partial class Gen5SpirvTranslator
             }
             else if (_stage == Gen5SpirvStage.Pixel)
             {
-                if (_baryCoordInput != 0)
+                var fragCoord = Load(_vec4Type, _fragCoordInput);
+                if (_pixelInputAddress != 0)
                 {
-                    // Under the fixed PERSP_CENTER + POS_X/Y input layout the
-                    // barycentric I/J weights occupy v0/v1. Seed them so the
-                    // guest's manual interpolation (v_interp_p1/p2 against the
-                    // reconstructed P0/P10/P20 coefficients) sees real weights.
-                    var barycentrics = Load(_vec3Type, _baryCoordInput);
-                    for (uint component = 0; component < 2; component++)
-                    {
-                        var weight = _module.AddInstruction(
-                            SpirvOp.CompositeExtract,
-                            _floatType,
-                            barycentrics,
-                            component + 1);
-                        StoreV(component, Bitcast(_uintType, weight), guardWithExec: false);
-                    }
+                    // Real draw: allocate the pixel-input VGPRs in the hardware
+                    // order gated by SPI_PS_INPUT_ADDR so the barycentric weights
+                    // and POS values land in the same VGPRs the guest reads.
+                    EmitPixelInputState(fragCoord);
+                }
+                else
+                {
+                    // Legacy callers (unit tests) provide no ADDR/ENA. Preserve
+                    // the historical fixed PERSP_CENTER + POS_X/Y layout: I/J in
+                    // v0/v1, fragCoord X/Y in v2/v3.
+                    EmitLegacyPixelInputState(fragCoord);
                 }
 
-                var fragCoord = Load(_vec4Type, _fragCoordInput);
-                var x = _module.AddInstruction(
-                    SpirvOp.CompositeExtract,
-                    _floatType,
-                    fragCoord,
-                    0);
-                var y = _module.AddInstruction(
-                    SpirvOp.CompositeExtract,
-                    _floatType,
-                    fragCoord,
-                    1);
-                StoreV(2, Bitcast(_uintType, x), guardWithExec: false);
-                StoreV(3, Bitcast(_uintType, y), guardWithExec: false);
                 foreach (var output in _pixelOutputs.Values)
                 {
                     Store(output.Variable, _module.ConstantNull(output.Type));
@@ -1287,6 +1320,133 @@ internal static partial class Gen5SpirvTranslator
                     StoreV(8, invocationIndex, guardWithExec: false);
                 }
             }
+        }
+
+        private void EmitLegacyPixelInputState(uint fragCoord)
+        {
+            if (_baryCoordInput != 0)
+            {
+                // Under the fixed PERSP_CENTER + POS_X/Y input layout the
+                // barycentric I/J weights occupy v0/v1. Seed them so the
+                // guest's manual interpolation (v_interp_p1/p2 against the
+                // reconstructed P0/P10/P20 coefficients) sees real weights.
+                var barycentrics = Load(_vec3Type, _baryCoordInput);
+                for (uint component = 0; component < 2; component++)
+                {
+                    var weight = _module.AddInstruction(
+                        SpirvOp.CompositeExtract,
+                        _floatType,
+                        barycentrics,
+                        component + 1);
+                    StoreV(component, Bitcast(_uintType, weight), guardWithExec: false);
+                }
+            }
+
+            var x = _module.AddInstruction(
+                SpirvOp.CompositeExtract,
+                _floatType,
+                fragCoord,
+                0);
+            var y = _module.AddInstruction(
+                SpirvOp.CompositeExtract,
+                _floatType,
+                fragCoord,
+                1);
+            StoreV(2, Bitcast(_uintType, x), guardWithExec: false);
+            StoreV(3, Bitcast(_uintType, y), guardWithExec: false);
+        }
+
+        private void EmitPixelInputState(uint fragCoord)
+        {
+            uint vgpr = 0;
+
+            // Pixel input VGPRs are compacted in SPI_PS_INPUT_ADDR order. Each
+            // ADDR bit that is set consumes its VGPR slot(s) whether or not the
+            // matching ENA bit requests data, so inputs that follow (notably the
+            // POS_* fragCoord values and, for centroid/sample sampling, the
+            // barycentric weights) land in the hardware-selected registers.
+            EmitPixelBarycentricInput(0, _baryCoordInput, ref vgpr); // PERSP_SAMPLE
+            EmitPixelBarycentricInput(1, _baryCoordInput, ref vgpr); // PERSP_CENTER
+            EmitPixelBarycentricInput(2, _baryCoordInput, ref vgpr); // PERSP_CENTROID
+            AdvancePixelInput(3, 3, ref vgpr); // PERSP_PULL_MODEL
+            EmitPixelBarycentricInput(4, _baryCoordNoPerspInput, ref vgpr); // LINEAR_SAMPLE
+            EmitPixelBarycentricInput(5, _baryCoordNoPerspInput, ref vgpr); // LINEAR_CENTER
+            EmitPixelBarycentricInput(6, _baryCoordNoPerspInput, ref vgpr); // LINEAR_CENTROID
+            AdvancePixelInput(7, 1, ref vgpr); // LINE_STIPPLE_TEX
+
+            EmitPixelPositionInput(8, 0, fragCoord, ref vgpr); // POS_X_FLOAT
+            EmitPixelPositionInput(9, 1, fragCoord, ref vgpr); // POS_Y_FLOAT
+            EmitPixelPositionInput(10, 2, fragCoord, ref vgpr); // POS_Z_FLOAT
+            EmitPixelPositionInput(11, 3, fragCoord, ref vgpr); // POS_W_FLOAT
+
+            // FRONT_FACE, ANCILLARY, SAMPLE_COVERAGE and POS_FIXED_PT follow the
+            // position inputs. Reserve their compact slots so anything the guest
+            // reads past them stays aligned; their builtins are not seeded yet.
+            AdvancePixelInput(12, 1, ref vgpr); // FRONT_FACE
+            AdvancePixelInput(13, 1, ref vgpr); // ANCILLARY
+            AdvancePixelInput(14, 1, ref vgpr); // SAMPLE_COVERAGE
+            AdvancePixelInput(15, 1, ref vgpr); // POS_FIXED_PT
+        }
+
+        private void EmitPixelBarycentricInput(int bit, uint input, ref uint vgpr)
+        {
+            var mask = 1u << bit;
+            if ((_pixelInputAddress & mask) == 0)
+            {
+                return;
+            }
+
+            if ((_pixelInputEnable & mask) != 0 && input != 0)
+            {
+                // The barycentric I/J weights map to vertex-one/vertex-two
+                // components of the fragment-shader-barycentric builtin, matching
+                // the guest interpolation equation P0 + P10 * I + P20 * J.
+                var barycentrics = Load(_vec3Type, input);
+                for (uint component = 0; component < 2; component++)
+                {
+                    var weight = _module.AddInstruction(
+                        SpirvOp.CompositeExtract,
+                        _floatType,
+                        barycentrics,
+                        component + 1);
+                    StoreV(vgpr + component, Bitcast(_uintType, weight), guardWithExec: false);
+                }
+            }
+
+            vgpr += 2;
+        }
+
+        private void AdvancePixelInput(int bit, uint dwordCount, ref uint vgpr)
+        {
+            if ((_pixelInputAddress & (1u << bit)) != 0)
+            {
+                vgpr += dwordCount;
+            }
+        }
+
+        private void EmitPixelPositionInput(
+            int bit,
+            uint component,
+            uint fragCoord,
+            ref uint vgpr)
+        {
+            var mask = 1u << bit;
+            if ((_pixelInputAddress & mask) == 0)
+            {
+                return;
+            }
+
+            if ((_pixelInputEnable & mask) != 0)
+            {
+                var value = _module.AddInstruction(
+                    SpirvOp.CompositeExtract,
+                    _floatType,
+                    fragCoord,
+                    component);
+                StoreV(vgpr, Bitcast(_uintType, value), guardWithExec: false);
+            }
+
+            vgpr++;
         }
 
         private uint LoadGlobalInvocationIdX()

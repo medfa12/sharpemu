@@ -191,6 +191,225 @@ public sealed class Gen5SpirvCompileTests
         AssertVectorCompositeConstituentsMatchComponentType(shader.Spirv);
     }
 
+    // SPI_PS_INPUT_ENA / SPI_PS_INPUT_ADDR bit positions (RDNA2).
+    private const uint PerspSample = 1u << 0;
+    private const uint PerspCenter = 1u << 1;
+    private const uint PerspCentroid = 1u << 2;
+    private const uint LinearCenter = 1u << 5;
+    private const uint PosXFloat = 1u << 8;
+    private const uint PosYFloat = 1u << 9;
+    private const uint BaryCoordKhrBuiltIn = 5286;
+    private const uint BaryCoordNoPerspBuiltIn = 5287;
+    private const uint FragCoordBuiltIn = 15;
+
+    [Fact]
+    public void PixelInputVgprs_PerspCenterAndPos_KeepLegacyV0V1V2V3Layout()
+    {
+        // ADDR = ENA = PERSP_CENTER + POS_X + POS_Y. Both the barycentric and
+        // the position bits are enabled, so the compacted layout matches the
+        // historical fixed one: I/J in v0/v1 and fragCoord X/Y in v2/v3.
+        var addr = PerspCenter | PosXFloat | PosYFloat;
+        var (state, evaluation, _) = DecodeAndEvaluate(PackedNormExportPs);
+
+        var ok = Gen5SpirvTranslator.TryCompilePixelShader(
+            state, evaluation, Gen5PixelOutputKind.Float, out var shader, out var error,
+            pixelInputEnable: addr, pixelInputAddress: addr);
+        Assert.True(ok, error);
+
+        Assert.Equal(
+            [0u, 1u],
+            SeededVgprSlotsFromBuiltIn(shader.Spirv, BaryCoordKhrBuiltIn));
+        Assert.Equal(
+            [2u, 3u],
+            SeededVgprSlotsFromBuiltIn(shader.Spirv, FragCoordBuiltIn));
+    }
+
+    [Fact]
+    public void PixelInputVgprs_PerspCentroid_SeedsWeightsAtV4V5()
+    {
+        // ADDR reserves PERSP_SAMPLE + PERSP_CENTER + PERSP_CENTROID (all three
+        // barycentric slots), but only PERSP_CENTROID is enabled. The reserved
+        // sample/center slots (v0..v3) push the centroid weights to v4/v5 -- the
+        // exact zero-init the black-title pack-provenance trace observed. This is
+        // the regression the pixel-input allocation fix targets.
+        var addr = PerspSample | PerspCenter | PerspCentroid;
+        var ena = PerspCentroid;
+        var (state, evaluation, _) = DecodeAndEvaluate(PackedNormExportPs);
+
+        var ok = Gen5SpirvTranslator.TryCompilePixelShader(
+            state, evaluation, Gen5PixelOutputKind.Float, out var shader, out var error,
+            pixelInputEnable: ena, pixelInputAddress: addr);
+        Assert.True(ok, error);
+
+        Assert.Equal(
+            [4u, 5u],
+            SeededVgprSlotsFromBuiltIn(shader.Spirv, BaryCoordKhrBuiltIn));
+    }
+
+    [Fact]
+    public void PixelInputVgprs_PerspSampleReservedCenterEnabled_SeedsCenterAtV2V3()
+    {
+        // ADDR reserves PERSP_SAMPLE + PERSP_CENTER; only PERSP_CENTER is
+        // enabled. The reserved sample slot (v0/v1) stays unseeded and the
+        // centre weights land at v2/v3.
+        var addr = PerspSample | PerspCenter;
+        var ena = PerspCenter;
+        var (state, evaluation, _) = DecodeAndEvaluate(PackedNormExportPs);
+
+        var ok = Gen5SpirvTranslator.TryCompilePixelShader(
+            state, evaluation, Gen5PixelOutputKind.Float, out var shader, out var error,
+            pixelInputEnable: ena, pixelInputAddress: addr);
+        Assert.True(ok, error);
+
+        Assert.Equal(
+            [2u, 3u],
+            SeededVgprSlotsFromBuiltIn(shader.Spirv, BaryCoordKhrBuiltIn));
+    }
+
+    [Fact]
+    public void PixelInputVgprs_LinearCenter_SeedsFromNoPerspBuiltinAfterPerspSlots()
+    {
+        // ADDR reserves PERSP_CENTER (persp slot v0/v1) then enables
+        // LINEAR_CENTER. Linear weights read the NoPersp barycentric builtin and
+        // land at v2/v3, after the reserved perspective slot.
+        var addr = PerspCenter | LinearCenter;
+        var ena = LinearCenter;
+        var (state, evaluation, _) = DecodeAndEvaluate(PackedNormExportPs);
+
+        var ok = Gen5SpirvTranslator.TryCompilePixelShader(
+            state, evaluation, Gen5PixelOutputKind.Float, out var shader, out var error,
+            pixelInputEnable: ena, pixelInputAddress: addr);
+        Assert.True(ok, error);
+
+        // The perspective builtin slot is reserved but unseeded (ENA off).
+        Assert.Empty(SeededVgprSlotsFromBuiltIn(shader.Spirv, BaryCoordKhrBuiltIn));
+        Assert.Equal(
+            [2u, 3u],
+            SeededVgprSlotsFromBuiltIn(shader.Spirv, BaryCoordNoPerspBuiltIn));
+    }
+
+    [Fact]
+    public void PixelInputVgprs_NoAddress_PreservesLegacySeeding()
+    {
+        // Legacy callers pass no ADDR/ENA (both zero); the historical fixed
+        // layout must still seed fragCoord X/Y into v2/v3.
+        var (state, evaluation, _) = DecodeAndEvaluate(PackedNormExportPs);
+
+        var ok = Gen5SpirvTranslator.TryCompilePixelShader(
+            state, evaluation, Gen5PixelOutputKind.Float, out var shader, out var error);
+        Assert.True(ok, error);
+
+        Assert.Equal(
+            [2u, 3u],
+            SeededVgprSlotsFromBuiltIn(shader.Spirv, FragCoordBuiltIn));
+    }
+
+    // Traces which guest VGPR slots are seeded (in the shader entry block) from
+    // the value of the given input builtin. Follows the fixed seeding pattern:
+    //   OpLoad(builtinVar) -> OpCompositeExtract -> OpBitcast
+    //     -> OpStore(OpAccessChain(vgpr, constIndex), ...)
+    // and returns the ordered set of constIndex values.
+    private static uint[] SeededVgprSlotsFromBuiltIn(byte[] spirv, uint builtIn)
+    {
+        var module = SpirvModuleAssert.Parse(spirv);
+        const ushort opName = 5, opDecorate = 71, opConstant = 43, opLoad = 61,
+            opCompositeExtract = 81, opBitcast = 124, opAccessChain = 65, opStore = 62;
+        const uint builtInDecoration = 11;
+
+        var vgprVariable = 0u;
+        foreach (var (opcode, words) in module.Instructions)
+        {
+            if (opcode == opName && DecodeString(words, 2) == "vgpr")
+            {
+                vgprVariable = words[1];
+            }
+        }
+
+        Assert.NotEqual(0u, vgprVariable);
+
+        var builtinVariable = 0u;
+        foreach (var (opcode, words) in module.Instructions)
+        {
+            if (opcode == opDecorate &&
+                words.Length >= 4 &&
+                words[2] == builtInDecoration &&
+                words[3] == builtIn)
+            {
+                builtinVariable = words[1];
+            }
+        }
+
+        if (builtinVariable == 0u)
+        {
+            return [];
+        }
+
+        var constantValues = new Dictionary<uint, uint>();
+        var loads = new HashSet<uint>();
+        var extracts = new HashSet<uint>();
+        var bitcasts = new HashSet<uint>();
+        var accessChainIndex = new Dictionary<uint, uint>();
+        foreach (var (opcode, words) in module.Instructions)
+        {
+            switch (opcode)
+            {
+                case opConstant when words.Length >= 4:
+                    constantValues[words[2]] = words[3];
+                    break;
+                case opLoad when words.Length >= 4 && words[3] == builtinVariable:
+                    loads.Add(words[2]);
+                    break;
+                case opCompositeExtract when words.Length >= 4 && loads.Contains(words[3]):
+                    extracts.Add(words[2]);
+                    break;
+                case opBitcast when words.Length >= 4 && extracts.Contains(words[3]):
+                    bitcasts.Add(words[2]);
+                    break;
+                case opAccessChain when words.Length >= 5 && words[3] == vgprVariable:
+                    if (constantValues.TryGetValue(words[4], out var index))
+                    {
+                        accessChainIndex[words[2]] = index;
+                    }
+
+                    break;
+            }
+        }
+
+        var slots = new SortedSet<uint>();
+        foreach (var (opcode, words) in module.Instructions)
+        {
+            if (opcode == opStore &&
+                words.Length >= 3 &&
+                bitcasts.Contains(words[2]) &&
+                accessChainIndex.TryGetValue(words[1], out var slot))
+            {
+                slots.Add(slot);
+            }
+        }
+
+        return [.. slots];
+    }
+
+    private static string DecodeString(uint[] words, int start)
+    {
+        var bytes = new List<byte>();
+        for (var i = start; i < words.Length; i++)
+        {
+            for (var shift = 0; shift < 32; shift += 8)
+            {
+                var b = (byte)(words[i] >> shift);
+                if (b == 0)
+                {
+                    return System.Text.Encoding.ASCII.GetString([.. bytes]);
+                }
+
+                bytes.Add(b);
+            }
+        }
+
+        return System.Text.Encoding.ASCII.GetString([.. bytes]);
+    }
+
     [Fact]
     public void VertexShader_WithSwappedInputControls_DeclaresOneOutputPerAttribute()
     {
