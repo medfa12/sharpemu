@@ -1331,11 +1331,26 @@ internal static partial class Gen5SpirvTranslator
                     Store(_scc, IsNotZero(result));
                     return true;
                 case "SWqmB32":
-                    // Whole-quad-mode approximated as a move, matching the
-                    // SWqmB64 handling in TryEmitScalar64; SCC is exact.
-                    StoreS(destination, left);
-                    Store(_scc, IsNotZero(left));
+                {
+                    if (_subgroupInvocationIdInput == 0)
+                    {
+                        // Scalar path: a lone lane is its own quad.
+                        StoreS(destination, left);
+                        Store(_scc, IsNotZero(left));
+                        return true;
+                    }
+
+                    // Whole-quad-mode: reconstruct the full mask, widen to
+                    // whole quads, then keep the current lane's expanded bit.
+                    var laneSet = IsCurrentLaneSet(
+                        _module.AddInstruction(SpirvOp.UConvert, _ulongType, left));
+                    var wqm = WholeQuadModeExpand(laneSet, out var expandedFullMask);
+                    StoreS(
+                        destination,
+                        _module.AddInstruction(SpirvOp.UConvert, _uintType, wqm));
+                    Store(_scc, IsNotZero64(expandedFullMask));
                     return true;
+                }
                 case "SBrevB32":
                     result = _module.AddInstruction(SpirvOp.BitReverse, _uintType, left);
                     StoreS(destination, result);
@@ -2155,8 +2170,28 @@ internal static partial class Gen5SpirvTranslator
                 return true;
             }
 
+            if (instruction.Opcode == "SWqmB64")
+            {
+                if (_subgroupInvocationIdInput == 0)
+                {
+                    // No subgroup lane id (scalar path): a lone lane is its own
+                    // quad, so s_wqm degenerates to a move.
+                    StoreS64(destination, left);
+                    Store(_scc, IsNotZero64(left));
+                    return true;
+                }
+
+                // Expand exec (or any saved mask) to whole quads so covered
+                // quads keep their helper lanes active for the body.
+                var laneSet = IsWaveMaskActive(left);
+                var wqm = WholeQuadModeExpand(laneSet, out var expandedFullMask);
+                StoreS64(destination, wqm);
+                Store(_scc, IsNotZero64(expandedFullMask));
+                return true;
+            }
+
             uint value;
-            if (instruction.Opcode is "SMovB64" or "SWqmB64")
+            if (instruction.Opcode == "SMovB64")
             {
                 value = left;
             }

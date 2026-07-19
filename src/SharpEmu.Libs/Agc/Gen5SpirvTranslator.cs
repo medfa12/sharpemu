@@ -565,7 +565,7 @@ internal static partial class Gen5SpirvTranslator
                     _module.AddCapability(SpirvCapability.GroupNonUniformVote);
                 }
 
-                if (UsesSubgroupBroadcast())
+                if (UsesSubgroupBroadcast() || UsesWholeQuadMode())
                 {
                     _module.AddCapability(SpirvCapability.GroupNonUniformBallot);
                 }
@@ -3664,6 +3664,9 @@ internal static partial class Gen5SpirvTranslator
         private uint BitwiseOr(uint left, uint right) =>
             _module.AddInstruction(SpirvOp.BitwiseOr, _uintType, left, right);
 
+        private uint BitwiseOr64(uint left, uint right) =>
+            _module.AddInstruction(SpirvOp.BitwiseOr, _ulongType, left, right);
+
         private uint BitwiseXor(uint left, uint right) =>
             _module.AddInstruction(SpirvOp.BitwiseXor, _uintType, left, right);
 
@@ -3733,6 +3736,56 @@ internal static partial class Gen5SpirvTranslator
         private void StoreWaveMask(uint register, uint condition) =>
             StoreS64(register, BooleanToLaneMask(condition));
 
+        // s_wqm widens the active mask to whole quads: any quad (4 consecutive
+        // lanes) with at least one set lane becomes fully set. Our wave masks
+        // keep only each lane's own bit, so a plain move can never see a
+        // sibling lane -- reconstruct the full 32-lane mask with a ballot,
+        // expand it, then hand back the current lane's expanded bit. Callers
+        // also receive the full expanded mask for the s_wqm SCC result.
+        private uint WholeQuadModeExpand(uint sourceLaneSet, out uint expandedFullMask)
+        {
+            var fullMask = WaveBallotMask(sourceLaneSet);
+            expandedFullMask = ExpandWholeQuads(fullMask);
+            return BooleanToLaneMask(IsCurrentLaneSet(expandedFullMask));
+        }
+
+        // (m | m>>1 | m>>2 | m>>3) & 0x1111... isolates the low bit of every
+        // 4-lane quad that has any lane set; multiplying by 0xF fills the quad.
+        private uint ExpandWholeQuads(uint mask)
+        {
+            var quadAny = BitwiseAnd64(
+                BitwiseOr64(
+                    mask,
+                    BitwiseOr64(
+                        ShiftRightLogical64(mask, _module.Constant64(_ulongType, 1)),
+                        BitwiseOr64(
+                            ShiftRightLogical64(mask, _module.Constant64(_ulongType, 2)),
+                            ShiftRightLogical64(mask, _module.Constant64(_ulongType, 3))))),
+                _module.Constant64(_ulongType, 0x1111_1111_1111_1111UL));
+            return _module.AddInstruction(
+                SpirvOp.IMul,
+                _ulongType,
+                quadAny,
+                _module.Constant64(_ulongType, 0xFUL));
+        }
+
+        // Ballot the per-lane condition into a full 32-lane wave mask that every
+        // participating invocation (covered and helper lanes alike) can read.
+        private uint WaveBallotMask(uint condition)
+        {
+            var ballot = _module.AddInstruction(
+                SpirvOp.GroupNonUniformBallot,
+                _uvec4Type,
+                UInt(3),
+                condition);
+            var low = _module.AddInstruction(
+                SpirvOp.CompositeExtract,
+                _uintType,
+                ballot,
+                0);
+            return _module.AddInstruction(SpirvOp.UConvert, _ulongType, low);
+        }
+
         // Only lanes enabled by EXEC can contribute to a balloted mask;
         // letting disabled lanes through leaks stale results into later
         // saveexec/branch sequences.
@@ -3787,11 +3840,18 @@ internal static partial class Gen5SpirvTranslator
             _state.Program.Instructions.Any(static instruction =>
                 instruction.Opcode == "VReadfirstlaneB32");
 
+        // s_wqm has to look across the quad, so it needs the subgroup lane id
+        // (and a ballot) even when the shader uses no other subgroup op.
+        private bool UsesWholeQuadMode() =>
+            _state.Program.Instructions.Any(static instruction =>
+                instruction.Opcode is "SWqmB32" or "SWqmB64");
+
         private bool UsesSubgroupOperations() =>
             UsesSubgroupBroadcast() ||
             // Lane shuffles (readlane, ds permutes) need the subgroup lane id
             // in every stage; wave control alone only opts in for compute.
             UsesSubgroupShuffle() ||
+            UsesWholeQuadMode() ||
             (_stage == Gen5SpirvStage.Compute && UsesWaveControl());
 
         private static bool IsWaveMaskOperand(Gen5Operand operand) =>

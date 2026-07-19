@@ -213,10 +213,10 @@ public sealed class Gen5ShaderScalarEvaluatorTests
     }
 
     [Fact]
-    public void SWqmB32_KeepsValueAndSetsScc()
+    public void SWqmB32_WidensToWholeQuadsAndSetsScc()
     {
-        // Whole-quad-mode is approximated as a move (matching SWqmB64); SCC
-        // (result != 0) is exact because WQM(x) != 0 iff x != 0.
+        // Whole-quad-mode fills every quad (4 lanes) that has any set lane.
+        // 0x12 = bits 1 and 4 -> quad0 and quad1 fill -> 0xFF. SCC = result!=0.
         var evaluation = Evaluate(
             [0x12, 0xAAAA, 0xBBBB],
             0,
@@ -226,10 +226,40 @@ public sealed class Gen5ShaderScalarEvaluatorTests
             Sop2(12, "SCselectB32", dest: 6, Gen5Operand.Scalar(1), Gen5Operand.Scalar(2)),
             EndPgm(16));
 
-        Assert.Equal(0x12u, evaluation.ScalarRegisters[3]);
+        Assert.Equal(0xFFu, evaluation.ScalarRegisters[3]);
         Assert.Equal(0xAAAAu, evaluation.ScalarRegisters[4]); // SCC=1 selects first
         Assert.Equal(0u, evaluation.ScalarRegisters[5]);
         Assert.Equal(0xBBBBu, evaluation.ScalarRegisters[6]); // SCC=0 selects second
+    }
+
+    [Fact]
+    public void SWqmB64_WidensQuadsAcrossBothDwords()
+    {
+        // s0:s1 = 0x0000_0008_0000_0012. Low quad0(bit1)+quad1(bit4) -> 0xFF;
+        // high quad0(bit3) -> 0xF.
+        var evaluation = Evaluate(
+            [0x12, 0x8],
+            0,
+            Sop1(0, "SWqmB64", dest: 2, Gen5Operand.Scalar(0)),
+            EndPgm(4));
+
+        Assert.Equal(0xFFu, evaluation.ScalarRegisters[2]); // low dword
+        Assert.Equal(0x0Fu, evaluation.ScalarRegisters[3]); // high dword
+    }
+
+    [Fact]
+    public void SWqmB64_ToExec_WidensExecMaskToWholeQuads()
+    {
+        // Writing s_wqm to EXEC must widen the live mask: a single set lane
+        // pulls in its three quad siblings.
+        var evaluation = Evaluate(
+            [0x12, 0x0],
+            0,
+            Sop1(0, "SWqmB64", dest: 126, Gen5Operand.Scalar(0)),
+            EndPgm(4));
+
+        Assert.Equal(0xFFu, evaluation.ScalarRegisters[126]); // EXEC lo widened
+        Assert.Equal(0u, evaluation.ScalarRegisters[127]);    // EXEC hi
     }
 
     [Fact]

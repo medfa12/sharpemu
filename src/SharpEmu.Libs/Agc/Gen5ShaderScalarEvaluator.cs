@@ -1025,6 +1025,15 @@ internal static class Gen5ShaderScalarEvaluator
                 value = ~value;
                 scalarConditionCode = value != 0;
             }
+            else if (instruction.Opcode == "SWqmB64")
+            {
+                // Whole-quad-mode: any quad (4 lanes) with a set lane becomes
+                // fully set. SCC = (result != 0).
+                var quadAny = (value | (value >> 1) | (value >> 2) | (value >> 3)) &
+                    0x1111_1111_1111_1111UL;
+                value = quadAny * 0xFUL;
+                scalarConditionCode = value != 0;
+            }
 
             WriteScalarPair(registers, destination.Value, value, ref execMask);
             return true;
@@ -1163,18 +1172,20 @@ internal static class Gen5ShaderScalarEvaluator
             return true;
         }
 
-        // s_wqm_b32 expands each active quad's bits; approximated as a move
-        // exactly like the SWqmB64 handling above. SCC (result != 0) is exact
-        // either way since WQM(x) != 0 iff x != 0.
+        // s_wqm_b32 widens each active quad's bits: any quad (4 lanes) with a
+        // set lane becomes fully set. SCC = (result != 0).
         if (instruction.Opcode == "SWqmB32")
         {
-            registers[destination.Value] = left;
+            var quadAny = (left | (left >> 1) | (left >> 2) | (left >> 3)) &
+                0x1111_1111u;
+            var value = quadAny * 0xFu;
+            registers[destination.Value] = value;
             if (destination.Value == 126)
             {
-                execMask = MaskWaveValue((execMask & ~0xFFFF_FFFFUL) | left);
+                execMask = MaskWaveValue((execMask & ~0xFFFF_FFFFUL) | value);
             }
 
-            scalarConditionCode = left != 0;
+            scalarConditionCode = value != 0;
             return true;
         }
 

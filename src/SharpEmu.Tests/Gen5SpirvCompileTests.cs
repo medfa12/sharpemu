@@ -703,6 +703,24 @@ public sealed class Gen5SpirvCompileTests
         Assert.Equal(1, stores.GetValueOrDefault(5u));
     }
 
+    [Fact]
+    public void PixelShader_WholeQuadMode_BallotsToWidenExecAcrossQuads()
+    {
+        // s_wqm_b64 exec, exec (SOP1 op 0x0A, sdst/ssrc0 = 126) must widen the
+        // active mask to whole quads. Our per-lane masks can't see a sibling
+        // lane, so a plain move is wrong: WQM must reconstruct the full mask
+        // with a subgroup ballot before expanding it.
+        const ushort OpGroupNonUniformBallot = 339;
+        const uint SWqmB64ExecExec = 0xBEFE_0A7E;
+        var module = CompilePixelShader(
+            SWqmB64ExecExec, ExportV0Rgba, 0x00000000, SEndpgm);
+
+        Assert.Contains(
+            module.Instructions,
+            i => i.Opcode == OpGroupNonUniformBallot);
+        SpirvModuleAssert.AssertShaderModule(module, ExecutionModelFragment);
+    }
+
     private const ushort OpCapability = 17;
     private const ushort OpDPdx = 207;
     private const uint CapabilityFragmentBarycentricKhr = 5284;
