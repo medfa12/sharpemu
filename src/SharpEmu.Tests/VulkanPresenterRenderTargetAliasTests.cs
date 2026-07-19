@@ -316,7 +316,8 @@ public sealed class VulkanPresenterGuestSurfaceCacheTests
         // but the rendered content is still bound through its own format.
         Assert.False(cache.TryFindSampleAlias(
             texture, Format.R32G32B32A32Sfloat, out _));
-        Assert.True(cache.TryFindNativeAlias(texture, out var native));
+        Assert.True(cache.TryFindNativeAlias(
+            texture, Format.R32G32B32A32Sfloat, out var native));
         Assert.Same(rgba8, native);
     }
 
@@ -330,7 +331,9 @@ public sealed class VulkanPresenterGuestSurfaceCacheTests
         cache.Add(cpu);
         cache.Add(gpu);
 
-        Assert.True(cache.TryFindNativeAlias(Texture(Address, 1920, 1080), out var chosen));
+        // Format-agnostic request: the GPU-over-CPU rule alone decides.
+        Assert.True(cache.TryFindNativeAlias(
+            Texture(Address, 1920, 1080), Format.Undefined, out var chosen));
         Assert.Same(gpu, chosen);
     }
 
@@ -385,6 +388,65 @@ public sealed class VulkanPresenterGuestSurfaceCacheTests
         Assert.Same(sibling, kept);
         Assert.True(cache.TryGetExact(Address, Format.R8G8B8A8Unorm, out var current));
         Assert.Same(replacement, current);
+    }
+
+    [Fact]
+    public void SampleExactFormatWinsOverHigherContentGenSibling()
+    {
+        var cache = new VulkanVideoPresenter.GuestSurfaceCache();
+        // Astro Bot: the rendered R16G16B16A16Sfloat scene holds the title's
+        // pixels while an empty R8G8Unorm variant that shares the address was
+        // written (content-generation bumped) more recently. The present must
+        // still sample the exact requested-format producer, not the empty one.
+        var rgba16f = Surface(Address, Format.R16G16B16A16Sfloat, 2432, 1368, stamp: 1);
+        rgba16f.ContentGeneration = 5;
+        var rg8 = Surface(Address, Format.R8G8Unorm, 2432, 1368, stamp: 9);
+        rg8.ContentGeneration = 99;
+        cache.Add(rgba16f);
+        cache.Add(rg8);
+
+        Assert.True(cache.TryFindSampleAlias(
+            Texture(Address, 2432, 1368), Format.R16G16B16A16Sfloat, out var chosen));
+        Assert.Same(rgba16f, chosen);
+    }
+
+    [Fact]
+    public void NativeAliasHonorsRequestedFormatOverHigherContentGenSibling()
+    {
+        var cache = new VulkanVideoPresenter.GuestSurfaceCache();
+        // Same two variants, resolved through the native-format fallback (the
+        // path taken when no strictly view-compatible surface was bound). The
+        // empty R8G8Unorm sibling has the fresher content-write generation, but
+        // the requested-format producer that holds real content must win.
+        var rgba16f = Surface(Address, Format.R16G16B16A16Sfloat, 2432, 1368, stamp: 1);
+        rgba16f.ContentGeneration = 5;
+        var rg8 = Surface(Address, Format.R8G8Unorm, 2432, 1368, stamp: 9);
+        rg8.ContentGeneration = 99;
+        cache.Add(rgba16f);
+        cache.Add(rg8);
+
+        Assert.True(cache.TryFindNativeAlias(
+            Texture(Address, 2432, 1368), Format.R16G16B16A16Sfloat, out var chosen));
+        Assert.Same(rgba16f, chosen);
+    }
+
+    [Fact]
+    public void NativeAliasContentGenTiebreakAppliesAmongEquallyFitSiblings()
+    {
+        var cache = new VulkanVideoPresenter.GuestSurfaceCache();
+        // Neither sibling matches the requested R16G16B16A16Sfloat exactly, but
+        // both share its 64-bit texel class (fit is equal), so d77baeb's
+        // content-write generation ranking still decides between them.
+        var older = Surface(Address, Format.R32G32Sfloat, 2432, 1368, stamp: 9);
+        older.ContentGeneration = 5;
+        var newer = Surface(Address, Format.R16G16B16A16Uint, 2432, 1368, stamp: 1);
+        newer.ContentGeneration = 42;
+        cache.Add(older);
+        cache.Add(newer);
+
+        Assert.True(cache.TryFindNativeAlias(
+            Texture(Address, 2432, 1368), Format.R16G16B16A16Sfloat, out var chosen));
+        Assert.Same(newer, chosen);
     }
 
     [Fact]

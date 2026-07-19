@@ -2528,13 +2528,21 @@ internal static unsafe class VulkanVideoPresenter
         }
 
         /// <summary>
-        /// Native-format fallback: no view-compatible surface exists, but a
-        /// rendered sibling still holds real content while the guest memory
-        /// behind the address was never GPU-written and reads back black.
-        /// Prefers GPU-rendered surfaces over CPU uploads, then recency.
+        /// Native-format fallback: no strictly view-compatible surface was
+        /// bound, but a rendered sibling still holds real content while the
+        /// guest memory behind the address was never GPU-written and reads back
+        /// black. Ranking, highest priority first: GPU-rendered over CPU upload;
+        /// then how well the surface serves the sampler's requested format
+        /// (exact, then same texel class, then unrelated); then last-completed
+        /// content write; then recency. Honoring the requested format here keeps
+        /// a stale empty variant -- whose content-write generation was bumped
+        /// merely by being sampled -- from outranking the producer that actually
+        /// holds the requested format's contents (Astro Bot's present sampling a
+        /// R16G16B16A16Sfloat scene at an address it also touched as R8G8Unorm).
         /// </summary>
         public bool TryFindNativeAlias(
             VulkanGuestDrawTexture texture,
+            Format viewFormat,
             out GuestImageResource surface)
         {
             GuestImageResource? best = null;
@@ -2546,12 +2554,7 @@ internal static unsafe class VulkanVideoPresenter
                     continue;
                 }
 
-                if (best is null ||
-                    (best.IsCpuBacked && !candidate.IsCpuBacked) ||
-                    (best.IsCpuBacked == candidate.IsCpuBacked &&
-                     (candidate.ContentGeneration > best.ContentGeneration ||
-                      (candidate.ContentGeneration == best.ContentGeneration &&
-                       candidate.LastUseStamp > best.LastUseStamp))))
+                if (best is null || IsBetterNativeAlias(candidate, best, viewFormat))
                 {
                     best = candidate;
                 }
@@ -2559,6 +2562,55 @@ internal static unsafe class VulkanVideoPresenter
 
             surface = best!;
             return best is not null;
+        }
+
+        private static bool IsBetterNativeAlias(
+            GuestImageResource candidate,
+            GuestImageResource best,
+            Format viewFormat)
+        {
+            // A GPU producer outranks a CPU upload unconditionally: the guest
+            // bytes behind a repurposed render-target address read back black.
+            if (best.IsCpuBacked != candidate.IsCpuBacked)
+            {
+                return best.IsCpuBacked;
+            }
+
+            // The requested format is the primary key among peers: an exact or
+            // class-compatible surface wins over an unrelated sibling regardless
+            // of content-generation/recency.
+            var candidateFit = NativeAliasFormatFit(candidate.Format, viewFormat);
+            var bestFit = NativeAliasFormatFit(best.Format, viewFormat);
+            if (candidateFit != bestFit)
+            {
+                return candidateFit > bestFit;
+            }
+
+            // Same format fitness: the freshest completed content write wins,
+            // recency breaks remaining ties (preserves d77baeb's ranking).
+            if (candidate.ContentGeneration != best.ContentGeneration)
+            {
+                return candidate.ContentGeneration > best.ContentGeneration;
+            }
+
+            return candidate.LastUseStamp > best.LastUseStamp;
+        }
+
+        // 2 = exact requested format, 1 = same texel class (a mutable-format
+        // view reinterprets it), 0 = unrelated / no request expressed.
+        private static int NativeAliasFormatFit(Format surfaceFormat, Format viewFormat)
+        {
+            if (viewFormat == Format.Undefined)
+            {
+                return 0;
+            }
+
+            if (surfaceFormat == viewFormat)
+            {
+                return 2;
+            }
+
+            return IsCompatibleViewFormat(surfaceFormat, viewFormat) ? 1 : 0;
         }
 
         /// <summary>
@@ -5595,7 +5647,7 @@ internal static unsafe class VulkanVideoPresenter
             if (texture.Address != 0 &&
                 !texture.IsFallback &&
                 (texture.RgbaPixels.Length == 0 || ShouldUseFlipCompositeFix()) &&
-                _guestImages.TryFindNativeAlias(texture, out var renderedImage) &&
+                _guestImages.TryFindNativeAlias(texture, vkFormat, out var renderedImage) &&
                 TryGetOrCreateGuestImageView(
                     renderedImage,
                     renderedImage.Format,
