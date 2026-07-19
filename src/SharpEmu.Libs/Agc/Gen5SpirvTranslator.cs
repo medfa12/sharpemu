@@ -287,10 +287,19 @@ internal static partial class Gen5SpirvTranslator
             ImageComponentKind ComponentKind,
             bool IsStorage);
 
+        private enum VertexInputComponentKind
+        {
+            Float,
+            Sint,
+            Uint,
+        }
+
         private readonly record struct SpirvVertexInput(
             uint Variable,
             uint Type,
-            uint ComponentCount);
+            uint ComponentType,
+            uint ComponentCount,
+            VertexInputComponentKind ComponentKind);
 
         private readonly record struct SpirvPixelOutput(
             uint Variable,
@@ -1077,12 +1086,26 @@ internal static partial class Gen5SpirvTranslator
         {
             foreach (var input in _evaluation.VertexInputs ?? [])
             {
+                // Declare UINT/SINT attributes with integer component types so
+                // the shader interface matches the Vulkan pipeline's vertex
+                // format; normalized/scaled/float formats stay on float inputs.
+                var componentKind = input.NumberFormat switch
+                {
+                    4 => VertexInputComponentKind.Uint,
+                    5 => VertexInputComponentKind.Sint,
+                    _ => VertexInputComponentKind.Float,
+                };
+                var componentType = componentKind switch
+                {
+                    VertexInputComponentKind.Uint => _uintType,
+                    VertexInputComponentKind.Sint => _intType,
+                    _ => _floatType,
+                };
                 var type = input.ComponentCount switch
                 {
-                    1u => _floatType,
-                    2u => _vec2Type,
-                    3u => _vec3Type,
-                    4u => _vec4Type,
+                    1u => componentType,
+                    >= 2u and <= 4u =>
+                        _module.TypeVector(componentType, input.ComponentCount),
                     _ => 0u,
                 };
                 if (type == 0)
@@ -1104,7 +1127,9 @@ internal static partial class Gen5SpirvTranslator
                     new SpirvVertexInput(
                         variable,
                         type,
-                        input.ComponentCount));
+                        componentType,
+                        input.ComponentCount,
+                        componentKind));
                 _interfaces.Add(variable);
             }
         }
@@ -2361,10 +2386,13 @@ internal static partial class Gen5SpirvTranslator
                     ? loaded
                     : _module.AddInstruction(
                         SpirvOp.CompositeExtract,
-                        _floatType,
+                        input.ComponentType,
                         loaded,
                         component);
-                StoreV(control.VectorData + component, Bitcast(_uintType, value));
+                var raw = input.ComponentKind == VertexInputComponentKind.Uint
+                    ? value
+                    : Bitcast(_uintType, value);
+                StoreV(control.VectorData + component, raw);
             }
 
             return true;
