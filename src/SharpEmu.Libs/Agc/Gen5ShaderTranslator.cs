@@ -421,6 +421,229 @@ internal static class Gen5ShaderTranslator
             $"srt={metadata.ShaderResourceTableSizeDwords},direct={direct},resources={resources}]";
     }
 
+    // Static, readback-free provenance trace for the final-colour pack.
+    //
+    // Astro renders black because every pixel shader's v_cvt_pkrtz_f16_f32
+    // (the FP16 colour pack feeding the MRT export) resolves to zero. This
+    // walks each pack's two float inputs back through their VGPR producers so
+    // a log run can see, per shader, whether the pack is fed by a texture
+    // sample, an interpolant, a constant-buffer load, an ALU chain, or an
+    // unwritten (zero-initialised) register -- and which EXEC-writing
+    // instruction most recently gated the region the pack sits in. Pairs with
+    // the runtime EXEC probe (SHARPEMU_FORCE_PACKED_STORE_EXEC_VALUES): if the
+    // probe shows the pack lane inactive, the "afterExec" tag here names the
+    // control-flow op that emptied EXEC; if the lane is active, the "roots"
+    // tags name the zero-valued input source.
+    public static string DescribePackProvenance(Gen5ShaderProgram program)
+    {
+        var instructions = program.Instructions;
+        var packs = new List<string>();
+        for (var index = 0; index < instructions.Count; index++)
+        {
+            var instruction = instructions[index];
+            if (instruction.Opcode != "VCvtPkrtzF16F32")
+            {
+                continue;
+            }
+
+            var operands = new List<string>();
+            for (var source = 0; source < instruction.Sources.Count && source < 2; source++)
+            {
+                operands.Add(DescribePackOperand(instructions, index, instruction.Sources[source]));
+            }
+
+            packs.Add(
+                $"pc=0x{instruction.Pc:X}[{string.Join('|', operands)}]" +
+                $"{DescribePrecedingExecWrite(instructions, index)}");
+        }
+
+        return packs.Count == 0
+            ? "packs=none"
+            : $"packs={packs.Count} {string.Join(' ', packs)}";
+    }
+
+    private static string DescribePackOperand(
+        IReadOnlyList<Gen5ShaderInstruction> instructions,
+        int packIndex,
+        Gen5Operand operand)
+    {
+        switch (operand.Kind)
+        {
+            case Gen5OperandKind.ScalarRegister:
+                return $"s{operand.Value}=sreg";
+            case Gen5OperandKind.EncodedConstant:
+            case Gen5OperandKind.LiteralConstant:
+                return "const";
+        }
+
+        // Vector register: find the immediate producer, then chase the ALU
+        // chain back to its leaf source kinds (bounded, cycle-guarded).
+        var producer = FindVectorProducer(instructions, packIndex, operand.Value);
+        if (producer < 0)
+        {
+            return $"v{operand.Value}=unwritten(zero-init)";
+        }
+
+        var roots = new SortedSet<string>(StringComparer.Ordinal);
+        var visited = new HashSet<(int, uint)>();
+        CollectRootKinds(instructions, producer, operand.Value, roots, visited, budget: 64);
+        return
+            $"v{operand.Value}<-{instructions[producer].Opcode}" +
+            $"@0x{instructions[producer].Pc:X}{{{string.Join(',', roots)}}}";
+    }
+
+    private static void CollectRootKinds(
+        IReadOnlyList<Gen5ShaderInstruction> instructions,
+        int producerIndex,
+        uint register,
+        SortedSet<string> roots,
+        HashSet<(int, uint)> visited,
+        int budget)
+    {
+        if (budget <= 0 || !visited.Add((producerIndex, register)))
+        {
+            roots.Add("...");
+            return;
+        }
+
+        var opcode = instructions[producerIndex].Opcode;
+        var kind = ClassifyProducer(opcode);
+        if (kind != "alu")
+        {
+            roots.Add(kind);
+            return;
+        }
+
+        // ALU passthrough: recurse into vector sources to reach leaf kinds.
+        var producer = instructions[producerIndex];
+        var recursed = false;
+        foreach (var source in producer.Sources)
+        {
+            if (source.Kind == Gen5OperandKind.ScalarRegister)
+            {
+                roots.Add($"s{source.Value}");
+                continue;
+            }
+
+            if (source.Kind != Gen5OperandKind.VectorRegister)
+            {
+                roots.Add("const");
+                continue;
+            }
+
+            var next = FindVectorProducer(instructions, producerIndex, source.Value);
+            if (next < 0)
+            {
+                roots.Add($"v{source.Value}=zero-init");
+                continue;
+            }
+
+            recursed = true;
+            CollectRootKinds(instructions, next, source.Value, roots, visited, budget - 1);
+        }
+
+        if (!recursed && producer.Sources.Count == 0)
+        {
+            roots.Add(kind);
+        }
+    }
+
+    private static int FindVectorProducer(
+        IReadOnlyList<Gen5ShaderInstruction> instructions,
+        int beforeIndex,
+        uint register)
+    {
+        for (var index = beforeIndex - 1; index >= 0; index--)
+        {
+            foreach (var destination in instructions[index].Destinations)
+            {
+                if (destination.Kind == Gen5OperandKind.VectorRegister &&
+                    destination.Value == register)
+                {
+                    return index;
+                }
+            }
+        }
+
+        return -1;
+    }
+
+    private static string ClassifyProducer(string opcode)
+    {
+        if (opcode.StartsWith("ImageSample", StringComparison.Ordinal) ||
+            opcode.StartsWith("ImageGather", StringComparison.Ordinal) ||
+            opcode.StartsWith("ImageLoad", StringComparison.Ordinal))
+        {
+            return "tex";
+        }
+
+        if (opcode.StartsWith("VInterp", StringComparison.Ordinal))
+        {
+            return "interp";
+        }
+
+        if (opcode.StartsWith("SBufferLoad", StringComparison.Ordinal) ||
+            opcode.StartsWith("SLoad", StringComparison.Ordinal))
+        {
+            return "cbuf";
+        }
+
+        if (opcode.StartsWith("BufferLoad", StringComparison.Ordinal) ||
+            opcode.StartsWith("TBufferLoad", StringComparison.Ordinal) ||
+            opcode.StartsWith("GlobalLoad", StringComparison.Ordinal))
+        {
+            return "buf";
+        }
+
+        if (opcode.StartsWith("DsRead", StringComparison.Ordinal))
+        {
+            return "lds";
+        }
+
+        // Treat plain float/int ALU (including moves and converts) as a
+        // passthrough so the caller keeps chasing to the real leaf source.
+        return "alu";
+    }
+
+    private static string DescribePrecedingExecWrite(
+        IReadOnlyList<Gen5ShaderInstruction> instructions,
+        int packIndex)
+    {
+        for (var index = packIndex - 1; index >= 0; index--)
+        {
+            var instruction = instructions[index];
+            if (!WritesExec(instruction))
+            {
+                continue;
+            }
+
+            return $" afterExec={instruction.Opcode}@0x{instruction.Pc:X}";
+        }
+
+        return string.Empty;
+    }
+
+    private static bool WritesExec(Gen5ShaderInstruction instruction)
+    {
+        if (instruction.Opcode.Contains("Saveexec", StringComparison.Ordinal) ||
+            instruction.Opcode.Contains("Cmpx", StringComparison.Ordinal) ||
+            instruction.Opcode.StartsWith("SWqm", StringComparison.Ordinal))
+        {
+            return true;
+        }
+
+        foreach (var destination in instruction.Destinations)
+        {
+            if (destination.Kind == Gen5OperandKind.ScalarRegister &&
+                destination.Value is 126 or 127)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     private static string DescribeComputeSystemRegisters(Gen5ComputeSystemRegisters registers) =>
         $"x={DescribeRegister(registers.WorkGroupXRegister)}," +
         $"y={DescribeRegister(registers.WorkGroupYRegister)}," +

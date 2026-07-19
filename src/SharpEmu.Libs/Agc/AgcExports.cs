@@ -4912,6 +4912,17 @@ public static class AgcExports
             {
                 _graphicsSpirvCache.TryAdd(shaderKey, compiled);
             }
+
+            // One-time per shader: trace where the final-colour pack's inputs
+            // come from. Fires for successfully compiled pixel shaders (the
+            // failure dump only covers translate misses, so the real present
+            // and composite shaders are never otherwise inspected).
+            if (_traceAgcShader)
+            {
+                TraceAgcShader(
+                    $"agc.shader_pack_provenance ps=0x{pixelShaderAddress:X16} " +
+                    Gen5ShaderTranslator.DescribePackProvenance(pixelState.Program));
+            }
         }
 
         var imageBindings = pixelEvaluation.ImageBindings
