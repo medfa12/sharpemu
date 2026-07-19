@@ -912,6 +912,24 @@ internal static class Gen5ShaderTranslator
             return DecodeSop(word, out name, out sizeDwords, out error);
         }
 
+        // gfx10 moved VOP3P (packed 16-bit math) to its own 0b110011000 prefix
+        // (word0 top byte 0xCC), separate from the VOP3 block. Its top six bits
+        // (0x33) collide with SMEM in the coarse major-opcode switch below, so
+        // match the full 9-bit prefix here first, or packed instructions are
+        // decoded as scalar memory and silently emitted as no-ops.
+        if ((word & 0xFF800000u) == 0xCC000000u)
+        {
+            encoding = Gen5ShaderEncoding.Vop3p;
+            if (availableBytes < 2 * sizeof(uint) ||
+                !ctx.TryReadUInt32(baseAddress + pc + sizeof(uint), out var vop3pExtra))
+            {
+                error = $"vop3p-extra-read-failed pc=0x{pc:X}";
+                return false;
+            }
+
+            return DecodeVop3p(word, vop3pExtra, out name, out sizeDwords, out error);
+        }
+
         switch (word >> 26)
         {
             case 0x33:
@@ -974,9 +992,6 @@ internal static class Gen5ShaderTranslator
                 name = "Exp";
                 sizeDwords = 2;
                 return true;
-            case 0x3F:
-                encoding = Gen5ShaderEncoding.Vop3p;
-                return DecodeRaw2(word, "Vop3p", out name, out sizeDwords, out error);
             default:
                 error = $"unknown-top pc=0x{pc:X} word=0x{word:X8}";
                 return false;
@@ -1521,6 +1536,37 @@ internal static class Gen5ShaderTranslator
     private static bool IsVop3BOpcode(uint opcode) =>
         opcode is 0x128 or 0x129 or 0x12A or
             0x16D or 0x16E or 0x176 or 0x177 or 0x30F or 0x310 or 0x319;
+
+    private static bool DecodeVop3p(
+        uint word,
+        uint extra,
+        out string name,
+        out uint sizeDwords,
+        out string error)
+    {
+        var opcode = (word >> 16) & 0x7F;
+        var src0 = extra & 0x1FF;
+        var src1 = (extra >> 9) & 0x1FF;
+        var src2 = (extra >> 18) & 0x1FF;
+        sizeDwords = src0 == 0xFF || src1 == 0xFF || src2 == 0xFF ? 3u : 2u;
+        error = string.Empty;
+
+        // Opcode numbers taken from LLVM's AMDGPU VOP3PInstructions.td and the
+        // gfx9/gfx10 MC test encodings; they are unchanged across gfx9 and gfx10.
+        // Unhandled packed opcodes (integer, fma_mix, ...) stay opaque here and
+        // fail loudly at emission rather than being silently mis-emitted.
+        name = opcode switch
+        {
+            0x0E => "VPkFmaF16",
+            0x0F => "VPkAddF16",
+            0x10 => "VPkMulF16",
+            0x11 => "VPkMinF16",
+            0x12 => "VPkMaxF16",
+            _ => $"Vop3pRaw{opcode:X2}",
+        };
+
+        return true;
+    }
 
     private static bool DecodeRaw2(
         uint word,
@@ -2114,6 +2160,28 @@ internal static class Gen5ShaderTranslator
                     (extra >> 27) & 0x3,
                     ((word >> 15) & 1) != 0,
                     isVop3B ? (word >> 8) & 0x7F : null);
+                break;
+            }
+            case Gen5ShaderEncoding.Vop3p:
+            {
+                var extra = words[1];
+                sources =
+                [
+                    Gen5Operand.Source(extra & 0x1FF, literal),
+                    Gen5Operand.Source((extra >> 9) & 0x1FF, literal),
+                    Gen5Operand.Source((extra >> 18) & 0x1FF, literal),
+                ];
+                destinations = [Gen5Operand.Vector(word & 0xFF)];
+
+                // op_sel_hi is split across both dwords: bits [1:0] live in word1
+                // [28:27], bit [2] in word0 [14].
+                var opSelHi = ((extra >> 27) & 0x3) | (((word >> 14) & 0x1) << 2);
+                control = new Gen5Vop3pControl(
+                    (word >> 11) & 0x7,
+                    opSelHi,
+                    (extra >> 29) & 0x7,
+                    (word >> 8) & 0x7,
+                    ((word >> 15) & 1) != 0);
                 break;
             }
             case Gen5ShaderEncoding.Ds:
