@@ -532,7 +532,7 @@ public sealed partial class DirectExecutionBackend
 				}
 
 				*(ulong*)(argPackPtr + 96) = unchecked((ulong)transferStub);
-				if (string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_FIBER"), "1", StringComparison.Ordinal))
+				if (_logFiber)
 				{
 					Console.Error.WriteLine(
 						$"[LOADER][TRACE] fiber.context-transfer rip=0x{transferTarget.Rip:X16} " +
@@ -839,11 +839,15 @@ public sealed partial class DirectExecutionBackend
 		return count <= 8 || count % 10000 == 0;
 	}
 
-	private static bool ShouldLogExpectedImportResults() =>
-		string.Equals(
-			Environment.GetEnvironmentVariable("SHARPEMU_LOG_EXPECTED_IMPORT_RESULTS"),
-			"1",
-			StringComparison.Ordinal);
+	// Cached once: this gate sits on the expected-result path of hot imports
+	// (trylock busy, timed-wait timeouts), where a per-call
+	// Environment.GetEnvironmentVariable is a P/Invoke plus a transient string.
+	private static readonly bool _logExpectedImportResults = string.Equals(
+		Environment.GetEnvironmentVariable("SHARPEMU_LOG_EXPECTED_IMPORT_RESULTS"),
+		"1",
+		StringComparison.Ordinal);
+
+	private static bool ShouldLogExpectedImportResults() => _logExpectedImportResults;
 
 	private static bool IsExpectedFileProbeNotFoundNid(string nid) =>
 		nid is
