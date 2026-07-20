@@ -181,30 +181,16 @@ public static class KernelSemaphoreCompatExports
 
             if (!pollTimedOut)
             {
-                var waiter = new SemaphoreWaiter
-                {
-                    NeedCount = needCount,
-                    CancelEpochAtBlock = semaphore.CancelEpoch,
-                };
-                if (!GuestThreadExecution.RequestCurrentThreadBlock(
-                        ctx,
-                        "sceKernelWaitSema",
-                        GetSemaphoreWakeKey(handle),
-                        resumeHandler: () => CompleteBlockedSemaWait(semaphore, waiter),
-                        wakeHandler: () => TryConsumeBlockedSemaWait(semaphore, waiter)))
-                {
-                    // Host-owned thread: it cannot park in the guest scheduler, but an
-                    // infinite sceKernelWaitSema must still block. Wait on the semaphore's
-                    // own gate -- a producer's SignalSema/Cancel/Delete pulses it and we
-                    // re-check the count. This is the same 1:1 host-blocking model the
-                    // pthread-mutex and POSIX-sem paths use; returning EAGAIN here instead
-                    // makes callers that treat a blocking wait as infallible spin forever.
-                    return HostBlockingWait(ctx, semaphore, handle, needCount);
-                }
-
-                semaphore.WaitingThreads++;
-                TraceSemaphore($"wait-block handle=0x{handle:X8} name='{semaphore.Name}' need={needCount} count={semaphore.Count} waiters={semaphore.WaitingThreads}");
-                return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
+                // Block the calling thread IN PLACE on the semaphore's own gate
+                // (port of #412's block-in-place model). A producer's SignalSema/
+                // Cancel/Delete does Monitor.PulseAll(Gate) and we re-check the
+                // count. Unlike the cooperative continuation park this never
+                // unwinds the host thread out of guest context, so its per-thread
+                // FsBase is preserved -- the cooperative resume could collapse a
+                // worker onto the shared TLS base. Both guest and host-owned
+                // threads take this path now; the pump/backoff spin below is dead
+                // for the blocking case.
+                return HostBlockingWait(ctx, semaphore, handle, needCount);
             }
         }
 
