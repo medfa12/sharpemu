@@ -3720,10 +3720,16 @@ internal static partial class Gen5SpirvTranslator
                 CurrentLaneBit(),
                 _module.Constant64(_ulongType, 0));
 
+        // A wave-mask SGPR (VCC/EXEC) consumed as a per-lane predicate must be
+        // tested at the current lane's bit, exactly as the hardware does, not as
+        // "the 64-bit value is non-zero". They coincide for comparison results
+        // (only the lane's own bit is set), but bitwise-complement idioms
+        // (S_NOT/S_ORN2/S_ANDN2/S_NAND/S_NOR) set the unused upper 63 bits, so a
+        // whole-word test reports the lane active even when its bit is clear.
+        // A NaN killer like `anyNaN | ~allFinite` then reads every valid pixel as
+        // NaN and replaces it with 0, zeroing the scene. Always extract the bit.
         private uint IsWaveMaskActive(uint mask) =>
-            _subgroupInvocationIdInput == 0
-                ? IsNotZero64(mask)
-                : IsCurrentLaneSet(mask);
+            IsCurrentLaneSet(mask);
 
         private uint IsCurrentLaneSet(uint mask) =>
             IsNotZero64(
