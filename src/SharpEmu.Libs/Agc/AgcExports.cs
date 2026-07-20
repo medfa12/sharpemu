@@ -4908,7 +4908,8 @@ public static class AgcExports
                     scalarRegisterBufferIndex: totalGlobalBuffers,
                     pixelInputControls: pixelInputControls,
                     pixelInputEnable: psInputEna,
-                    pixelInputAddress: psInputAddr) ||
+                    pixelInputAddress: psInputAddr,
+                    pixelShaderAddress: pixelShaderAddress) ||
                 !Gen5SpirvTranslator.TryCompileVertexShader(
                     exportState,
                     exportEvaluation,

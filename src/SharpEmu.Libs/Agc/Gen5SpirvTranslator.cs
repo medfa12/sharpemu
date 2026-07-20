@@ -22,7 +22,8 @@ internal static partial class Gen5SpirvTranslator
         int scalarRegisterBufferIndex = -1,
         IReadOnlyList<uint>? pixelInputControls = null,
         uint pixelInputEnable = 0,
-        uint pixelInputAddress = 0) =>
+        uint pixelInputAddress = 0,
+        ulong pixelShaderAddress = 0) =>
         TryCompilePixelShader(
             state,
             evaluation,
@@ -35,7 +36,8 @@ internal static partial class Gen5SpirvTranslator
             scalarRegisterBufferIndex,
             pixelInputControls,
             pixelInputEnable,
-            pixelInputAddress);
+            pixelInputAddress,
+            pixelShaderAddress);
 
     public static bool TryCompilePixelShader(
         Gen5ShaderState state,
@@ -49,7 +51,8 @@ internal static partial class Gen5SpirvTranslator
         int scalarRegisterBufferIndex = -1,
         IReadOnlyList<uint>? pixelInputControls = null,
         uint pixelInputEnable = 0,
-        uint pixelInputAddress = 0)
+        uint pixelInputAddress = 0,
+        ulong pixelShaderAddress = 0)
     {
         if (outputs.Count > 8 || outputs.Any(output => output.GuestSlot > 7))
         {
@@ -90,7 +93,8 @@ internal static partial class Gen5SpirvTranslator
             scalarRegisterBufferIndex,
             pixelInputControls: pixelInputControls,
             pixelInputEnable: pixelInputEnable,
-            pixelInputAddress: pixelInputAddress);
+            pixelInputAddress: pixelInputAddress,
+            pixelShaderAddress: pixelShaderAddress);
         return context.TryCompile(out shader, out error);
     }
 
@@ -207,6 +211,7 @@ internal static partial class Gen5SpirvTranslator
         // fixed order); ENA selects which of those slots actually receive data.
         private readonly uint _pixelInputEnable;
         private readonly uint _pixelInputAddress;
+        private readonly ulong _pixelShaderAddress;
         private readonly List<uint> _interfaces = [];
         private readonly Dictionary<uint, uint> _pixelInputs = [];
         private readonly Dictionary<uint, SpirvPixelOutput> _pixelOutputs = [];
@@ -254,6 +259,33 @@ internal static partial class Gen5SpirvTranslator
         private static readonly bool _forcePackedStoreExecValues =
             Environment.GetEnvironmentVariable(
                 "SHARPEMU_FORCE_PACKED_STORE_EXEC_VALUES") == "1";
+        // SHARPEMU_PS_FORCE_EXEC=1 (low-probability backup toggle): seed the
+        // fragment-stage launch EXEC (SGPR 126/127) full instead of from the
+        // guest SGPR-init buffer. On the GCN pixel-shader ABI the entry EXEC
+        // is the hardware coverage mask (all invoked lanes live), not user
+        // data; shaders that save EXEC on entry and gate their MRT export /
+        // discard on it would go black if EXEC were seeded 0 out of the
+        // SGPR-init buffer region.
+        private static readonly bool _forcePixelExec =
+            Environment.GetEnvironmentVariable(
+                "SHARPEMU_PS_FORCE_EXEC") == "1";
+        // SHARPEMU_PS_FORCE_EXPOSURE_SCALAR=1 (high-probability toggle): for
+        // the tonemap/composite pixel shader at PixelShaderAddress
+        // 0x0000000500640200 only, force the exposure-scale S_BUFFER_LOAD_DWORD
+        // (descriptor base = user-SGPR reg 125, immediate byte offset 116) to
+        // return float 1.0 instead of the runtime cbuffer value. That scalar
+        // feeds the first tonemap FMul against the in0 sample; when it reads 0
+        // every channel multiplies to 0 and the menu presents black.
+        private static readonly bool _forceExposureScalar =
+            Environment.GetEnvironmentVariable(
+                "SHARPEMU_PS_FORCE_EXPOSURE_SCALAR") == "1";
+        // The specific tonemap/composite pixel shader whose exposure scalar the
+        // toggle above pins to 1.0. Scoped so default codegen is byte-identical.
+        private const ulong ExposureScalarShaderAddress = 0x0000000500640200UL;
+        // The exposure-scale S_BUFFER_LOAD_DWORD in that shader: descriptor base
+        // in user-SGPR reg 125, immediate byte offset 0x74 (116).
+        private const uint ExposureScalarBaseRegister = 125;
+        private const int ExposureScalarOffsetBytes = 116;
         private uint _voidType;
         private uint _boolType;
         private uint _uintType;
@@ -349,7 +381,8 @@ internal static partial class Gen5SpirvTranslator
             IReadOnlyCollection<uint>? requiredVertexOutputLocations = null,
             IReadOnlyList<uint>? pixelInputControls = null,
             uint pixelInputEnable = 0,
-            uint pixelInputAddress = 0)
+            uint pixelInputAddress = 0,
+            ulong pixelShaderAddress = 0)
         {
             _stage = stage;
             _state = state;
@@ -359,6 +392,7 @@ internal static partial class Gen5SpirvTranslator
             _pixelInputControls = pixelInputControls ?? [];
             _pixelInputEnable = pixelInputEnable;
             _pixelInputAddress = pixelInputAddress;
+            _pixelShaderAddress = pixelShaderAddress;
             _localSizeX = localSizeX;
             _localSizeY = localSizeY;
             _localSizeZ = localSizeZ;
@@ -1250,6 +1284,18 @@ internal static partial class Gen5SpirvTranslator
             }
             else if (_stage == Gen5SpirvStage.Pixel)
             {
+                if (_forcePixelExec)
+                {
+                    // Override the buffer-seeded (and, on subgroup shaders, the
+                    // per-lane StoreWaveMask) EXEC set above: the fragment wave
+                    // launches with the full wave32 coverage mask, so both the
+                    // guest's saved-EXEC copy (s_mov s[..], exec) and the
+                    // derived _exec predicate stay active for every fragment.
+                    // EXEC_HI is 0 for wave32.
+                    StoreS(126, UInt(0xFFFFFFFFu));
+                    StoreS(127, UInt(0u));
+                }
+
                 var fragCoord = Load(_vec4Type, _fragCoordInput);
                 if (_pixelInputAddress != 0)
                 {
@@ -2348,6 +2394,17 @@ internal static partial class Gen5SpirvTranslator
                 return true;
             }
 
+            // SHARPEMU_PS_FORCE_EXPOSURE_SCALAR: pin the exposure-scale scalar of
+            // the ts/composite shader (its S_BUFFER_LOAD reads the cbuffer at
+            // reg-125-descriptor + 116 bytes) to float 1.0 so a zero exposure
+            // value cannot multiply the tonemap output to black.
+            var forceExposureScalar =
+                _forceExposureScalar &&
+                _stage == Gen5SpirvStage.Pixel &&
+                _pixelShaderAddress == ExposureScalarShaderAddress &&
+                control.DynamicOffsetRegister == ExposureScalarBaseRegister &&
+                control.ImmediateOffsetBytes == ExposureScalarOffsetBytes;
+
             var dynamicOffset = control.DynamicOffsetRegister is { } register
                 ? LoadS(register)
                 : UInt(0);
@@ -2367,7 +2424,10 @@ internal static partial class Gen5SpirvTranslator
                 var address = index == 0
                     ? dwordAddress
                     : IAdd(dwordAddress, UInt((uint)index));
-                StoreS(destination.Value, LoadBufferWord(bindingIndex, address));
+                var value = forceExposureScalar && index == 0
+                    ? UInt(0x3F800000u)
+                    : LoadBufferWord(bindingIndex, address);
+                StoreS(destination.Value, value);
             }
 
             return true;
