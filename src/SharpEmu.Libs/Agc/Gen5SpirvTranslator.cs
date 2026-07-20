@@ -277,8 +277,32 @@ internal static partial class Gen5SpirvTranslator
         // feeds the first tonemap FMul against the in0 sample; when it reads 0
         // every channel multiplies to 0 and the menu presents black.
         private static readonly bool _forceExposureScalar =
-            Environment.GetEnvironmentVariable(
-                "SHARPEMU_PS_FORCE_EXPOSURE_SCALAR") == "1";
+            !string.IsNullOrEmpty(Environment.GetEnvironmentVariable(
+                "SHARPEMU_PS_FORCE_EXPOSURE_SCALAR"));
+        // The float value the toggle pins the exposure scalar to. "1" (or any
+        // non-numeric) => 1.0; a positive float (e.g. "0.1") => that value, so
+        // the exposure can be dialed in without over/under-saturating the HDR
+        // scene. Stored as its 32-bit float bit pattern for the UInt() constant.
+        private static readonly uint _forceExposureScalarBits =
+            ParseForceExposureScalarBits();
+
+        private static uint ParseForceExposureScalarBits()
+        {
+            var raw = Environment.GetEnvironmentVariable(
+                "SHARPEMU_PS_FORCE_EXPOSURE_SCALAR");
+            if (string.IsNullOrEmpty(raw))
+            {
+                return 0x3F800000u;
+            }
+
+            return float.TryParse(
+                raw,
+                System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture,
+                out var value) && value > 0f
+                ? BitConverter.SingleToUInt32Bits(value)
+                : 0x3F800000u;
+        }
         // The specific tonemap/composite pixel shader whose exposure scalar the
         // toggle above pins to 1.0. Scoped so default codegen is byte-identical.
         private const ulong ExposureScalarShaderAddress = 0x0000000500640200UL;
@@ -2425,7 +2449,7 @@ internal static partial class Gen5SpirvTranslator
                     ? dwordAddress
                     : IAdd(dwordAddress, UInt((uint)index));
                 var value = forceExposureScalar && index == 0
-                    ? UInt(0x3F800000u)
+                    ? UInt(_forceExposureScalarBits)
                     : LoadBufferWord(bindingIndex, address);
                 StoreS(destination.Value, value);
             }
