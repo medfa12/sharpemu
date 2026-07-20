@@ -14,6 +14,15 @@ public static class NpWebApi2Exports
     private static int _initialized;
     private static int _lastLibraryContextId;
     private static int _lastPushEventHandleId;
+    private static int _lastUserContextId;
+
+    // SHARPEMU_NP_FAKE_USERCTX=1: hand sceNpWebApi2CreateUserContext a synthetic
+    // valid user-context id instead of NOT_SIGNED_IN. Some titles (Astro Bot's
+    // online-init) do NOT treat NOT_SIGNED_IN as terminal and retry the context
+    // creation every frame, gating menu progression; a fake success lets that
+    // state machine advance. Off by default (keeps the offline-refusal behavior).
+    private static readonly bool _fakeUserContext =
+        Environment.GetEnvironmentVariable("SHARPEMU_NP_FAKE_USERCTX") == "1";
 
     // sceNpWebApi2Initialize returns the library context id, not plain success. Handing back 0
     // makes titles carry libCtxId=0 into sceNpWebApi2CreateUserContext, whose invalid-argument
@@ -72,6 +81,13 @@ public static class NpWebApi2Exports
         if (!IsKnownLibraryContext(libraryContextId))
         {
             return ctx.SetReturn(NpWebApi2ErrorInvalidLibContextId);
+        }
+
+        if (_fakeUserContext)
+        {
+            var userContextId = Interlocked.Increment(ref _lastUserContextId);
+            TraceNpWebApi2("create-user-context-fake", libraryContextId, (ulong)userContextId);
+            return ctx.SetReturn(userContextId);
         }
 
         return ctx.SetReturn(NpWebApi2ErrorNotSignedIn);
