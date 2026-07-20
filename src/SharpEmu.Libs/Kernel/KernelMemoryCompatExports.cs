@@ -2009,9 +2009,14 @@ public static class KernelMemoryCompatExports
             var hostPath = ResolveGuestPath(guestPath);
             if (!TryGetAprFileSize(hostPath, out var fileSize))
             {
+                // A single missing path (typically a "~~N" numbered variant that is not a
+                // standalone file in this dump) must not abort the whole batch. Write a
+                // sentinel id/size of 0 for this entry and keep resolving the rest so the
+                // many co-batched files that DO exist still get registered.
                 LogIoTrace("apr_resolve", guestPath, $"host='{hostPath}' index={i} count={count} result=not_found");
-                KernelRuntimeCompatExports.TrySetErrno(ctx, 2);
-                return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
+                localIds[index] = 0;
+                localSizes[index] = 0;
+                continue;
             }
 
             var fileId = AmprFileRegistry.ComputeFileId(guestPath);
@@ -2052,6 +2057,11 @@ public static class KernelMemoryCompatExports
 
         for (var i = 0; i < entryCount; i++)
         {
+            if (resolvedGuestPaths[i] is null || resolvedHostPaths[i] is null)
+            {
+                continue;
+            }
+
             AmprFileRegistry.Register(resolvedGuestPaths[i], resolvedHostPaths[i]);
         }
 

@@ -270,30 +270,14 @@ public static class AmprExports
 
         ulong bytesRead = 0;
 
-        // Unregistered/missing files are zero-filled instead of failing: games queue
-        // speculative reads and only consume the bytes on success paths.
+        // An unregistered or absent file id must surface a real error instead of a silent
+        // zero-fill: previously these "succeeded" with all-zero data, so the asset streamers
+        // consumed garbage and no failure ever propagated. Emit the read trace with the
+        // attempted path so the miss is visible, then return NOT_FOUND.
         if (!AmprFileRegistry.TryGetHostPath(fileId, out var hostPath) || !File.Exists(hostPath))
         {
-            if (destination != 0 && size > 0)
-            {
-                int chunkSize = (int)Math.Min(size, 4096);
-                Span<byte> zeros = stackalloc byte[chunkSize];
-                zeros.Clear();
-                while (bytesRead < size)
-                {
-                    int currentChunk = (int)Math.Min((ulong)chunkSize, size - bytesRead);
-                    if (!ctx.Memory.TryWrite(destination + bytesRead, zeros[..currentChunk]))
-                    {
-                        break;
-                    }
-
-                    bytesRead += (ulong)currentChunk;
-                }
-            }
-
-            TraceAmprRead(ctx, commandBuffer, fileId, destination, size, fileOffset, bytesRead, "(missing)", (int)OrbisGen2Result.ORBIS_GEN2_OK);
-            ctx[CpuRegister.Rax] = 0;
-            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+            TraceAmprRead(ctx, commandBuffer, fileId, destination, size, fileOffset, 0, hostPath ?? "(unregistered)", (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND);
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
         }
 
         // Offset -1 means "continue after the previous read of this file id".
