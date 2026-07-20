@@ -88,6 +88,10 @@ public sealed class GuestCallbackOverloadTests
             return false;
         }
 
+        public void RegisterGuestThreadContext(ulong threadHandle, CpuContext context)
+        {
+        }
+
         public bool TryJoinThread(CpuContext callerContext, ulong threadHandle, out ulong returnValue, out string? error)
         {
             returnValue = 0;

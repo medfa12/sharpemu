@@ -3,7 +3,9 @@
 
 using System.Collections.Concurrent;
 using SharpEmu.HLE;
-using SharpEmu.Libs.Fiber;
+using System.Buffers.Binary;
+using System.Diagnostics;
+using System.Threading;
 using System.Diagnostics.CodeAnalysis;
 
 namespace SharpEmu.Libs.Kernel;
@@ -18,15 +20,12 @@ public static class KernelPthreadCompatExports
     private const int MutexObjectSize = 0x100;
     private const int MutexAttrObjectSize = 0x40;
     private const int CondObjectSize = 0x100;
-    private const int DefaultSpuriousCondWakeMilliseconds = 1;
     private const int PthreadOnceUninitialized = 0;
     private const int PthreadOnceInProgress = 1;
     private const int PthreadOnceDone = 2;
 
     private static readonly object _stateGate = new();
     private static readonly ConcurrentDictionary<ulong, PthreadMutexState> _mutexStates = new();
-    private static readonly ConcurrentDictionary<ulong, string> _mutexWakeKeys = new();
-    private static readonly ConcurrentDictionary<ulong, string> _condWakeKeys = new();
     private static readonly Dictionary<ulong, PthreadMutexAttrState> _mutexAttrStates = new();
     private static readonly Dictionary<ulong, PthreadCondState> _condStates = new();
     private static readonly Dictionary<ulong, object> _onceGates = new();
@@ -38,33 +37,20 @@ public static class KernelPthreadCompatExports
         string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_PTHREAD_CONDS"), "1", StringComparison.Ordinal);
     private static readonly HashSet<ulong>? _tracePthreadMutexFilter = ParseTraceAddressFilter(
         Environment.GetEnvironmentVariable("SHARPEMU_LOG_PTHREAD_MUTEX_FILTER"));
-    private static readonly bool _enableMutexLockBlocking =
-        string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_MUTEX_LOCK_BLOCKING"), "1", StringComparison.Ordinal);
 
-    // On the outer class deliberately: a static on the nested state classes gives them a
-    // type initializer that first runs on a guest thread and fail-fasts the CLR.
-    private static long _nextMutexWakeId;
-    private static long _nextCondWakeId;
-    private static readonly ConcurrentDictionary<ulong, long> _posixTimedWaitCounts = new();
-    private static readonly ConcurrentDictionary<ulong, byte> _reportedContendedMutexes = new();
-
+    // Blocking model: waiters block their own host thread in place via
+    // Monitor.Wait on the state object (mutexes) or SyncRoot (condvars).
+    // Block-and-wake is therefore atomic — no waiter queues, wake keys, or
+    // continuation hand-offs, and no lost-wakeup window between a thread
+    // deciding to block and registering as blocked.
     private sealed class PthreadMutexState
     {
-        public SemaphoreSlim Semaphore { get; } = new(1, 1);
         public ulong OwnerThreadId { get; set; }
         public int RecursionCount { get; set; }
         public int Type { get; set; } = MutexTypeErrorCheck;
         public int Protocol { get; set; }
-
-        // Keyed on state identity, not the resolved address (which can differ between a
-        // lock and its unlock for the same state, stranding the waiter).
-        public string WakeKey { get; } = "pthread_mutex#" + Interlocked.Increment(ref _nextMutexWakeId).ToString("X");
-    }
-
-    private sealed class PthreadMutexWaiter
-    {
-        public required ulong ThreadId { get; init; }
-        public int Reserved;
+        // Threads currently blocked in PthreadMutexLockCore; destroy reports BUSY while nonzero.
+        public int WaiterCount { get; set; }
     }
 
     private sealed class PthreadCondState
@@ -72,23 +58,10 @@ public static class KernelPthreadCompatExports
         public object SyncRoot { get; } = new();
         public ulong SignalEpoch { get; set; }
         public int Waiters { get; set; }
-
-        // See PthreadMutexState.WakeKey.
-        public string WakeKey { get; } = "pthread_cond#" + Interlocked.Increment(ref _nextCondWakeId).ToString("X");
-
-        // A signal with no waiter stays pending; the guest often signals before the wait.
-        public int PendingSignals { get; set; }
-
-        public bool TryConsumePendingSignal()
-        {
-            if (PendingSignals <= 0)
-            {
-                return false;
-            }
-
-            PendingSignals--;
-            return true;
-        }
+        // Signals produced but not yet consumed by a waiter. A signal only
+        // increments this when an unserved waiter exists (POSIX: signaling an
+        // empty condvar is a no-op), so stale signals cannot accumulate.
+        public int SignalsPending { get; set; }
     }
 
     private readonly record struct PthreadMutexAttrState(int Type, int Protocol);
@@ -101,6 +74,7 @@ public static class KernelPthreadCompatExports
     public static int PthreadSelf(CpuContext ctx)
     {
         var currentThreadHandle = KernelPthreadState.GetCurrentThreadHandle();
+        GuestThreadExecution.Scheduler?.RegisterGuestThreadContext(currentThreadHandle, ctx);
         ctx[CpuRegister.Rax] = currentThreadHandle;
         TracePthreadSelf(ctx, currentThreadHandle);
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
@@ -140,7 +114,7 @@ public static class KernelPthreadCompatExports
         LibraryName = "libKernel")]
     public static int PthreadYield(CpuContext ctx)
     {
-        GuestThreadExecution.Scheduler?.Pump(ctx, "scePthreadYield");
+        _ = ctx;
         Thread.Yield();
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
@@ -155,10 +129,13 @@ public static class KernelPthreadCompatExports
         if (_tracePthreads)
         {
             var nameAddress = ctx[CpuRegister.Rsi];
-            var name = nameAddress != 0 &&
-                KernelMemoryCompatExports.TryReadNullTerminatedUtf8(ctx, nameAddress, 64, out var value)
-                    ? value
-                    : "<unreadable>";
+            Span<byte> nameBytes = stackalloc byte[64];
+            var name = "<unreadable>";
+            if (nameAddress != 0 && ctx.Memory.TryRead(nameAddress, nameBytes))
+            {
+                var length = nameBytes.IndexOf((byte)0);
+                name = System.Text.Encoding.UTF8.GetString(length >= 0 ? nameBytes[..length] : nameBytes);
+            }
             Console.Error.WriteLine(
                 $"[LOADER][TRACE] pthread.rename thread=0x{ctx[CpuRegister.Rdi]:X16} name=\"{name}\"");
         }
@@ -334,6 +311,13 @@ public static class KernelPthreadCompatExports
     public static int PthreadCondDestroy(CpuContext ctx) => PthreadCondDestroyCore(ctx, ctx[CpuRegister.Rdi]);
 
     [SysAbiExport(
+        Nid = "RXXqi4CtF8w",
+        ExportName = "pthread_cond_destroy",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int PosixPthreadCondDestroy(CpuContext ctx) => PthreadCondDestroyCore(ctx, ctx[CpuRegister.Rdi]);
+
+    [SysAbiExport(
         Nid = "WKAXJ4XBPQ4",
         ExportName = "scePthreadCondWait",
         Target = Generation.Gen4 | Generation.Gen5,
@@ -346,104 +330,6 @@ public static class KernelPthreadCompatExports
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libKernel")]
     public static int PthreadCondTimedwait(CpuContext ctx) => PthreadCondWaitCore(ctx, ctx[CpuRegister.Rdi], ctx[CpuRegister.Rsi], timed: true, timeoutUsec: unchecked((uint)ctx[CpuRegister.Rdx]));
-
-    [SysAbiExport(
-        Nid = "27bAgiJmOh0",
-        ExportName = "pthread_cond_timedwait",
-        Target = Generation.Gen4 | Generation.Gen5,
-        LibraryName = "libKernel")]
-    public static int PosixPthreadCondTimedwait(CpuContext ctx)
-    {
-        var absoluteTimeAddress = ctx[CpuRegister.Rdx];
-        if (absoluteTimeAddress == 0 ||
-            !ctx.TryReadUInt64(absoluteTimeAddress, out var secondsRaw) ||
-            !ctx.TryReadUInt64(absoluteTimeAddress + sizeof(ulong), out var nanosecondsRaw))
-        {
-            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
-        }
-
-        var deadlineSeconds = unchecked((long)secondsRaw);
-        var deadlineNanoseconds = unchecked((long)nanosecondsRaw);
-        if (deadlineSeconds < 0 || deadlineNanoseconds is < 0 or >= 1_000_000_000)
-        {
-            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
-        }
-
-        long nowSeconds;
-        long nowNanoseconds;
-        if (deadlineSeconds >= 1_000_000_000)
-        {
-            var now = DateTimeOffset.UtcNow;
-            nowSeconds = now.ToUnixTimeSeconds();
-            nowNanoseconds = (now.Ticks % TimeSpan.TicksPerSecond) * 100;
-        }
-        else
-        {
-            // Engine condition variables use monotonic deadlines.
-            KernelRuntimeCompatExports.GetProcessMonotonicTime(out nowSeconds, out nowNanoseconds);
-        }
-
-        var remainingNanoseconds =
-            ((Int128)deadlineSeconds * 1_000_000_000 + deadlineNanoseconds) -
-            ((Int128)nowSeconds * 1_000_000_000 + nowNanoseconds);
-        var timeoutUsec = remainingNanoseconds <= 0
-            ? 0u
-            : (uint)Int128.Min(uint.MaxValue, (remainingNanoseconds + 999) / 1_000);
-
-        TracePosixTimedWait(
-            ctx,
-            deadlineSeconds,
-            deadlineNanoseconds,
-            nowSeconds,
-            nowNanoseconds,
-            remainingNanoseconds,
-            timeoutUsec);
-
-        return PthreadCondWaitCore(
-            ctx,
-            ctx[CpuRegister.Rdi],
-            ctx[CpuRegister.Rsi],
-            timed: true,
-            timeoutUsec,
-            posixResult: true);
-    }
-
-    private static void TracePosixTimedWait(
-        CpuContext ctx,
-        long deadlineSeconds,
-        long deadlineNanoseconds,
-        long nowSeconds,
-        long nowNanoseconds,
-        Int128 remainingNanoseconds,
-        uint timeoutUsec)
-    {
-        var condAddress = ctx[CpuRegister.Rdi];
-        var count = _posixTimedWaitCounts.AddOrUpdate(condAddress, 1, static (_, current) => current + 1);
-        if (count != 1 && count % 1_000_000 != 0)
-        {
-            return;
-        }
-
-        _ = ctx.TryReadUInt64(ctx[CpuRegister.Rsp], out var returnRip);
-        Console.Error.WriteLine(
-            $"[LOADER][DIAG] pthread_cond_timedwait#{count}: thread=0x{KernelPthreadState.GetCurrentThreadHandle():X16} " +
-            $"cond=0x{condAddress:X16} mutex=0x{ctx[CpuRegister.Rsi]:X16} abstime=0x{ctx[CpuRegister.Rdx]:X16} " +
-            $"deadline={deadlineSeconds}.{deadlineNanoseconds:D9} now={nowSeconds}.{nowNanoseconds:D9} " +
-            $"remaining_ns={remainingNanoseconds} timeout_us={timeoutUsec} ret=0x{returnRip:X16}");
-
-        if (GuestThreadExecution.Scheduler is not { } scheduler)
-        {
-            return;
-        }
-
-        foreach (var snapshot in scheduler.SnapshotThreads())
-        {
-            Console.Error.WriteLine(
-                $"[LOADER][DIAG] guest_thread handle=0x{snapshot.ThreadHandle:X16} name='{snapshot.Name}' " +
-                $"state={snapshot.State} imports={snapshot.ImportCount} nid={snapshot.LastImportNid ?? "none"} " +
-                $"ret=0x{snapshot.LastReturnRip:X16} block={snapshot.BlockReason ?? "none"}");
-        }
-    }
 
     [SysAbiExport(
         Nid = "kDh-NfxgMtE",
@@ -465,6 +351,62 @@ public static class KernelPthreadCompatExports
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libKernel")]
     public static int PosixPthreadCondWait(CpuContext ctx) => PthreadCondWaitCore(ctx, ctx[CpuRegister.Rdi], ctx[CpuRegister.Rsi], timed: false);
+
+    [SysAbiExport(
+        Nid = "27bAgiJmOh0",
+        ExportName = "pthread_cond_timedwait",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int PosixPthreadCondTimedwait(CpuContext ctx)
+    {
+        var deadlineAddress = ctx[CpuRegister.Rdx];
+        if (deadlineAddress == 0 ||
+            !KernelMemoryCompatExports.TryReadUInt64Compat(ctx, deadlineAddress, out var rawSeconds) ||
+            !KernelMemoryCompatExports.TryReadUInt64Compat(
+                ctx,
+                deadlineAddress + sizeof(long),
+                out var rawNanoseconds))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        var seconds = unchecked((long)rawSeconds);
+        var nanoseconds = unchecked((long)rawNanoseconds);
+        if (seconds < 0 || nanoseconds is < 0 or >= 1_000_000_000)
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+
+        var now = DateTimeOffset.UtcNow;
+        var deltaSeconds = seconds - now.ToUnixTimeSeconds();
+        var nowNanoseconds = (now.Ticks % TimeSpan.TicksPerSecond) * 100L;
+        uint timeoutUsec;
+        if (deltaSeconds < 0)
+        {
+            timeoutUsec = 0;
+        }
+        else if (deltaSeconds > uint.MaxValue / 1_000_000L + 1)
+        {
+            timeoutUsec = uint.MaxValue;
+        }
+        else
+        {
+            var remainingNanoseconds =
+                deltaSeconds * 1_000_000_000L + nanoseconds - nowNanoseconds;
+            var remainingUsec = remainingNanoseconds <= 0
+                ? 0
+                : (remainingNanoseconds + 999L) / 1_000L;
+            timeoutUsec = (uint)Math.Min(remainingUsec, uint.MaxValue);
+        }
+
+        return PthreadCondWaitCore(
+            ctx,
+            ctx[CpuRegister.Rdi],
+            ctx[CpuRegister.Rsi],
+            timed: true,
+            timeoutUsec,
+            posixErrors: true);
+    }
 
     [SysAbiExport(
         Nid = "mkx2fVhNMsg",
@@ -533,42 +475,42 @@ public static class KernelPthreadCompatExports
         var initRoutine = ctx[CpuRegister.Rsi];
         if (onceAddress == 0 || initRoutine == 0)
         {
-            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
         }
 
-        if (!ctx.TryReadInt32(onceAddress, out var onceValue))
+        if (!TryReadInt32(ctx, onceAddress, out var onceValue))
         {
-            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
         }
 
         if (onceValue == PthreadOnceDone)
         {
-            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK);
         }
 
         var gate = GetPthreadOnceGate(onceAddress);
         var shouldCall = false;
         lock (gate)
         {
-            if (!ctx.TryReadInt32(onceAddress, out onceValue))
+            if (!TryReadInt32(ctx, onceAddress, out onceValue))
             {
-                return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+                return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
             }
 
             while (onceValue == PthreadOnceInProgress)
             {
                 Monitor.Wait(gate, TimeSpan.FromMilliseconds(1));
-                if (!ctx.TryReadInt32(onceAddress, out onceValue))
+                if (!TryReadInt32(ctx, onceAddress, out onceValue))
                 {
-                    return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+                    return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
                 }
             }
 
             if (onceValue != PthreadOnceDone)
             {
-                if (!ctx.TryWriteInt32(onceAddress, PthreadOnceInProgress))
+                if (!TryWriteInt32(ctx, onceAddress, PthreadOnceInProgress))
                 {
-                    return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+                    return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
                 }
 
                 shouldCall = true;
@@ -584,21 +526,21 @@ public static class KernelPthreadCompatExports
             {
                 lock (gate)
                 {
-                    _ = ctx.TryWriteInt32(onceAddress, PthreadOnceUninitialized);
+                    _ = TryWriteInt32(ctx, onceAddress, PthreadOnceUninitialized);
                     Monitor.PulseAll(gate);
                 }
 
                 TracePthreadOnce(onceAddress, initRoutine, "failed", error);
-                return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_TRY_AGAIN);
+                return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_TRY_AGAIN);
             }
 
             lock (gate)
             {
-                if (!ctx.TryWriteInt32(onceAddress, PthreadOnceDone))
+                if (!TryWriteInt32(ctx, onceAddress, PthreadOnceDone))
                 {
-                    _ = ctx.TryWriteInt32(onceAddress, PthreadOnceUninitialized);
+                    _ = TryWriteInt32(ctx, onceAddress, PthreadOnceUninitialized);
                     Monitor.PulseAll(gate);
-                    return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+                    return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
                 }
 
                 Monitor.PulseAll(gate);
@@ -606,7 +548,7 @@ public static class KernelPthreadCompatExports
         }
 
         TracePthreadOnce(onceAddress, initRoutine, shouldCall ? "call" : "done", null);
-        return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
+        return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK);
     }
 
     private static int PthreadMutexInitCore(CpuContext ctx, ulong mutexAddress, ulong attrAddress)
@@ -629,7 +571,6 @@ public static class KernelPthreadCompatExports
         }
         if (!InitializeMutexObject(ctx, handle, state))
         {
-            state.Semaphore.Dispose();
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }
 
@@ -641,7 +582,6 @@ public static class KernelPthreadCompatExports
             _mutexStates.TryRemove(mutexAddress, out _);
             _mutexStates.TryRemove(handle, out _);
 
-            state.Semaphore.Dispose();
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }
 
@@ -656,19 +596,26 @@ public static class KernelPthreadCompatExports
         }
 
         var resolvedAddress = ResolveMutexHandle(ctx, mutexAddress);
-        _mutexStates.TryRemove(resolvedAddress, out var state);
-        if (resolvedAddress != mutexAddress)
-        {
-            _mutexStates.TryRemove(mutexAddress, out _);
-        }
-
-        if (state is null)
+        if (!_mutexStates.TryGetValue(resolvedAddress, out var state))
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
         }
 
+        lock (state)
+        {
+            if (state.OwnerThreadId != 0 || state.RecursionCount != 0 || state.WaiterCount != 0)
+            {
+                return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_BUSY;
+            }
+
+            _mutexStates.TryRemove(resolvedAddress, out _);
+            if (resolvedAddress != mutexAddress)
+            {
+                _mutexStates.TryRemove(mutexAddress, out _);
+            }
+        }
+
         _ = KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, mutexAddress, 0);
-        state.Semaphore.Dispose();
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
@@ -705,6 +652,12 @@ public static class KernelPthreadCompatExports
                         return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_BUSY;
                     }
 
+                    // Several Gen5 runtimes layer their own owner/count bookkeeping
+                    // over a NORMAL or ADAPTIVE kernel mutex. Returning EDEADLK here
+                    // leaves that guest bookkeeping out of sync with the HLE owner and
+                    // turns the wrapper into a permanent lock/unlock retry loop. Keep
+                    // the compatibility recursion used by the original implementation;
+                    // ERRORCHECK mutexes still take the strict EDEADLK path below.
                     state.RecursionCount++;
                     TracePthreadMutex(ctx, "lock", mutexAddress, resolvedAddress, state, currentThreadId, (int)OrbisGen2Result.ORBIS_GEN2_OK);
                     return (int)OrbisGen2Result.ORBIS_GEN2_OK;
@@ -718,119 +671,50 @@ public static class KernelPthreadCompatExports
                     return ownedResult;
                 }
             }
-        }
 
-        var acquired = state.Semaphore.Wait(0);
-        if (!acquired)
-        {
-            // The contended path lives in a separate method so its lambdas do not
-            // force a closure allocation at method entry on the uncontended
-            // lock/trylock fast path (captured parameters hoist the display class
-            // to the top of the capturing method).
-            if (TryRequestContendedMutexBlock(ctx, mutexAddress, resolvedAddress, state, currentThreadId, tryOnly))
+            if (state.OwnerThreadId == 0)
             {
+                state.OwnerThreadId = currentThreadId;
+                state.RecursionCount = 1;
+                TracePthreadMutex(ctx, tryOnly ? "trylock" : "lock", mutexAddress, resolvedAddress, state, currentThreadId, (int)OrbisGen2Result.ORBIS_GEN2_OK);
                 return (int)OrbisGen2Result.ORBIS_GEN2_OK;
             }
 
-            if (!tryOnly)
+            if (tryOnly)
             {
-                state.Semaphore.Wait();
-                acquired = true;
+                TracePthreadMutex(ctx, "trylock", mutexAddress, resolvedAddress, state, currentThreadId, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_BUSY);
+                return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_BUSY;
             }
-        }
 
-        if (!acquired)
-        {
-            TracePthreadMutex(ctx, tryOnly ? "trylock" : "lock", mutexAddress, resolvedAddress, state, currentThreadId, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_BUSY);
-            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_BUSY;
-        }
-
-        lock (state)
-        {
-            DetectMutexDoubleOwner(resolvedAddress, state, currentThreadId, "lock");
-            state.OwnerThreadId = currentThreadId;
-            state.RecursionCount = 1;
-        }
-
-        TracePthreadMutex(ctx, tryOnly ? "trylock" : "lock", mutexAddress, resolvedAddress, state, currentThreadId, (int)OrbisGen2Result.ORBIS_GEN2_OK);
-        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
-    }
-
-    private static bool TryRequestContendedMutexBlock(
-        CpuContext ctx,
-        ulong mutexAddress,
-        ulong resolvedAddress,
-        PthreadMutexState state,
-        ulong currentThreadId,
-        bool tryOnly)
-    {
-        TraceContendedMutex(ctx, mutexAddress, resolvedAddress, state, currentThreadId);
-        var waiter = new PthreadMutexWaiter { ThreadId = currentThreadId };
-        // Fibers retain the synchronous fallback to preserve switch state.
-        var currentFiber = FiberExports.GetCurrentFiberAddressForDiagnostics(ctx);
-        var canCooperativelyBlock = _enableMutexLockBlocking || currentFiber == 0;
-        if (canCooperativelyBlock &&
-            !tryOnly &&
-            GuestThreadExecution.IsGuestThread &&
-            GuestThreadExecution.TryGetCurrentImportCallFrame(out _) &&
-            GuestThreadExecution.RequestCurrentThreadBlock(
-                ctx,
-                "pthread_mutex_lock",
-                state.WakeKey,
-                () => CompleteBlockedMutexLock(ctx, mutexAddress, resolvedAddress, state, waiter),
-                () => TryReserveBlockedMutexLock(ctx, mutexAddress, resolvedAddress, state, waiter)))
-        {
+            // Contended: block this host thread in place until the owner
+            // releases. Monitor.Wait atomically releases the state lock and
+            // parks, so an unlock's PulseAll cannot be missed. Waits are
+            // sliced only so teardown can unwind parked threads.
             TracePthreadMutex(ctx, "lock-block", mutexAddress, resolvedAddress, state, currentThreadId, (int)OrbisGen2Result.ORBIS_GEN2_OK);
-            return true;
-        }
-
-        return false;
-    }
-
-    private static void TraceContendedMutex(
-        CpuContext ctx,
-        ulong mutexAddress,
-        ulong resolvedAddress,
-        PthreadMutexState state,
-        ulong currentThreadId)
-    {
-        if (!_reportedContendedMutexes.TryAdd(resolvedAddress, 0))
-        {
-            return;
-        }
-
-        ulong ownerThreadId;
-        int recursionCount;
-        int type;
-        lock (state)
-        {
-            ownerThreadId = state.OwnerThreadId;
-            recursionCount = state.RecursionCount;
-            type = state.Type;
-        }
-
-        _ = ctx.TryReadUInt64(ctx[CpuRegister.Rsp], out var returnRip);
-        Console.Error.WriteLine(
-            $"[LOADER][DIAG] pthread_mutex_contended: waiter=0x{currentThreadId:X16} owner=0x{ownerThreadId:X16} " +
-            $"mutex=0x{mutexAddress:X16} resolved=0x{resolvedAddress:X16} recursion={recursionCount} " +
-            $"type={type} semaphore_count={state.Semaphore.CurrentCount} ret=0x{returnRip:X16}");
-
-        if (GuestThreadExecution.Scheduler is not { } scheduler)
-        {
-            return;
-        }
-
-        foreach (var snapshot in scheduler.SnapshotThreads())
-        {
-            if (snapshot.ThreadHandle != currentThreadId && snapshot.ThreadHandle != ownerThreadId)
+            state.WaiterCount++;
+            try
             {
-                continue;
+                while (state.OwnerThreadId != 0)
+                {
+                    if (GuestThreadBlocking.ShutdownRequested)
+                    {
+                        TracePthreadMutex(ctx, "lock-shutdown", mutexAddress, resolvedAddress, state, currentThreadId, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_TRY_AGAIN);
+                        return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_TRY_AGAIN;
+                    }
+
+                    _ = Monitor.Wait(state, GuestThreadBlocking.WaitSliceMilliseconds);
+                }
+
+                state.OwnerThreadId = currentThreadId;
+                state.RecursionCount = 1;
+            }
+            finally
+            {
+                state.WaiterCount--;
             }
 
-            Console.Error.WriteLine(
-                $"[LOADER][DIAG] pthread_mutex_party handle=0x{snapshot.ThreadHandle:X16} name='{snapshot.Name}' " +
-                $"state={snapshot.State} imports={snapshot.ImportCount} nid={snapshot.LastImportNid ?? "none"} " +
-                $"ret=0x{snapshot.LastReturnRip:X16} block={snapshot.BlockReason ?? "none"}");
+            TracePthreadMutex(ctx, "lock", mutexAddress, resolvedAddress, state, currentThreadId, (int)OrbisGen2Result.ORBIS_GEN2_OK);
+            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
         }
     }
 
@@ -848,24 +732,15 @@ public static class KernelPthreadCompatExports
         }
 
         var currentThreadId = KernelPthreadState.GetCurrentThreadHandle();
-        var lenientOwnership = state.Type is MutexTypeNormal or MutexTypeAdaptiveNp;
-
-        var shouldRelease = false;
         lock (state)
         {
             if (state.RecursionCount <= 0)
             {
-                if (lenientOwnership)
-                {
-                    TracePthreadMutex(ctx, "unlock", mutexAddress, resolvedAddress, state, currentThreadId, (int)OrbisGen2Result.ORBIS_GEN2_OK);
-                    return (int)OrbisGen2Result.ORBIS_GEN2_OK;
-                }
-
                 TracePthreadMutex(ctx, "unlock", mutexAddress, resolvedAddress, state, currentThreadId, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
                 return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
             }
 
-            if (requireOwner && !lenientOwnership && state.OwnerThreadId != currentThreadId)
+            if (requireOwner && state.OwnerThreadId != currentThreadId)
             {
                 TracePthreadMutex(ctx, "unlock", mutexAddress, resolvedAddress, state, currentThreadId, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_PERMISSION_DENIED);
                 return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_PERMISSION_DENIED;
@@ -875,23 +750,9 @@ public static class KernelPthreadCompatExports
             if (state.RecursionCount == 0)
             {
                 state.OwnerThreadId = 0;
-                shouldRelease = true;
-            }
-        }
-
-        if (shouldRelease)
-        {
-            try
-            {
-                state.Semaphore.Release();
-                _ = GuestThreadExecution.Scheduler?.WakeBlockedThreads(state.WakeKey, 1);
-            }
-            catch (SemaphoreFullException)
-            {
-                if (!lenientOwnership)
+                if (state.WaiterCount != 0)
                 {
-                    TracePthreadMutex(ctx, "unlock", mutexAddress, resolvedAddress, state, currentThreadId, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
-                    return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+                    Monitor.PulseAll(state);
                 }
             }
         }
@@ -1119,7 +980,7 @@ public static class KernelPthreadCompatExports
     {
         if (attrAddress == 0)
         {
-            return default;
+            return new PthreadMutexAttrState(MutexTypeErrorCheck, 0);
         }
 
         var resolvedAddress = ResolveMutexAttrHandle(ctx, attrAddress);
@@ -1213,13 +1074,6 @@ public static class KernelPthreadCompatExports
 
         lock (_stateGate)
         {
-            if (_condStates.TryGetValue(condAddress, out var raced))
-            {
-                resolvedAddress = condAddress;
-                state = raced;
-                return true;
-            }
-
             _condStates[condAddress] = createdState;
             _condStates[handle] = createdState;
         }
@@ -1255,12 +1109,19 @@ public static class KernelPthreadCompatExports
     }
 
     private static bool InitializeMutexObject(CpuContext ctx, ulong address, PthreadMutexState state) =>
-        ctx.TryWriteUInt32(address + 0x20, unchecked((uint)state.Type)) &&
-        ctx.TryWriteUInt32(address + 0x3C, unchecked((uint)state.Protocol));
+        TryWriteUInt32(ctx, address + 0x20, unchecked((uint)state.Type)) &&
+        TryWriteUInt32(ctx, address + 0x3C, unchecked((uint)state.Protocol));
 
     private static bool WriteMutexAttrObject(CpuContext ctx, ulong address, PthreadMutexAttrState state) =>
-        ctx.TryWriteUInt32(address, unchecked((uint)state.Type)) &&
-        ctx.TryWriteUInt32(address + 4, unchecked((uint)state.Protocol));
+        TryWriteUInt32(ctx, address, unchecked((uint)state.Type)) &&
+        TryWriteUInt32(ctx, address + 4, unchecked((uint)state.Protocol));
+
+    private static bool TryWriteUInt32(CpuContext ctx, ulong address, uint value)
+    {
+        Span<byte> bytes = stackalloc byte[sizeof(uint)];
+        BitConverter.TryWriteBytes(bytes, value);
+        return ctx.Memory.TryWrite(address, bytes);
+    }
 
     private static int PthreadCondInitCore(CpuContext ctx, ulong condAddress)
     {
@@ -1305,6 +1166,19 @@ public static class KernelPthreadCompatExports
         var resolvedAddress = ResolveCondHandle(ctx, condAddress);
         lock (_stateGate)
         {
+            if (!_condStates.TryGetValue(resolvedAddress, out var state))
+            {
+                return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
+            }
+
+            lock (state.SyncRoot)
+            {
+                if (state.Waiters != 0)
+                {
+                    return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_BUSY;
+                }
+            }
+
             _condStates.Remove(resolvedAddress);
             if (resolvedAddress != condAddress)
             {
@@ -1322,35 +1196,60 @@ public static class KernelPthreadCompatExports
         ulong mutexAddress,
         bool timed,
         uint timeoutUsec = 0,
-        bool posixResult = false)
+        bool posixErrors = false)
     {
         if (condAddress == 0 || mutexAddress == 0)
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
         }
 
-        if (!TryResolveCondState(ctx, condAddress, createIfZero: true, out var resolvedCondAddress, out var state))
+        if (!TryResolveCondState(ctx, condAddress, createIfZero: true, out _, out var state))
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
         }
 
-        var waitResult = (int)OrbisGen2Result.ORBIS_GEN2_OK;
-        var spuriousWake = false;
-        var releasedRecursion = 0;
+        if (!TryResolveMutexState(ctx, mutexAddress, createIfZero: true, out _, out var mutexState))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
+        }
+
+        var currentThreadId = KernelPthreadState.GetCurrentThreadHandle();
+        lock (mutexState)
+        {
+            if (mutexState.OwnerThreadId == 0 && mutexState.RecursionCount == 0)
+            {
+                // The guest holds the mutex through a path our host-side tracking
+                // never observed — most commonly libkernel's uncontended userspace
+                // fast-path, which locks the mutex word directly without an HLE
+                // call. Real pthread_cond_wait requires the caller to own the
+                // mutex and does not verify it for normal mutexes, so returning
+                // EPERM here is wrong: it spins the guest and, worse, leaves the
+                // mutex held (the unlock below is skipped), wedging every thread
+                // that later blocks on pthread_mutex_lock. Adopt ownership so the
+                // unlock/wait/re-lock cycle is balanced and releases the mutex.
+                mutexState.OwnerThreadId = currentThreadId;
+                mutexState.RecursionCount = 1;
+            }
+            else if (mutexState.OwnerThreadId != currentThreadId || mutexState.RecursionCount != 1)
+            {
+                return mutexState.OwnerThreadId == currentThreadId
+                    ? (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT
+                    : (int)OrbisGen2Result.ORBIS_GEN2_ERROR_PERMISSION_DENIED;
+            }
+        }
+
+        var signaled = false;
         lock (state.SyncRoot)
         {
             state.Waiters++;
-            var observedEpoch = state.SignalEpoch;
-            var consumedPendingSignal = state.TryConsumePendingSignal();
-            TracePthreadCond(
-                consumedPendingSignal ? "wait-enter-pending" : "wait-enter",
-                condAddress,
-                mutexAddress,
-                state,
-                timed,
-                waitResult);
+            TracePthreadCond("wait-enter", condAddress, mutexAddress, state, timed, (int)OrbisGen2Result.ORBIS_GEN2_OK);
 
-            var unlockResult = PthreadMutexFullUnlockForCondWait(ctx, mutexAddress, out releasedRecursion);
+            // POSIX atomicity: we are registered as a waiter (Waiters++ under
+            // SyncRoot) before the mutex is released, so a signal issued the
+            // instant the mutex unlocks already counts us and lands in
+            // SignalsPending — checked before the first Monitor.Wait. No
+            // window exists where a wake can be lost.
+            var unlockResult = PthreadMutexUnlockCore(ctx, mutexAddress, requireOwner: true);
             if (unlockResult != (int)OrbisGen2Result.ORBIS_GEN2_OK)
             {
                 state.Waiters--;
@@ -1358,116 +1257,53 @@ public static class KernelPthreadCompatExports
                 return unlockResult;
             }
 
-            if (consumedPendingSignal)
+            var deadline = timed
+                ? GuestThreadExecution.ComputeDeadlineTimestamp(GetCondWaitTimeout(timeoutUsec))
+                : long.MaxValue;
+            while (state.SignalsPending == 0 && !GuestThreadBlocking.ShutdownRequested)
             {
-                state.Waiters = Math.Max(0, state.Waiters - 1);
-                TracePthreadCond("wait-wake-pending", condAddress, mutexAddress, state, timed, waitResult);
-
-                // Relock outside SyncRoot to preserve lock ordering.
-                Monitor.Exit(state.SyncRoot);
-                try
+                var remaining = timed
+                    ? GetRemainingTimeout(deadline)
+                    : TimeSpan.FromMilliseconds(GuestThreadBlocking.WaitSliceMilliseconds);
+                if (timed && remaining <= TimeSpan.Zero)
                 {
-                    var pendingLockResult = PthreadMutexRelockForCondWait(ctx, mutexAddress, releasedRecursion);
-                    return pendingLockResult != (int)OrbisGen2Result.ORBIS_GEN2_OK ? pendingLockResult : waitResult;
-                }
-                finally
-                {
-                    // Balance the surrounding lock statement.
-                    Monitor.Enter(state.SyncRoot);
-                }
-            }
-
-            var scheduler = GuestThreadExecution.Scheduler;
-            if (GuestThreadExecution.IsGuestThread &&
-                GuestThreadExecution.RequestCurrentThreadBlock(
-                    ctx,
-                    timed ? "pthread_cond_timedwait" : "pthread_cond_wait",
-                    state.WakeKey,
-                    () => ResumePthreadCondWait(ctx, condAddress, mutexAddress, state, observedEpoch, timed, releasedRecursion, posixResult),
-                    () => state.SignalEpoch != observedEpoch,
-                    timed ? GuestThreadExecution.ComputeDeadlineTimestamp(GetCondWaitTimeout(timeoutUsec)) : 0))
-            {
-                TracePthreadCond(timed ? "wait-block-timed" : "wait-block", condAddress, mutexAddress, state, timed, waitResult);
-                return waitResult;
-            }
-
-            if (scheduler is not null)
-            {
-                Monitor.Exit(state.SyncRoot);
-                try
-                {
-                    scheduler.Pump(ctx, "pthread_cond_wait");
-                }
-                finally
-                {
-                    Monitor.Enter(state.SyncRoot);
-                }
-            }
-
-            while (state.SignalEpoch == observedEpoch)
-            {
-                if (!timed)
-                {
-                    if (!Monitor.Wait(state.SyncRoot, GetCondSpuriousWakeTimeout()))
-                    {
-                        if (scheduler is not null && !GuestThreadExecution.IsGuestThread)
-                        {
-                            Monitor.Exit(state.SyncRoot);
-                            try
-                            {
-                                scheduler.Pump(ctx, "pthread_cond_wait");
-                            }
-                            finally
-                            {
-                                Monitor.Enter(state.SyncRoot);
-                            }
-
-                            continue;
-                        }
-
-                        spuriousWake = true;
-                        break;
-                    }
-
-                    continue;
-                }
-
-                if (!Monitor.Wait(state.SyncRoot, GetCondWaitTimeout(timeoutUsec)))
-                {
-                    waitResult = (int)OrbisGen2Result.ORBIS_GEN2_ERROR_TIMED_OUT;
                     break;
                 }
+
+                if (remaining > TimeSpan.FromMilliseconds(GuestThreadBlocking.WaitSliceMilliseconds))
+                {
+                    remaining = TimeSpan.FromMilliseconds(GuestThreadBlocking.WaitSliceMilliseconds);
+                }
+
+                _ = Monitor.Wait(state.SyncRoot, remaining);
             }
 
-            state.Waiters = Math.Max(0, state.Waiters - 1);
-            TracePthreadCond(
-                spuriousWake
-                    ? "wait-spurious"
-                    : (waitResult == (int)OrbisGen2Result.ORBIS_GEN2_OK ? "wait-wake" : "wait-timeout"),
-                condAddress,
-                mutexAddress,
-                state,
-                timed,
-                waitResult);
+            if (state.SignalsPending > 0)
+            {
+                state.SignalsPending--;
+                signaled = true;
+            }
+
+            state.Waiters--;
+            if (state.SignalsPending > state.Waiters)
+            {
+                // A timed-out waiter left a signal unconsumed with nobody
+                // remaining to take it; drop it so a future wait does not
+                // observe a phantom wake (signals on an empty condvar are
+                // no-ops on real hardware).
+                state.SignalsPending = state.Waiters;
+            }
         }
 
-        var lockResult = PthreadMutexRelockForCondWait(ctx, mutexAddress, releasedRecursion);
-        if (lockResult != (int)OrbisGen2Result.ORBIS_GEN2_OK)
-        {
-            TracePthreadCond("wait-relock-fail", condAddress, mutexAddress, state, timed, lockResult);
-            return lockResult;
-        }
+        // POSIX guarantees the mutex is re-acquired on every return path,
+        // signaled or timed out. Blocks in place like any other locker.
+        _ = PthreadMutexLockCore(ctx, mutexAddress, tryOnly: false);
 
-        TracePthreadCond(
-            spuriousWake
-                ? "wait-exit-spurious"
-                : (waitResult == (int)OrbisGen2Result.ORBIS_GEN2_OK ? "wait-exit" : "wait-exit-timeout"),
-            condAddress,
-            mutexAddress,
-            state,
-            timed,
-            waitResult);
-        return TranslatePthreadResult(waitResult, posixResult);
+        var waitResult = signaled || !timed
+            ? (int)OrbisGen2Result.ORBIS_GEN2_OK
+            : CondTimedOutResult(posixErrors);
+        TracePthreadCond(signaled ? "wait-exit" : "wait-exit-timeout", condAddress, mutexAddress, state, timed, waitResult);
+        return waitResult;
     }
 
     private static int PthreadCondSignalCore(CpuContext ctx, ulong condAddress, bool broadcast)
@@ -1477,258 +1313,40 @@ public static class KernelPthreadCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
         }
 
-        if (!TryResolveCondState(ctx, condAddress, createIfZero: true, out var resolvedCondAddress, out var state))
+        if (!TryResolveCondState(ctx, condAddress, createIfZero: true, out _, out var state))
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
         }
 
-        var shouldWakeScheduler = false;
         lock (state.SyncRoot)
         {
-            // Advance the epoch even with no waiter registered — it's the wait predicate.
             state.SignalEpoch++;
-            if (state.Waiters > 0)
+            if (broadcast)
             {
-                shouldWakeScheduler = true;
-                if (broadcast)
-                {
-                    Monitor.PulseAll(state.SyncRoot);
-                }
-                else
-                {
-                    Monitor.Pulse(state.SyncRoot);
-                }
+                state.SignalsPending = state.Waiters;
             }
-            else
+            else if (state.SignalsPending < state.Waiters)
             {
-                state.PendingSignals++;
+                // Only count a signal an unserved waiter can consume; signaling
+                // an empty condvar is a no-op per POSIX.
+                state.SignalsPending++;
+            }
+
+            if (state.Waiters != 0)
+            {
+                Monitor.PulseAll(state.SyncRoot);
             }
 
             TracePthreadCond(broadcast ? "broadcast" : "signal", condAddress, mutexAddress: 0, state, timed: false, (int)OrbisGen2Result.ORBIS_GEN2_OK);
         }
 
-        if (shouldWakeScheduler)
-        {
-            _ = GuestThreadExecution.Scheduler?.WakeBlockedThreads(
-                state.WakeKey,
-                broadcast ? int.MaxValue : 1);
-        }
-
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
-    private static int ResumePthreadCondWait(
-        CpuContext ctx,
-        ulong condAddress,
-        ulong mutexAddress,
-        PthreadCondState state,
-        ulong observedEpoch,
-        bool timed,
-        int releasedRecursion,
-        bool posixResult)
-    {
-        var waitResult = (int)OrbisGen2Result.ORBIS_GEN2_OK;
-        lock (state.SyncRoot)
-        {
-            state.Waiters = Math.Max(0, state.Waiters - 1);
-            if (timed && state.SignalEpoch == observedEpoch)
-            {
-                waitResult = (int)OrbisGen2Result.ORBIS_GEN2_ERROR_TIMED_OUT;
-            }
-
-            TracePthreadCond(
-                waitResult == (int)OrbisGen2Result.ORBIS_GEN2_OK ? "wait-resume" : "wait-resume-timeout",
-                condAddress,
-                mutexAddress,
-                state,
-                timed,
-                waitResult);
-        }
-
-        var lockResult = PthreadMutexRelockForCondWait(ctx, mutexAddress, releasedRecursion);
-        return TranslatePthreadResult(
-            lockResult == (int)OrbisGen2Result.ORBIS_GEN2_OK ? waitResult : lockResult,
-            posixResult);
-    }
-
-    private static int TranslatePthreadResult(int result, bool posixResult)
-    {
-        if (!posixResult || result == (int)OrbisGen2Result.ORBIS_GEN2_OK)
-        {
-            return result;
-        }
-
-        return result switch
-        {
-            (int)OrbisGen2Result.ORBIS_GEN2_ERROR_PERMISSION_DENIED => 1, // EPERM
-            (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND => 2,        // ENOENT
-            (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT => 22, // EINVAL
-            (int)OrbisGen2Result.ORBIS_GEN2_ERROR_DEADLOCK => 11,        // EDEADLK
-            (int)OrbisGen2Result.ORBIS_GEN2_ERROR_DELETED => 13,         // EACCES
-            (int)OrbisGen2Result.ORBIS_GEN2_ERROR_BUSY => 16,            // EBUSY
-            (int)OrbisGen2Result.ORBIS_GEN2_ERROR_TRY_AGAIN => 35,       // EAGAIN
-            (int)OrbisGen2Result.ORBIS_GEN2_ERROR_TIMED_OUT => 60,       // ETIMEDOUT
-            (int)OrbisGen2Result.ORBIS_GEN2_ERROR_CANCELED => 85,        // ECANCELED
-            (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT => 14,    // EFAULT
-            _ => result
-        };
-    }
-
-    private static string GetCondWakeKey(ulong resolvedCondAddress) =>
-        _condWakeKeys.GetOrAdd(resolvedCondAddress, static address => string.Create(
-            31,
-            address,
-            static (destination, value) =>
-            {
-                "pthread_cond:0x".AsSpan().CopyTo(destination);
-                _ = value.TryFormat(destination[15..], out _, "X16");
-            }));
-
-    private static int PthreadMutexFullUnlockForCondWait(CpuContext ctx, ulong mutexAddress, out int releasedRecursion)
-    {
-        releasedRecursion = 0;
-        if (!TryResolveMutexState(ctx, mutexAddress, createIfZero: false, out _, out var state))
-        {
-            return PthreadMutexUnlockCore(ctx, mutexAddress, requireOwner: true);
-        }
-
-        var currentThreadId = KernelPthreadState.GetCurrentThreadHandle();
-        lock (state)
-        {
-            if (state.RecursionCount <= 0 || state.OwnerThreadId != currentThreadId)
-            {
-                return PthreadMutexUnlockCore(ctx, mutexAddress, requireOwner: true);
-            }
-
-            releasedRecursion = state.RecursionCount;
-            state.RecursionCount = 1;
-        }
-
-        return PthreadMutexUnlockCore(ctx, mutexAddress, requireOwner: true);
-    }
-
-    private static int PthreadMutexRelockForCondWait(CpuContext ctx, ulong mutexAddress, int releasedRecursion)
-    {
-        var result = PthreadMutexLockCore(ctx, mutexAddress, tryOnly: false);
-        if (result != (int)OrbisGen2Result.ORBIS_GEN2_OK)
-        {
-            return result;
-        }
-
-        if (releasedRecursion > 1 &&
-            TryResolveMutexState(ctx, mutexAddress, createIfZero: false, out _, out var state))
-        {
-            lock (state)
-            {
-                if (state.OwnerThreadId == KernelPthreadState.GetCurrentThreadHandle())
-                {
-                    state.RecursionCount = releasedRecursion;
-                }
-            }
-        }
-
-        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
-    }
-
-    public static string? DumpMutexStateForStall(ulong mutexAddress)
-    {
-        if (!_mutexStates.TryGetValue(mutexAddress, out var state))
-        {
-            return null;
-        }
-
-        var waiterThreads = string.Join(",", _mutexStates
-            .Where(pair => ReferenceEquals(pair.Value, state))
-            .Select(pair => $"0x{pair.Key:X}"));
-
-        return $"mutex=0x{mutexAddress:X16} owner=0x{state.OwnerThreadId:X} recursion={state.RecursionCount} " +
-               $"type={state.Type} semaphore_count={state.Semaphore.CurrentCount} aliases=[{waiterThreads}]";
-    }
-
-    private static string GetMutexWakeKey(ulong resolvedMutexAddress) =>
-        _mutexWakeKeys.GetOrAdd(resolvedMutexAddress, static address => string.Create(
-            32,
-            address,
-            static (destination, value) =>
-            {
-                "pthread_mutex:0x".AsSpan().CopyTo(destination);
-                _ = value.TryFormat(destination[16..], out _, "X16");
-            }));
-
-    private static bool TryReserveBlockedMutexLock(
-        CpuContext ctx,
-        ulong mutexAddress,
-        ulong resolvedAddress,
-        PthreadMutexState state,
-        PthreadMutexWaiter waiter)
-    {
-        lock (state)
-        {
-            if (state.OwnerThreadId != 0 || state.RecursionCount != 0)
-            {
-                TracePthreadMutex(ctx, "lock-reserve-busy", mutexAddress, resolvedAddress, state, waiter.ThreadId, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_BUSY);
-                return false;
-            }
-
-            if (!state.Semaphore.Wait(0))
-            {
-                TracePthreadMutex(ctx, "lock-reserve-busy", mutexAddress, resolvedAddress, state, waiter.ThreadId, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_BUSY);
-                return false;
-            }
-
-            DetectMutexDoubleOwner(resolvedAddress, state, waiter.ThreadId, "reserve");
-            state.OwnerThreadId = waiter.ThreadId;
-            state.RecursionCount = 1;
-            Interlocked.Exchange(ref waiter.Reserved, 1);
-        }
-
-        TracePthreadMutex(ctx, "lock-reserve", mutexAddress, resolvedAddress, state, waiter.ThreadId, (int)OrbisGen2Result.ORBIS_GEN2_OK);
-        return true;
-    }
-
-    private static int CompleteBlockedMutexLock(
-        CpuContext ctx,
-        ulong mutexAddress,
-        ulong resolvedAddress,
-        PthreadMutexState state,
-        PthreadMutexWaiter waiter)
-    {
-        var currentThreadId = KernelPthreadState.GetCurrentThreadHandle();
-        if (Interlocked.Exchange(ref waiter.Reserved, 0) == 1)
-        {
-            TracePthreadMutex(ctx, "lock-resume", mutexAddress, resolvedAddress, state, currentThreadId, (int)OrbisGen2Result.ORBIS_GEN2_OK);
-            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
-        }
-
-        if (!state.Semaphore.Wait(0))
-        {
-            TracePthreadMutex(ctx, "lock-resume-busy", mutexAddress, resolvedAddress, state, currentThreadId, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_BUSY);
-            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_BUSY;
-        }
-
-        lock (state)
-        {
-            DetectMutexDoubleOwner(resolvedAddress, state, currentThreadId, "resume");
-            state.OwnerThreadId = currentThreadId;
-            state.RecursionCount = 1;
-        }
-
-        TracePthreadMutex(ctx, "lock-resume", mutexAddress, resolvedAddress, state, currentThreadId, (int)OrbisGen2Result.ORBIS_GEN2_OK);
-        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
-    }
-
-    // A nonzero foreign prior owner means two guest threads are in the same critical
-    // section. Call while holding lock(state).
-    private static void DetectMutexDoubleOwner(ulong resolvedAddress, PthreadMutexState state, ulong currentThreadId, string site)
-    {
-        var priorOwner = state.OwnerThreadId;
-        if (priorOwner != 0 && priorOwner != currentThreadId)
-        {
-            Console.Error.WriteLine(
-                $"[LOADER][ERROR] MUTEX DOUBLE-OWNER at {site}: resolved=0x{resolvedAddress:X} acquirer=0x{currentThreadId:X} " +
-                $"prior_owner=0x{priorOwner:X} recursion={state.RecursionCount} type={state.Type} sem_count={state.Semaphore.CurrentCount}");
-        }
-    }
+    private static int CondTimedOutResult(bool posixErrors) =>
+        posixErrors
+            ? 60 // ETIMEDOUT on Orbis/FreeBSD; pthread APIs return errno directly.
+            : (int)OrbisGen2Result.ORBIS_GEN2_ERROR_TIMED_OUT;
 
     private static TimeSpan GetCondWaitTimeout(uint timeoutUsec)
     {
@@ -1737,22 +1355,18 @@ public static class KernelPthreadCompatExports
             return TimeSpan.Zero;
         }
 
-        // Round positive sub-millisecond waits to the host sleep quantum.
-        return timeoutUsec < 1_000
-            ? TimeSpan.FromMilliseconds(1)
-            : TimeSpan.FromTicks((long)timeoutUsec * 10L);
+        return TimeSpan.FromTicks((long)timeoutUsec * 10L);
     }
 
-    // Cached once; cond waits consult this per wait and a per-call
-    // Environment.GetEnvironmentVariable is a P/Invoke plus a transient string.
-    private static readonly TimeSpan _condSpuriousWakeTimeout =
-        int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_PTHREAD_COND_SPURIOUS_WAKE_MS"), out var _condSpuriousWakeMilliseconds)
-            ? TimeSpan.FromMilliseconds(Math.Max(1, _condSpuriousWakeMilliseconds))
-            : TimeSpan.FromMilliseconds(DefaultSpuriousCondWakeMilliseconds);
-
-    private static TimeSpan GetCondSpuriousWakeTimeout()
+    private static TimeSpan GetRemainingTimeout(long deadlineTimestamp)
     {
-        return _condSpuriousWakeTimeout;
+        var remainingTicks = deadlineTimestamp - Stopwatch.GetTimestamp();
+        if (remainingTicks <= 0)
+        {
+            return TimeSpan.Zero;
+        }
+
+        return TimeSpan.FromSeconds(remainingTicks / (double)Stopwatch.Frequency);
     }
 
     private static int NormalizeMutexType(int type)
@@ -1780,6 +1394,32 @@ public static class KernelPthreadCompatExports
 
             return gate;
         }
+    }
+
+    private static int SetReturn(CpuContext ctx, OrbisGen2Result result)
+    {
+        ctx[CpuRegister.Rax] = unchecked((ulong)(int)result);
+        return (int)result;
+    }
+
+    private static bool TryReadInt32(CpuContext ctx, ulong address, out int value)
+    {
+        Span<byte> bytes = stackalloc byte[sizeof(int)];
+        if (!ctx.Memory.TryRead(address, bytes))
+        {
+            value = 0;
+            return false;
+        }
+
+        value = BinaryPrimitives.ReadInt32LittleEndian(bytes);
+        return true;
+    }
+
+    private static bool TryWriteInt32(CpuContext ctx, ulong address, int value)
+    {
+        Span<byte> bytes = stackalloc byte[sizeof(int)];
+        BinaryPrimitives.WriteInt32LittleEndian(bytes, value);
+        return ctx.Memory.TryWrite(address, bytes);
     }
 
     private static bool CreateImplicitMutexState(CpuContext ctx, ulong mutexAddress, int type, out ulong resolvedAddress, [NotNullWhen(true)] out PthreadMutexState? state)
@@ -1872,8 +1512,7 @@ public static class KernelPthreadCompatExports
             $"[LOADER][TRACE] pthread_{operation}: mutex=0x{mutexAddress:X16} resolved=0x{resolvedAddress:X16} " +
             $"guest[0]=0x{guestWord0:X16} guest[8]=0x{guestWord1:X16} " +
             $"current=0x{currentThreadId:X16} owner=0x{(state?.OwnerThreadId ?? 0):X16} " +
-            $"recursion={(state?.RecursionCount ?? 0)} type={(state?.Type ?? 0)} result=0x{unchecked((uint)result):X8} " +
-            $"guest_thread=0x{GuestThreadExecution.CurrentGuestThreadHandle:X16} managed={Environment.CurrentManagedThreadId}");
+            $"recursion={(state?.RecursionCount ?? 0)} type={(state?.Type ?? 0)} result=0x{unchecked((uint)result):X8}");
     }
 
     private static void TracePthreadCond(string operation, ulong condAddress, ulong mutexAddress, PthreadCondState? state, bool timed, int result)
@@ -1884,8 +1523,7 @@ public static class KernelPthreadCompatExports
         }
 
         Console.Error.WriteLine(
-            $"[LOADER][TRACE] pthread_cond_{operation}: thread=0x{KernelPthreadState.GetCurrentThreadHandle():X16} " +
-            $"cond=0x{condAddress:X16} key={state?.WakeKey ?? "none"} mutex=0x{mutexAddress:X16} " +
+            $"[LOADER][TRACE] pthread_cond_{operation}: cond=0x{condAddress:X16} mutex=0x{mutexAddress:X16} " +
             $"waiters={(state?.Waiters ?? 0)} epoch=0x{(state?.SignalEpoch ?? 0):X} timed={timed} result=0x{unchecked((uint)result):X8}");
     }
 

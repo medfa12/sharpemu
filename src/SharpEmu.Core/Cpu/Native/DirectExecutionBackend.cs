@@ -596,6 +596,14 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 	private readonly Dictionary<ulong, GuestThreadState> _guestThreads = new Dictionary<ulong, GuestThreadState>();
 
+	// Threads that entered guest code without going through TryStartThread
+	// (native/external callers). Their CpuContext is registered here so the
+	// block-in-place path can resolve a parked thread's context; the exception
+	// delivery machinery (a later phase) reads it.
+	private readonly Dictionary<ulong, ExternalGuestThreadState> _externalGuestThreads = new Dictionary<ulong, ExternalGuestThreadState>();
+
+	private static ulong _currentExternalGuestThreadHandle;
+
 	private int _guestThreadPumpDepth;
 
 	private bool _guestThreadYieldRequested;
@@ -1087,6 +1095,11 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		_hostShutdownRequested = true;
 		_forcedGuestExit = true;
 		_guestTeardownRequested = true;
+		// Unwind guest threads parked in-place on host primitives (see
+		// GuestThreadBlocking); they slice their waits and observe this.
+		// NOTE: must NOT be signaled from the Execute() finally — Execute runs
+		// once per module initializer during boot, long before teardown.
+		GuestThreadBlocking.RequestShutdown();
 		LastError = string.IsNullOrWhiteSpace(reason)
 			? "Host shutdown requested."
 			: $"Host shutdown requested: {reason}";
@@ -2915,6 +2928,42 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	private static bool ContainsAddress(ulong baseAddress, ulong size, ulong address)
 	{
 		return size != 0 && address >= baseAddress && address - baseAddress < size;
+	}
+
+	// Context of a guest thread that entered guest code without TryStartThread.
+	private sealed class ExternalGuestThreadState
+	{
+		public CpuContext Context { get; set; } = null!;
+
+		public ulong ExceptionStackBase { get; set; }
+	}
+
+	public void RegisterGuestThreadContext(ulong threadHandle, CpuContext context)
+	{
+		if (threadHandle == 0)
+		{
+			return;
+		}
+
+		lock (_guestThreadGate)
+		{
+			_currentExternalGuestThreadHandle = threadHandle;
+			if (_guestThreads.ContainsKey(threadHandle))
+			{
+				return;
+			}
+
+			if (_externalGuestThreads.TryGetValue(threadHandle, out var existing))
+			{
+				existing.Context = context;
+				return;
+			}
+
+			_externalGuestThreads[threadHandle] = new ExternalGuestThreadState
+			{
+				Context = context,
+			};
+		}
 	}
 
 	public bool TryStartThread(CpuContext creatorContext, GuestThreadStartRequest request, out string? error)

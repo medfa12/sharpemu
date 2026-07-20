@@ -29,6 +29,8 @@ public interface IGuestThreadScheduler
 
     bool TryStartThread(CpuContext creatorContext, GuestThreadStartRequest request, out string? error);
 
+    void RegisterGuestThreadContext(ulong threadHandle, CpuContext context);
+
     bool TryJoinThread(
         CpuContext callerContext,
         ulong threadHandle,
