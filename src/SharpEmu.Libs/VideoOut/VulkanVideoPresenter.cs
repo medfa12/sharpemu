@@ -2870,6 +2870,40 @@ internal static unsafe class VulkanVideoPresenter
             "1",
             StringComparison.Ordinal);
 
+        // SHARPEMU_DUMP_SHADER_ADDR=0x<pixelShaderAddr>: dump the vertex+pixel
+        // SPIR-V (base64) once for any capture.draw whose pixel shader matches,
+        // regardless of whether translation/submit threw. The existing SPIRVDUMP
+        // path only fires on a draw that raises, but a shader that translates and
+        // runs yet writes black (e.g. the final tonemap/composite) never throws,
+        // so it can only be captured by matching its address here. Piggybacks on
+        // SHARPEMU_CAPTURE_DRAWS (which must also be set).
+        private static readonly ulong DumpShaderAddr = ParseDumpShaderAddr();
+        private readonly HashSet<ulong> _dumpedTargetShaders = new();
+
+        private static ulong ParseDumpShaderAddr()
+        {
+            var raw = Environment.GetEnvironmentVariable("SHARPEMU_DUMP_SHADER_ADDR");
+            if (string.IsNullOrEmpty(raw))
+            {
+                return 0;
+            }
+
+            var span = raw.AsSpan();
+            if (span.StartsWith("0x", StringComparison.OrdinalIgnoreCase) ||
+                span.StartsWith("0X", StringComparison.Ordinal))
+            {
+                span = span[2..];
+            }
+
+            return ulong.TryParse(
+                span,
+                System.Globalization.NumberStyles.HexNumber,
+                System.Globalization.CultureInfo.InvariantCulture,
+                out var value)
+                ? value
+                : 0;
+        }
+
         // SHARPEMU_FORCE_EXPOSURE=<value>: the game's auto-exposure luminance
         // (a 1x1 float surface) is never written by any pass we execute, so it
         // reads zero and the tonemap multiplies the (fully rendered) HDR scene
@@ -10081,6 +10115,20 @@ internal static unsafe class VulkanVideoPresenter
             Check(
                 _vk.QueueWaitIdle(_queue),
                 "vkQueueWaitIdle(capture draws)");
+
+            if (DumpShaderAddr != 0 &&
+                work.Draw.PixelShaderAddress == DumpShaderAddr &&
+                _dumpedTargetShaders.Add(DumpShaderAddr))
+            {
+                Console.Error.WriteLine(
+                    $"[LOADER][SPIRVDUMP] addr=0x{DumpShaderAddr:X16} " +
+                    $"vs_bytes={work.Draw.VertexSpirv.Length} " +
+                    $"ps_bytes={work.Draw.PixelSpirv.Length}");
+                Console.Error.WriteLine(
+                    $"[LOADER][SPIRVDUMP] addr=0x{DumpShaderAddr:X16} vs_b64={Convert.ToBase64String(work.Draw.VertexSpirv)}");
+                Console.Error.WriteLine(
+                    $"[LOADER][SPIRVDUMP] addr=0x{DumpShaderAddr:X16} ps_b64={Convert.ToBase64String(work.Draw.PixelSpirv)}");
+            }
 
             var line = new System.Text.StringBuilder();
             line.Append("capture.draw seq=").Append(seq)
