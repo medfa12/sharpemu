@@ -226,6 +226,13 @@ internal static partial class Gen5SpirvTranslator
         private readonly List<SpirvImageResource> _imageResources = [];
         private readonly Dictionary<uint, int> _imageBindingByPc = [];
         private readonly Dictionary<uint, int> _bufferBindingByPc = [];
+
+        // SHARPEMU_KEEP_UNBOUND_SMEM=1: don't zero the destinations of a scalar
+        // load with no buffer binding; leave whatever an earlier bound load wrote.
+        private static readonly bool _keepUnboundSmem = string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_KEEP_UNBOUND_SMEM"),
+            "1",
+            StringComparison.Ordinal);
         // Attributes touched by V_INTERP_MOV_F32: their P0/P10/P20 hardware
         // interpolation coefficients are reconstructed in the entry block and
         // the guest's manual interpolation sequence replays them.
@@ -2321,6 +2328,15 @@ internal static partial class Gen5SpirvTranslator
             error = string.Empty;
             if (!_bufferBindingByPc.TryGetValue(instruction.Pc, out var bindingIndex))
             {
+                // SHARPEMU_KEEP_UNBOUND_SMEM=1: a later unbound duplicate scalar
+                // load can clobber a valid earlier bound load into the same
+                // registers (e.g. a shader reloading a constant/color-grade slot).
+                // Leaving the registers untouched preserves the earlier value.
+                if (_keepUnboundSmem)
+                {
+                    return true;
+                }
+
                 foreach (var destination in instruction.Destinations)
                 {
                     if (destination.Kind == Gen5OperandKind.ScalarRegister)
