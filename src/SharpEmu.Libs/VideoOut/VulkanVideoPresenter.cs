@@ -2802,6 +2802,33 @@ internal static unsafe class VulkanVideoPresenter
             Environment.GetEnvironmentVariable("SHARPEMU_CAPTURE_DRAWS"),
             "1",
             StringComparison.Ordinal);
+
+        // SHARPEMU_FORCE_EXPOSURE=<value>: the game's auto-exposure luminance
+        // (a 1x1 float surface) is never written by any pass we execute, so it
+        // reads zero and the tonemap multiplies the (fully rendered) HDR scene
+        // to black. When set, bind a constant into any tiny (<=2x2) sampled
+        // float texture so the tonemap gets a sane exposure and the scene shows.
+        // Value "1" (or non-numeric) defaults to 0.25; otherwise the parsed float.
+        private static readonly float? ForcedExposureValue = ParseForcedExposure();
+        private GuestImageResource? _forcedExposureImage;
+
+        private static float? ParseForcedExposure()
+        {
+            var raw = Environment.GetEnvironmentVariable("SHARPEMU_FORCE_EXPOSURE");
+            if (string.IsNullOrEmpty(raw))
+            {
+                return null;
+            }
+
+            return float.TryParse(
+                raw,
+                System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture,
+                out var value) && value != 0f
+                ? value
+                : 0.25f;
+        }
+
         private int _frameDumpBudget = 24;
         private bool _swapchainReadbackPending;
         private bool _deviceLost;
@@ -5588,6 +5615,31 @@ internal static unsafe class VulkanVideoPresenter
             }
 
             var vkFormat = GetTextureFormat(texture.Format, texture.NumberType);
+
+            // SHARPEMU_FORCE_EXPOSURE: a tiny (<=2x2) sampled surface is the
+            // game's auto-exposure average-luminance value, which nothing writes
+            // (so it reads zero and blacks out the tonemap). Bind a constant.
+            if (ForcedExposureValue is { } exposure &&
+                texture.Address != 0 &&
+                texture.Width <= 2 &&
+                texture.Height <= 2 &&
+                !texture.IsStorage)
+            {
+                var lumImage = EnsureForcedExposureImage(exposure);
+                lumImage.LastUseStamp = _useStamp;
+                return new TextureResource
+                {
+                    Address = texture.Address,
+                    Image = lumImage.Image,
+                    View = lumImage.View,
+                    Width = lumImage.Width,
+                    Height = lumImage.Height,
+                    RowLength = lumImage.Width,
+                    DstSelect = texture.DstSelect,
+                    SamplerState = texture.Sampler,
+                    GuestImage = lumImage,
+                };
+            }
 
             // A rendered depth surface at this address holds real depth in a
             // depth format that no color view can alias. Bind its depth-aspect
@@ -8531,6 +8583,80 @@ internal static unsafe class VulkanVideoPresenter
         }
 
         [MethodImpl(MethodImplOptions.NoInlining)]
+        // Lazily builds a 1x1 R16G16B16A16Sfloat image cleared to a constant
+        // (SHARPEMU_FORCE_EXPOSURE). Bound in place of the game's never-written
+        // auto-exposure luminance so the tonemap gets a sane exposure. Cleared
+        // once on a self-contained transient command buffer (the member
+        // _commandBuffer is busy while a draw is resolving its textures).
+        private unsafe GuestImageResource EnsureForcedExposureImage(float value)
+        {
+            if (_forcedExposureImage is { } cached)
+            {
+                return cached;
+            }
+
+            const ulong forcedExposureAddress = 0xFFFF_FF00_0000_0000UL;
+            var target = new VulkanGuestRenderTarget(forcedExposureAddress, 1, 1, 0, 0);
+            var image = GetOrCreateGuestImage(target, Format.R16G16B16A16Sfloat);
+
+            var commandBuffer = AllocateGuestCommandBuffer();
+            var beginInfo = new CommandBufferBeginInfo
+            {
+                SType = StructureType.CommandBufferBeginInfo,
+                Flags = CommandBufferUsageFlags.OneTimeSubmitBit,
+            };
+            Check(
+                _vk.BeginCommandBuffer(commandBuffer, &beginInfo),
+                "vkBeginCommandBuffer(forced exposure)");
+
+            if (TryPlanGuestImageTransition(
+                    image,
+                    ImageLayout.TransferDstOptimal,
+                    PipelineStageFlags.TransferBit,
+                    AccessFlags.TransferWriteBit,
+                    out var toTransfer,
+                    out var srcToTransfer))
+            {
+                var src = srcToTransfer == 0 ? PipelineStageFlags.TopOfPipeBit : srcToTransfer;
+                _vk.CmdPipelineBarrier(
+                    commandBuffer, src, PipelineStageFlags.TransferBit, 0,
+                    0, null, 0, null, 1, &toTransfer);
+            }
+
+            var clearColor = new ClearColorValue(value, value, value, value);
+            var range = ColorSubresourceRange(0, image.MipLevels);
+            _vk.CmdClearColorImage(
+                commandBuffer, image.Image, ImageLayout.TransferDstOptimal,
+                &clearColor, 1, &range);
+
+            const PipelineStageFlags shaderStages =
+                PipelineStageFlags.VertexShaderBit |
+                PipelineStageFlags.FragmentShaderBit |
+                PipelineStageFlags.ComputeShaderBit;
+            if (TryPlanGuestImageTransition(
+                    image,
+                    ImageLayout.ShaderReadOnlyOptimal,
+                    shaderStages,
+                    AccessFlags.ShaderReadBit,
+                    out var toRead,
+                    out var srcToRead))
+            {
+                var src = srcToRead == 0 ? PipelineStageFlags.TopOfPipeBit : srcToRead;
+                _vk.CmdPipelineBarrier(
+                    commandBuffer, src, shaderStages, 0,
+                    0, null, 0, null, 1, &toRead);
+            }
+
+            Check(
+                _vk.EndCommandBuffer(commandBuffer),
+                "vkEndCommandBuffer(forced exposure)");
+            SubmitGuestCommandBufferAndWait(commandBuffer);
+            Console.Error.WriteLine(
+                $"[LOADER][INFO] forced_exposure luminance image ready value={value}");
+            _forcedExposureImage = image;
+            return image;
+        }
+
         private GuestImageResource GetOrCreateGuestImage(
             VulkanGuestRenderTarget target,
             Format format)
@@ -10109,6 +10235,9 @@ internal static unsafe class VulkanVideoPresenter
                 Format.R8Unorm or
                 Format.R8Uint or
                 Format.R8Sint => 1,
+                Format.R8G8Unorm or
+                Format.R8G8Uint or
+                Format.R8G8Sint => 2,
                 Format.R32Uint or
                 Format.R32Sint or
                 Format.R32Sfloat or
