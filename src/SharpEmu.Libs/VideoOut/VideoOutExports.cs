@@ -1638,7 +1638,30 @@ public static class VideoOutExports
         return result;
     }
 
+    // SHARPEMU_FORCE_SDR=1: the A2R10G10B10 (HDR10, incl. BT2020 PQ) display
+    // output path renders all-black in our pipeline (every A2R10G10B10 target is
+    // black while R16F/R8G8B8A8 render fine). Remap the display pixel format to
+    // 8-bit RGBA so the final tonemap output lands in a format that renders and
+    // presents. Colors may be off (the game's PQ/HDR encode is unconverted) but
+    // the menu becomes visible -- the "disable HDR" fallback.
+    private static readonly bool _forceSdr = string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_FORCE_SDR"), "1", StringComparison.Ordinal);
+
     private static ulong NormalizePixelFormat(ulong pixelFormat)
+    {
+        var normalized = NormalizePixelFormatCore(pixelFormat);
+        if (_forceSdr &&
+            (normalized == SceVideoOutPixelFormatA2R10G10B10 ||
+             normalized == SceVideoOutPixelFormatA2R10G10B10Srgb ||
+             normalized == SceVideoOutPixelFormatA2R10G10B10Bt2020Pq))
+        {
+            return SceVideoOutPixelFormatR8G8B8A8Unorm;
+        }
+
+        return normalized;
+    }
+
+    private static ulong NormalizePixelFormatCore(ulong pixelFormat)
     {
         if (GetBytesPerPixel(pixelFormat) != 0)
         {
