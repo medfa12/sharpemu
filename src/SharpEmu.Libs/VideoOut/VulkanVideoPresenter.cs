@@ -2026,12 +2026,26 @@ internal static unsafe class VulkanVideoPresenter
         out VulkanRenderTargetFormat result) =>
         TryDecodeRenderTargetFormat(dataFormat, numberType, componentSwap: 0, out result);
 
+    // SHARPEMU_FORCE_SDR=1: every A2R10G10B10 (HDR10, COLOR_2_10_10_10) color
+    // target renders all-black in our pipeline while 8-bit RGBA renders fine.
+    // Decode dataFormat=9 as R8G8B8A8Unorm so the final tonemap output lands in a
+    // format that renders and presents (the "disable HDR" fallback; colors may be
+    // off since the game's HDR encode is unconverted, but the menu becomes visible).
+    private static readonly bool ForceSdrOutput = string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_FORCE_SDR"), "1", StringComparison.Ordinal);
+
     internal static bool TryDecodeRenderTargetFormat(
         uint dataFormat,
         uint numberType,
         uint componentSwap,
         out VulkanRenderTargetFormat result)
     {
+        if (ForceSdrOutput && dataFormat == 9)
+        {
+            dataFormat = 10;
+            numberType = 0;
+        }
+
         var format = (dataFormat, numberType) switch
         {
             (4, 4) => Format.R32Uint,
