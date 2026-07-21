@@ -2876,8 +2876,28 @@ internal static unsafe class VulkanVideoPresenter
         private VkSemaphore[] _asyncRenderFinished = [];
         private int _asyncFrameCursor;
 
-        // SHARPEMU_PERF_PHASES per-frame counter for the phase-timing log line.
+        // SHARPEMU_PERF_PHASES: measures the FULL frame period, not just the
+        // inside of one present. Because presents can be many Render() calls
+        // apart (the render thread idles in WaitForRenderWork between them), the
+        // idle/drain/fence times are ACCUMULATED across every Render() call and
+        // flushed on the next present, so one line is emitted per present with a
+        // true present-to-present period and a breakdown of where it went.
+        // A heartbeat also fires during long stalls so the log never goes silent.
         private long _perfPhaseFrame;
+        private long _perfPeriodStartTs;   // timestamp of last present (period base)
+        private long _perfLastEmitTs;      // last time any PHASES line was emitted
+        private long _perfIdleAccumTicks;  // WaitForRenderWork time since last present
+        private long _perfDrainAccumTicks; // guest offscreen/compute drain time
+        private long _perfFenceAccumTicks; // blocking GPU fence/idle waits
+        private const double PerfHeartbeatMs = 1000.0;
+
+        // SHARPEMU_ASYNC_PRESENT diagnostics: incremented every Render() (not just
+        // on present) so a present STALL still advances it. Traces are emitted for
+        // the first N ticks plus a periodic heartbeat, so a boot log shows exactly
+        // where the ring stops advancing without flooding at steady state.
+        private long _asyncTraceTick;
+        private const long AsyncTraceEagerTicks = 150;
+        private const long AsyncTraceHeartbeat = 240;
 
         private VkBuffer _stagingBuffer;
         private DeviceMemory _stagingMemory;
@@ -4347,9 +4367,15 @@ internal static unsafe class VulkanVideoPresenter
             }
 
             var fence = _presentationFence;
+            long tWait0 = _perfPhases && wait ? Stopwatch.GetTimestamp() : 0;
             var result = wait
                 ? _vk.WaitForFences(_device, 1, &fence, true, ulong.MaxValue)
                 : _vk.GetFenceStatus(_device, fence);
+            if (_perfPhases && wait)
+            {
+                _perfFenceAccumTicks += Stopwatch.GetTimestamp() - tWait0;
+            }
+
             if (!wait && result == Result.NotReady)
             {
                 return;
@@ -4376,6 +4402,11 @@ internal static unsafe class VulkanVideoPresenter
             if (!_asyncFrameInFlight[slot])
             {
                 return;
+            }
+
+            if (_asyncPresent && _asyncTraceTick <= AsyncTraceEagerTicks)
+            {
+                Console.Error.WriteLine($"[LOADER][ASYNCPRESENT] recycle slot={slot}");
             }
 
             _asyncFrameInFlight[slot] = false;
@@ -4432,9 +4463,15 @@ internal static unsafe class VulkanVideoPresenter
                 }
 
                 var fence = _asyncInFlightFences[slot];
+                long tWait0 = _perfPhases ? Stopwatch.GetTimestamp() : 0;
                 Check(
                     _vk.WaitForFences(_device, 1, &fence, true, ulong.MaxValue),
                     "vkWaitForFences(async present drain)");
+                if (_perfPhases)
+                {
+                    _perfFenceAccumTicks += Stopwatch.GetTimestamp() - tWait0;
+                }
+
                 RecycleAsyncPresentFrame(slot);
             }
         }
@@ -4450,10 +4487,22 @@ internal static unsafe class VulkanVideoPresenter
             var slot = _asyncFrameCursor;
             if (_asyncFrameInFlight[slot])
             {
+                if (_asyncPresent && _asyncTraceTick <= AsyncTraceEagerTicks)
+                {
+                    Console.Error.WriteLine(
+                        $"[LOADER][ASYNCPRESENT] slot_wait slot={slot} (ring full, capping)");
+                }
+
                 var fence = _asyncInFlightFences[slot];
+                long tWait0 = _perfPhases ? Stopwatch.GetTimestamp() : 0;
                 Check(
                     _vk.WaitForFences(_device, 1, &fence, true, ulong.MaxValue),
                     "vkWaitForFences(async present slot)");
+                if (_perfPhases)
+                {
+                    _perfFenceAccumTicks += Stopwatch.GetTimestamp() - tWait0;
+                }
+
                 RecycleAsyncPresentFrame(slot);
             }
 
@@ -4588,12 +4637,18 @@ internal static unsafe class VulkanVideoPresenter
             if (waitForOldest && _pendingGuestSubmissions.TryPeek(out var oldest))
             {
                 var fence = oldest.Fence;
+                long tWait0 = _perfPhases ? Stopwatch.GetTimestamp() : 0;
                 var result = _vk.WaitForFences(
                     _device,
                     1,
                     &fence,
                     true,
                     ulong.MaxValue);
+                if (_perfPhases)
+                {
+                    _perfFenceAccumTicks += Stopwatch.GetTimestamp() - tWait0;
+                }
+
                 Check(result, $"vkWaitForFences(guest: {oldest.DebugName})");
             }
 
@@ -9770,6 +9825,26 @@ internal static unsafe class VulkanVideoPresenter
             }
         }
 
+        private static double TicksToMs(long ticks) =>
+            ticks * 1000.0 / Stopwatch.Frequency;
+
+        // Emits one SHARPEMU_PERF_PHASES line. presented=true is a real present
+        // (full period + this frame's present span); presented=false is a stall
+        // heartbeat (present span 0, partial=1) so a long idle gap still logs.
+        private void EmitPerfPhases(long nowTs, long presentTicks, bool presented)
+        {
+            var periodMs = _perfPeriodStartTs == 0
+                ? 0.0
+                : Stopwatch.GetElapsedTime(_perfPeriodStartTs, nowTs).TotalMilliseconds;
+            Console.Error.WriteLine(
+                $"[LOADER][PHASES] frame={_perfPhaseFrame} period={periodMs:F2} " +
+                $"drainExec={TicksToMs(_perfDrainAccumTicks):F2} " +
+                $"gpuFenceWait={TicksToMs(_perfFenceAccumTicks):F2} " +
+                $"present={TicksToMs(presentTicks):F2} " +
+                $"idleWaitForGuest={TicksToMs(_perfIdleAccumTicks):F2}" +
+                (presented ? string.Empty : " partial=1"));
+        }
+
         private void Render(double _)
         {
             if (_closeRequested)
@@ -9783,21 +9858,39 @@ internal static unsafe class VulkanVideoPresenter
                 return;
             }
 
+            // SHARPEMU_PERF_PHASES: capture the Render() entry and, if presents
+            // have gone quiet, emit a heartbeat so a stall still logs its growing
+            // idle time. _perfPeriodStartTs is the base of the present-to-present
+            // period; the idle/drain/fence accumulators span every Render() call
+            // since the last present.
+            long tRenderStart = _perfPhases ? Stopwatch.GetTimestamp() : 0;
+            if (_perfPhases)
+            {
+                if (_perfPeriodStartTs == 0)
+                {
+                    _perfPeriodStartTs = tRenderStart;
+                    _perfLastEmitTs = tRenderStart;
+                }
+                else if (Stopwatch.GetElapsedTime(_perfLastEmitTs, tRenderStart)
+                             .TotalMilliseconds >= PerfHeartbeatMs)
+                {
+                    EmitPerfPhases(tRenderStart, presentTicks: 0, presented: false);
+                    _perfLastEmitTs = tRenderStart;
+                }
+            }
+
+            long tIdle0 = _perfPhases ? Stopwatch.GetTimestamp() : 0;
             WaitForRenderWork();
+            if (_perfPhases)
+            {
+                _perfIdleAccumTicks += Stopwatch.GetTimestamp() - tIdle0;
+            }
+
             UpdatePerformanceHud();
 
-            // SHARPEMU_PERF_PHASES boundary timestamps (allocation-free; only
-            // read when the flag is set). Segments: guest drain+build (t0..t1),
-            // pre-present GPU wait (t2..t3), present build+submit (t3..t4),
-            // post-present GPU wait/readback (t4..t5).
-            long tGuestStart = _perfPhases ? Stopwatch.GetTimestamp() : 0;
-            long tGuestEnd = 0;
-            long tPreWaitStart = 0;
-            long tPreWaitEnd = 0;
-            long tPostWaitStart = 0;
-            long tPostWaitEnd = 0;
-
             _commandBuffer = _presentationCommandBuffer;
+            long tDrain0 = _perfPhases ? Stopwatch.GetTimestamp() : 0;
+            long drainFenceBase = _perfFenceAccumTicks;
             if (!_deviceLost)
             {
                 CollectCompletedGuestSubmissions(waitForOldest: false);
@@ -9832,13 +9925,45 @@ internal static unsafe class VulkanVideoPresenter
 
             if (_perfPhases)
             {
-                tGuestEnd = Stopwatch.GetTimestamp();
+                // drainExec is the guest-work span MINUS any blocking GPU fence
+                // waits that fired inside it (the depth-N submission throttle), so
+                // it reflects pure CPU build time; the fence time lands in
+                // gpuFenceWait instead.
+                _perfDrainAccumTicks +=
+                    (Stopwatch.GetTimestamp() - tDrain0) -
+                    (_perfFenceAccumTicks - drainFenceBase);
             }
+
+            var traceAsync = _asyncPresent &&
+                (++_asyncTraceTick <= AsyncTraceEagerTicks ||
+                 _asyncTraceTick % AsyncTraceHeartbeat == 0);
 
             if (!TryTakePresentation(_presentedSequence, out var presentation))
             {
+                if (traceAsync)
+                {
+                    long latestSeq, completed, enqueued, pendingCount;
+                    lock (_gate)
+                    {
+                        latestSeq = _latestPresentation?.Sequence ?? -1;
+                        completed = _completedGuestWorkSequence;
+                        enqueued = _enqueuedGuestWorkSequence;
+                        pendingCount = _pendingGuestWork.Count;
+                    }
+
+                    Console.Error.WriteLine(
+                        $"[LOADER][ASYNCPRESENT] no_presentation presentedSeq={_presentedSequence} " +
+                        $"latestSeq={latestSeq} completed={completed} enqueued={enqueued} " +
+                        $"pending={pendingCount} inFlight={AsyncPresentInFlightCount()}");
+                }
+
                 return;
             }
+
+            // Present span base (this frame only). Fence waits inside it are
+            // subtracted out at emit time, same as the drain span.
+            long tPresent0 = _perfPhases ? Stopwatch.GetTimestamp() : 0;
+            long presentFenceBase = _perfFenceAccumTicks;
 
             if (presentation.Pixels is null &&
                 presentation.DrawKind != GuestDrawKind.FullscreenBarycentric &&
@@ -9846,11 +9971,6 @@ internal static unsafe class VulkanVideoPresenter
                 presentation.GuestImageAddress == 0)
             {
                 return;
-            }
-
-            if (_perfPhases)
-            {
-                tPreWaitStart = Stopwatch.GetTimestamp();
             }
 
             if (_asyncPresent)
@@ -9865,11 +9985,6 @@ internal static unsafe class VulkanVideoPresenter
             else
             {
                 CompletePendingPresentation(wait: true);
-            }
-
-            if (_perfPhases)
-            {
-                tPreWaitEnd = Stopwatch.GetTimestamp();
             }
 
             _useStamp++;
@@ -9912,6 +10027,13 @@ internal static unsafe class VulkanVideoPresenter
                         presentation.GuestImageAddress,
                         out var presentable))
                 {
+                    if (traceAsync)
+                    {
+                        Console.Error.WriteLine(
+                            "[LOADER][ASYNCPRESENT] not_presentable " +
+                            $"addr=0x{presentation.GuestImageAddress:X16} seq={presentation.Sequence}");
+                    }
+
                     return;
                 }
 
@@ -9976,16 +10098,45 @@ internal static unsafe class VulkanVideoPresenter
                 asyncSlot = AcquireAsyncPresentFrame();
                 imageAvailable = _asyncImageAvailable[asyncSlot];
                 _commandBuffer = _asyncPresentCommandBuffers[asyncSlot];
+                if (traceAsync)
+                {
+                    Console.Error.WriteLine(
+                        $"[LOADER][ASYNCPRESENT] acquire_slot slot={asyncSlot} " +
+                        $"cursor={_asyncFrameCursor} inFlight={AsyncPresentInFlightCount()}");
+                }
             }
 
             uint imageIndex;
+            // Under async, use a finite acquire timeout so a swapchain that stops
+            // handing back images surfaces as a traced, recoverable timeout
+            // instead of a silent hang. On VK_TIMEOUT nothing was acquired and the
+            // slot's image-available semaphore is untouched, so retrying next frame
+            // is safe. Default path keeps the infinite wait (byte-identical).
+            var acquireTimeout = _asyncPresent ? 500_000_000UL : ulong.MaxValue;
             var acquireResult = _swapchainApi.AcquireNextImage(
                 _device,
                 _swapchain,
-                ulong.MaxValue,
+                acquireTimeout,
                 imageAvailable,
                 default,
                 &imageIndex);
+            if (_asyncPresent && acquireResult == Result.Timeout)
+            {
+                if (traceAsync)
+                {
+                    Console.Error.WriteLine(
+                        $"[LOADER][ASYNCPRESENT] acquire_timeout slot={asyncSlot} " +
+                        $"inFlight={AsyncPresentInFlightCount()}");
+                }
+
+                if (translatedResources is not null)
+                {
+                    DestroyTranslatedDrawResources(translatedResources);
+                }
+
+                return;
+            }
+
             if (acquireResult == Result.ErrorOutOfDateKhr)
             {
                 RecreateSwapchainResources("vkAcquireNextImageKHR", acquireResult);
@@ -9998,6 +10149,11 @@ internal static unsafe class VulkanVideoPresenter
             }
 
             CheckSwapchainResult(acquireResult, "vkAcquireNextImageKHR");
+            if (traceAsync && _asyncPresent)
+            {
+                Console.Error.WriteLine(
+                    $"[LOADER][ASYNCPRESENT] acquire_image result={acquireResult} index={imageIndex}");
+            }
             var recreateAfterPresent = acquireResult == Result.SuboptimalKhr;
 
             if (pixels is not null)
@@ -10106,6 +10262,12 @@ internal static unsafe class VulkanVideoPresenter
                 // the removed QueueWaitIdle previously guarded against.
                 _asyncFrameInFlight[asyncSlot] = true;
                 _asyncFrameResources[asyncSlot] = translatedResources;
+                if (traceAsync)
+                {
+                    Console.Error.WriteLine(
+                        $"[LOADER][ASYNCPRESENT] submit slot={asyncSlot} " +
+                        $"fence=0x{presentationFence.Handle:X} rf=0x{renderFinished.Handle:X}");
+                }
             }
             else
             {
@@ -10142,9 +10304,10 @@ internal static unsafe class VulkanVideoPresenter
 
             CheckSwapchainResult(presentResult, "vkQueuePresentKHR");
             recreateAfterPresent |= presentResult == Result.SuboptimalKhr;
-            if (_perfPhases)
+            if (traceAsync && _asyncPresent)
             {
-                tPostWaitStart = Stopwatch.GetTimestamp();
+                Console.Error.WriteLine(
+                    $"[LOADER][ASYNCPRESENT] present result={presentResult} slot={asyncSlot}");
             }
 
             if (_asyncPresent)
@@ -10166,16 +10329,17 @@ internal static unsafe class VulkanVideoPresenter
             }
             else
             {
+                long tWait0 = _perfPhases ? Stopwatch.GetTimestamp() : 0;
                 Check(_vk.QueueWaitIdle(_queue), "vkQueueWaitIdle");
+                if (_perfPhases)
+                {
+                    _perfFenceAccumTicks += Stopwatch.GetTimestamp() - tWait0;
+                }
+
                 // Queue is now idle: any ordered-flip snapshot whose copy/blit
                 // just completed (or that was abandoned this frame) is safe to
                 // free.
                 DrainRetiredGuestFlipSnapshots();
-            }
-
-            if (_perfPhases)
-            {
-                tPostWaitEnd = Stopwatch.GetTimestamp();
             }
 
             Interlocked.Increment(ref _presentedFrameTotal);
@@ -10220,19 +10384,20 @@ internal static unsafe class VulkanVideoPresenter
 
             if (_perfPhases)
             {
-                // One compact stderr line per presented frame. gpuWait folds the
-                // pre-present wait and the post-present WaitIdle/recycle; present
-                // is the residual swapchain build+present time.
-                var total = Stopwatch.GetElapsedTime(tGuestStart, tPostWaitEnd).TotalMilliseconds;
-                var guestExec = Stopwatch.GetElapsedTime(tGuestStart, tGuestEnd).TotalMilliseconds;
-                var gpuWait =
-                    Stopwatch.GetElapsedTime(tPreWaitStart, tPreWaitEnd).TotalMilliseconds +
-                    Stopwatch.GetElapsedTime(tPostWaitStart, tPostWaitEnd).TotalMilliseconds;
-                var present = total - guestExec - gpuWait;
-                Console.Error.WriteLine(
-                    $"[LOADER][PHASES] frame={_perfPhaseFrame} total={total:F2} " +
-                    $"guestExec={guestExec:F2} gpuWait={gpuWait:F2} present={present:F2}");
+                // Present succeeded: flush one PHASES line covering the full
+                // present-to-present period, then reset the accumulators and
+                // rebase the period at this present. present is THIS frame's
+                // present span minus any fence waits inside it.
+                var nowTs = Stopwatch.GetTimestamp();
+                var presentTicks =
+                    (nowTs - tPresent0) - (_perfFenceAccumTicks - presentFenceBase);
+                EmitPerfPhases(nowTs, presentTicks, presented: true);
                 _perfPhaseFrame++;
+                _perfPeriodStartTs = nowTs;
+                _perfLastEmitTs = nowTs;
+                _perfIdleAccumTicks = 0;
+                _perfDrainAccumTicks = 0;
+                _perfFenceAccumTicks = 0;
             }
 
             if (recreateAfterPresent)
