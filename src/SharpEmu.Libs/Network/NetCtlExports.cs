@@ -11,8 +11,9 @@ public static class NetCtlExports
     private const int MaxCallbacks = 8;
     private const int NatInfoSize = 16;
     private const int NetCtlErrorNoSpace = unchecked((int)0x80412103);
+    private const int NetCtlErrorInvalidId = unchecked((int)0x80412105);
     private const int NetCtlErrorInvalidAddress = unchecked((int)0x80412107);
-    private const int NetCtlErrorNotConnected = unchecked((int)0x80412108);
+    private const int NetCtlErrorNotAvailable = unchecked((int)0x80412109);
     private const int NetCtlInfoDevice = 1;
     private const int NetCtlInfoEtherAddress = 2;
     private const int NetCtlInfoMtu = 3;
@@ -29,8 +30,9 @@ public static class NetCtlExports
     private const int NetCtlInfoHttpProxyServer = 20;
     private const int NetCtlInfoHttpProxyPort = 21;
     private const int NetCtlDeviceWired = 0;
-    private const int NetCtlLinkDisconnected = 0;
-    private const int NetCtlIpConfigStatic = 0;
+    private const int NetCtlLinkConnected = 1;
+    private const int NetCtlIpConfigStatic = 1;
+    private const int NetCtlStateIpObtained = 3;
     private static readonly object CallbackGate = new();
     private static readonly CallbackRegistration[] Callbacks = new CallbackRegistration[MaxCallbacks];
 
@@ -72,9 +74,9 @@ public static class NetCtlExports
             return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT, typeof(long));
         }
 
-        BinaryPrimitives.WriteInt32LittleEndian(natInfo[4..], 1);
+        BinaryPrimitives.WriteInt32LittleEndian(natInfo[4..], 0);
         BinaryPrimitives.WriteInt32LittleEndian(natInfo[8..], 3);
-        BinaryPrimitives.WriteUInt32LittleEndian(natInfo[12..], 0x7F000001);
+        BinaryPrimitives.WriteUInt32LittleEndian(natInfo[12..], 0x0200A8C0);
         return ctx.Memory.TryWrite(natInfoAddress, natInfo)
             ? ctx.SetReturn(0, typeof(long))
             : ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT, typeof(long));
@@ -104,7 +106,7 @@ public static class NetCtlExports
         }
 
         Span<byte> stateBytes = stackalloc byte[sizeof(int)];
-        BinaryPrimitives.WriteInt32LittleEndian(stateBytes, 0);
+        BinaryPrimitives.WriteInt32LittleEndian(stateBytes, NetCtlStateIpObtained);
         return ctx.Memory.TryWrite(stateAddress, stateBytes)
             ? ctx.SetReturn(0, typeof(long))
             : ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT, typeof(long));
@@ -170,31 +172,76 @@ public static class NetCtlExports
         return code switch
         {
             NetCtlInfoDevice => WriteUInt32(ctx, infoAddress, NetCtlDeviceWired),
-            NetCtlInfoEtherAddress => WriteZeroBytes(ctx, infoAddress, 6),
+            NetCtlInfoEtherAddress => WriteBytes(ctx, infoAddress, [0x02, 0x53, 0x48, 0x41, 0x52, 0x50]),
             NetCtlInfoMtu => WriteUInt32(ctx, infoAddress, 1500),
-            NetCtlInfoLink => WriteUInt32(ctx, infoAddress, NetCtlLinkDisconnected),
+            NetCtlInfoLink => WriteUInt32(ctx, infoAddress, NetCtlLinkConnected),
             NetCtlInfoIpConfig => WriteUInt32(ctx, infoAddress, NetCtlIpConfigStatic),
             NetCtlInfoDhcpHostname => WriteAsciiZ(ctx, infoAddress, string.Empty, 256),
             NetCtlInfoPppoeAuthName => WriteAsciiZ(ctx, infoAddress, string.Empty, 128),
-            NetCtlInfoIpAddress => WriteAsciiZ(ctx, infoAddress, "127.0.0.1", 16),
-            NetCtlInfoNetmask => WriteAsciiZ(ctx, infoAddress, "255.0.0.0", 16),
-            NetCtlInfoDefaultRoute => WriteAsciiZ(ctx, infoAddress, "127.0.0.1", 16),
+            NetCtlInfoIpAddress => WriteAsciiZ(ctx, infoAddress, "192.168.0.2", 16),
+            NetCtlInfoNetmask => WriteAsciiZ(ctx, infoAddress, "255.255.255.0", 16),
+            NetCtlInfoDefaultRoute => WriteAsciiZ(ctx, infoAddress, "192.168.0.1", 16),
             NetCtlInfoPrimaryDns => WriteAsciiZ(ctx, infoAddress, "1.1.1.1", 16),
             NetCtlInfoSecondaryDns => WriteAsciiZ(ctx, infoAddress, "1.1.1.1", 16),
             NetCtlInfoHttpProxyConfig => WriteUInt32(ctx, infoAddress, 0),
             NetCtlInfoHttpProxyServer => WriteAsciiZ(ctx, infoAddress, string.Empty, 256),
             NetCtlInfoHttpProxyPort => WriteUInt16(ctx, infoAddress, 0),
-            _ => ctx.SetReturn(NetCtlErrorNotConnected, typeof(long)),
+            _ => ctx.SetReturn(NetCtlErrorNotAvailable, typeof(long)),
         };
     }
 
-    private static int WriteZeroBytes(CpuContext ctx, ulong address, int count)
+    [SysAbiExport(
+        Nid = "Rqm2OnZMCz0",
+        ExportName = "sceNetCtlUnregisterCallback",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceNetCtl")]
+    public static int NetCtlUnregisterCallback(CpuContext ctx)
     {
-        Span<byte> bytes = stackalloc byte[count];
-        return ctx.Memory.TryWrite(address, bytes)
+        var callbackId = unchecked((int)ctx[CpuRegister.Rdi]);
+        if ((uint)callbackId >= MaxCallbacks)
+        {
+            return ctx.SetReturn(NetCtlErrorInvalidId, typeof(long));
+        }
+
+        lock (CallbackGate)
+        {
+            if (Callbacks[callbackId].Function == 0)
+            {
+                return ctx.SetReturn(NetCtlErrorInvalidId, typeof(long));
+            }
+
+            Callbacks[callbackId] = default;
+        }
+
+        return ctx.SetReturn(0, typeof(long));
+    }
+
+    [SysAbiExport(
+        Nid = "hIUVeUNxAwc",
+        ExportName = "sceNetCtlUnregisterCallbackV6",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceNetCtl")]
+    public static int NetCtlUnregisterCallbackV6(CpuContext ctx) => NetCtlUnregisterCallback(ctx);
+
+    [SysAbiExport(
+        Nid = "Z4wwCFiBELQ",
+        ExportName = "sceNetCtlTerm",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceNetCtl")]
+    public static int NetCtlTerm(CpuContext ctx)
+    {
+        lock (CallbackGate)
+        {
+            Array.Clear(Callbacks);
+        }
+
+        return ctx.SetReturn(0, typeof(long));
+    }
+
+    private static int WriteBytes(CpuContext ctx, ulong address, ReadOnlySpan<byte> bytes) =>
+        ctx.Memory.TryWrite(address, bytes)
             ? ctx.SetReturn(0, typeof(long))
             : ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT, typeof(long));
-    }
 
     private static int WriteUInt32(CpuContext ctx, ulong address, uint value)
     {
