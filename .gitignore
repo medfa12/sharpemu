@@ -49,3 +49,4 @@ inspiration/
 # Local game dumps / packages (never commit copyrighted content)
 games/
 *.pkg
+__pycache__/
