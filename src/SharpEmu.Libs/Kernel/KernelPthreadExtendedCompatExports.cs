@@ -36,6 +36,18 @@ public static class KernelPthreadExtendedCompatExports
 
     private static readonly ConcurrentDictionary<ulong, ConcurrentDictionary<int, ulong>> _threadLocalSpecific = new();
 
+    [SysAbiExport(
+        Nid = "B5GmVDKwpn0",
+        ExportName = "pthread_yield",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libc")]
+    public static int PosixPthreadYield(CpuContext ctx)
+    {
+        _ = ctx;
+        Thread.Yield();
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
     internal static void GetThreadStartScheduling(
         CpuContext ctx,
         ulong attrAddress,
