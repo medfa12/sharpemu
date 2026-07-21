@@ -1254,13 +1254,25 @@ public static class KernelPthreadCompatExports
         lock (state.SyncRoot)
         {
             state.Waiters++;
+
+            // Snapshot the signal epoch at the instant we register (still under
+            // SyncRoot). A pending wake may only be consumed by a waiter that was
+            // already blocked when the signal was issued, i.e. one whose recorded
+            // epoch is older than the current SignalEpoch. Without this guard a
+            // thread that re-enters cond_wait on the same condvar can steal a
+            // SignalsPending token that PulseAll already delivered to an older,
+            // still-waking waiter: the newcomer decrements SignalsPending to 0, the
+            // older waiter re-checks its predicate, finds nothing pending, and parks
+            // forever. That stolen wake is the DrawThread/Draw-Extra-Geometry
+            // handshake deadlock (both park on the same cond with SignalsPending=0).
+            var enterEpoch = state.SignalEpoch;
             TracePthreadCond("wait-enter", condAddress, mutexAddress, state, timed, (int)OrbisGen2Result.ORBIS_GEN2_OK);
 
             // POSIX atomicity: we are registered as a waiter (Waiters++ under
             // SyncRoot) before the mutex is released, so a signal issued the
-            // instant the mutex unlocks already counts us and lands in
-            // SignalsPending — checked before the first Monitor.Wait. No
-            // window exists where a wake can be lost.
+            // instant the mutex unlocks already counts us (Waiters includes us,
+            // and SignalEpoch advances past our snapshot). No window exists where
+            // a wake can be lost.
             var unlockResult = PthreadMutexUnlockCore(ctx, mutexAddress, requireOwner: true);
             if (unlockResult != (int)OrbisGen2Result.ORBIS_GEN2_OK)
             {
@@ -1277,7 +1289,7 @@ public static class KernelPthreadCompatExports
             var deadline = timed
                 ? GuestThreadExecution.ComputeDeadlineTimestamp(GetCondWaitTimeout(timeoutUsec))
                 : long.MaxValue;
-            while (state.SignalsPending == 0 && !GuestThreadBlocking.ShutdownRequested)
+            while ((state.SignalsPending == 0 || state.SignalEpoch == enterEpoch) && !GuestThreadBlocking.ShutdownRequested)
             {
                 var remaining = timed
                     ? GetRemainingTimeout(deadline)
@@ -1295,8 +1307,12 @@ public static class KernelPthreadCompatExports
                 _ = Monitor.Wait(state.SyncRoot, remaining);
             }
 
-            if (state.SignalsPending > 0)
+            if (state.SignalsPending > 0 && state.SignalEpoch != enterEpoch)
             {
+                // Only consume a token produced by a signal issued after we
+                // registered (SignalEpoch advanced past our snapshot). This keeps
+                // the wake bound to the waiters that were present at signal time
+                // and prevents a late arrival from stealing an older waiter's wake.
                 state.SignalsPending--;
                 signaled = true;
             }
