@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Origin: vendored verbatim from sharpemu/FFmpeg scripts/build-sharpemu-ffmpeg.sh (Bink2/BK2 decoder fork).
 # Copyright (C) 2026 SharpEmu Emulator Project
-# SPDX-License-Identifier: LGPL-2.1-or-later
+# SPDX-License-Identifier: GPL-2.0-or-later
 
 set -euo pipefail
 

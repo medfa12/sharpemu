@@ -1,3 +1,8 @@
+<!--
+Copyright (C) 2026 SharpEmu Emulator Project
+SPDX-License-Identifier: GPL-2.0-or-later
+-->
+
 # FFmpeg with Bink2 (BK2) decoding for SharpEmu
 
 PS5 titles frequently ship their intros, logos, and cutscenes as RAD Game Tools
