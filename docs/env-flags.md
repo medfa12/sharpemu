@@ -37,6 +37,7 @@ default-off unless noted.
 
 | Flag | Status |
 |---|---|
+| `SHARPEMU_POOL_DRAW_OBJECTS=1` | Pools per-draw Vulkan objects (fences, command buffers, descriptor pools, per-draw texture image/view/memory) across draws instead of destroy-per-reap; adds LRU + stats to the host-buffer pool. Targets the measured ~570 ms/draw capReap. `[POOLSTATS]` line every 64 draws proves engagement. Not yet boot-verified. |
 | `SHARPEMU_REUSE_GUEST_IMAGE_MEMORY=1` | Guest-image device-memory reuse pool. Structurally cannot engage during pure load (no destroys happen); POOLDBG `releases=` counter proves activity either way. Relevant only once eviction/replacement fires. |
 | `SHARPEMU_CACHE_RENDERPASS=1` | Caches transient render passes/framebuffers. Correct, but measured cost lives in the reap (capReap), so gain was small. |
 | `SHARPEMU_DEEP_PIPELINE=1` | Raises submission/work caps 8/16→32/48. No measured effect (retire speed dominates). |

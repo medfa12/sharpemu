@@ -54,13 +54,29 @@ fences, buffers destroyed every draw). `capFence=0`: the GPU itself is fast.
 
 ## Next steps, ranked
 
-1. Pool/reuse per-draw Vulkan objects (command buffers, fences, image views,
-   host buffers) instead of create-per-draw + destroy-per-reap. This is the
-   FPS lever; home: `VulkanVideoPresenter.GuestMemoryPool.cs` /
-   `PipelineCaches.cs` partials.
-2. Present election: scene renders to 0x520440000 with 100% content but the
-   presented frame is black — fix the flip/composite election or the tonemap
-   input binding for the post-deadlock frame graph.
+1. DONE IN CODE, NEEDS BOOT VERIFICATION: per-draw Vulkan object pooling
+   landed opt-in as `SHARPEMU_POOL_DRAW_OBJECTS=1` (partial
+   `VulkanVideoPresenter.DrawObjectPool.cs`). Pools fences, command buffers,
+   descriptor pools (bucketed by descriptor counts), and per-draw OwnsStorage
+   texture image/view/memory triples; adds LRU + stats to the existing
+   host-buffer pool. Parking happens only at the reap's post-fence-signal
+   destroy points. A `[POOLSTATS]` line every 64 draws proves engagement
+   (rent-hit/miss/park/trim per class) — check it FIRST on the verification
+   boot, then compare capReap. Storage-scratch images and
+   ownership-transferring first-uploads are deliberately excluded.
+2. Present-election black: DIAGNOSED (code-read, high conf) — the election
+   is NOT broken. The game flips 0x507410000/0x5093F0000, written only by the
+   tonemap ps=0x500640200, which multiplies by the zero exposure scalar; with
+   `SHARPEMU_PS_FORCE_EXPOSURE_SCALAR` unset the elected buffer is
+   legitimately black and faithfully blitted (the nodeadlock1/scene1 boots
+   did not set the flag). The scene target 0x520440000 is an intermediate
+   that never enters the election. Discriminating boot (NOT a perf boot):
+   `SHARPEMU_PS_FORCE_EXPOSURE_SCALAR=0.1` + `SHARPEMU_CAPTURE_DRAWS=1` +
+   `SHARPEMU_DUMP_SWAPCHAIN=1`; grep `[CAPTURE].*ps=0x0000000500640200` for
+   in0/out0 addr+nonblack (in0 stale/black => tonemap input rebinding; out0
+   nonblack but swapchain black => election/staleness), then
+   `vk.submit_call|vk.flip_redirect|vk.submit_guest_image_unknown`, then
+   FRAMEDUMP.
 3. Find why the exposure cbuffer scalar is 0 (proper fix for the tonemap
    force) and why libScePad never loads (what gates the interactive gamemode).
 4. Watch run-to-run variance — if threads park again, use
