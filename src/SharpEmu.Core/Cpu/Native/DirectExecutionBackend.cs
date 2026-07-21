@@ -476,6 +476,12 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		public int HostThreadId;
 
 		public GuestContinuationRunner? ContinuationRunner { get; set; }
+
+		// Set once, permanently, when the thread reaches a terminal state
+		// (Exited/Faulted). Joiners wait on it instead of polling with Sleep(1);
+		// the set-once ManualReset semantics make a lost wakeup impossible (a late
+		// waiter still observes the signal).
+		public readonly ManualResetEventSlim TerminationSignal = new(false);
 	}
 
 	private sealed class GuestContinuationRunner : IDisposable
@@ -579,6 +585,12 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	private static readonly object _guestThreadRegionMapGate = new object();
 
 	private readonly Queue<GuestThreadState> _readyGuestThreads = new Queue<GuestThreadState>();
+
+	// Nudged whenever a guest thread becomes ready so the background dispatcher can
+	// re-drive Pump immediately instead of sleeping out its 1 ms poll. The 1 ms wait
+	// timeout is retained so timed (deadline) blocks still expire on schedule; this
+	// only removes latency from the safety-net path, never correctness.
+	private readonly AutoResetEvent _dispatcherWake = new AutoResetEvent(false);
 
 	// Once set, guest worker threads are unwound to the host at their next import
 	// dispatch and Pump refuses to start new ones. This must happen before the
@@ -2983,6 +2995,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			_guestThreads[request.ThreadHandle] = thread;
 			_readyGuestThreads.Enqueue(thread);
 			Interlocked.Increment(ref _readyGuestThreadCount);
+			_dispatcherWake.Set();
 		}
 		Console.Error.WriteLine(
 			$"[LOADER][INFO] Scheduled guest thread '{thread.Name}' handle=0x{thread.ThreadHandle:X16} " +
@@ -3016,7 +3029,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 		while (!ActiveForcedGuestExit)
 		{
-			Thread? hostThread;
+			ManualResetEventSlim terminationSignal;
 			lock (_guestThreadGate)
 			{
 				if (!_guestThreads.TryGetValue(threadHandle, out var thread))
@@ -3039,31 +3052,21 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 					return false;
 				}
 
-				hostThread = thread.HostThread;
+				terminationSignal = thread.TerminationSignal;
 			}
 
-			if (hostThread is not null &&
-				!ReferenceEquals(hostThread, Thread.CurrentThread))
+			// Block until the target reaches a terminal state (Exited/Faulted) rather
+			// than spinning on a Sleep(1) poll. The signal is set-once and permanent,
+			// so a wakeup can never be lost; the bounded timeout only caps how quickly
+			// a forced guest exit (the loop condition) is observed.
+			try
 			{
-				// The handle is published before the host thread starts.
-				if ((hostThread.ThreadState & System.Threading.ThreadState.Unstarted) != 0)
-				{
-					Thread.Sleep(1);
-					continue;
-				}
-
-				try
-				{
-					hostThread.Join(1);
-				}
-				catch (ThreadStateException)
-				{
-					Thread.Sleep(1);
-				}
+				terminationSignal.Wait(5);
 			}
-			else
+			catch (ObjectDisposedException)
 			{
-				Thread.Sleep(1);
+				// The thread table was cleared during teardown; re-loop to observe the
+				// removal (returns "unknown guest thread") or the forced-exit flag.
 			}
 		}
 
@@ -3115,6 +3118,14 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				if (runSynchronously)
 				{
 					RunGuestThread(thread, reason);
+					continue;
+				}
+
+				if (GuestOrchestratorPoolEnabled)
+				{
+					// Reuse a warm orchestrator thread instead of paying a thread
+					// create + cold-schedule per wake (opt-in; see the pool file).
+					DispatchGuestThreadOnOrchestrator(thread, reason);
 					continue;
 				}
 
@@ -3843,15 +3854,33 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			}
 		}
 
+		if (GuestOrchestratorPoolEnabled)
+		{
+			// Pooled orchestrator workers park rather than exit, so they carry no
+			// HostThread to Join. Wait for any that are still inside a guest run to
+			// unwind (Pump stopped dispatching once _guestTeardownRequested was set)
+			// before the caller frees executable memory.
+			var remaining = (int)Math.Max(1L, deadline - Environment.TickCount64);
+			if (!DrainOrchestratorRuns(remaining))
+			{
+				allStopped = false;
+				Console.Error.WriteLine(
+					$"[LOADER][WARN] {Volatile.Read(ref _activeOrchestratorRuns)} guest orchestrator worker(s) " +
+					"still running after teardown wait.");
+			}
+		}
+
 		return allStopped;
 	}
 
 	private void ClearGuestThreads()
 	{
 		GuestContinuationRunner[] runners;
+		GuestThreadState[] clearedThreads;
 		lock (_guestThreadGate)
 		{
-			runners = _guestThreads.Values
+			clearedThreads = _guestThreads.Values.ToArray();
+			runners = clearedThreads
 				.Select(static thread => thread.ContinuationRunner)
 				.Where(static runner => runner is not null)
 				.Cast<GuestContinuationRunner>()
@@ -3864,6 +3893,13 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		foreach (var runner in runners)
 		{
 			runner.Dispose();
+		}
+
+		foreach (var clearedThread in clearedThreads)
+		{
+			// Release any joiner still parked on this thread, then dispose.
+			clearedThread.TerminationSignal.Set();
+			clearedThread.TerminationSignal.Dispose();
 		}
 	}
 
@@ -4186,6 +4222,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 					case GuestNativeCallExitReason.Returned:
 						thread.ExitValue = thread.Context[CpuRegister.Rax];
 						thread.State = GuestThreadRunState.Exited;
+						thread.TerminationSignal.Set();
 						break;
 					case GuestNativeCallExitReason.Blocked:
 						thread.State = GuestThreadRunState.Blocked;
@@ -4200,11 +4237,13 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 							thread.BlockDeadlineTimestamp = 0;
 							_readyGuestThreads.Enqueue(thread);
 							Interlocked.Increment(ref _readyGuestThreadCount);
+							_dispatcherWake.Set();
 						}
 						break;
 					default:
 						thread.State = GuestThreadRunState.Faulted;
 						thread.BlockReason = blockReason;
+						thread.TerminationSignal.Set();
 						break;
 				}
 			}
@@ -4949,7 +4988,9 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		{
 			while (!_stallWatchdogStop)
 			{
-				Thread.Sleep(1);
+				// Wake immediately when a guest thread becomes ready; otherwise fall
+				// through every 1 ms so timed (deadline) blocks still expire promptly.
+				_dispatcherWake.WaitOne(1);
 				WakeExpiredBlockedGuestThreads();
 				if (Volatile.Read(ref _readyGuestThreadCount) > 0 && _cpuContext is { } dispatchContext)
 				{
@@ -5211,6 +5252,9 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		// Native guest workers park idle once every guest thread has unwound; stop
 		// them before any executable stub or TLS index they reference is freed.
 		DisposeNativeGuestExecutors();
+		// Pooled orchestrator workers (opt-in) have already drained in
+		// RequestGuestThreadTeardown; stop and reap their parked threads.
+		DisposeGuestOrchestrators();
 		ClearImportHandlerTrampolines();
 		_importEntries = Array.Empty<ImportStubEntry>();
 		_runtimeSymbolsByName.Clear();

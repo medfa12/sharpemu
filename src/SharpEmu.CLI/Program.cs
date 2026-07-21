@@ -46,6 +46,14 @@ internal static partial class Program
     [STAThread]
     private static int Main(string[] args)
     {
+        // Raise the host timer resolution to 1 ms for the whole process lifetime.
+        // The guest thread scheduler parks/wakes many worker threads on timed
+        // waits and a 1 ms dispatcher poll; at the default ~15.6 ms quantum each
+        // of those waits rounds up, adding latency during boot (Havok/tbb/loader
+        // threads spin up long before VideoOut is opened). VideoOut also requests
+        // this lazily, but doing it here covers the whole run and the call is
+        // idempotent (Windows-guarded, no-op on non-Windows).
+        SharpEmu.Libs.HostTimerResolution.Request();
         InstallProcessDeathDiagnostics();
         try
         {
