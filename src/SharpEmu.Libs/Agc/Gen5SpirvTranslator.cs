@@ -259,16 +259,6 @@ internal static partial class Gen5SpirvTranslator
         private static readonly bool _forcePackedStoreExecValues =
             Environment.GetEnvironmentVariable(
                 "SHARPEMU_FORCE_PACKED_STORE_EXEC_VALUES") == "1";
-        // SHARPEMU_PS_FORCE_EXEC=1 (low-probability backup toggle): seed the
-        // fragment-stage launch EXEC (SGPR 126/127) full instead of from the
-        // guest SGPR-init buffer. On the GCN pixel-shader ABI the entry EXEC
-        // is the hardware coverage mask (all invoked lanes live), not user
-        // data; shaders that save EXEC on entry and gate their MRT export /
-        // discard on it would go black if EXEC were seeded 0 out of the
-        // SGPR-init buffer region.
-        private static readonly bool _forcePixelExec =
-            Environment.GetEnvironmentVariable(
-                "SHARPEMU_PS_FORCE_EXEC") == "1";
         // SHARPEMU_PS_FORCE_EXPOSURE_SCALAR=1 (high-probability toggle): for
         // the tonemap/composite pixel shader at PixelShaderAddress
         // 0x0000000500640200 only, force the exposure-scale S_BUFFER_LOAD_DWORD
@@ -1308,18 +1298,6 @@ internal static partial class Gen5SpirvTranslator
             }
             else if (_stage == Gen5SpirvStage.Pixel)
             {
-                if (_forcePixelExec)
-                {
-                    // Override the buffer-seeded (and, on subgroup shaders, the
-                    // per-lane StoreWaveMask) EXEC set above: the fragment wave
-                    // launches with the full wave32 coverage mask, so both the
-                    // guest's saved-EXEC copy (s_mov s[..], exec) and the
-                    // derived _exec predicate stay active for every fragment.
-                    // EXEC_HI is 0 for wave32.
-                    StoreS(126, UInt(0xFFFFFFFFu));
-                    StoreS(127, UInt(0u));
-                }
-
                 var fragCoord = Load(_vec4Type, _fragCoordInput);
                 if (_pixelInputAddress != 0)
                 {
