@@ -223,17 +223,12 @@ internal sealed record VulkanOrderedGuestFlip(
 internal static unsafe class VulkanVideoPresenter
 {
     // Env-gated performance flags. Read ONCE at type load; when unset the
-    // higher caps / async-present / phase-timing paths are never taken and the
-    // presenter behaves byte-for-byte as before. Defined ahead of the caps
-    // below so their static-field initializers observe the resolved value.
+    // higher caps / phase-timing paths are never taken and the presenter
+    // behaves byte-for-byte as before. Defined ahead of the caps below so
+    // their static-field initializers observe the resolved value.
     private static readonly bool _deepPipeline =
         string.Equals(
             Environment.GetEnvironmentVariable("SHARPEMU_DEEP_PIPELINE"),
-            "1",
-            StringComparison.Ordinal);
-    private static readonly bool _asyncPresent =
-        string.Equals(
-            Environment.GetEnvironmentVariable("SHARPEMU_ASYNC_PRESENT"),
             "1",
             StringComparison.Ordinal);
     private static readonly bool _perfPhases =
@@ -2906,28 +2901,6 @@ internal static unsafe class VulkanVideoPresenter
         private bool _presentationInFlight;
         private TranslatedDrawResources? _pendingPresentationResources;
 
-        // SHARPEMU_ASYNC_PRESENT frames-in-flight ring. Replaces the per-present
-        // QueueWaitIdle with fence-polled double/triple buffering. Only created
-        // (in CreateCommandResources) and used when _asyncPresent is set; the
-        // legacy singletons above are left untouched on the default path.
-        //
-        // Per frame-in-flight slot: its own present command buffer, image-
-        // available semaphore, in-flight fence, and the resources/snapshots that
-        // slot's submit references (freed only once its fence retires). The
-        // render-finished semaphore is per SWAPCHAIN IMAGE (indexed by image
-        // index), not per slot: a swapchain image cannot be reacquired until the
-        // present that consumed its render-finished semaphore has completed, so
-        // indexing by image is what makes reuse of that semaphore race-free.
-        private const int PresentFramesInFlight = 3;
-        private CommandBuffer[] _asyncPresentCommandBuffers = [];
-        private VkSemaphore[] _asyncImageAvailable = [];
-        private Fence[] _asyncInFlightFences = [];
-        private bool[] _asyncFrameInFlight = [];
-        private TranslatedDrawResources?[] _asyncFrameResources = [];
-        private List<GuestImageResource>?[] _asyncFrameSnapshots = [];
-        private VkSemaphore[] _asyncRenderFinished = [];
-        private int _asyncFrameCursor;
-
         // SHARPEMU_PERF_PHASES: measures the FULL frame period, not just the
         // inside of one present. Because presents can be many Render() calls
         // apart (the render thread idles in WaitForRenderWork between them), the
@@ -2968,14 +2941,6 @@ internal static unsafe class VulkanVideoPresenter
         private int _dtPipelineMisses;       // graphics pipeline cache misses (real vkCreate)
         private int _dtDigestMisses;         // shader-digest cache misses (recomputed SHA256)
         private const int DrawTimingEmitInterval = 50;
-
-        // SHARPEMU_ASYNC_PRESENT diagnostics: incremented every Render() (not just
-        // on present) so a present STALL still advances it. Traces are emitted for
-        // the first N ticks plus a periodic heartbeat, so a boot log shows exactly
-        // where the ring stops advancing without flooding at steady state.
-        private long _asyncTraceTick;
-        private const long AsyncTraceEagerTicks = 150;
-        private const long AsyncTraceHeartbeat = 240;
 
         private VkBuffer _stagingBuffer;
         private DeviceMemory _stagingMemory;
@@ -3116,6 +3081,13 @@ internal static unsafe class VulkanVideoPresenter
             _freeDeviceMemoryPool = new();
         private int _pooledDeviceMemoryBlockCount;
         private ulong _pooledDeviceMemoryBytes;
+        // POOLDBG: how many times ReleaseGuestImageMemory (the sole guest-image
+        // device-memory free path, reached only via DestroyGuestImage) has run.
+        // Surfaced in every POOLDBG line so a run that shows only rent misses
+        // proves whether guest images are being destroyed at all -- park/free_skip
+        // can never engage while this stays 0, and it has its own trace budget
+        // below so a park is never silenced by rent-attempt trace flooding.
+        private long _guestImageReleaseEvents;
         // Monotonic per-block reuse fence tracking (render-thread only). A parked
         // block is safe to rent once every submission that could still reference
         // it has retired: _guestRetireSeq >= its GuestGuardSeq (all guest-queue
@@ -4502,100 +4474,11 @@ internal static unsafe class VulkanVideoPresenter
                 _vk.CreateFence(_device, &fenceInfo, null, out _presentationFence),
                 "vkCreateFence(presentation)");
 
-            if (_asyncPresent)
-            {
-                CreateAsyncPresentResources(semaphoreInfo, fenceInfo);
-            }
-
             CreateStagingBuffer((ulong)_extent.Width * _extent.Height * 4);
-        }
-
-        // Allocates the SHARPEMU_ASYNC_PRESENT frames-in-flight ring. Called from
-        // CreateCommandResources (initial + every swapchain recreate) after the
-        // legacy sync objects, and torn down in DestroySwapchainResources.
-        private void CreateAsyncPresentResources(
-            SemaphoreCreateInfo semaphoreInfo,
-            FenceCreateInfo fenceInfo)
-        {
-            _asyncPresentCommandBuffers = new CommandBuffer[PresentFramesInFlight];
-            _asyncImageAvailable = new VkSemaphore[PresentFramesInFlight];
-            _asyncInFlightFences = new Fence[PresentFramesInFlight];
-            _asyncFrameInFlight = new bool[PresentFramesInFlight];
-            _asyncFrameResources = new TranslatedDrawResources?[PresentFramesInFlight];
-            _asyncFrameSnapshots = new List<GuestImageResource>?[PresentFramesInFlight];
-            _asyncFrameCursor = 0;
-
-            var allocateInfo = new CommandBufferAllocateInfo
-            {
-                SType = StructureType.CommandBufferAllocateInfo,
-                CommandPool = _commandPool,
-                Level = CommandBufferLevel.Primary,
-                CommandBufferCount = 1,
-            };
-            for (var i = 0; i < PresentFramesInFlight; i++)
-            {
-                Check(
-                    _vk.AllocateCommandBuffers(
-                        _device,
-                        &allocateInfo,
-                        out _asyncPresentCommandBuffers[i]),
-                    "vkAllocateCommandBuffers(async present)");
-                Check(
-                    _vk.CreateSemaphore(
-                        _device,
-                        &semaphoreInfo,
-                        null,
-                        out _asyncImageAvailable[i]),
-                    "vkCreateSemaphore(async image available)");
-                // Fences start SIGNALED so the very first use of each slot polls
-                // as "retired" without a spurious wait.
-                var signaledFenceInfo = fenceInfo;
-                signaledFenceInfo.Flags = FenceCreateFlags.SignaledBit;
-                Check(
-                    _vk.CreateFence(
-                        _device,
-                        &signaledFenceInfo,
-                        null,
-                        out _asyncInFlightFences[i]),
-                    "vkCreateFence(async present)");
-            }
-
-            // One render-finished semaphore per swapchain image.
-            var imageCount = _swapchainImages.Length;
-            _asyncRenderFinished = new VkSemaphore[imageCount];
-            for (var i = 0; i < imageCount; i++)
-            {
-                Check(
-                    _vk.CreateSemaphore(
-                        _device,
-                        &semaphoreInfo,
-                        null,
-                        out _asyncRenderFinished[i]),
-                    "vkCreateSemaphore(async render finished)");
-            }
         }
 
         private void CompletePendingPresentation(bool wait)
         {
-            if (_asyncPresent)
-            {
-                // Async path: presentation state lives in the frames-in-flight
-                // ring, not the legacy singletons (which stay untouched). Route
-                // every caller through the ring so its correctness contract is
-                // preserved: wait:true means "no in-flight present may still be
-                // reading resources I'm about to destroy" -> drain all slots.
-                if (wait)
-                {
-                    DrainAllAsyncPresentFrames();
-                }
-                else
-                {
-                    RecycleCompletedAsyncPresentFrames();
-                }
-
-                return;
-            }
-
             if (!_presentationInFlight)
             {
                 return;
@@ -4626,138 +4509,6 @@ internal static unsafe class VulkanVideoPresenter
                 DestroyTranslatedDrawResources(_pendingPresentationResources);
                 _pendingPresentationResources = null;
             }
-        }
-
-        // Frees a retired async-present slot's referenced resources and any
-        // ordered-flip snapshots its blit read. Precondition: the slot's fence is
-        // signaled, so the present submit (and thus every read of these
-        // resources) has completed on the GPU. This is the async analogue of the
-        // legacy CompletePendingPresentation resource release.
-        private void RecycleAsyncPresentFrame(int slot)
-        {
-            if (!_asyncFrameInFlight[slot])
-            {
-                return;
-            }
-
-            if (_asyncPresent && _asyncTraceTick <= AsyncTraceEagerTicks)
-            {
-                Console.Error.WriteLine($"[LOADER][ASYNCPRESENT] recycle slot={slot}");
-            }
-
-            _asyncFrameInFlight[slot] = false;
-            _presentRetireSeq++;
-            if (_asyncFrameResources[slot] is { } resources)
-            {
-                MarkSampledImagesInitialized(resources);
-                MarkStorageImagesInitialized(resources);
-                DestroyTranslatedDrawResources(resources);
-                _asyncFrameResources[slot] = null;
-            }
-
-            if (_asyncFrameSnapshots[slot] is { } snapshots && snapshots.Count > 0)
-            {
-                foreach (var snapshot in snapshots)
-                {
-                    DestroyGuestImage(snapshot);
-                }
-
-                snapshots.Clear();
-            }
-        }
-
-        // Non-blocking: recycles every slot whose fence has already signaled.
-        private void RecycleCompletedAsyncPresentFrames()
-        {
-            for (var slot = 0; slot < _asyncFrameInFlight.Length; slot++)
-            {
-                if (!_asyncFrameInFlight[slot])
-                {
-                    continue;
-                }
-
-                var status = _vk.GetFenceStatus(_device, _asyncInFlightFences[slot]);
-                if (status == Result.NotReady)
-                {
-                    continue;
-                }
-
-                Check(status, "vkGetFenceStatus(async present)");
-                RecycleAsyncPresentFrame(slot);
-            }
-        }
-
-        // Blocking: waits every in-flight slot's fence and recycles it. Used by
-        // the wait:true callers (resource reallocation, readback, teardown) that
-        // must know no present is still reading GPU resources.
-        private void DrainAllAsyncPresentFrames()
-        {
-            for (var slot = 0; slot < _asyncFrameInFlight.Length; slot++)
-            {
-                if (!_asyncFrameInFlight[slot])
-                {
-                    continue;
-                }
-
-                var fence = _asyncInFlightFences[slot];
-                long tWait0 = _perfPhases ? Stopwatch.GetTimestamp() : 0;
-                Check(
-                    _vk.WaitForFences(_device, 1, &fence, true, ulong.MaxValue),
-                    "vkWaitForFences(async present drain)");
-                if (_perfPhases)
-                {
-                    _perfFenceAccumTicks += Stopwatch.GetTimestamp() - tWait0;
-                }
-
-                RecycleAsyncPresentFrame(slot);
-            }
-        }
-
-        // Reserves the next slot in the ring for a present. Recycles any already-
-        // completed slots without blocking, then, if the chosen slot is still in
-        // flight (all N frames busy), blocks on its fence -- this is the cap at N
-        // frames in flight. Returns the slot index; its command buffer, image-
-        // available semaphore, and fence are then used to build/submit the frame.
-        private int AcquireAsyncPresentFrame()
-        {
-            RecycleCompletedAsyncPresentFrames();
-            var slot = _asyncFrameCursor;
-            if (_asyncFrameInFlight[slot])
-            {
-                if (_asyncPresent && _asyncTraceTick <= AsyncTraceEagerTicks)
-                {
-                    Console.Error.WriteLine(
-                        $"[LOADER][ASYNCPRESENT] slot_wait slot={slot} (ring full, capping)");
-                }
-
-                var fence = _asyncInFlightFences[slot];
-                long tWait0 = _perfPhases ? Stopwatch.GetTimestamp() : 0;
-                Check(
-                    _vk.WaitForFences(_device, 1, &fence, true, ulong.MaxValue),
-                    "vkWaitForFences(async present slot)");
-                if (_perfPhases)
-                {
-                    _perfFenceAccumTicks += Stopwatch.GetTimestamp() - tWait0;
-                }
-
-                RecycleAsyncPresentFrame(slot);
-            }
-
-            return slot;
-        }
-
-        private int AsyncPresentInFlightCount()
-        {
-            var count = 0;
-            for (var slot = 0; slot < _asyncFrameInFlight.Length; slot++)
-            {
-                if (_asyncFrameInFlight[slot])
-                {
-                    count++;
-                }
-            }
-
-            return count;
         }
 
         private CommandBuffer AllocateGuestCommandBuffer()
@@ -8080,6 +7831,24 @@ internal static unsafe class VulkanVideoPresenter
                 return;
             }
 
+            // Release-only trace budget, disjoint from ShouldTracePool's shared
+            // rent/park event counter: guarantee the first 300 releases (plus
+            // every 128th after) always emit their park/free_skip line. Earlier
+            // VM runs showed ONLY rent misses and zero park/free_skip; because
+            // rent attempts fire on every device-local allocation and share
+            // ShouldTracePool's 300-event budget, an actual release could be
+            // silenced by rent flooding. This dedicated counter makes a real
+            // release provably visible, and staying 0 all run proves the
+            // opposite: DestroyGuestImage was never reached, so the pool cannot
+            // engage no matter what (allocation growth is all NEW distinct
+            // blocks, never destroy-and-repark churn).
+            var traceRelease = false;
+            if (_reuseGuestImageMemory)
+            {
+                var releaseCount = ++_guestImageReleaseEvents;
+                traceRelease = releaseCount <= 300 || (releaseCount & 127) == 0;
+            }
+
             // Pool whenever reuse is on, the block's size/type is known and
             // device-local, and the pool has headroom. Parking is decoupled from
             // global GPU idle: the block is stamped with the guest/present
@@ -8109,10 +7878,11 @@ internal static unsafe class VulkanVideoPresenter
                     memory, _guestSubmitSeq, _presentSubmitSeq));
                 _pooledDeviceMemoryBlockCount++;
                 _pooledDeviceMemoryBytes += resource.MemorySize;
-                if (ShouldTracePool())
+                if (traceRelease)
                 {
                     Console.Error.WriteLine(
-                        $"[LOADER][POOLDBG] park size={resource.MemorySize / (1024 * 1024)}MB " +
+                        $"[LOADER][POOLDBG] park release#={_guestImageReleaseEvents} " +
+                        $"size={resource.MemorySize / (1024 * 1024)}MB " +
                         $"type={resource.MemoryTypeIndex} guestGuard={_guestSubmitSeq} " +
                         $"presentGuard={_presentSubmitSeq} pending={_pendingGuestSubmissions.Count} " +
                         $"presentInFlight={_presentationInFlight} reclaim={_reclaimInProgress} " +
@@ -8122,10 +7892,11 @@ internal static unsafe class VulkanVideoPresenter
                 return;
             }
 
-            if (_reuseGuestImageMemory && ShouldTracePool())
+            if (traceRelease)
             {
                 Console.Error.WriteLine(
-                    $"[LOADER][POOLDBG] free_skip size={resource.MemorySize / (1024 * 1024)}MB " +
+                    $"[LOADER][POOLDBG] free_skip release#={_guestImageReleaseEvents} " +
+                    $"size={resource.MemorySize / (1024 * 1024)}MB " +
                     $"type={resource.MemoryTypeIndex} deviceLocal={deviceLocal} " +
                     $"sizeKnown={resource.MemorySize != 0} headroom={headroom} " +
                     $"pool={_pooledDeviceMemoryBytes / (1024 * 1024)}MB/{_pooledDeviceMemoryBlockCount}");
@@ -8159,7 +7930,7 @@ internal static unsafe class VulkanVideoPresenter
                     {
                         Console.Error.WriteLine(
                             $"[LOADER][POOLDBG] rent_hit size={size / (1024 * 1024)}MB " +
-                            $"type={memoryTypeIndex} " +
+                            $"type={memoryTypeIndex} releases={_guestImageReleaseEvents} " +
                             $"guestGuard={front.GuestGuardSeq}/{_guestRetireSeq} " +
                             $"presentGuard={front.PresentGuardSeq}/{_presentRetireSeq} " +
                             $"pool={_pooledDeviceMemoryBytes / (1024 * 1024)}MB/{_pooledDeviceMemoryBlockCount}");
@@ -8172,7 +7943,7 @@ internal static unsafe class VulkanVideoPresenter
                 {
                     Console.Error.WriteLine(
                         $"[LOADER][POOLDBG] rent_miss_notready size={size / (1024 * 1024)}MB " +
-                        $"type={memoryTypeIndex} " +
+                        $"type={memoryTypeIndex} releases={_guestImageReleaseEvents} " +
                         $"guestGuard={front.GuestGuardSeq}/{_guestRetireSeq} " +
                         $"presentGuard={front.PresentGuardSeq}/{_presentRetireSeq} " +
                         $"queued={queue.Count}");
@@ -8186,7 +7957,8 @@ internal static unsafe class VulkanVideoPresenter
             {
                 Console.Error.WriteLine(
                     $"[LOADER][POOLDBG] rent_miss_empty size={size / (1024 * 1024)}MB " +
-                    $"type={memoryTypeIndex} keys={_freeDeviceMemoryPool.Count}");
+                    $"type={memoryTypeIndex} releases={_guestImageReleaseEvents} " +
+                    $"keys={_freeDeviceMemoryPool.Count}");
             }
 
             memory = default;
@@ -10502,8 +10274,7 @@ internal static unsafe class VulkanVideoPresenter
                     }
 
                     var gpuInFlight = _pendingGuestSubmissions.Count +
-                        (_presentationInFlight ? 1 : 0) +
-                        (_asyncPresent ? AsyncPresentInFlightCount() : 0);
+                        (_presentationInFlight ? 1 : 0);
                     var readCount = Interlocked.Read(
                         ref Agc.Gen5ShaderScalarEvaluator.GlobalMemoryReadCount);
                     var readBytes = Interlocked.Read(
@@ -10622,8 +10393,7 @@ internal static unsafe class VulkanVideoPresenter
 
         private void WaitForRenderWork()
         {
-            var gpuWorkInFlight = _pendingGuestSubmissions.Count > 0 || _presentationInFlight ||
-                (_asyncPresent && AsyncPresentInFlightCount() > 0);
+            var gpuWorkInFlight = _pendingGuestSubmissions.Count > 0 || _presentationInFlight;
             lock (_gate)
             {
                 if (_closed ||
@@ -10814,29 +10584,8 @@ internal static unsafe class VulkanVideoPresenter
                     (_perfFenceAccumTicks - drainFenceBase);
             }
 
-            var traceAsync = _asyncPresent &&
-                (++_asyncTraceTick <= AsyncTraceEagerTicks ||
-                 _asyncTraceTick % AsyncTraceHeartbeat == 0);
-
             if (!TryTakePresentation(_presentedSequence, out var presentation))
             {
-                if (traceAsync)
-                {
-                    long latestSeq, completed, enqueued, pendingCount;
-                    lock (_gate)
-                    {
-                        latestSeq = _latestPresentation?.Sequence ?? -1;
-                        completed = _completedGuestWorkSequence;
-                        enqueued = _enqueuedGuestWorkSequence;
-                        pendingCount = _pendingGuestWork.Count;
-                    }
-
-                    Console.Error.WriteLine(
-                        $"[LOADER][ASYNCPRESENT] no_presentation presentedSeq={_presentedSequence} " +
-                        $"latestSeq={latestSeq} completed={completed} enqueued={enqueued} " +
-                        $"pending={pendingCount} inFlight={AsyncPresentInFlightCount()}");
-                }
-
                 return;
             }
 
@@ -10853,19 +10602,7 @@ internal static unsafe class VulkanVideoPresenter
                 return;
             }
 
-            if (_asyncPresent)
-            {
-                // Non-blocking: free any already-retired frames' resources. The
-                // blocking cap-at-N-frames-in-flight wait happens later in
-                // AcquireAsyncPresentFrame, not here -- keeping this poll-only is
-                // what lets frame N+1 build while frame N's present is still in
-                // flight (the whole point of removing the per-present WaitIdle).
-                RecycleCompletedAsyncPresentFrames();
-            }
-            else
-            {
-                CompletePendingPresentation(wait: true);
-            }
+            CompletePendingPresentation(wait: true);
 
             _useStamp++;
 
@@ -10907,13 +10644,6 @@ internal static unsafe class VulkanVideoPresenter
                         presentation.GuestImageAddress,
                         out var presentable))
                 {
-                    if (traceAsync)
-                    {
-                        Console.Error.WriteLine(
-                            "[LOADER][ASYNCPRESENT] not_presentable " +
-                            $"addr=0x{presentation.GuestImageAddress:X16} seq={presentation.Sequence}");
-                    }
-
                     return;
                 }
 
@@ -10967,56 +10697,16 @@ internal static unsafe class VulkanVideoPresenter
                 }
             }
 
-            // Async present reserves a frames-in-flight slot (blocks only if all
-            // N are still executing) and uses that slot's image-available
-            // semaphore, command buffer, and fence. Default path keeps the single
-            // shared objects.
-            var asyncSlot = -1;
             var imageAvailable = _imageAvailable;
-            if (_asyncPresent)
-            {
-                asyncSlot = AcquireAsyncPresentFrame();
-                imageAvailable = _asyncImageAvailable[asyncSlot];
-                _commandBuffer = _asyncPresentCommandBuffers[asyncSlot];
-                if (traceAsync)
-                {
-                    Console.Error.WriteLine(
-                        $"[LOADER][ASYNCPRESENT] acquire_slot slot={asyncSlot} " +
-                        $"cursor={_asyncFrameCursor} inFlight={AsyncPresentInFlightCount()}");
-                }
-            }
 
             uint imageIndex;
-            // Under async, use a finite acquire timeout so a swapchain that stops
-            // handing back images surfaces as a traced, recoverable timeout
-            // instead of a silent hang. On VK_TIMEOUT nothing was acquired and the
-            // slot's image-available semaphore is untouched, so retrying next frame
-            // is safe. Default path keeps the infinite wait (byte-identical).
-            var acquireTimeout = _asyncPresent ? 500_000_000UL : ulong.MaxValue;
             var acquireResult = _swapchainApi.AcquireNextImage(
                 _device,
                 _swapchain,
-                acquireTimeout,
+                ulong.MaxValue,
                 imageAvailable,
                 default,
                 &imageIndex);
-            if (_asyncPresent && acquireResult == Result.Timeout)
-            {
-                if (traceAsync)
-                {
-                    Console.Error.WriteLine(
-                        $"[LOADER][ASYNCPRESENT] acquire_timeout slot={asyncSlot} " +
-                        $"inFlight={AsyncPresentInFlightCount()}");
-                }
-
-                if (translatedResources is not null)
-                {
-                    DestroyTranslatedDrawResources(translatedResources);
-                }
-
-                return;
-            }
-
             if (acquireResult == Result.ErrorOutOfDateKhr)
             {
                 RecreateSwapchainResources("vkAcquireNextImageKHR", acquireResult);
@@ -11029,11 +10719,6 @@ internal static unsafe class VulkanVideoPresenter
             }
 
             CheckSwapchainResult(acquireResult, "vkAcquireNextImageKHR");
-            if (traceAsync && _asyncPresent)
-            {
-                Console.Error.WriteLine(
-                    $"[LOADER][ASYNCPRESENT] acquire_image result={acquireResult} index={imageIndex}");
-            }
             var recreateAfterPresent = acquireResult == Result.SuboptimalKhr;
 
             if (pixels is not null)
@@ -11106,13 +10791,7 @@ internal static unsafe class VulkanVideoPresenter
             Check(_vk.EndCommandBuffer(_commandBuffer), "vkEndCommandBuffer");
 
             var commandBuffer = _commandBuffer;
-            // Render-finished is per SWAPCHAIN IMAGE under async: the swapchain
-            // will not hand this image back (nor let us re-signal this semaphore)
-            // until the present that consumed it has completed, which is the
-            // guarantee that makes reuse across pipelined frames race-free.
-            var renderFinished = _asyncPresent
-                ? _asyncRenderFinished[imageIndex]
-                : _renderFinished;
+            var renderFinished = _renderFinished;
             var submitInfo = new SubmitInfo
             {
                 SType = StructureType.SubmitInfo,
@@ -11124,38 +10803,16 @@ internal static unsafe class VulkanVideoPresenter
                 SignalSemaphoreCount = 1,
                 PSignalSemaphores = &renderFinished,
             };
-            var presentationFence = _asyncPresent
-                ? _asyncInFlightFences[asyncSlot]
-                : _presentationFence;
+            var presentationFence = _presentationFence;
             Check(
                 _vk.ResetFences(_device, 1, &presentationFence),
                 "vkResetFences(presentation)");
             Check(
                 _vk.QueueSubmit(_queue, 1, &submitInfo, presentationFence),
                 "vkQueueSubmit");
-            if (_asyncPresent)
-            {
-                // This slot's submit references translatedResources (and, below,
-                // any ordered-flip snapshots blitted this frame). They are freed
-                // only when this slot's fence retires -- never before its GPU
-                // reads finish -- which is what prevents the tearing/corruption
-                // the removed QueueWaitIdle previously guarded against.
-                _asyncFrameInFlight[asyncSlot] = true;
-                _presentSubmitSeq++;
-                _asyncFrameResources[asyncSlot] = translatedResources;
-                if (traceAsync)
-                {
-                    Console.Error.WriteLine(
-                        $"[LOADER][ASYNCPRESENT] submit slot={asyncSlot} " +
-                        $"fence=0x{presentationFence.Handle:X} rf=0x{renderFinished.Handle:X}");
-                }
-            }
-            else
-            {
-                _presentationInFlight = true;
-                _presentSubmitSeq++;
-                _pendingPresentationResources = translatedResources;
-            }
+            _presentationInFlight = true;
+            _presentSubmitSeq++;
+            _pendingPresentationResources = translatedResources;
 
             translatedResources = null;
 
@@ -11186,43 +10843,18 @@ internal static unsafe class VulkanVideoPresenter
 
             CheckSwapchainResult(presentResult, "vkQueuePresentKHR");
             recreateAfterPresent |= presentResult == Result.SuboptimalKhr;
-            if (traceAsync && _asyncPresent)
+
+            long tWait0 = _perfPhases ? Stopwatch.GetTimestamp() : 0;
+            Check(_vk.QueueWaitIdle(_queue), "vkQueueWaitIdle");
+            if (_perfPhases)
             {
-                Console.Error.WriteLine(
-                    $"[LOADER][ASYNCPRESENT] present result={presentResult} slot={asyncSlot}");
+                _perfFenceAccumTicks += Stopwatch.GetTimestamp() - tWait0;
             }
 
-            if (_asyncPresent)
-            {
-                // No QueueWaitIdle: the presented snapshot (and any snapshot
-                // abandoned this frame) was blitted/copied on this slot's submit,
-                // so it must NOT be freed until this slot's fence retires. Hand
-                // the retire list to the slot; RecycleAsyncPresentFrame frees them
-                // once the fence signals. Then rotate to the next slot.
-                if (_retiringGuestFlipSnapshots.Count > 0)
-                {
-                    var slotSnapshots =
-                        _asyncFrameSnapshots[asyncSlot] ??= new List<GuestImageResource>();
-                    slotSnapshots.AddRange(_retiringGuestFlipSnapshots);
-                    _retiringGuestFlipSnapshots.Clear();
-                }
-
-                _asyncFrameCursor = (asyncSlot + 1) % PresentFramesInFlight;
-            }
-            else
-            {
-                long tWait0 = _perfPhases ? Stopwatch.GetTimestamp() : 0;
-                Check(_vk.QueueWaitIdle(_queue), "vkQueueWaitIdle");
-                if (_perfPhases)
-                {
-                    _perfFenceAccumTicks += Stopwatch.GetTimestamp() - tWait0;
-                }
-
-                // Queue is now idle: any ordered-flip snapshot whose copy/blit
-                // just completed (or that was abandoned this frame) is safe to
-                // free.
-                DrainRetiredGuestFlipSnapshots();
-            }
+            // Queue is now idle: any ordered-flip snapshot whose copy/blit
+            // just completed (or that was abandoned this frame) is safe to
+            // free.
+            DrainRetiredGuestFlipSnapshots();
 
             Interlocked.Increment(ref _presentedFrameTotal);
             VideoOutExports.ReportPresentedFrame();
@@ -13425,48 +13057,6 @@ internal static unsafe class VulkanVideoPresenter
                 _vk.DestroyFence(_device, _presentationFence, null);
                 _presentationFence = default;
             }
-            // Async present ring. Callers reach DestroySwapchainResources only
-            // after a DeviceWaitIdle, so every slot is retired: free any
-            // resources/snapshots the slots still hold, then destroy the sync
-            // objects. Slot command buffers are freed with the command pool
-            // below.
-            for (var i = 0; i < _asyncFrameInFlight.Length; i++)
-            {
-                RecycleAsyncPresentFrame(i);
-            }
-
-            foreach (var semaphore in _asyncImageAvailable)
-            {
-                if (semaphore.Handle != 0)
-                {
-                    _vk.DestroySemaphore(_device, semaphore, null);
-                }
-            }
-
-            foreach (var semaphore in _asyncRenderFinished)
-            {
-                if (semaphore.Handle != 0)
-                {
-                    _vk.DestroySemaphore(_device, semaphore, null);
-                }
-            }
-
-            foreach (var fence in _asyncInFlightFences)
-            {
-                if (fence.Handle != 0)
-                {
-                    _vk.DestroyFence(_device, fence, null);
-                }
-            }
-
-            _asyncPresentCommandBuffers = [];
-            _asyncImageAvailable = [];
-            _asyncInFlightFences = [];
-            _asyncFrameInFlight = [];
-            _asyncFrameResources = [];
-            _asyncFrameSnapshots = [];
-            _asyncRenderFinished = [];
-            _asyncFrameCursor = 0;
             if (_barycentricPipeline.Handle != 0)
             {
                 _vk.DestroyPipeline(_device, _barycentricPipeline, null);
