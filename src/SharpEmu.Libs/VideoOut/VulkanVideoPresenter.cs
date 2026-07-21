@@ -269,6 +269,26 @@ internal static unsafe class VulkanVideoPresenter
             Environment.GetEnvironmentVariable("SHARPEMU_REUSE_GUEST_IMAGE_MEMORY"),
             "1",
             StringComparison.Ordinal);
+    // SHARPEMU_CACHE_RENDERPASS: cache the transient VkRenderPass + VkFramebuffer
+    // that ExecuteOffscreenDraw builds per depth/MRT draw, instead of
+    // vkCreateRenderPass + vkCreateFramebuffer + vkDestroy* every single draw.
+    //   * Render passes key on (color formats[], depth format, clear-depth) --
+    //     only a handful of distinct combos -- and reference no image, so they
+    //     are never destroyed per-draw (only at DisposeVulkan). Always safe.
+    //   * Framebuffers key on (attachment image-view handles[], extent). They
+    //     DO reference specific image views, so a cached framebuffer is purged
+    //     the instant any of its attachment images is destroyed
+    //     (PurgeCachedFramebuffersForImage, hooked into DestroyGuestImage). That
+    //     destroy path is always preceded by WaitForAllGuestSubmissions (evict /
+    //     realloc) or DeviceWaitIdle (dispose), the same drain-before-destroy
+    //     invariant the per-image cached framebuffer already depends on, so no
+    //     in-flight submission can reference a purged framebuffer.
+    // Default (unset) keeps the byte-identical create-and-destroy-every-draw path.
+    private static readonly bool _cacheRenderPass =
+        string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_CACHE_RENDERPASS"),
+            "1",
+            StringComparison.Ordinal);
 
     private const uint DefaultWindowWidth = 1280;
     private const uint DefaultWindowHeight = 720;
@@ -2930,6 +2950,9 @@ internal static unsafe class VulkanVideoPresenter
         private long _dtValidateTicks;       // prologue: MRT format/blend validation + LINQ, pre-setup
         private long _dtSetupTicks;          // guest-image get + depth + transient pass (incl capacityWait)
         private long _dtCapacityWaitTicks;   // EnsureGuestSubmissionCapacity blocking + reaping (subset of setup)
+        private long _dtCapFenceTicks;       // capacityWait: pure GPU fence-wait (WaitForFences on oldest)
+        private long _dtCapReapTicks;        // capacityWait: CPU reap (fb/renderpass/imageview destroys, frees)
+        private bool _dtCapacityActive;      // true only inside EnsureGuestSubmissionCapacity, to scope the split
         private long _dtPostTicks;           // post-submit bookkeeping (publish/locks/marks), pre-teardown
         private long _dtTeardownTicks;       // finally: transient framebuffer/renderpass destroy + resource free
         private long _dtResolveTicks;        // texture/global/vertex/index resolve+upload
@@ -3063,6 +3086,16 @@ internal static unsafe class VulkanVideoPresenter
         private bool _deviceLostLogged;
         private int _directPresentationCount;
         private readonly GuestSurfaceCache _guestImages = new();
+        // SHARPEMU_CACHE_RENDERPASS caches (all render-thread state, no locking).
+        // Render passes: keyed by attachment formats + clear-depth, never image-
+        // coupled, destroyed only at DisposeVulkan. Framebuffers: keyed by exact
+        // attachment view handles + extent; _framebufferViewIndex maps each view
+        // handle to the framebuffer keys that reference it so DestroyGuestImage
+        // can purge dependents. _framebufferPurgeHandles is scratch for that purge.
+        private readonly Dictionary<RenderPassCacheKey, RenderPass> _renderPassCache = new();
+        private readonly Dictionary<FramebufferCacheKey, CachedFramebuffer> _framebufferCache = new();
+        private readonly Dictionary<ulong, List<FramebufferCacheKey>> _framebufferViewIndex = new();
+        private readonly HashSet<ulong> _framebufferPurgeHandles = [];
         private readonly VulkanDeviceMemoryLedger _deviceMemoryLedger = new();
         // Free-list of retired guest-image device-memory blocks eligible for
         // reuse (SHARPEMU_REUSE_GUEST_IMAGE_MEMORY). Keyed by the exact
@@ -3182,6 +3215,119 @@ internal static unsafe class VulkanVideoPresenter
             VkBuffer Buffer,
             DeviceMemory Memory,
             HostBufferPoolKey Key);
+
+        // Structural key for the transient render-pass cache: the ordered color
+        // attachment formats, the depth format (-1 = none), and whether depth is
+        // cleared (its load op differs). Equality compares the format array by value.
+        private sealed class RenderPassCacheKey : IEquatable<RenderPassCacheKey>
+        {
+            private readonly int[] _formats;
+            private readonly int _depthFormat;
+            private readonly bool _clearDepth;
+            private readonly int _hash;
+
+            public RenderPassCacheKey(int[] formats, int depthFormat, bool clearDepth)
+            {
+                _formats = formats;
+                _depthFormat = depthFormat;
+                _clearDepth = clearDepth;
+                var hash = new HashCode();
+                foreach (var format in formats)
+                {
+                    hash.Add(format);
+                }
+
+                hash.Add(depthFormat);
+                hash.Add(clearDepth);
+                _hash = hash.ToHashCode();
+            }
+
+            public bool Equals(RenderPassCacheKey? other)
+            {
+                if (other is null ||
+                    _depthFormat != other._depthFormat ||
+                    _clearDepth != other._clearDepth ||
+                    _formats.Length != other._formats.Length)
+                {
+                    return false;
+                }
+
+                for (var index = 0; index < _formats.Length; index++)
+                {
+                    if (_formats[index] != other._formats[index])
+                    {
+                        return false;
+                    }
+                }
+
+                return true;
+            }
+
+            public override bool Equals(object? obj) => Equals(obj as RenderPassCacheKey);
+
+            public override int GetHashCode() => _hash;
+        }
+
+        // Structural key for the transient framebuffer cache: the ordered
+        // attachment image-view handles (color then depth) plus the render extent.
+        // Distinct guest images always own distinct view handles, so identical
+        // keys mean genuinely reusable framebuffers.
+        private sealed class FramebufferCacheKey : IEquatable<FramebufferCacheKey>
+        {
+            private readonly ulong[] _handles;
+            private readonly uint _width;
+            private readonly uint _height;
+            private readonly int _hash;
+
+            public FramebufferCacheKey(ulong[] handles, uint width, uint height)
+            {
+                _handles = handles;
+                _width = width;
+                _height = height;
+                var hash = new HashCode();
+                foreach (var handle in handles)
+                {
+                    hash.Add(handle);
+                }
+
+                hash.Add(width);
+                hash.Add(height);
+                _hash = hash.ToHashCode();
+            }
+
+            public bool Equals(FramebufferCacheKey? other)
+            {
+                if (other is null ||
+                    _width != other._width ||
+                    _height != other._height ||
+                    _handles.Length != other._handles.Length)
+                {
+                    return false;
+                }
+
+                for (var index = 0; index < _handles.Length; index++)
+                {
+                    if (_handles[index] != other._handles[index])
+                    {
+                        return false;
+                    }
+                }
+
+                return true;
+            }
+
+            public override bool Equals(object? obj) => Equals(obj as FramebufferCacheKey);
+
+            public override int GetHashCode() => _hash;
+        }
+
+        // A cached framebuffer plus the view handles it was built from, kept so
+        // the purge path can unregister it from every referencing view handle.
+        private sealed class CachedFramebuffer(Framebuffer framebuffer, ulong[] viewHandles)
+        {
+            public Framebuffer Framebuffer { get; } = framebuffer;
+            public ulong[] ViewHandles { get; } = viewHandles;
+        }
 
         private sealed class TranslatedDrawResources
         {
@@ -4712,10 +4858,26 @@ internal static unsafe class VulkanVideoPresenter
 
         private void EnsureGuestSubmissionCapacity()
         {
-            CollectCompletedGuestSubmissions(waitForOldest: false);
-            if (_pendingGuestSubmissions.Count >= MaxInFlightGuestSubmissions)
+            // Scope the fence-vs-reap split (capFence/capReap) to only the work
+            // done on behalf of the per-draw capacity throttle, so it sums back
+            // to capacityWait rather than counting present-path reaps too.
+            var previousCapacityActive = _dtCapacityActive;
+            if (_drawTiming)
             {
-                CollectCompletedGuestSubmissions(waitForOldest: true);
+                _dtCapacityActive = true;
+            }
+
+            try
+            {
+                CollectCompletedGuestSubmissions(waitForOldest: false);
+                if (_pendingGuestSubmissions.Count >= MaxInFlightGuestSubmissions)
+                {
+                    CollectCompletedGuestSubmissions(waitForOldest: true);
+                }
+            }
+            finally
+            {
+                _dtCapacityActive = previousCapacityActive;
             }
         }
 
@@ -4729,24 +4891,41 @@ internal static unsafe class VulkanVideoPresenter
 
         private void CollectCompletedGuestSubmissions(bool waitForOldest)
         {
+            var splitCapacity = _drawTiming && _dtCapacityActive;
             if (waitForOldest && _pendingGuestSubmissions.TryPeek(out var oldest))
             {
                 var fence = oldest.Fence;
-                long tWait0 = _perfPhases ? Stopwatch.GetTimestamp() : 0;
+                var timeFence = _perfPhases || splitCapacity;
+                long tWait0 = timeFence ? Stopwatch.GetTimestamp() : 0;
                 var result = _vk.WaitForFences(
                     _device,
                     1,
                     &fence,
                     true,
                     ulong.MaxValue);
-                if (_perfPhases)
+                if (timeFence)
                 {
-                    _perfFenceAccumTicks += Stopwatch.GetTimestamp() - tWait0;
+                    var fenceDelta = Stopwatch.GetTimestamp() - tWait0;
+                    if (_perfPhases)
+                    {
+                        _perfFenceAccumTicks += fenceDelta;
+                    }
+
+                    if (splitCapacity)
+                    {
+                        // Pure GPU-execution wait: the render thread blocked here
+                        // for the oldest guest submission's fence to signal.
+                        _dtCapFenceTicks += fenceDelta;
+                    }
                 }
 
                 Check(result, $"vkWaitForFences(guest: {oldest.DebugName})");
             }
 
+            // Everything below is the CPU reap: fence-status polls plus the
+            // per-submission resource teardown (transient framebuffer/renderpass/
+            // imageview destroys, command-buffer + fence frees).
+            long tReap0 = splitCapacity ? Stopwatch.GetTimestamp() : 0;
             while (_pendingGuestSubmissions.TryPeek(out var submission))
             {
                 var status = _vk.GetFenceStatus(_device, submission.Fence);
@@ -4785,6 +4964,11 @@ internal static unsafe class VulkanVideoPresenter
                     1,
                     &commandBuffer);
                 _vk.DestroyFence(_device, submission.Fence, null);
+            }
+
+            if (splitCapacity)
+            {
+                _dtCapReapTicks += Stopwatch.GetTimestamp() - tReap0;
             }
         }
 
@@ -8681,16 +8865,37 @@ internal static unsafe class VulkanVideoPresenter
                 // the color targets with the depth surface.
                 if (targets.Length > 1 || depthImage is not null)
                 {
-                    (renderPass, framebuffer) = CreateRenderPassAndFramebuffer(
-                        formats,
-                        targets.Select(target => target.AttachmentView).ToArray(),
-                        renderWidth,
-                        renderHeight,
-                        depthImage?.Format,
-                        depthImage?.View ?? default,
-                        clearDepth);
-                    transientRenderPass = renderPass;
-                    transientFramebuffer = framebuffer;
+                    var attachmentViews =
+                        targets.Select(target => target.AttachmentView).ToArray();
+                    if (_cacheRenderPass)
+                    {
+                        // Cached: the render pass + framebuffer are owned by the
+                        // caches (destroyed on image-purge / dispose), NOT by this
+                        // draw, so transientRenderPass/transientFramebuffer stay 0
+                        // and the per-draw finally/reap never destroys them.
+                        (renderPass, framebuffer) =
+                            GetOrCreateCachedRenderPassAndFramebuffer(
+                                formats,
+                                attachmentViews,
+                                renderWidth,
+                                renderHeight,
+                                depthImage?.Format,
+                                depthImage?.View ?? default,
+                                clearDepth);
+                    }
+                    else
+                    {
+                        (renderPass, framebuffer) = CreateRenderPassAndFramebuffer(
+                            formats,
+                            attachmentViews,
+                            renderWidth,
+                            renderHeight,
+                            depthImage?.Format,
+                            depthImage?.View ?? default,
+                            clearDepth);
+                        transientRenderPass = renderPass;
+                        transientFramebuffer = framebuffer;
+                    }
                 }
 
                 if (_drawTiming)
@@ -9749,11 +9954,21 @@ internal static unsafe class VulkanVideoPresenter
                 throw new InvalidOperationException("render target formats and views must have matching counts");
             }
 
+            var renderPass = CreateRenderPassOnly(formats, depthFormat, clearDepth);
+            var framebuffer = CreateFramebufferOnly(
+                renderPass, attachmentViews, depthFormat.HasValue, depthView, width, height);
+            return (renderPass, framebuffer);
+        }
+
+        private RenderPass CreateRenderPassOnly(
+            IReadOnlyList<Format> formats,
+            Format? depthFormat,
+            bool clearDepth)
+        {
             var hasDepth = depthFormat.HasValue;
             var attachmentCount = formats.Count + (hasDepth ? 1 : 0);
             var attachments = stackalloc AttachmentDescription[attachmentCount];
             var colorReferences = stackalloc AttachmentReference[formats.Count];
-            var views = stackalloc ImageView[attachmentCount];
             for (var index = 0; index < formats.Count; index++)
             {
                 attachments[index] = new AttachmentDescription
@@ -9772,7 +9987,6 @@ internal static unsafe class VulkanVideoPresenter
                     Attachment = (uint)index,
                     Layout = ImageLayout.ColorAttachmentOptimal,
                 };
-                views[index] = attachmentViews[index];
             }
 
             var depthReference = new AttachmentReference
@@ -9793,7 +10007,6 @@ internal static unsafe class VulkanVideoPresenter
                     InitialLayout = ImageLayout.DepthStencilAttachmentOptimal,
                     FinalLayout = ImageLayout.DepthStencilAttachmentOptimal,
                 };
-                views[formats.Count] = depthView;
             }
 
             var subpass = new SubpassDescription
@@ -9814,6 +10027,28 @@ internal static unsafe class VulkanVideoPresenter
             Check(
                 _vk.CreateRenderPass(_device, &renderPassInfo, null, out var renderPass),
                 "vkCreateRenderPass(offscreen)");
+            return renderPass;
+        }
+
+        private Framebuffer CreateFramebufferOnly(
+            RenderPass renderPass,
+            IReadOnlyList<ImageView> attachmentViews,
+            bool hasDepth,
+            ImageView depthView,
+            uint width,
+            uint height)
+        {
+            var attachmentCount = attachmentViews.Count + (hasDepth ? 1 : 0);
+            var views = stackalloc ImageView[attachmentCount];
+            for (var index = 0; index < attachmentViews.Count; index++)
+            {
+                views[index] = attachmentViews[index];
+            }
+
+            if (hasDepth)
+            {
+                views[attachmentViews.Count] = depthView;
+            }
 
             var framebufferInfo = new FramebufferCreateInfo
             {
@@ -9828,8 +10063,181 @@ internal static unsafe class VulkanVideoPresenter
             Check(
                 _vk.CreateFramebuffer(_device, &framebufferInfo, null, out var framebuffer),
                 "vkCreateFramebuffer(offscreen)");
+            return framebuffer;
+        }
 
-            return (renderPass, framebuffer);
+        // SHARPEMU_CACHE_RENDERPASS: returns a cached (VkRenderPass, VkFramebuffer)
+        // pair for a transient depth/MRT offscreen draw, creating either half only
+        // on a cache miss. The render pass keys on the attachment formats +
+        // clear-depth (never destroyed per-draw); the framebuffer keys on the
+        // exact attachment image-view handles + extent, and every cached
+        // framebuffer registers its view handles so DestroyGuestImage can purge it
+        // when an attachment image goes away (see PurgeCachedFramebuffersForImage).
+        private (RenderPass RenderPass, Framebuffer Framebuffer)
+            GetOrCreateCachedRenderPassAndFramebuffer(
+                IReadOnlyList<Format> formats,
+                IReadOnlyList<ImageView> attachmentViews,
+                uint width,
+                uint height,
+                Format? depthFormat,
+                ImageView depthView,
+                bool clearDepth)
+        {
+            var hasDepth = depthFormat.HasValue;
+            var renderPassKey = new RenderPassCacheKey(
+                FormatKey(formats),
+                hasDepth ? (int)depthFormat!.Value : -1,
+                clearDepth);
+            if (!_renderPassCache.TryGetValue(renderPassKey, out var renderPass))
+            {
+                renderPass = CreateRenderPassOnly(formats, depthFormat, clearDepth);
+                _renderPassCache[renderPassKey] = renderPass;
+            }
+
+            // Framebuffer compatibility ignores load/store ops, so the key omits
+            // clearDepth: one framebuffer serves both the clear and load render
+            // passes over the same views.
+            var handleCount = attachmentViews.Count + (hasDepth ? 1 : 0);
+            var handles = new ulong[handleCount];
+            for (var index = 0; index < attachmentViews.Count; index++)
+            {
+                handles[index] = attachmentViews[index].Handle;
+            }
+
+            if (hasDepth)
+            {
+                handles[attachmentViews.Count] = depthView.Handle;
+            }
+
+            var framebufferKey = new FramebufferCacheKey(handles, width, height);
+            if (!_framebufferCache.TryGetValue(framebufferKey, out var cached))
+            {
+                var framebuffer = CreateFramebufferOnly(
+                    renderPass, attachmentViews, hasDepth, depthView, width, height);
+                cached = new CachedFramebuffer(framebuffer, handles);
+                _framebufferCache[framebufferKey] = cached;
+                foreach (var handle in handles)
+                {
+                    if (handle == 0)
+                    {
+                        continue;
+                    }
+
+                    if (!_framebufferViewIndex.TryGetValue(handle, out var keys))
+                    {
+                        keys = [];
+                        _framebufferViewIndex[handle] = keys;
+                    }
+
+                    keys.Add(framebufferKey);
+                }
+            }
+
+            return (renderPass, cached.Framebuffer);
+        }
+
+        // Purges every cached framebuffer that references one of this image's
+        // attachment image views, destroying the Vulkan object. Called from
+        // DestroyGuestImage, which is always reached after the render thread has
+        // drained all in-flight guest submissions (WaitForAllGuestSubmissions on
+        // the evict / realloc paths, DeviceWaitIdle on dispose), so no submission
+        // can still reference a purged framebuffer. Handle reuse by the driver is
+        // safe because the stale entry is removed before the handle can be reissued.
+        private void PurgeCachedFramebuffersForImage(GuestImageResource resource)
+        {
+            if (!_cacheRenderPass || _framebufferCache.Count == 0)
+            {
+                return;
+            }
+
+            _framebufferPurgeHandles.Clear();
+            AddPurgeHandle(resource.View.Handle);
+            foreach (var mipView in resource.MipViews)
+            {
+                AddPurgeHandle(mipView.Handle);
+            }
+
+            foreach (var view in resource.FormatViews.Values)
+            {
+                AddPurgeHandle(view.Handle);
+            }
+
+            foreach (var handle in _framebufferPurgeHandles)
+            {
+                if (!_framebufferViewIndex.TryGetValue(handle, out var keys))
+                {
+                    continue;
+                }
+
+                foreach (var key in keys)
+                {
+                    if (!_framebufferCache.Remove(key, out var cached))
+                    {
+                        continue;
+                    }
+
+                    _vk.DestroyFramebuffer(_device, cached.Framebuffer, null);
+                    // Unregister this framebuffer from every OTHER view handle it
+                    // referenced so those index lists never point at a freed object.
+                    foreach (var otherHandle in cached.ViewHandles)
+                    {
+                        if (otherHandle == handle || otherHandle == 0)
+                        {
+                            continue;
+                        }
+
+                        if (_framebufferViewIndex.TryGetValue(otherHandle, out var otherKeys))
+                        {
+                            otherKeys.Remove(key);
+                        }
+                    }
+                }
+
+                _framebufferViewIndex.Remove(handle);
+            }
+
+            _framebufferPurgeHandles.Clear();
+        }
+
+        private void AddPurgeHandle(ulong handle)
+        {
+            if (handle != 0)
+            {
+                _framebufferPurgeHandles.Add(handle);
+            }
+        }
+
+        // Destroys every cached render pass and framebuffer. Called only from
+        // DisposeVulkan after DeviceWaitIdle, so the GPU is idle and nothing
+        // references these objects.
+        private void DestroyRenderPassFramebufferCaches()
+        {
+            foreach (var cached in _framebufferCache.Values)
+            {
+                _vk.DestroyFramebuffer(_device, cached.Framebuffer, null);
+            }
+
+            _framebufferCache.Clear();
+            _framebufferViewIndex.Clear();
+            _framebufferPurgeHandles.Clear();
+
+            foreach (var renderPass in _renderPassCache.Values)
+            {
+                _vk.DestroyRenderPass(_device, renderPass, null);
+            }
+
+            _renderPassCache.Clear();
+        }
+
+        private static int[] FormatKey(IReadOnlyList<Format> formats)
+        {
+            var key = new int[formats.Count];
+            for (var index = 0; index < formats.Count; index++)
+            {
+                key[index] = (int)formats[index];
+            }
+
+            return key;
         }
 
         private static uint ClampMipLevels(uint width, uint height, uint requestedMipLevels)
@@ -9847,6 +10255,12 @@ internal static unsafe class VulkanVideoPresenter
 
         private void DestroyGuestImage(GuestImageResource resource)
         {
+            // Correctness (SHARPEMU_CACHE_RENDERPASS): any cached framebuffer that
+            // binds one of this image's views is now dangling; destroy it before
+            // the views below are freed. Every caller has already drained in-flight
+            // guest submissions, so no recorded-but-pending draw references it.
+            PurgeCachedFramebuffersForImage(resource);
+
             foreach (var view in resource.FormatViews.Values)
             {
                 if (view.Handle != 0)
@@ -10256,6 +10670,13 @@ internal static unsafe class VulkanVideoPresenter
         {
             var validate = TicksToMs(_dtValidateTicks);
             var capacityWait = TicksToMs(_dtCapacityWaitTicks);
+            // capacityWait split: capFence = pure GPU fence-wait (submissions
+            // retiring on the GPU); capReap = CPU reap/destroy of retired
+            // submissions (framebuffer/renderpass/imageview destroys, frees).
+            // capFence + capReap ~= capacityWait; if capFence dominates the cost
+            // is GPU-execution-bound, if capReap dominates it is CPU-teardown-bound.
+            var capFence = TicksToMs(_dtCapFenceTicks);
+            var capReap = TicksToMs(_dtCapReapTicks);
             // _dtSetupTicks spans the whole setup phase INCLUDING the capacity
             // wait; report the image-create part alone so setup and capacityWait
             // are disjoint and sum back to the raw setup span.
@@ -10276,6 +10697,7 @@ internal static unsafe class VulkanVideoPresenter
             Console.Error.WriteLine(
                 $"[LOADER][DRAWTIME] draws={_dtDraws} total={total:F1} perDraw={perDraw:F2} " +
                 $"validate={validate:F1} setup={setup:F1} capacityWait={capacityWait:F1} " +
+                $"capFence={capFence:F1} capReap={capReap:F1} " +
                 $"resolve={resolve:F1} descriptors={descriptors:F1} " +
                 $"pipeLookup={pipeLookup:F1} pipeCreate={pipeCreate:F1} " +
                 $"record={record:F1} submit={submit:F1} " +
@@ -10286,6 +10708,8 @@ internal static unsafe class VulkanVideoPresenter
             _dtValidateTicks = 0;
             _dtSetupTicks = 0;
             _dtCapacityWaitTicks = 0;
+            _dtCapFenceTicks = 0;
+            _dtCapReapTicks = 0;
             _dtResolveTicks = 0;
             _dtDescriptorTicks = 0;
             _dtPipelineLookupTicks = 0;
@@ -12886,6 +13310,10 @@ internal static unsafe class VulkanVideoPresenter
             }
             _guestImageVersions.Clear();
             _capturedGuestFlipVersions.Clear();
+            // SHARPEMU_CACHE_RENDERPASS: destroy any surviving cached render
+            // passes (never image-coupled) and framebuffers. The device is idle
+            // (DeviceWaitIdle above) so this is safe; must run before DestroyDevice.
+            DestroyRenderPassFramebufferCaches();
             // Destroying the images above may have parked their blocks in the
             // reuse pool (GPU is idle here); really free them before the device
             // goes away so no VkDeviceMemory outlives vkDestroyDevice.
