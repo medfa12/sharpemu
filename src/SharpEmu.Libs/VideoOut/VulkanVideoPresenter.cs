@@ -3005,6 +3005,10 @@ internal static unsafe partial class VulkanVideoPresenter
             public bool DescriptorLayoutCached;
             public DescriptorSetLayout DescriptorSetLayout;
             public DescriptorPool DescriptorPool;
+            // Non-default only when SHARPEMU_POOL_DRAW_OBJECTS created/rented
+            // this DescriptorPool for a known (sampled/storage/buffer) shape;
+            // used at destroy time to park it back under the right bucket.
+            public DescriptorPoolBucketKey DescriptorPoolKey;
             public DescriptorSet DescriptorSet;
             public TextureResource[] Textures = [];
             public GlobalBufferResource[] GlobalMemoryBuffers = [];
@@ -3087,6 +3091,11 @@ internal static unsafe partial class VulkanVideoPresenter
             // resources, where the recorder chooses vkCmdCopyImage vs
             // vkCmdBlitImage by comparing it against the producer's format.
             public Format Format;
+            // Non-null only when SHARPEMU_POOL_DRAW_OBJECTS rented/created Image/
+            // ImageMemory/View from the per-draw texture-image pool; the entry
+            // (and its View) is parked back at destroy time instead of being
+            // destroyed. Only ever set alongside OwnsStorage=true, GuestImage=null.
+            public PooledTextureImage? PooledStorage;
         }
 
         private sealed class GlobalBufferResource
@@ -4206,38 +4215,14 @@ internal static unsafe partial class VulkanVideoPresenter
             }
         }
 
-        private CommandBuffer AllocateGuestCommandBuffer()
-        {
-            var allocateInfo = new CommandBufferAllocateInfo
-            {
-                SType = StructureType.CommandBufferAllocateInfo,
-                CommandPool = _commandPool,
-                Level = CommandBufferLevel.Primary,
-                CommandBufferCount = 1,
-            };
-            CommandBuffer commandBuffer;
-            Check(
-                _vk.AllocateCommandBuffers(
-                    _device,
-                    &allocateInfo,
-                    out commandBuffer),
-                "vkAllocateCommandBuffers(guest)");
-            return commandBuffer;
-        }
+        private CommandBuffer AllocateGuestCommandBuffer() => RentGuestCommandBuffer();
 
         private void SubmitGuestCommandBuffer(
             CommandBuffer commandBuffer,
             TranslatedDrawResources resources,
             IReadOnlyList<GuestImageResource> traceImages)
         {
-            var fenceInfo = new FenceCreateInfo
-            {
-                SType = StructureType.FenceCreateInfo,
-            };
-            Fence fence;
-            Check(
-                _vk.CreateFence(_device, &fenceInfo, null, out fence),
-                "vkCreateFence(guest)");
+            var fence = RentGuestFence();
             try
             {
                 var submitInfo = new SubmitInfo
@@ -4252,7 +4237,9 @@ internal static unsafe partial class VulkanVideoPresenter
             }
             catch
             {
-                _vk.DestroyFence(_device, fence, null);
+                // vkQueueSubmit failed, so the fence is unsignaled and was never
+                // touched by the driver -- park it without a reset.
+                ParkGuestFence(fence, needsReset: false);
                 throw;
             }
 
@@ -4271,14 +4258,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
         private void SubmitGuestCommandBufferAndWait(CommandBuffer commandBuffer)
         {
-            var fenceInfo = new FenceCreateInfo
-            {
-                SType = StructureType.FenceCreateInfo,
-            };
-            Fence fence;
-            Check(
-                _vk.CreateFence(_device, &fenceInfo, null, out fence),
-                "vkCreateFence(guest chunk)");
+            var fence = RentGuestFence();
             try
             {
                 var submitInfo = new SubmitInfo
@@ -4296,10 +4276,14 @@ internal static unsafe partial class VulkanVideoPresenter
             }
             finally
             {
-                _vk.DestroyFence(_device, fence, null);
+                // Every path here (success, throw-before-signal, throw-after-
+                // signal) leaves the fence either unsignaled or WaitForFences-
+                // observed signaled, so an unconditional reset keeps the pool
+                // invariant (unsignaled-only) on every path.
+                ParkGuestFence(fence, needsReset: true);
             }
 
-            _vk.FreeCommandBuffers(_device, _commandPool, 1, &commandBuffer);
+            ParkGuestCommandBuffer(commandBuffer);
         }
 
         private void EnsureGuestSubmissionCapacity()
@@ -4403,13 +4387,10 @@ internal static unsafe partial class VulkanVideoPresenter
                 }
 
                 DestroyTranslatedDrawResources(submission.Resources);
-                var commandBuffer = submission.CommandBuffer;
-                _vk.FreeCommandBuffers(
-                    _device,
-                    _commandPool,
-                    1,
-                    &commandBuffer);
-                _vk.DestroyFence(_device, submission.Fence, null);
+                ParkGuestCommandBuffer(submission.CommandBuffer);
+                // The fence status was just confirmed Success above, so it is
+                // safe to reset and reuse.
+                ParkGuestFence(submission.Fence, needsReset: true);
             }
 
             if (splitCapacity)
@@ -5259,25 +5240,35 @@ internal static unsafe partial class VulkanVideoPresenter
                 };
             }
 
-            fixed (DescriptorPoolSize* poolSizePointer = poolSizes)
+            var bucketKey = new DescriptorPoolBucketKey(
+                (uint)sampledImageCount, (uint)storageImageCount, (uint)globalBufferCount);
+            if (_poolDrawObjects)
             {
-                var poolInfo = new DescriptorPoolCreateInfo
-                {
-                    SType = StructureType.DescriptorPoolCreateInfo,
-                    MaxSets = 1,
-                    PoolSizeCount = (uint)poolSizes.Length,
-                    PPoolSizes = poolSizePointer,
-                };
-                DescriptorPool descriptorPool;
-                Check(
-                    _vk.CreateDescriptorPool(
-                        _device,
-                        &poolInfo,
-                        null,
-                        out descriptorPool),
-                    "vkCreateDescriptorPool");
-                resources.DescriptorPool = descriptorPool;
+                resources.DescriptorPoolKey = bucketKey;
             }
+
+            if (!TryRentDescriptorPool(bucketKey, out var descriptorPool))
+            {
+                fixed (DescriptorPoolSize* poolSizePointer = poolSizes)
+                {
+                    var poolInfo = new DescriptorPoolCreateInfo
+                    {
+                        SType = StructureType.DescriptorPoolCreateInfo,
+                        MaxSets = 1,
+                        PoolSizeCount = (uint)poolSizes.Length,
+                        PPoolSizes = poolSizePointer,
+                    };
+                    Check(
+                        _vk.CreateDescriptorPool(
+                            _device,
+                            &poolInfo,
+                            null,
+                            out descriptorPool),
+                        "vkCreateDescriptorPool");
+                }
+            }
+
+            resources.DescriptorPool = descriptorPool;
 
             var allocateInfo = new DescriptorSetAllocateInfo
             {
@@ -6029,39 +6020,64 @@ internal static unsafe partial class VulkanVideoPresenter
                 SharingMode = SharingMode.Exclusive,
                 InitialLayout = ImageLayout.Undefined,
             };
-            Check(_vk.CreateImage(_device, &imageInfo, null, out var image), "vkCreateImage(copy_on_sample)");
-            _vk.GetImageMemoryRequirements(_device, image, out var imageRequirements);
-            var memoryInfo = new MemoryAllocateInfo
-            {
-                SType = StructureType.MemoryAllocateInfo,
-                AllocationSize = imageRequirements.Size,
-                MemoryTypeIndex = FindMemoryType(
-                    imageRequirements.MemoryTypeBits,
-                    MemoryPropertyFlags.DeviceLocalBit),
-            };
-            DeviceMemory imageMemory = default;
+            var poolKey = new PooledTextureImageKey((int)vkFormat, width, height, supportsAttachmentUsage);
+            Image image;
+            DeviceMemory imageMemory;
             ImageView view;
-            try
+            PooledTextureImage? pooledEntry = null;
+            if (_poolDrawObjects &&
+                TryRentPooledTextureImage(poolKey, texture.DstSelect, out pooledEntry, out view))
             {
-                imageMemory = AllocateDeviceMemory(memoryInfo, "copy_on_sample");
-                Check(_vk.BindImageMemory(_device, image, imageMemory, 0), "vkBindImageMemory(copy_on_sample)");
-
-                var viewInfo = new ImageViewCreateInfo
-                {
-                    SType = StructureType.ImageViewCreateInfo,
-                    Image = image,
-                    ViewType = ImageViewType.Type2D,
-                    Format = vkFormat,
-                    Components = ToVkComponentMapping(texture.DstSelect),
-                    SubresourceRange = ColorSubresourceRange(),
-                };
-                Check(_vk.CreateImageView(_device, &viewInfo, null, out view), "vkCreateImageView(copy_on_sample)");
+                image = pooledEntry.Image;
+                imageMemory = pooledEntry.Memory;
             }
-            catch
+            else
             {
-                _vk.DestroyImage(_device, image, null);
-                FreeDeviceMemory(imageMemory);
-                throw;
+                Check(_vk.CreateImage(_device, &imageInfo, null, out image), "vkCreateImage(copy_on_sample)");
+                _vk.GetImageMemoryRequirements(_device, image, out var imageRequirements);
+                var memoryInfo = new MemoryAllocateInfo
+                {
+                    SType = StructureType.MemoryAllocateInfo,
+                    AllocationSize = imageRequirements.Size,
+                    MemoryTypeIndex = FindMemoryType(
+                        imageRequirements.MemoryTypeBits,
+                        MemoryPropertyFlags.DeviceLocalBit),
+                };
+                imageMemory = default;
+                try
+                {
+                    imageMemory = AllocateDeviceMemory(memoryInfo, "copy_on_sample");
+                    Check(_vk.BindImageMemory(_device, image, imageMemory, 0), "vkBindImageMemory(copy_on_sample)");
+
+                    var viewInfo = new ImageViewCreateInfo
+                    {
+                        SType = StructureType.ImageViewCreateInfo,
+                        Image = image,
+                        ViewType = ImageViewType.Type2D,
+                        Format = vkFormat,
+                        Components = ToVkComponentMapping(texture.DstSelect),
+                        SubresourceRange = ColorSubresourceRange(),
+                    };
+                    Check(_vk.CreateImageView(_device, &viewInfo, null, out view), "vkCreateImageView(copy_on_sample)");
+                }
+                catch
+                {
+                    _vk.DestroyImage(_device, image, null);
+                    FreeDeviceMemory(imageMemory);
+                    throw;
+                }
+
+                if (_poolDrawObjects)
+                {
+                    pooledEntry = new PooledTextureImage
+                    {
+                        Image = image,
+                        Memory = imageMemory,
+                        MemorySize = imageRequirements.Size,
+                        Key = poolKey,
+                    };
+                    pooledEntry.Views[texture.DstSelect] = view;
+                }
             }
 
             var debugName = TextureDebugName(texture, vkFormat);
@@ -6081,6 +6097,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 SamplerState = texture.Sampler,
                 NeedsUpload = true,
                 OwnsStorage = true,
+                PooledStorage = pooledEntry,
                 CopySource = producer,
                 Format = vkFormat,
             };
@@ -6375,64 +6392,128 @@ internal static unsafe partial class VulkanVideoPresenter
             var contentFingerprint = ComputeTextureContentFingerprint(pixels);
 
             var supportsAttachmentUsage = !IsBlockCompressedFormat(vkFormat);
-            var imageInfo = new ImageCreateInfo
-            {
-                SType = StructureType.ImageCreateInfo,
-                Flags = supportsAttachmentUsage
-                    ? ImageCreateFlags.CreateMutableFormatBit | ImageCreateFlags.CreateExtendedUsageBit
-                    : 0,
-                ImageType = ImageType.Type2D,
-                Format = vkFormat,
-                Extent = new Extent3D(width, height, 1),
-                MipLevels = 1,
-                ArrayLayers = 1,
-                Samples = SampleCountFlags.Count1Bit,
-                Tiling = ImageTiling.Optimal,
-                Usage = supportsAttachmentUsage
-                    ? ImageUsageFlags.TransferDstBit |
-                      ImageUsageFlags.SampledBit |
-                      ImageUsageFlags.ColorAttachmentBit |
-                      ImageUsageFlags.StorageBit |
-                      ImageUsageFlags.TransferSrcBit
-                    : ImageUsageFlags.TransferDstBit | ImageUsageFlags.SampledBit,
-                SharingMode = SharingMode.Exclusive,
-                InitialLayout = ImageLayout.Undefined,
-            };
-            Check(_vk.CreateImage(_device, &imageInfo, null, out var image), "vkCreateImage(texture)");
-            _vk.GetImageMemoryRequirements(_device, image, out var imageRequirements);
-            var memoryInfo = new MemoryAllocateInfo
-            {
-                SType = StructureType.MemoryAllocateInfo,
-                AllocationSize = imageRequirements.Size,
-                MemoryTypeIndex = FindMemoryType(
-                    imageRequirements.MemoryTypeBits,
-                    MemoryPropertyFlags.DeviceLocalBit),
-            };
-            DeviceMemory imageMemory = default;
-            ImageView view;
-            try
-            {
-                imageMemory = AllocateDeviceMemory(memoryInfo, "texture");
-                Check(_vk.BindImageMemory(_device, image, imageMemory, 0), "vkBindImageMemory(texture)");
 
-                var viewInfo = new ImageViewCreateInfo
-                {
-                    SType = StructureType.ImageViewCreateInfo,
-                    Image = image,
-                    ViewType = ImageViewType.Type2D,
-                    Format = vkFormat,
-                    Components = ToVkComponentMapping(texture.DstSelect),
-                    SubresourceRange = ColorSubresourceRange(),
-                };
-                Check(_vk.CreateImageView(_device, &viewInfo, null, out view), "vkCreateImageView(texture)");
-            }
-            catch
+            // Pool eligibility mirrors the ownership-transfer check below
+            // (texture.Address != 0 && !uploadIsLiveRenderTarget &&
+            // !_guestImages.ContainsAddress): this image is only safe to pool
+            // when it is provably NOT about to be handed over to the guest-image
+            // registry, i.e. when that check will fail. AllocateDeviceMemory
+            // (directly, and via CreateTextureStagingBuffer below) can run
+            // EvictLeastRecentlyUsedGuestImages between this check and the
+            // transfer check, which can remove texture.Address from the
+            // registries and make the two checks disagree; the transfer check
+            // below is additionally gated on pooledEntry == null so a pooled
+            // image (rented or freshly pooled) is never handed to the
+            // registry regardless of what eviction did in between.
+            var poolEligible = false;
+            if (_poolDrawObjects)
             {
-                // A partially-created texture never reaches resources.Textures,
-                // so the per-draw cleanup cannot free it. Unwind it here.
-                _vk.DestroyImage(_device, image, null);
-                FreeDeviceMemory(imageMemory);
-                throw;
+                if (texture.Address == 0)
+                {
+                    poolEligible = true;
+                }
+                else
+                {
+                    lock (_gate)
+                    {
+                        poolEligible =
+                            _renderTargetGuestImages.ContainsKey(texture.Address) ||
+                            _gpuGuestImages.ContainsKey(texture.Address) ||
+                            _guestImages.ContainsAddress(texture.Address);
+                    }
+                }
+            }
+
+            var poolKey = new PooledTextureImageKey((int)vkFormat, width, height, supportsAttachmentUsage);
+            Image image;
+            DeviceMemory imageMemory;
+            ImageView view;
+            PooledTextureImage? pooledEntry = null;
+            var imageRequirementsSize = 0UL;
+            // Only used when this call ends up in the ownership-transfer branch
+            // below, which is mutually exclusive with a pool rent/park (that
+            // branch is only reached when poolEligible was false).
+            var memoryTypeIndexForGuestImage = 0u;
+            if (poolEligible && TryRentPooledTextureImage(poolKey, texture.DstSelect, out pooledEntry, out view))
+            {
+                image = pooledEntry.Image;
+                imageMemory = pooledEntry.Memory;
+                imageRequirementsSize = pooledEntry.MemorySize;
+            }
+            else
+            {
+                var imageInfo = new ImageCreateInfo
+                {
+                    SType = StructureType.ImageCreateInfo,
+                    Flags = supportsAttachmentUsage
+                        ? ImageCreateFlags.CreateMutableFormatBit | ImageCreateFlags.CreateExtendedUsageBit
+                        : 0,
+                    ImageType = ImageType.Type2D,
+                    Format = vkFormat,
+                    Extent = new Extent3D(width, height, 1),
+                    MipLevels = 1,
+                    ArrayLayers = 1,
+                    Samples = SampleCountFlags.Count1Bit,
+                    Tiling = ImageTiling.Optimal,
+                    Usage = supportsAttachmentUsage
+                        ? ImageUsageFlags.TransferDstBit |
+                          ImageUsageFlags.SampledBit |
+                          ImageUsageFlags.ColorAttachmentBit |
+                          ImageUsageFlags.StorageBit |
+                          ImageUsageFlags.TransferSrcBit
+                        : ImageUsageFlags.TransferDstBit | ImageUsageFlags.SampledBit,
+                    SharingMode = SharingMode.Exclusive,
+                    InitialLayout = ImageLayout.Undefined,
+                };
+                Check(_vk.CreateImage(_device, &imageInfo, null, out image), "vkCreateImage(texture)");
+                _vk.GetImageMemoryRequirements(_device, image, out var imageRequirements);
+                var memoryInfo = new MemoryAllocateInfo
+                {
+                    SType = StructureType.MemoryAllocateInfo,
+                    AllocationSize = imageRequirements.Size,
+                    MemoryTypeIndex = FindMemoryType(
+                        imageRequirements.MemoryTypeBits,
+                        MemoryPropertyFlags.DeviceLocalBit),
+                };
+                imageMemory = default;
+                try
+                {
+                    imageMemory = AllocateDeviceMemory(memoryInfo, "texture");
+                    Check(_vk.BindImageMemory(_device, image, imageMemory, 0), "vkBindImageMemory(texture)");
+
+                    var viewInfo = new ImageViewCreateInfo
+                    {
+                        SType = StructureType.ImageViewCreateInfo,
+                        Image = image,
+                        ViewType = ImageViewType.Type2D,
+                        Format = vkFormat,
+                        Components = ToVkComponentMapping(texture.DstSelect),
+                        SubresourceRange = ColorSubresourceRange(),
+                    };
+                    Check(_vk.CreateImageView(_device, &viewInfo, null, out view), "vkCreateImageView(texture)");
+                }
+                catch
+                {
+                    // A partially-created texture never reaches resources.Textures,
+                    // so the per-draw cleanup cannot free it. Unwind it here.
+                    _vk.DestroyImage(_device, image, null);
+                    FreeDeviceMemory(imageMemory);
+                    throw;
+                }
+
+                imageRequirementsSize = imageRequirements.Size;
+                memoryTypeIndexForGuestImage = memoryInfo.MemoryTypeIndex;
+                if (poolEligible)
+                {
+                    pooledEntry = new PooledTextureImage
+                    {
+                        Image = image,
+                        Memory = imageMemory,
+                        MemorySize = imageRequirementsSize,
+                        Key = poolKey,
+                    };
+                    pooledEntry.Views[texture.DstSelect] = view;
+                }
             }
 
             var debugName = TextureDebugName(texture, vkFormat);
@@ -6455,6 +6536,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 DstSelect = texture.DstSelect,
                 NeedsUpload = true,
                 OwnsStorage = true,
+                PooledStorage = pooledEntry,
                 SamplerState = texture.Sampler,
                 CpuContentFingerprint = contentFingerprint,
                 UpdatesCpuContent = texture.Address != 0,
@@ -6485,7 +6567,8 @@ internal static unsafe partial class VulkanVideoPresenter
 
             if (texture.Address != 0 &&
                 !uploadIsLiveRenderTarget &&
-                !_guestImages.ContainsAddress(texture.Address))
+                !_guestImages.ContainsAddress(texture.Address) &&
+                pooledEntry == null)
             {
                 var guestImage = new GuestImageResource
                 {
@@ -6500,8 +6583,8 @@ internal static unsafe partial class VulkanVideoPresenter
                     InitialUploadPending = true,
                     IsCpuBacked = true,
                     CpuContentFingerprint = contentFingerprint,
-                    MemorySize = imageRequirements.Size,
-                    MemoryTypeIndex = memoryInfo.MemoryTypeIndex,
+                    MemorySize = imageRequirementsSize,
+                    MemoryTypeIndex = memoryTypeIndexForGuestImage,
                     LastUseStamp = _useStamp,
                 };
                 _guestImages.Add(guestImage);
@@ -6840,11 +6923,20 @@ internal static unsafe partial class VulkanVideoPresenter
                 {
                     allocation = pooled;
                     _pooledHostBufferBytes -= capacity;
+                    if (_poolDrawObjects)
+                    {
+                        _hostbufRentHit++;
+                    }
                 }
             }
 
             if (allocation is null)
             {
+                if (_poolDrawObjects)
+                {
+                    _hostbufRentMiss++;
+                }
+
                 var buffer = CreateBuffer(
                     capacity,
                     usage,
@@ -6891,27 +6983,123 @@ internal static unsafe partial class VulkanVideoPresenter
                 if (_hostBufferAllocations.TryGetValue(buffer.Handle, out var allocation) &&
                     allocation.Memory.Handle == memory.Handle)
                 {
-                    if (_pooledHostBufferBytes + allocation.Key.Capacity <=
+                    if (_pooledHostBufferBytes + allocation.Key.Capacity >
                         MaxPooledHostBufferBytes)
                     {
-                        _pooledHostBufferBytes += allocation.Key.Capacity;
-                        if (!_hostBufferPool.TryGetValue(allocation.Key, out var available))
+                        if (_poolDrawObjects)
                         {
-                            available = new Stack<HostBufferAllocation>();
-                            _hostBufferPool.Add(allocation.Key, available);
+                            // LRU-evict enough idle buffers (any bucket) to make
+                            // room instead of dropping the incoming allocation.
+                            var bytesToFree =
+                                _pooledHostBufferBytes + allocation.Key.Capacity -
+                                MaxPooledHostBufferBytes;
+                            EvictLruHostBuffersLocked(bytesToFree);
                         }
-
-                        available.Push(allocation);
-                        return;
+                        else
+                        {
+                            // Pool is at capacity; drop this buffer entirely
+                            // (default, unchanged behavior).
+                            _hostBufferAllocations.Remove(buffer.Handle);
+                            goto dropIncoming;
+                        }
                     }
 
-                    // Pool is at capacity; drop this buffer entirely.
-                    _hostBufferAllocations.Remove(buffer.Handle);
+                    _pooledHostBufferBytes += allocation.Key.Capacity;
+                    if (!_hostBufferPool.TryGetValue(allocation.Key, out var available))
+                    {
+                        available = new Stack<HostBufferAllocation>();
+                        _hostBufferPool.Add(allocation.Key, available);
+                    }
+
+                    available.Push(allocation);
+                    if (_poolDrawObjects)
+                    {
+                        _hostbufPark++;
+                        _hostBufferLastParked[allocation.Buffer.Handle] = ++_hostBufferParkStamp;
+                    }
+
+                    return;
                 }
+            }
+
+        dropIncoming:
+            if (_poolDrawObjects)
+            {
+                _hostbufTrim++;
             }
 
             _vk.DestroyBuffer(_device, buffer, null);
             FreeDeviceMemory(memory);
+        }
+
+        // SHARPEMU_POOL_DRAW_OBJECTS only: LRU-evicts idle host buffers (across
+        // every usage/capacity bucket) totaling at least bytesToFree, via
+        // DrawObjectPoolMath.SelectLruEvictions over _hostBufferLastParked park
+        // stamps. Must be called with _hostBufferPoolGate already held. Off the
+        // flag RecycleHostBuffer never calls this -- the original drop-newest
+        // behavior is unchanged.
+        private void EvictLruHostBuffersLocked(ulong bytesToFree)
+        {
+            if (bytesToFree == 0 || _hostBufferPool.Count == 0)
+            {
+                return;
+            }
+
+            var keys = new List<HostBufferPoolKey>();
+            var perKeyOriginal = new List<List<HostBufferAllocation>>();
+            var flatScratch = new List<(long LastUse, ulong Bytes)>();
+            var flatRefs = new List<(int KeyIndex, HostBufferAllocation Alloc)>();
+
+            foreach (var kvp in _hostBufferPool)
+            {
+                var keyIndex = keys.Count;
+                keys.Add(kvp.Key);
+                var items = new List<HostBufferAllocation>(kvp.Value);
+                perKeyOriginal.Add(items);
+                foreach (var alloc in items)
+                {
+                    var stamp = _hostBufferLastParked.TryGetValue(alloc.Buffer.Handle, out var s)
+                        ? s
+                        : 0;
+                    flatScratch.Add((stamp, kvp.Key.Capacity));
+                    flatRefs.Add((keyIndex, alloc));
+                }
+            }
+
+            var victimIndices = DrawObjectPoolMath.SelectLruEvictions(flatScratch, bytesToFree);
+            if (victimIndices.Length == 0)
+            {
+                return;
+            }
+
+            var victimSet = new HashSet<int>(victimIndices);
+            for (var i = 0; i < flatRefs.Count; i++)
+            {
+                if (!victimSet.Contains(i))
+                {
+                    continue;
+                }
+
+                var (keyIndex, alloc) = flatRefs[i];
+                perKeyOriginal[keyIndex].Remove(alloc);
+                _hostBufferAllocations.Remove(alloc.Buffer.Handle);
+                _hostBufferLastParked.Remove(alloc.Buffer.Handle);
+                _pooledHostBufferBytes -= keys[keyIndex].Capacity;
+                _hostbufTrim++;
+                _vk.DestroyBuffer(_device, alloc.Buffer, null);
+                FreeDeviceMemory(alloc.Memory);
+            }
+
+            for (var k = 0; k < keys.Count; k++)
+            {
+                var rebuilt = new Stack<HostBufferAllocation>();
+                for (var i = perKeyOriginal[k].Count - 1; i >= 0; i--)
+                {
+                    rebuilt.Push(perKeyOriginal[k][i]);
+                }
+
+                _hostBufferPool[keys[k]] = rebuilt;
+            }
         }
 
         private void TrimHostBufferPool()
@@ -6923,6 +7111,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     while (available.TryPop(out var allocation))
                     {
                         _hostBufferAllocations.Remove(allocation.Buffer.Handle);
+                        _hostBufferLastParked.Remove(allocation.Buffer.Handle);
                         _vk.DestroyBuffer(_device, allocation.Buffer, null);
                         FreeDeviceMemory(allocation.Memory);
                     }
@@ -7481,6 +7670,13 @@ internal static unsafe partial class VulkanVideoPresenter
                 // The reuse pool is holding real VRAM the driver could hand
                 // back; return every idle block before falling back to eviction.
                 DrainFreeDeviceMemoryPool();
+                if (_poolDrawObjects)
+                {
+                    // Parked texture images are idle VRAM too; the command pool
+                    // is still live here, so free parked command buffers instead
+                    // of just clearing the stack.
+                    DrainDrawObjectPools(deviceIdle: false);
+                }
                 if (deviceLocal)
                 {
                     EvictLeastRecentlyUsedGuestImages(ulong.MaxValue);
@@ -7820,11 +8016,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 _commandBuffer = _presentationCommandBuffer;
                 if (!submitted && commandBuffer.Handle != 0)
                 {
-                    _vk.FreeCommandBuffers(
-                        _device,
-                        _commandPool,
-                        1,
-                        &commandBuffer);
+                    ParkGuestCommandBuffer(commandBuffer);
                 }
 
                 if (!submitted && resources is not null)
@@ -8556,11 +8748,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 _commandBuffer = _presentationCommandBuffer;
                 if (!submitted && commandBuffer.Handle != 0)
                 {
-                    _vk.FreeCommandBuffers(
-                        _device,
-                        _commandPool,
-                        1,
-                        &commandBuffer);
+                    ParkGuestCommandBuffer(commandBuffer);
                 }
 
                 if (!submitted && resources is not null)
@@ -8597,6 +8785,16 @@ internal static unsafe partial class VulkanVideoPresenter
                     if (_dtDraws >= DrawTimingEmitInterval)
                     {
                         EmitDrawTiming();
+                    }
+                }
+
+                if (_poolDrawObjects && submitted)
+                {
+                    _poolStatsDraws++;
+                    _poolStatsDrawsTotal++;
+                    if (_poolStatsDraws >= PoolStatsEmitInterval)
+                    {
+                        EmitPoolStats();
                     }
                 }
             }
@@ -8740,7 +8938,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 {
                     if (commandBuffer.Handle != 0)
                     {
-                        _vk.FreeCommandBuffers(_device, _commandPool, 1, &commandBuffer);
+                        ParkGuestCommandBuffer(commandBuffer);
                     }
 
                     DestroyGuestImage(snapshot);
@@ -11428,19 +11626,29 @@ internal static unsafe partial class VulkanVideoPresenter
                     continue;
                 }
 
-                if (texture.OwnsStorage && texture.View.Handle != 0)
+                if (_poolDrawObjects && texture.PooledStorage is { } pooledEntry)
                 {
-                    _vk.DestroyImageView(_device, texture.View, null);
+                    // The pooled entry owns View/Image/Memory; they are parked
+                    // together and destroyed only together (LRU trim / OOM
+                    // drain / dispose), never here.
+                    ParkPooledTextureImage(pooledEntry);
                 }
-
-                if (texture.OwnsStorage && texture.Image.Handle != 0)
+                else
                 {
-                    _vk.DestroyImage(_device, texture.Image, null);
-                }
+                    if (texture.OwnsStorage && texture.View.Handle != 0)
+                    {
+                        _vk.DestroyImageView(_device, texture.View, null);
+                    }
 
-                if (texture.OwnsStorage)
-                {
-                    FreeDeviceMemory(texture.ImageMemory);
+                    if (texture.OwnsStorage && texture.Image.Handle != 0)
+                    {
+                        _vk.DestroyImage(_device, texture.Image, null);
+                    }
+
+                    if (texture.OwnsStorage)
+                    {
+                        FreeDeviceMemory(texture.ImageMemory);
+                    }
                 }
 
                 // Only reached after the submission fence signaled (or before
@@ -11484,7 +11692,14 @@ internal static unsafe partial class VulkanVideoPresenter
 
             if (resources.DescriptorPool.Handle != 0)
             {
-                _vk.DestroyDescriptorPool(_device, resources.DescriptorPool, null);
+                if (_poolDrawObjects && resources.DescriptorPoolKey != default)
+                {
+                    ParkDescriptorPool(resources.DescriptorPool, resources.DescriptorPoolKey);
+                }
+                else
+                {
+                    _vk.DestroyDescriptorPool(_device, resources.DescriptorPool, null);
+                }
             }
 
             if (!resources.DescriptorLayoutCached &&
@@ -12064,6 +12279,11 @@ internal static unsafe partial class VulkanVideoPresenter
             // reuse pool (GPU is idle here); really free them before the device
             // goes away so no VkDeviceMemory outlives vkDestroyDevice.
             DrainFreeDeviceMemoryPool();
+            if (_poolDrawObjects)
+            {
+                DrainDrawObjectPools(deviceIdle: true);
+            }
+
             DrainRetiredGuestFlipSnapshots();
             lock (_gate)
             {
@@ -12202,6 +12422,10 @@ internal static unsafe partial class VulkanVideoPresenter
             }
             if (_commandPool.Handle != 0)
             {
+                // Parked guest command buffers were allocated from this pool; destroying
+                // the pool implicitly frees them, so drop the stale handles instead of
+                // letting a later RentGuestCommandBuffer pop a freed command buffer.
+                _freeGuestCommandBuffers.Clear();
                 _vk.DestroyCommandPool(_device, _commandPool, null);
                 _commandPool = default;
                 _commandBuffer = default;
