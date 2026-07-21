@@ -5,10 +5,13 @@ using SharpEmu.HLE;
 
 namespace SharpEmu.Libs.Np;
 
-// Stub for sce::Np::CppWebApi: titles abort PS5-component startup if
-// Common::initialize returns a negative SCE error, so no-op success is required to boot.
+// Offline adapter for sce::Np::CppWebApi: titles abort PS5-component startup if
+// Common::initialize returns a negative SCE error, so local initialization succeeds.
 public static class NpCppWebApiExports
 {
+    private static readonly object ContextGate = new();
+    private static readonly HashSet<ulong> LibraryContexts = [];
+
     [SysAbiExport(
         Nid = "UYPxv8MIzGo",
         ExportName = "_ZN3sce2Np9CppWebApi6Common10initializeERKNS2_10InitParamsERNS2_10LibContextE",
@@ -17,7 +20,31 @@ public static class NpCppWebApiExports
     public static int CppWebApiCommonInitialize(CpuContext ctx)
     {
         // int Common::initialize(const InitParams&, LibContext&) — 0 on success.
+        if (ctx[CpuRegister.Rsi] != 0)
+        {
+            lock (ContextGate)
+            {
+                LibraryContexts.Add(ctx[CpuRegister.Rsi]);
+            }
+        }
+
         TraceCppWebApi("common_initialize", ctx[CpuRegister.Rdi], ctx[CpuRegister.Rsi]);
+        return ctx.SetReturn(0);
+    }
+
+    [SysAbiExport(
+        Nid = "oTirsxQpqj0",
+        ExportName = "_ZN3sce2Np9CppWebApi6Common9terminateERNS2_10LibContextE",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceNpCppWebApi")]
+    public static int CppWebApiCommonTerminate(CpuContext ctx)
+    {
+        lock (ContextGate)
+        {
+            LibraryContexts.Remove(ctx[CpuRegister.Rdi]);
+        }
+
+        TraceCppWebApi("common_terminate", ctx[CpuRegister.Rdi], 0);
         return ctx.SetReturn(0);
     }
 
