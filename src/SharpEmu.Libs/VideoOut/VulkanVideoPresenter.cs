@@ -241,6 +241,18 @@ internal static unsafe class VulkanVideoPresenter
             Environment.GetEnvironmentVariable("SHARPEMU_PERF_PHASES"),
             "1",
             StringComparison.Ordinal);
+    // SHARPEMU_DRAW_TIMING: fine-grained, per-sub-step CPU timing of the
+    // offscreen-draw drain. Isolates which part of ExecuteOffscreenDraw is slow
+    // (guest-image setup, texture/buffer resolve, descriptor build, pipeline
+    // key lookup, pipeline creation, command recording, submit) so a
+    // per-draw-catch-all 'drainExec' can be broken down. Every accumulator is
+    // touched only under this gate, so a default run is byte-identical and the
+    // per-draw path stays allocation-free (Stopwatch.GetTimestamp + long adds).
+    private static readonly bool _drawTiming =
+        string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_DRAW_TIMING"),
+            "1",
+            StringComparison.Ordinal);
 
     private const uint DefaultWindowWidth = 1280;
     private const uint DefaultWindowHeight = 720;
@@ -2891,6 +2903,25 @@ internal static unsafe class VulkanVideoPresenter
         private long _perfFenceAccumTicks; // blocking GPU fence/idle waits
         private const double PerfHeartbeatMs = 1000.0;
 
+        // SHARPEMU_DRAW_TIMING accumulators (render thread only, so no locking).
+        // Ticks are Stopwatch timestamps summed per sub-step; a DRAWTIME line is
+        // emitted and every accumulator is reset every DrawTimingEmitInterval
+        // real (submitted) draws, so each line is a per-interval breakdown.
+        private long _dtSetupTicks;          // guest-image get + depth + transient pass
+        private long _dtResolveTicks;        // texture/global/vertex/index resolve+upload
+        private long _dtDescriptorTicks;     // descriptor set/layout build
+        private long _dtPipelineLookupTicks; // pipeline key build (incl shader digest) + dict lookup
+        private long _dtPipelineCreateTicks; // vkCreateGraphicsPipelines (cache miss only)
+        private long _dtRecordTicks;         // command buffer begin..end recording
+        private long _dtSubmitTicks;         // QueueSubmit + fence create/enqueue
+        private long _dtTotalTicks;          // whole per-draw span (for 'other' derivation)
+        private int _dtDraws;                // submitted draws in the current interval
+        private long _dtDrawsTotal;          // cumulative submitted draws (context only)
+        private int _dtPipelineHits;         // graphics pipeline cache hits
+        private int _dtPipelineMisses;       // graphics pipeline cache misses (real vkCreate)
+        private int _dtDigestMisses;         // shader-digest cache misses (recomputed SHA256)
+        private const int DrawTimingEmitInterval = 50;
+
         // SHARPEMU_ASYNC_PRESENT diagnostics: incremented every Render() (not just
         // on present) so a present STALL still advances it. Traces are emitted for
         // the first N ticks plus a periodic heartbeat, so a boot log shows exactly
@@ -5012,6 +5043,7 @@ internal static unsafe class VulkanVideoPresenter
 
             try
             {
+                long tResolve0 = _drawTiming ? Stopwatch.GetTimestamp() : 0;
                 foreach (var texture in draw.Textures)
                 {
                     // Skip address-0 storage bindings here: the real resolution
@@ -5044,9 +5076,20 @@ internal static unsafe class VulkanVideoPresenter
                         captureLayout,
                         captureInputs!,
                         captureInvocations);
+                    long tCaptureDesc0 = 0;
+                    if (_drawTiming)
+                    {
+                        tCaptureDesc0 = Stopwatch.GetTimestamp();
+                        _dtResolveTicks += tCaptureDesc0 - tResolve0;
+                    }
+
                     CreateTranslatedDescriptorResources(
                         resources,
                         ShaderStageFlags.VertexBit | ShaderStageFlags.FragmentBit);
+                    if (_drawTiming)
+                    {
+                        _dtDescriptorTicks += Stopwatch.GetTimestamp() - tCaptureDesc0;
+                    }
                     // Diagnostic: replace the guest pixel shader with a solid-color
                     // one to prove the captured geometry rasterizes into the target
                     // independent of the guest PS's (currently unfed) varyings.
@@ -5100,9 +5143,21 @@ internal static unsafe class VulkanVideoPresenter
                     }
                 }
 
+                long tDesc0 = 0;
+                if (_drawTiming)
+                {
+                    tDesc0 = Stopwatch.GetTimestamp();
+                    _dtResolveTicks += tDesc0 - tResolve0;
+                }
+
                 CreateTranslatedDescriptorResources(
                     resources,
                     ShaderStageFlags.VertexBit | ShaderStageFlags.FragmentBit);
+                if (_drawTiming)
+                {
+                    _dtDescriptorTicks += Stopwatch.GetTimestamp() - tDesc0;
+                }
+
                 CreateTranslatedPipeline(
                     resources,
                     vertexSpirv,
@@ -5625,6 +5680,7 @@ internal static unsafe class VulkanVideoPresenter
             Extent2D extent,
             VulkanGuestDepthTarget? depth = null)
         {
+            long tPipeKey0 = _drawTiming ? Stopwatch.GetTimestamp() : 0;
             var depthKey = depth is { } depthState
                 ? $"{depthState.Format}:{(depthState.TestEnable ? 1 : 0)}:{(depthState.WriteEnable ? 1 : 0)}:{depthState.CompareOp}"
                 : "none";
@@ -5641,9 +5697,21 @@ internal static unsafe class VulkanVideoPresenter
                 GetVertexLayoutKey(resources));
             if (_graphicsPipelines.TryGetValue(pipelineKey, out var cachedPipeline))
             {
+                if (_drawTiming)
+                {
+                    _dtPipelineLookupTicks += Stopwatch.GetTimestamp() - tPipeKey0;
+                    _dtPipelineHits++;
+                }
+
                 resources.Pipeline = cachedPipeline;
                 resources.PipelineCached = true;
                 return;
+            }
+
+            if (_drawTiming)
+            {
+                _dtPipelineLookupTicks += Stopwatch.GetTimestamp() - tPipeKey0;
+                _dtPipelineMisses++;
             }
 
             var vertexModule = CreateShaderModule(vertexSpirv);
@@ -5807,6 +5875,7 @@ internal static unsafe class VulkanVideoPresenter
                         Subpass = 0,
                     };
                     Pipeline pipeline;
+                    long tPipeCreate0 = _drawTiming ? Stopwatch.GetTimestamp() : 0;
                     Check(
                         _vk.CreateGraphicsPipelines(
                             _device,
@@ -5816,6 +5885,11 @@ internal static unsafe class VulkanVideoPresenter
                             null,
                             out pipeline),
                         "vkCreateGraphicsPipelines(translated)");
+                    if (_drawTiming)
+                    {
+                        _dtPipelineCreateTicks += Stopwatch.GetTimestamp() - tPipeCreate0;
+                    }
+
                     resources.Pipeline = pipeline;
                     resources.PipelineCached = true;
                     _graphicsPipelines.Add(pipelineKey, pipeline);
@@ -5923,6 +5997,11 @@ internal static unsafe class VulkanVideoPresenter
 
             digest = Convert.ToHexString(SHA256.HashData(spirv));
             _shaderDigests.Add(spirv, digest);
+            if (_drawTiming)
+            {
+                _dtDigestMisses++;
+            }
+
             return digest;
         }
 
@@ -8087,6 +8166,7 @@ internal static unsafe class VulkanVideoPresenter
             }
 
             _useStamp++;
+            long tDrawTotal0 = _drawTiming ? Stopwatch.GetTimestamp() : 0;
 
             if (work.Targets.Count > _maxColorAttachments)
             {
@@ -8182,6 +8262,7 @@ internal static unsafe class VulkanVideoPresenter
                 }
             }
 
+            long tSetup0 = _drawTiming ? Stopwatch.GetTimestamp() : 0;
             var targets = new GuestImageResource[work.Targets.Count];
             EnsureGuestSubmissionCapacity();
             for (var index = 0; index < targets.Length; index++)
@@ -8344,6 +8425,13 @@ internal static unsafe class VulkanVideoPresenter
                     transientFramebuffer = framebuffer;
                 }
 
+                if (_drawTiming)
+                {
+                    _dtSetupTicks += Stopwatch.GetTimestamp() - tSetup0;
+                }
+
+                // Resolve+descriptors+pipeline sub-steps are accumulated inside
+                // CreateTranslatedDrawResources / CreateTranslatedPipeline.
                 resources = CreateTranslatedDrawResources(
                     work.Draw,
                     renderPass,
@@ -8359,6 +8447,7 @@ internal static unsafe class VulkanVideoPresenter
                     $"first=0x{work.Targets[0].Address:X16} " +
                     $"{renderWidth}x{renderHeight}";
 
+                long tRecord0 = _drawTiming ? Stopwatch.GetTimestamp() : 0;
                 commandBuffer = AllocateGuestCommandBuffer();
                 _commandBuffer = commandBuffer;
                 var beginInfo = new CommandBufferBeginInfo
@@ -8503,10 +8592,21 @@ internal static unsafe class VulkanVideoPresenter
                 EndDebugLabel(_commandBuffer);
 
                 Check(_vk.EndCommandBuffer(_commandBuffer), "vkEndCommandBuffer(offscreen)");
+                if (_drawTiming)
+                {
+                    _dtRecordTicks += Stopwatch.GetTimestamp() - tRecord0;
+                }
+
+                long tSubmit0 = _drawTiming ? Stopwatch.GetTimestamp() : 0;
                 SubmitGuestCommandBuffer(
                     commandBuffer,
                     resources,
                     GetTraceImages(resources, targets));
+                if (_drawTiming)
+                {
+                    _dtSubmitTicks += Stopwatch.GetTimestamp() - tSubmit0;
+                }
+
                 submitted = true;
                 foreach (var target in targets)
                 {
@@ -8684,6 +8784,17 @@ internal static unsafe class VulkanVideoPresenter
             }
             finally
             {
+                if (_drawTiming && submitted)
+                {
+                    _dtTotalTicks += Stopwatch.GetTimestamp() - tDrawTotal0;
+                    _dtDraws++;
+                    _dtDrawsTotal++;
+                    if (_dtDraws >= DrawTimingEmitInterval)
+                    {
+                        EmitDrawTiming();
+                    }
+                }
+
                 _commandBuffer = _presentationCommandBuffer;
                 if (!submitted && commandBuffer.Handle != 0)
                 {
@@ -9843,6 +9954,48 @@ internal static unsafe class VulkanVideoPresenter
                 $"present={TicksToMs(presentTicks):F2} " +
                 $"idleWaitForGuest={TicksToMs(_perfIdleAccumTicks):F2}" +
                 (presented ? string.Empty : " partial=1"));
+        }
+
+        // Emits one SHARPEMU_DRAW_TIMING breakdown line covering the draws since
+        // the last emit, then zeroes the interval accumulators. 'other' is the
+        // whole-draw span minus every measured sub-step (validation/LINQ, guest
+        // registry lock sections, cleanup) so nothing is hidden. pMiss==draws
+        // means a real vkCreateGraphicsPipelines every draw (driver shader
+        // compile); digMiss==2*draws means the shader-digest cache never hits
+        // (a fresh SPIR-V byte[] per draw -> SHA256 recomputed each time).
+        private void EmitDrawTiming()
+        {
+            var setup = TicksToMs(_dtSetupTicks);
+            var resolve = TicksToMs(_dtResolveTicks);
+            var descriptors = TicksToMs(_dtDescriptorTicks);
+            var pipeLookup = TicksToMs(_dtPipelineLookupTicks);
+            var pipeCreate = TicksToMs(_dtPipelineCreateTicks);
+            var record = TicksToMs(_dtRecordTicks);
+            var submit = TicksToMs(_dtSubmitTicks);
+            var total = TicksToMs(_dtTotalTicks);
+            var other = total - setup - resolve - descriptors -
+                pipeLookup - pipeCreate - record - submit;
+            var perDraw = _dtDraws > 0 ? total / _dtDraws : 0.0;
+            Console.Error.WriteLine(
+                $"[LOADER][DRAWTIME] draws={_dtDraws} total={total:F1} perDraw={perDraw:F2} " +
+                $"setup={setup:F1} resolve={resolve:F1} descriptors={descriptors:F1} " +
+                $"pipeLookup={pipeLookup:F1} pipeCreate={pipeCreate:F1} " +
+                $"record={record:F1} submit={submit:F1} other={other:F1} " +
+                $"pHit={_dtPipelineHits} pMiss={_dtPipelineMisses} digMiss={_dtDigestMisses} " +
+                $"cumDraws={_dtDrawsTotal}");
+
+            _dtSetupTicks = 0;
+            _dtResolveTicks = 0;
+            _dtDescriptorTicks = 0;
+            _dtPipelineLookupTicks = 0;
+            _dtPipelineCreateTicks = 0;
+            _dtRecordTicks = 0;
+            _dtSubmitTicks = 0;
+            _dtTotalTicks = 0;
+            _dtDraws = 0;
+            _dtPipelineHits = 0;
+            _dtPipelineMisses = 0;
+            _dtDigestMisses = 0;
         }
 
         private void Render(double _)
