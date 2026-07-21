@@ -13,6 +13,7 @@ namespace SharpEmu.Tests;
 /// document through the export entry points, and verify referValue hands out stable per-member
 /// child addresses plus the documented parser error codes.
 /// </summary>
+[Collection("Json exports")]
 public sealed class JsonParserExportsTests
 {
     private const ulong RootValueAddress = 0x4000;
@@ -20,8 +21,7 @@ public sealed class JsonParserExportsTests
     private const ulong KeyAddress = 0xC000;
     private const ulong StringAddress = 0x1_0000;
     private const ulong SecondStringAddress = 0x1_4000;
-    private const int ParserErrorInvalidToken = unchecked((int)0x80920101);
-    private const int ParserErrorEmptyBuffer = unchecked((int)0x80920105);
+    private const int ParserErrorInvalidToken = unchecked((int)0x80848101);
 
     private readonly AllocatingGuestMemory _memory = new();
     private readonly CpuContext _ctx;
@@ -95,9 +95,9 @@ public sealed class JsonParserExportsTests
         // back.
         var countValue = IndexByKey(RootValueAddress, "count");
         Assert.NotEqual(0UL, countValue);
-        Assert.Equal(2UL, GetType(countValue));
+        Assert.Equal(3UL, GetType(countValue));
         _ctx[CpuRegister.Rdi] = countValue;
-        JsonExports.ValueGetInteger(_ctx);
+        JsonExports.ValueGetUnsignedInteger(_ctx);
         Assert.True(_ctx.TryReadUInt64(_ctx[CpuRegister.Rax], out var integer));
         Assert.Equal(3UL, integer);
 
@@ -129,7 +129,7 @@ public sealed class JsonParserExportsTests
         JsonExports.ValueIndexPosition(_ctx);
         var secondItem = _ctx[CpuRegister.Rax];
         _ctx[CpuRegister.Rdi] = secondItem;
-        JsonExports.ValueGetInteger(_ctx);
+        JsonExports.ValueGetUnsignedInteger(_ctx);
         Assert.True(_ctx.TryReadUInt64(_ctx[CpuRegister.Rax], out var secondValue));
         Assert.Equal(20UL, secondValue);
 
@@ -137,7 +137,7 @@ public sealed class JsonParserExportsTests
         _ctx[CpuRegister.Rsi] = 2;
         JsonExports.ValueGetPosition(_ctx);
         _ctx[CpuRegister.Rdi] = _ctx[CpuRegister.Rax];
-        JsonExports.ValueGetInteger(_ctx);
+        JsonExports.ValueGetUnsignedInteger(_ctx);
         Assert.True(_ctx.TryReadUInt64(_ctx[CpuRegister.Rax], out var thirdValue));
         Assert.Equal(30UL, thirdValue);
 
@@ -182,7 +182,7 @@ public sealed class JsonParserExportsTests
         Assert.NotEqual(first, other);
 
         Assert.Equal(5UL, GetType(first));
-        Assert.Equal(2UL, GetType(other));
+        Assert.Equal(3UL, GetType(other));
     }
 
     [Fact]
@@ -205,21 +205,21 @@ public sealed class JsonParserExportsTests
         _ctx[CpuRegister.Rsi] = source;
         JsonExports.ValueAssignment(_ctx);
 
-        Assert.Equal(2UL, GetType(destination));
+        Assert.Equal(3UL, GetType(destination));
         _ctx[CpuRegister.Rdi] = destination;
-        JsonExports.ValueGetInteger(_ctx);
+        JsonExports.ValueGetUnsignedInteger(_ctx);
         Assert.True(_ctx.TryReadUInt64(_ctx[CpuRegister.Rax], out var copied));
         Assert.Equal(42UL, copied);
     }
 
     [Fact]
-    public void Parse_EmptyBufferReturnsEmptyBufferError()
+    public void Parse_EmptyBufferReturnsInvalidCharacterError()
     {
         _ctx[CpuRegister.Rdi] = RootValueAddress;
         _ctx[CpuRegister.Rsi] = BufferAddress;
         _ctx[CpuRegister.Rdx] = 0;
-        Assert.Equal(ParserErrorEmptyBuffer, JsonExports.ParserParseBuffer(_ctx));
-        Assert.Equal(ParserErrorEmptyBuffer, Result(_ctx));
+        Assert.Equal(ParserErrorInvalidToken, JsonExports.ParserParseBuffer(_ctx));
+        Assert.Equal(ParserErrorInvalidToken, Result(_ctx));
     }
 
     [Fact]
@@ -234,13 +234,13 @@ public sealed class JsonParserExportsTests
     {
         // strlen()+1 style call: the buffer length covers the terminating NUL.
         Assert.Equal(0, Parse("{\"count\":3}\0"));
-        Assert.Equal(2UL, GetType(IndexByKey(RootValueAddress, "count")));
+        Assert.Equal(3UL, GetType(IndexByKey(RootValueAddress, "count")));
     }
 
     [Fact]
-    public void Parse_AllNulBufferReturnsEmptyBufferError()
+    public void Parse_AllNulBufferReturnsInvalidCharacterError()
     {
-        Assert.Equal(ParserErrorEmptyBuffer, Parse("\0\0"));
+        Assert.Equal(ParserErrorInvalidToken, Parse("\0\0"));
     }
 
     [Fact]
