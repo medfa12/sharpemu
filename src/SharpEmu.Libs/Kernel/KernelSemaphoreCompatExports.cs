@@ -133,6 +133,10 @@ public static class KernelSemaphoreCompatExports
             {
                 semaphore.Count -= needCount;
                 TraceSemaphore($"wait handle=0x{handle:X8} name='{semaphore.Name}' need={needCount} count={semaphore.Count}");
+                if (GuestSyncTrace.Enabled)
+                {
+                    GuestSyncTrace.Log($"sema.wait {KernelPthreadState.CurrentSyncThreadTag()} prim=0x{handle:X8}('{semaphore.Name}') need={needCount} count={semaphore.Count} -> ok");
+                }
                 return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
             }
 
@@ -168,6 +172,10 @@ public static class KernelSemaphoreCompatExports
                     {
                         semaphore.WaitingThreads++;
                         TraceSemaphore($"wait-block-timed handle=0x{handle:X8} name='{semaphore.Name}' need={needCount} count={semaphore.Count} timeout_us={timeoutMicros} waiters={semaphore.WaitingThreads}");
+                        if (GuestSyncTrace.Enabled)
+                        {
+                            GuestSyncTrace.Log($"sema.wait_block {KernelPthreadState.CurrentSyncThreadTag()} prim=0x{handle:X8}('{semaphore.Name}') need={needCount} count={semaphore.Count} timeout_us={timeoutMicros} waiters={semaphore.WaitingThreads} -> parked");
+                        }
                         return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
                     }
 
@@ -274,6 +282,10 @@ public static class KernelSemaphoreCompatExports
             // lock-order safe: it touches no other lock.
             Monitor.PulseAll(semaphore.Gate);
             TraceSemaphore($"signal handle=0x{handle:X8} name='{semaphore.Name}' signal={signalCount} count={semaphore.Count} waiters={semaphore.WaitingThreads}");
+            if (GuestSyncTrace.Enabled)
+            {
+                GuestSyncTrace.Log($"sema.signal {KernelPthreadState.CurrentSyncThreadTag()} prim=0x{handle:X8}('{semaphore.Name}') signal={signalCount} count={semaphore.Count} waiters={semaphore.WaitingThreads} -> ok");
+            }
         }
 
         // Wake after releasing the gate (lock order: scheduler gate -> semaphore gate).
@@ -392,6 +404,10 @@ public static class KernelSemaphoreCompatExports
             waiter.Result = (int)OrbisGen2Result.ORBIS_GEN2_OK;
             semaphore.WaitingThreads = Math.Max(0, semaphore.WaitingThreads - 1);
             TraceSemaphore($"wake-consume name='{semaphore.Name}' need={waiter.NeedCount} count={semaphore.Count} waiters={semaphore.WaitingThreads}");
+            if (GuestSyncTrace.Enabled)
+            {
+                GuestSyncTrace.Log($"sema.wait_wake prim=('{semaphore.Name}') need={waiter.NeedCount} count={semaphore.Count} waiters={semaphore.WaitingThreads} -> ok");
+            }
             return true;
         }
 
@@ -465,6 +481,10 @@ public static class KernelSemaphoreCompatExports
         var cancelEpochAtBlock = semaphore.CancelEpoch;
         semaphore.WaitingThreads++;
         TraceSemaphore($"host-wait-block handle=0x{handle:X8} name='{semaphore.Name}' need={needCount} count={semaphore.Count} waiters={semaphore.WaitingThreads}");
+        if (GuestSyncTrace.Enabled)
+        {
+            GuestSyncTrace.Log($"sema.wait_block {KernelPthreadState.CurrentSyncThreadTag()} prim=0x{handle:X8}('{semaphore.Name}') need={needCount} count={semaphore.Count} waiters={semaphore.WaitingThreads} host=1 -> parked");
+        }
         try
         {
             while (true)
@@ -483,6 +503,10 @@ public static class KernelSemaphoreCompatExports
                 {
                     semaphore.Count -= needCount;
                     TraceSemaphore($"host-wait-wake handle=0x{handle:X8} name='{semaphore.Name}' need={needCount} count={semaphore.Count}");
+                    if (GuestSyncTrace.Enabled)
+                    {
+                        GuestSyncTrace.Log($"sema.wait_wake {KernelPthreadState.CurrentSyncThreadTag()} prim=0x{handle:X8}('{semaphore.Name}') need={needCount} count={semaphore.Count} host=1 -> ok");
+                    }
                     return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
                 }
 

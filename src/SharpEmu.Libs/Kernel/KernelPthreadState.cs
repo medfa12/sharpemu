@@ -72,6 +72,20 @@ internal static class KernelPthreadState
         return Threads.TryGetValue(threadHandle, out identity);
     }
 
+    /// <summary>
+    /// Builds the <c>thread='&lt;name&gt;'/id=0x&lt;id&gt;</c> tag used by the
+    /// SHARPEMU_LOG_SYNC runtime traces. Only call when tracing is enabled: it
+    /// resolves (and, for a not-yet-seen thread, lazily registers) the current
+    /// thread identity, so it allocates and must never run on the default path.
+    /// </summary>
+    internal static string CurrentSyncThreadTag()
+    {
+        var handle = GetCurrentThreadHandle();
+        return TryGetThreadIdentity(handle, out var identity)
+            ? $"thread='{identity.Name}'/id=0x{identity.UniqueId:X}"
+            : $"thread='?'/id=0x{handle:X16}";
+    }
+
     private static void EnsureCurrentThreadRegistered()
     {
         if (_currentThreadHandle != 0)

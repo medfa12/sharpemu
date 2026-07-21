@@ -1127,6 +1127,11 @@ public static class KernelPthreadExtendedCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_PERMISSION_DENIED;
         }
 
+        if (GuestSyncTrace.Enabled)
+        {
+            GuestSyncTrace.Log($"rwlock.unlock {KernelPthreadState.CurrentSyncThreadTag()} prim=0x{resolvedAddress:X16}('{rwlock.WakeKey}') writer=0x{rwlock.WriterThreadId:X16} readers={rwlock.ReaderTotalCount} waiting_writers={rwlock.WaitingWriters} -> wake");
+        }
+
         _ = GuestThreadExecution.Scheduler?.WakeBlockedThreads(rwlock.WakeKey);
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
@@ -1370,6 +1375,10 @@ public static class KernelPthreadExtendedCompatExports
                             () => TryAcquireBlockedRwlock(rwlock, currentThreadId, write: true)))
                     {
                         transferredToScheduler = true;
+                        if (GuestSyncTrace.Enabled)
+                        {
+                            GuestSyncTrace.Log($"rwlock.wrlock_block {KernelPthreadState.CurrentSyncThreadTag()} prim=0x{resolvedAddress:X16}('{rwlock.WakeKey}') writer=0x{rwlock.WriterThreadId:X16} readers={rwlock.ReaderTotalCount} waiting_writers={rwlock.WaitingWriters} -> parked");
+                        }
                         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
                     }
 
@@ -1406,6 +1415,10 @@ public static class KernelPthreadExtendedCompatExports
                             static () => (int)OrbisGen2Result.ORBIS_GEN2_OK,
                             () => TryAcquireBlockedRwlock(rwlock, currentThreadId, write: false)))
                     {
+                        if (GuestSyncTrace.Enabled)
+                        {
+                            GuestSyncTrace.Log($"rwlock.rdlock_block {KernelPthreadState.CurrentSyncThreadTag()} prim=0x{resolvedAddress:X16}('{rwlock.WakeKey}') writer=0x{rwlock.WriterThreadId:X16} readers={rwlock.ReaderTotalCount} waiting_writers={rwlock.WaitingWriters} -> parked");
+                        }
                         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
                     }
 

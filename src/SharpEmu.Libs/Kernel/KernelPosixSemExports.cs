@@ -166,6 +166,10 @@ public static class KernelPosixSemExports
 
         _ = GuestThreadExecution.Scheduler?.WakeBlockedThreads(GetWakeKey(sem));
         Trace($"post sem=0x{sem:X} count={state.Count}");
+        if (GuestSyncTrace.Enabled)
+        {
+            GuestSyncTrace.Log($"sem.post {KernelPthreadState.CurrentSyncThreadTag()} prim=0x{sem:X} count={state.Count} waiters={state.WaitingThreads} -> ok");
+        }
         return ctx.SetReturn(0);
     }
 
@@ -221,6 +225,10 @@ public static class KernelPosixSemExports
             if (state.Count >= 1)
             {
                 state.Count--;
+                if (GuestSyncTrace.Enabled)
+                {
+                    GuestSyncTrace.Log($"sem.wait {KernelPthreadState.CurrentSyncThreadTag()} prim=0x{sem:X} count={state.Count} -> ok");
+                }
                 return ctx.SetReturn(0);
             }
 
@@ -239,6 +247,10 @@ public static class KernelPosixSemExports
 
             state.WaitingThreads++;
             Trace($"wait-block sem=0x{sem:X} count={state.Count} waiters={state.WaitingThreads}");
+            if (GuestSyncTrace.Enabled)
+            {
+                GuestSyncTrace.Log($"sem.wait_block {KernelPthreadState.CurrentSyncThreadTag()} prim=0x{sem:X} count={state.Count} waiters={state.WaitingThreads} -> parked");
+            }
             return ctx.SetReturn(0);
         }
     }
@@ -266,6 +278,10 @@ public static class KernelPosixSemExports
             state.Count--;
             waiter.Result = 0;
             state.WaitingThreads = Math.Max(0, state.WaitingThreads - 1);
+            if (GuestSyncTrace.Enabled)
+            {
+                GuestSyncTrace.Log($"sem.wait_wake count={state.Count} waiters={state.WaitingThreads} -> ok");
+            }
             return true;
         }
 
@@ -299,6 +315,10 @@ public static class KernelPosixSemExports
     private static int HostBlockingWait(CpuContext ctx, PosixSemaphoreState state)
     {
         state.WaitingThreads++;
+        if (GuestSyncTrace.Enabled)
+        {
+            GuestSyncTrace.Log($"sem.wait_block {KernelPthreadState.CurrentSyncThreadTag()} count={state.Count} waiters={state.WaitingThreads} host=1 -> parked");
+        }
         try
         {
             while (state.Count < 1)
@@ -307,6 +327,10 @@ public static class KernelPosixSemExports
             }
 
             state.Count--;
+            if (GuestSyncTrace.Enabled)
+            {
+                GuestSyncTrace.Log($"sem.wait_wake {KernelPthreadState.CurrentSyncThreadTag()} count={state.Count} host=1 -> ok");
+            }
             return ctx.SetReturn(0);
         }
         finally

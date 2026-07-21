@@ -3184,6 +3184,12 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				_readyGuestThreads.Enqueue(thread);
 				Interlocked.Increment(ref _readyGuestThreadCount);
 				wakeCount++;
+
+				if (GuestSyncTrace.Enabled)
+				{
+					GuestSyncTrace.Log(
+						$"unpark thread='{thread.Name}'/id=0x{thread.ThreadHandle:X16} prim=wakeKey('{wakeKey}') -> readied");
+				}
 			}
 		}
 
@@ -3278,6 +3284,12 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				_readyGuestThreads.Enqueue(thread);
 				Interlocked.Increment(ref _readyGuestThreadCount);
 				wakeCount++;
+
+				if (GuestSyncTrace.Enabled)
+				{
+					GuestSyncTrace.Log(
+						$"unpark thread='{thread.Name}'/id=0x{thread.ThreadHandle:X16} prim=deadline -> readied_timeout");
+				}
 			}
 		}
 

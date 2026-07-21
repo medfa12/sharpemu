@@ -250,6 +250,13 @@ public static class GuestThreadExecution
             _pendingBlockContinuationValid = false;
         }
 
+        if (GuestSyncTrace.Enabled)
+        {
+            GuestSyncTrace.Log(
+                $"park thread='?'/id=0x{_currentGuestThreadHandle:X16} prim=wakeKey('{_pendingBlockWakeKey}') " +
+                $"reason='{_pendingBlockReason}' continuation={_pendingBlockContinuationValid} -> block_requested");
+        }
+
         return true;
     }
 

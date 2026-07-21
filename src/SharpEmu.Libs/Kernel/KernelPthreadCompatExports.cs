@@ -691,6 +691,10 @@ public static class KernelPthreadCompatExports
             // parks, so an unlock's PulseAll cannot be missed. Waits are
             // sliced only so teardown can unwind parked threads.
             TracePthreadMutex(ctx, "lock-block", mutexAddress, resolvedAddress, state, currentThreadId, (int)OrbisGen2Result.ORBIS_GEN2_OK);
+            if (GuestSyncTrace.Enabled)
+            {
+                GuestSyncTrace.Log($"mutex.lock_block {KernelPthreadState.CurrentSyncThreadTag()} prim=0x{resolvedAddress:X16} owner=0x{state.OwnerThreadId:X16} waiters={state.WaiterCount} -> parked");
+            }
             state.WaiterCount++;
             try
             {
@@ -714,6 +718,10 @@ public static class KernelPthreadCompatExports
             }
 
             TracePthreadMutex(ctx, "lock", mutexAddress, resolvedAddress, state, currentThreadId, (int)OrbisGen2Result.ORBIS_GEN2_OK);
+            if (GuestSyncTrace.Enabled)
+            {
+                GuestSyncTrace.Log($"mutex.lock {KernelPthreadState.CurrentSyncThreadTag()} prim=0x{resolvedAddress:X16} -> acquired_after_block");
+            }
             return (int)OrbisGen2Result.ORBIS_GEN2_OK;
         }
     }
@@ -753,6 +761,10 @@ public static class KernelPthreadCompatExports
                 if (state.WaiterCount != 0)
                 {
                     Monitor.PulseAll(state);
+                    if (GuestSyncTrace.Enabled)
+                    {
+                        GuestSyncTrace.Log($"mutex.unlock {KernelPthreadState.CurrentSyncThreadTag()} prim=0x{resolvedAddress:X16} waiters={state.WaiterCount} -> pulsed");
+                    }
                 }
             }
         }
@@ -1257,6 +1269,11 @@ public static class KernelPthreadCompatExports
                 return unlockResult;
             }
 
+            if (GuestSyncTrace.Enabled)
+            {
+                GuestSyncTrace.Log($"cond.wait_block {KernelPthreadState.CurrentSyncThreadTag()} prim=0x{condAddress:X16} mutex=0x{mutexAddress:X16} waiters={state.Waiters} pending={state.SignalsPending} timed={timed} -> parked");
+            }
+
             var deadline = timed
                 ? GuestThreadExecution.ComputeDeadlineTimestamp(GetCondWaitTimeout(timeoutUsec))
                 : long.MaxValue;
@@ -1303,6 +1320,10 @@ public static class KernelPthreadCompatExports
             ? (int)OrbisGen2Result.ORBIS_GEN2_OK
             : CondTimedOutResult(posixErrors);
         TracePthreadCond(signaled ? "wait-exit" : "wait-exit-timeout", condAddress, mutexAddress, state, timed, waitResult);
+        if (GuestSyncTrace.Enabled)
+        {
+            GuestSyncTrace.Log($"cond.wait_wake {KernelPthreadState.CurrentSyncThreadTag()} prim=0x{condAddress:X16} mutex=0x{mutexAddress:X16} signaled={signaled} waiters={state.Waiters} -> 0x{unchecked((uint)waitResult):X8}");
+        }
         return waitResult;
     }
 
@@ -1338,6 +1359,10 @@ public static class KernelPthreadCompatExports
             }
 
             TracePthreadCond(broadcast ? "broadcast" : "signal", condAddress, mutexAddress: 0, state, timed: false, (int)OrbisGen2Result.ORBIS_GEN2_OK);
+            if (GuestSyncTrace.Enabled)
+            {
+                GuestSyncTrace.Log($"cond.{(broadcast ? "broadcast" : "signal")} {KernelPthreadState.CurrentSyncThreadTag()} prim=0x{condAddress:X16} waiters={state.Waiters} pending={state.SignalsPending} -> {(state.Waiters != 0 ? "pulsed" : "no_waiter")}");
+            }
         }
 
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;

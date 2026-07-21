@@ -335,6 +335,10 @@ public static class KernelEventQueueCompatExports
         if (deliveredCount > 0)
         {
             TraceEventQueue(ctx, "wait-deliver", handle);
+            if (GuestSyncTrace.Enabled)
+            {
+                GuestSyncTrace.Log($"equeue.wait {KernelPthreadState.CurrentSyncThreadTag()} prim=0x{handle:X16} delivered={deliveredCount} -> ok");
+            }
             return (int)OrbisGen2Result.ORBIS_GEN2_OK;
         }
 
@@ -347,6 +351,10 @@ public static class KernelEventQueueCompatExports
                 () => HasPendingEvents(handle)))
         {
             TraceEventQueue(ctx, "wait-block", handle);
+            if (GuestSyncTrace.Enabled)
+            {
+                GuestSyncTrace.Log($"equeue.wait_block {KernelPthreadState.CurrentSyncThreadTag()} prim=0x{handle:X16} capacity={eventCapacity} -> parked");
+            }
             return (int)OrbisGen2Result.ORBIS_GEN2_OK;
         }
 
@@ -668,6 +676,10 @@ public static class KernelEventQueueCompatExports
 
     private static void WakeEventQueue(ulong handle)
     {
+        if (GuestSyncTrace.Enabled)
+        {
+            GuestSyncTrace.Log($"equeue.trigger {KernelPthreadState.CurrentSyncThreadTag()} prim=0x{handle:X16} pending={(HasPendingEvents(handle) ? 1 : 0)} -> wake");
+        }
         _ = GuestThreadExecution.Scheduler?.WakeBlockedThreads(GetEventQueueWakeKey(handle));
     }
 

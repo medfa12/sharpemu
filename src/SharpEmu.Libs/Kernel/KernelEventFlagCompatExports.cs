@@ -133,6 +133,10 @@ public static class KernelEventFlagCompatExports
             {
                 TraceEventFlag($"set handle=0x{handle:X16} pattern=0x{pattern:X16} bits=0x{state.Bits:X16} ret=0x{returnRip:X16}");
             }
+            if (GuestSyncTrace.Enabled)
+            {
+                GuestSyncTrace.Log($"evf.set {KernelPthreadState.CurrentSyncThreadTag()} prim=0x{handle:X16}('{state.Name}') pattern=0x{pattern:X16} bits=0x{state.Bits:X16} waiters={state.WaitingThreads} -> ok");
+            }
         }
 
         _ = GuestThreadExecution.Scheduler?.WakeBlockedThreads(GetEventFlagWakeKey(handle));
@@ -243,6 +247,10 @@ public static class KernelEventFlagCompatExports
         {
             if (TryCompleteSatisfiedWait(ctx, state, pattern, waitMode, resultAddress, out var immediateWaitResult))
             {
+                if (GuestSyncTrace.Enabled)
+                {
+                    GuestSyncTrace.Log($"evf.wait {KernelPthreadState.CurrentSyncThreadTag()} prim=0x{handle:X16}('{state.Name}') pattern=0x{pattern:X16} mode=0x{waitMode:X2} bits=0x{state.Bits:X16} -> 0x{unchecked((uint)(int)immediateWaitResult):X8}");
+                }
                 return ctx.SetReturn(immediateWaitResult);
             }
 
@@ -283,6 +291,10 @@ public static class KernelEventFlagCompatExports
                 {
                     state.WaitingThreads++;
                     TraceEventFlag($"wait-block-timed handle=0x{handle:X16} pattern=0x{pattern:X16} timeout={timeoutUsec} waiters={state.WaitingThreads} ret=0x{returnRip:X16}");
+                    if (GuestSyncTrace.Enabled)
+                    {
+                        GuestSyncTrace.Log($"evf.wait_block {KernelPthreadState.CurrentSyncThreadTag()} prim=0x{handle:X16}('{state.Name}') pattern=0x{pattern:X16} mode=0x{waitMode:X2} bits=0x{state.Bits:X16} timeout_us={timeoutUsec} waiters={state.WaitingThreads} -> parked");
+                    }
                     return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
                 }
 
@@ -371,6 +383,10 @@ public static class KernelEventFlagCompatExports
 
             state.WaitingThreads++;
             TraceEventFlag($"wait-block handle=0x{handle:X16} pattern=0x{pattern:X16} waiters={state.WaitingThreads} guest_thread=0x{currentGuestThread:X16} fiber=0x{currentFiber:X16} managed={managedThread} ret=0x{returnRip:X16}");
+            if (GuestSyncTrace.Enabled)
+            {
+                GuestSyncTrace.Log($"evf.wait_block {KernelPthreadState.CurrentSyncThreadTag()} prim=0x{handle:X16}('{state.Name}') pattern=0x{pattern:X16} mode=0x{waitMode:X2} bits=0x{state.Bits:X16} waiters={state.WaitingThreads} -> parked");
+            }
             return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
         }
         finally
@@ -500,6 +516,10 @@ public static class KernelEventFlagCompatExports
             state.WaitingThreads = Math.Max(0, state.WaitingThreads - 1);
             TraceEventFlag(
                 $"wait-wake pattern=0x{pattern:X16} mode=0x{waitMode:X2} bits=0x{state.Bits:X16} waiters={state.WaitingThreads}");
+            if (GuestSyncTrace.Enabled)
+            {
+                GuestSyncTrace.Log($"evf.wake prim=('{state.Name}') pattern=0x{pattern:X16} mode=0x{waitMode:X2} bits=0x{state.Bits:X16} waiters={state.WaitingThreads} -> satisfied");
+            }
             return true;
         }
     }
