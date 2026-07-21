@@ -256,10 +256,14 @@ internal static unsafe class VulkanVideoPresenter
     // SHARPEMU_REUSE_GUEST_IMAGE_MEMORY: pool retired guest-image device-memory
     // blocks and rent them back for later same-size allocations instead of
     // vkFreeMemory + vkAllocateMemory churning a fresh block every draw. A block
-    // is only pooled while the GPU is idle w.r.t. it (no pending submission or
-    // present in flight and not mid-reclaim), so a rented block can never alias
-    // in-flight work. Default unset keeps the byte-identical free-every-time
-    // path. See ReleaseGuestImageMemory / TryRentPooledDeviceMemory.
+    // is parked the instant its image is destroyed -- even while rendering is
+    // active -- stamped with the guest/present submission seqs live at that
+    // moment; it is rented back only once those seqs have RETIRED (its own
+    // last-use fence has signaled), so a rented block can never alias in-flight
+    // work. (The old "pool only while the whole GPU is idle" gate was never true
+    // during active rendering, so the pool stayed empty all run.) Default unset
+    // keeps the byte-identical free-every-time path. See ReleaseGuestImageMemory
+    // / TryRentPooledDeviceMemory.
     private static readonly bool _reuseGuestImageMemory =
         string.Equals(
             Environment.GetEnvironmentVariable("SHARPEMU_REUSE_GUEST_IMAGE_MEMORY"),
@@ -2923,7 +2927,11 @@ internal static unsafe class VulkanVideoPresenter
         // Ticks are Stopwatch timestamps summed per sub-step; a DRAWTIME line is
         // emitted and every accumulator is reset every DrawTimingEmitInterval
         // real (submitted) draws, so each line is a per-interval breakdown.
-        private long _dtSetupTicks;          // guest-image get + depth + transient pass
+        private long _dtValidateTicks;       // prologue: MRT format/blend validation + LINQ, pre-setup
+        private long _dtSetupTicks;          // guest-image get + depth + transient pass (incl capacityWait)
+        private long _dtCapacityWaitTicks;   // EnsureGuestSubmissionCapacity blocking + reaping (subset of setup)
+        private long _dtPostTicks;           // post-submit bookkeeping (publish/locks/marks), pre-teardown
+        private long _dtTeardownTicks;       // finally: transient framebuffer/renderpass destroy + resource free
         private long _dtResolveTicks;        // texture/global/vertex/index resolve+upload
         private long _dtDescriptorTicks;     // descriptor set/layout build
         private long _dtPipelineLookupTicks; // pipeline key build (incl shader digest) + dict lookup
@@ -3059,15 +3067,33 @@ internal static unsafe class VulkanVideoPresenter
         // Free-list of retired guest-image device-memory blocks eligible for
         // reuse (SHARPEMU_REUSE_GUEST_IMAGE_MEMORY). Keyed by the exact
         // (allocation size, memory type) so a rented block satisfies the new
-        // image's bind requirements without reallocating. Only blocks freed
-        // while the GPU is idle w.r.t. them are pooled, so nothing here is ever
-        // referenced by in-flight work. Render-thread state, no locking (same
-        // as _guestImages). Trimmed to MaxPooledDeviceMemoryBytes and fully
-        // drained on OOM/reclaim/dispose.
-        private readonly Dictionary<(ulong Size, uint MemoryTypeIndex), Stack<DeviceMemory>>
+        // image's bind requirements without reallocating. A block is parked the
+        // instant its image is destroyed -- NOT only when the whole GPU is idle
+        // -- and carries the guest/present submission seqs live at park time. It
+        // is rented back only once those seqs have RETIRED (its own last-use
+        // fence has signaled), so a rent can never alias in-flight GPU work.
+        // Render-thread state, no locking (same as _guestImages). Trimmed to
+        // MaxPooledDeviceMemoryBytes and fully drained on OOM/dispose. FIFO per
+        // key so the oldest (readiest) block is examined first.
+        private readonly record struct PooledDeviceMemoryBlock(
+            DeviceMemory Memory,
+            long GuestGuardSeq,
+            long PresentGuardSeq);
+        private readonly Dictionary<(ulong Size, uint MemoryTypeIndex), Queue<PooledDeviceMemoryBlock>>
             _freeDeviceMemoryPool = new();
         private int _pooledDeviceMemoryBlockCount;
         private ulong _pooledDeviceMemoryBytes;
+        // Monotonic per-block reuse fence tracking (render-thread only). A parked
+        // block is safe to rent once every submission that could still reference
+        // it has retired: _guestRetireSeq >= its GuestGuardSeq (all guest-queue
+        // submissions enqueued up to park time have completed) and
+        // _presentRetireSeq >= its PresentGuardSeq (same for presentation, which
+        // reads flip snapshots). These count submitted/retired events across BOTH
+        // the async ring and legacy present paths and never reset mid-run.
+        private long _guestSubmitSeq;
+        private long _guestRetireSeq;
+        private long _presentSubmitSeq;
+        private long _presentRetireSeq;
         // Cap the reuse pool so it cannot itself grow unbounded and hold VRAM
         // hostage. With a ~700MB live guest-image set this headroom is enough to
         // absorb the create/destroy churn while keeping real VRAM ~= live+cap.
@@ -4446,6 +4472,7 @@ internal static unsafe class VulkanVideoPresenter
 
             Check(result, "vkWaitForFences(presentation)");
             _presentationInFlight = false;
+            _presentRetireSeq++;
             if (_pendingPresentationResources is not null)
             {
                 MarkSampledImagesInitialized(_pendingPresentationResources);
@@ -4473,6 +4500,7 @@ internal static unsafe class VulkanVideoPresenter
             }
 
             _asyncFrameInFlight[slot] = false;
+            _presentRetireSeq++;
             if (_asyncFrameResources[slot] is { } resources)
             {
                 MarkSampledImagesInitialized(resources);
@@ -4643,6 +4671,10 @@ internal static unsafe class VulkanVideoPresenter
                     resources,
                     traceImages,
                     resources.DebugName));
+            // Per-block reuse guard: a block freed after this point may be
+            // referenced by this submission, so its GuestGuardSeq is captured
+            // from this counter.
+            _guestSubmitSeq++;
         }
 
         private void SubmitGuestCommandBufferAndWait(CommandBuffer commandBuffer)
@@ -4725,6 +4757,9 @@ internal static unsafe class VulkanVideoPresenter
 
                 Check(status, $"vkGetFenceStatus(guest: {submission.DebugName})");
                 _pendingGuestSubmissions.Dequeue();
+                // This submission's fence has signaled; retiring it may release a
+                // parked reuse block whose GuestGuardSeq this reaches.
+                _guestRetireSeq++;
 
                 try
                 {
@@ -7861,33 +7896,55 @@ internal static unsafe class VulkanVideoPresenter
                 return;
             }
 
-            // Pool only when: reuse is on; we know the block's size/type; we are
-            // not already reclaiming under memory pressure (then really free to
-            // relieve it); the pool has headroom; and the GPU is idle w.r.t.
-            // this block -- no guest submission or present in flight can still
-            // reference it, so a future rent can never alias live GPU work.
-            if (_reuseGuestImageMemory &&
-                resource.MemorySize != 0 &&
-                IsDeviceLocalMemoryType(resource.MemoryTypeIndex) &&
-                !_reclaimInProgress &&
-                _pendingGuestSubmissions.Count == 0 &&
-                !_presentationInFlight &&
-                _pooledDeviceMemoryBytes + resource.MemorySize <= MaxPooledDeviceMemoryBytes)
+            // Pool whenever reuse is on, the block's size/type is known and
+            // device-local, and the pool has headroom. Parking is decoupled from
+            // global GPU idle: the block is stamped with the guest/present
+            // submission seqs live right now (every submission that could still
+            // reference it has a seq <= these), and TryRentPooledDeviceMemory
+            // refuses to hand it back until those seqs have RETIRED. So a rent can
+            // never alias in-flight GPU work even while rendering is active --
+            // which is exactly when the old "_pendingGuestSubmissions.Count == 0"
+            // idle gate was never true, leaving the pool empty all run.
+            var deviceLocal = resource.MemorySize != 0 &&
+                IsDeviceLocalMemoryType(resource.MemoryTypeIndex);
+            var headroom =
+                _pooledDeviceMemoryBytes + resource.MemorySize <= MaxPooledDeviceMemoryBytes;
+            if (_reuseGuestImageMemory && deviceLocal && headroom)
             {
                 // Reserved, no longer live: drop it from the live ledger but keep
                 // the VkDeviceMemory alive for reuse.
                 _deviceMemoryLedger.Untrack(memory.Handle);
                 var key = (resource.MemorySize, resource.MemoryTypeIndex);
-                if (!_freeDeviceMemoryPool.TryGetValue(key, out var stack))
+                if (!_freeDeviceMemoryPool.TryGetValue(key, out var queue))
                 {
-                    stack = new Stack<DeviceMemory>();
-                    _freeDeviceMemoryPool[key] = stack;
+                    queue = new Queue<PooledDeviceMemoryBlock>();
+                    _freeDeviceMemoryPool[key] = queue;
                 }
 
-                stack.Push(memory);
+                queue.Enqueue(new PooledDeviceMemoryBlock(
+                    memory, _guestSubmitSeq, _presentSubmitSeq));
                 _pooledDeviceMemoryBlockCount++;
                 _pooledDeviceMemoryBytes += resource.MemorySize;
+                if (ShouldTracePool())
+                {
+                    Console.Error.WriteLine(
+                        $"[LOADER][POOLDBG] park size={resource.MemorySize / (1024 * 1024)}MB " +
+                        $"type={resource.MemoryTypeIndex} guestGuard={_guestSubmitSeq} " +
+                        $"presentGuard={_presentSubmitSeq} pending={_pendingGuestSubmissions.Count} " +
+                        $"presentInFlight={_presentationInFlight} reclaim={_reclaimInProgress} " +
+                        $"pool={_pooledDeviceMemoryBytes / (1024 * 1024)}MB/{_pooledDeviceMemoryBlockCount}");
+                }
+
                 return;
+            }
+
+            if (_reuseGuestImageMemory && ShouldTracePool())
+            {
+                Console.Error.WriteLine(
+                    $"[LOADER][POOLDBG] free_skip size={resource.MemorySize / (1024 * 1024)}MB " +
+                    $"type={resource.MemoryTypeIndex} deviceLocal={deviceLocal} " +
+                    $"sizeKnown={resource.MemorySize != 0} headroom={headroom} " +
+                    $"pool={_pooledDeviceMemoryBytes / (1024 * 1024)}MB/{_pooledDeviceMemoryBlockCount}");
             }
 
             FreeDeviceMemory(memory);
@@ -7898,17 +7955,73 @@ internal static unsafe class VulkanVideoPresenter
             uint memoryTypeIndex,
             out DeviceMemory memory)
         {
-            if (_freeDeviceMemoryPool.TryGetValue((size, memoryTypeIndex), out var stack) &&
-                stack.Count != 0)
+            if (_freeDeviceMemoryPool.TryGetValue((size, memoryTypeIndex), out var queue) &&
+                queue.Count != 0)
             {
-                memory = stack.Pop();
-                _pooledDeviceMemoryBlockCount--;
-                _pooledDeviceMemoryBytes -= size;
-                return true;
+                // FIFO by park order and the guard seqs are monotonic, so the
+                // front block is the readiest: if its guards have not retired,
+                // nothing behind it has either. Only rent once both the guest and
+                // present submissions live at park time have fully retired -- that
+                // is the block's own last-use fence signaling.
+                var front = queue.Peek();
+                if (_guestRetireSeq >= front.GuestGuardSeq &&
+                    _presentRetireSeq >= front.PresentGuardSeq)
+                {
+                    queue.Dequeue();
+                    _pooledDeviceMemoryBlockCount--;
+                    _pooledDeviceMemoryBytes -= size;
+                    memory = front.Memory;
+                    if (ShouldTracePool())
+                    {
+                        Console.Error.WriteLine(
+                            $"[LOADER][POOLDBG] rent_hit size={size / (1024 * 1024)}MB " +
+                            $"type={memoryTypeIndex} " +
+                            $"guestGuard={front.GuestGuardSeq}/{_guestRetireSeq} " +
+                            $"presentGuard={front.PresentGuardSeq}/{_presentRetireSeq} " +
+                            $"pool={_pooledDeviceMemoryBytes / (1024 * 1024)}MB/{_pooledDeviceMemoryBlockCount}");
+                    }
+
+                    return true;
+                }
+
+                if (ShouldTracePool())
+                {
+                    Console.Error.WriteLine(
+                        $"[LOADER][POOLDBG] rent_miss_notready size={size / (1024 * 1024)}MB " +
+                        $"type={memoryTypeIndex} " +
+                        $"guestGuard={front.GuestGuardSeq}/{_guestRetireSeq} " +
+                        $"presentGuard={front.PresentGuardSeq}/{_presentRetireSeq} " +
+                        $"queued={queue.Count}");
+                }
+
+                memory = default;
+                return false;
+            }
+
+            if (ShouldTracePool())
+            {
+                Console.Error.WriteLine(
+                    $"[LOADER][POOLDBG] rent_miss_empty size={size / (1024 * 1024)}MB " +
+                    $"type={memoryTypeIndex} keys={_freeDeviceMemoryPool.Count}");
             }
 
             memory = default;
             return false;
+        }
+
+        // Throttled [POOLDBG] gate: full detail for the first events, then a
+        // periodic sample, so a diagnostic run (SHARPEMU_REUSE_GUEST_IMAGE_MEMORY)
+        // shows park/rent/skip decisions without flooding the uploaded log.
+        private long _poolDebugEvents;
+        private bool ShouldTracePool()
+        {
+            if (!_reuseGuestImageMemory)
+            {
+                return false;
+            }
+
+            var n = ++_poolDebugEvents;
+            return n <= 300 || (n & 127) == 0;
         }
 
         // Really frees every pooled block (vkFreeMemory). Called when the driver
@@ -7921,11 +8034,11 @@ internal static unsafe class VulkanVideoPresenter
                 return;
             }
 
-            foreach (var stack in _freeDeviceMemoryPool.Values)
+            foreach (var queue in _freeDeviceMemoryPool.Values)
             {
-                while (stack.Count != 0)
+                while (queue.Count != 0)
                 {
-                    _vk.FreeMemory(_device, stack.Pop(), null);
+                    _vk.FreeMemory(_device, queue.Dequeue().Memory, null);
                 }
             }
 
@@ -8400,8 +8513,25 @@ internal static unsafe class VulkanVideoPresenter
             }
 
             long tSetup0 = _drawTiming ? Stopwatch.GetTimestamp() : 0;
+            if (_drawTiming)
+            {
+                // Everything from the draw-total start to here is the prologue:
+                // MRT format/blend validation and the associated LINQ. Attributing
+                // it drains it out of the 'other' bucket.
+                _dtValidateTicks += tSetup0 - tDrawTotal0;
+            }
+
             var targets = new GuestImageResource[work.Targets.Count];
+            // The depth-8 in-flight fence throttle: when the pipeline is full this
+            // blocks on the oldest guest fence, and it always reaps completed
+            // submissions (per-draw framebuffer/renderpass/imageview destroy).
+            // Timed as a subset of setup so its cost is visible separately.
+            long tCapacity0 = _drawTiming ? Stopwatch.GetTimestamp() : 0;
             EnsureGuestSubmissionCapacity();
+            if (_drawTiming)
+            {
+                _dtCapacityWaitTicks += Stopwatch.GetTimestamp() - tCapacity0;
+            }
             for (var index = 0; index < targets.Length; index++)
             {
                 var slotTarget = work.Targets[index];
@@ -8436,6 +8566,7 @@ internal static unsafe class VulkanVideoPresenter
             TranslatedDrawResources? resources = null;
             CommandBuffer commandBuffer = default;
             var submitted = false;
+            long tPostSubmit0 = 0;
             RenderPass transientRenderPass = default;
             Framebuffer transientFramebuffer = default;
             GuestImageResource? depthImage = null;
@@ -8741,7 +8872,12 @@ internal static unsafe class VulkanVideoPresenter
                     GetTraceImages(resources, targets));
                 if (_drawTiming)
                 {
-                    _dtSubmitTicks += Stopwatch.GetTimestamp() - tSubmit0;
+                    var tSubmitEnd = Stopwatch.GetTimestamp();
+                    _dtSubmitTicks += tSubmitEnd - tSubmit0;
+                    // Everything from here to the finally is post-submit
+                    // bookkeeping (target publish, gate locks, mark-initialized,
+                    // capture); the finally closes this span into _dtPostTicks.
+                    tPostSubmit0 = tSubmitEnd;
                 }
 
                 submitted = true;
@@ -8921,15 +9057,12 @@ internal static unsafe class VulkanVideoPresenter
             }
             finally
             {
+                long tTeardown0 = _drawTiming ? Stopwatch.GetTimestamp() : 0;
                 if (_drawTiming && submitted)
                 {
-                    _dtTotalTicks += Stopwatch.GetTimestamp() - tDrawTotal0;
-                    _dtDraws++;
-                    _dtDrawsTotal++;
-                    if (_dtDraws >= DrawTimingEmitInterval)
-                    {
-                        EmitDrawTiming();
-                    }
+                    // tPostSubmit0 was stamped right after the submit span; the
+                    // gap up to here is the post-submit bookkeeping.
+                    _dtPostTicks += tTeardown0 - tPostSubmit0;
                 }
 
                 _commandBuffer = _presentationCommandBuffer;
@@ -8961,6 +9094,22 @@ internal static unsafe class VulkanVideoPresenter
                 if (transientRenderPass.Handle != 0)
                 {
                     _vk.DestroyRenderPass(_device, transientRenderPass, null);
+                }
+
+                if (_drawTiming && submitted)
+                {
+                    // Capture total LAST so this finally's teardown (transient
+                    // framebuffer/renderpass destroy + any resource free) is
+                    // inside 'total' and attributed, not hidden after it.
+                    var tEnd = Stopwatch.GetTimestamp();
+                    _dtTeardownTicks += tEnd - tTeardown0;
+                    _dtTotalTicks += tEnd - tDrawTotal0;
+                    _dtDraws++;
+                    _dtDrawsTotal++;
+                    if (_dtDraws >= DrawTimingEmitInterval)
+                    {
+                        EmitDrawTiming();
+                    }
                 }
             }
         }
@@ -10105,32 +10254,46 @@ internal static unsafe class VulkanVideoPresenter
         // (a fresh SPIR-V byte[] per draw -> SHA256 recomputed each time).
         private void EmitDrawTiming()
         {
-            var setup = TicksToMs(_dtSetupTicks);
+            var validate = TicksToMs(_dtValidateTicks);
+            var capacityWait = TicksToMs(_dtCapacityWaitTicks);
+            // _dtSetupTicks spans the whole setup phase INCLUDING the capacity
+            // wait; report the image-create part alone so setup and capacityWait
+            // are disjoint and sum back to the raw setup span.
+            var setup = TicksToMs(_dtSetupTicks) - capacityWait;
             var resolve = TicksToMs(_dtResolveTicks);
             var descriptors = TicksToMs(_dtDescriptorTicks);
             var pipeLookup = TicksToMs(_dtPipelineLookupTicks);
             var pipeCreate = TicksToMs(_dtPipelineCreateTicks);
             var record = TicksToMs(_dtRecordTicks);
             var submit = TicksToMs(_dtSubmitTicks);
+            var postSubmit = TicksToMs(_dtPostTicks);
+            var teardown = TicksToMs(_dtTeardownTicks);
             var total = TicksToMs(_dtTotalTicks);
-            var other = total - setup - resolve - descriptors -
-                pipeLookup - pipeCreate - record - submit;
+            var other = total - validate - setup - capacityWait - resolve -
+                descriptors - pipeLookup - pipeCreate - record - submit -
+                postSubmit - teardown;
             var perDraw = _dtDraws > 0 ? total / _dtDraws : 0.0;
             Console.Error.WriteLine(
                 $"[LOADER][DRAWTIME] draws={_dtDraws} total={total:F1} perDraw={perDraw:F2} " +
-                $"setup={setup:F1} resolve={resolve:F1} descriptors={descriptors:F1} " +
+                $"validate={validate:F1} setup={setup:F1} capacityWait={capacityWait:F1} " +
+                $"resolve={resolve:F1} descriptors={descriptors:F1} " +
                 $"pipeLookup={pipeLookup:F1} pipeCreate={pipeCreate:F1} " +
-                $"record={record:F1} submit={submit:F1} other={other:F1} " +
+                $"record={record:F1} submit={submit:F1} " +
+                $"postSubmit={postSubmit:F1} teardown={teardown:F1} other={other:F1} " +
                 $"pHit={_dtPipelineHits} pMiss={_dtPipelineMisses} digMiss={_dtDigestMisses} " +
                 $"cumDraws={_dtDrawsTotal}");
 
+            _dtValidateTicks = 0;
             _dtSetupTicks = 0;
+            _dtCapacityWaitTicks = 0;
             _dtResolveTicks = 0;
             _dtDescriptorTicks = 0;
             _dtPipelineLookupTicks = 0;
             _dtPipelineCreateTicks = 0;
             _dtRecordTicks = 0;
             _dtSubmitTicks = 0;
+            _dtPostTicks = 0;
+            _dtTeardownTicks = 0;
             _dtTotalTicks = 0;
             _dtDraws = 0;
             _dtPipelineHits = 0;
@@ -10554,6 +10717,7 @@ internal static unsafe class VulkanVideoPresenter
                 // reads finish -- which is what prevents the tearing/corruption
                 // the removed QueueWaitIdle previously guarded against.
                 _asyncFrameInFlight[asyncSlot] = true;
+                _presentSubmitSeq++;
                 _asyncFrameResources[asyncSlot] = translatedResources;
                 if (traceAsync)
                 {
@@ -10565,6 +10729,7 @@ internal static unsafe class VulkanVideoPresenter
             else
             {
                 _presentationInFlight = true;
+                _presentSubmitSeq++;
                 _pendingPresentationResources = translatedResources;
             }
 
