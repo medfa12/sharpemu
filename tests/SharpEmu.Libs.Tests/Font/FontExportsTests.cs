@@ -52,6 +52,8 @@ public sealed class FontExportsTests
         return BitConverter.UInt32BitsToSingle(bits);
     }
 
+    private static float Q(float value) => MathF.Round(value * 64f) / 64f;
+
     private void FillGarbage(ulong address, int size)
     {
         for (var offset = 0; offset < size; offset += sizeof(uint))
@@ -71,14 +73,14 @@ public sealed class FontExportsTests
         FontExports.FontGetRenderCharGlyphMetrics(_ctx);
 
         Assert.Equal(0UL, _ctx[CpuRegister.Rax]);
-        Assert.Equal(0.55f * 32f, ReadFloat(MetricsAddress + 0x00)); // width
-        Assert.Equal(0.72f * 32f, ReadFloat(MetricsAddress + 0x04)); // height
-        Assert.Equal(0.04f * 32f, ReadFloat(MetricsAddress + 0x08)); // Horizontal.bearingX
-        Assert.Equal(0.72f * 32f, ReadFloat(MetricsAddress + 0x0C)); // Horizontal.bearingY
-        Assert.Equal(0.60f * 32f, ReadFloat(MetricsAddress + 0x10)); // Horizontal.advance
-        Assert.Equal(0f, ReadFloat(MetricsAddress + 0x14)); // Vertical.bearingX
-        Assert.Equal(0f, ReadFloat(MetricsAddress + 0x18)); // Vertical.bearingY
-        Assert.Equal(0f, ReadFloat(MetricsAddress + 0x1C)); // Vertical.advance
+        Assert.Equal(Q(0.55f * 32f), ReadFloat(MetricsAddress + 0x00)); // width
+        Assert.Equal(Q(0.72f * 32f), ReadFloat(MetricsAddress + 0x04)); // height
+        Assert.Equal(Q(0.04f * 32f), ReadFloat(MetricsAddress + 0x08)); // Horizontal.bearingX
+        Assert.Equal(Q(0.72f * 32f), ReadFloat(MetricsAddress + 0x0C)); // Horizontal.bearingY
+        Assert.Equal(Q(0.60f * 32f), ReadFloat(MetricsAddress + 0x10)); // Horizontal.advance
+        Assert.Equal(Q(Q(0.55f * 32f) * 0.5f), ReadFloat(MetricsAddress + 0x14)); // Vertical.bearingX
+        Assert.Equal(Q(0.14f * 32f), ReadFloat(MetricsAddress + 0x18)); // Vertical.bearingY
+        Assert.Equal(32f, ReadFloat(MetricsAddress + 0x1C)); // Vertical.advance
     }
 
     [Fact]
@@ -92,8 +94,8 @@ public sealed class FontExportsTests
         FontExports.FontGetCharGlyphMetrics(_ctx);
 
         Assert.Equal(0UL, _ctx[CpuRegister.Rax]);
-        Assert.Equal(0.55f * 24f, ReadFloat(MetricsAddress + 0x00));
-        Assert.Equal(0.60f * 24f, ReadFloat(MetricsAddress + 0x10));
+        Assert.Equal(Q(0.55f * 24f), ReadFloat(MetricsAddress + 0x00));
+        Assert.Equal(Q(0.60f * 24f), ReadFloat(MetricsAddress + 0x10));
     }
 
     [Fact]
@@ -106,8 +108,8 @@ public sealed class FontExportsTests
         FontExports.FontGetRenderCharGlyphMetrics(_ctx);
 
         Assert.Equal(0UL, _ctx[CpuRegister.Rax]);
-        Assert.Equal(0.55f * 16f, ReadFloat(MetricsAddress + 0x00));
-        Assert.Equal(0.60f * 16f, ReadFloat(MetricsAddress + 0x10));
+        Assert.Equal(Q(0.55f * 16f), ReadFloat(MetricsAddress + 0x00));
+        Assert.Equal(Q(0.60f * 16f), ReadFloat(MetricsAddress + 0x10));
     }
 
     [Fact]
@@ -123,7 +125,7 @@ public sealed class FontExportsTests
         Assert.Equal(0UL, _ctx[CpuRegister.Rax]);
         Assert.Equal(0f, ReadFloat(MetricsAddress + 0x00));
         Assert.Equal(0f, ReadFloat(MetricsAddress + 0x04));
-        Assert.Equal(0.30f * 32f, ReadFloat(MetricsAddress + 0x10));
+        Assert.Equal(Q(0.60f * 32f), ReadFloat(MetricsAddress + 0x10));
     }
 
     [Fact]
@@ -182,8 +184,8 @@ public sealed class FontExportsTests
         FontExports.FontGetHorizontalLayout(_ctx);
 
         Assert.Equal(0UL, _ctx[CpuRegister.Rax]);
-        Assert.Equal(0.88f * 32f, ReadFloat(LayoutAddress + 0x00)); // baselineOffset
-        Assert.Equal(1.18f * 32f, ReadFloat(LayoutAddress + 0x04)); // lineAdvance
+        Assert.Equal(Q(0.88f * 32f), ReadFloat(LayoutAddress + 0x00)); // baselineOffset
+        Assert.Equal(Q(0.88f * 32f) + Q(0.30f * 32f), ReadFloat(LayoutAddress + 0x04)); // lineAdvance
         Assert.Equal(0f, ReadFloat(LayoutAddress + 0x08)); // decorationExtent
     }
 
@@ -254,7 +256,7 @@ public sealed class FontExportsTests
         _ctx[CpuRegister.Rdx] = MetricsAddress;
         FontExports.FontGetRenderCharGlyphMetrics(_ctx);
 
-        Assert.Equal(0.60f * 20f, ReadFloat(MetricsAddress + 0x10));
+        Assert.Equal(Q(0.60f * 20f), ReadFloat(MetricsAddress + 0x10));
     }
 
     // (handle, codepoint, params, outGlyph) -> RDI, ESI, RDX, RCX.
@@ -444,10 +446,10 @@ public sealed class FontExportsTests
 
         Assert.Equal(0UL, _ctx[CpuRegister.Rax]);
         // Metrics agree with the layout queries so pen advances stay coherent.
-        Assert.Equal(0.55f * 32f, ReadFloat(MetricsAddress + 0x00));
-        Assert.Equal(0.60f * 32f, ReadFloat(MetricsAddress + 0x10));
+        Assert.Equal(Q(0.55f * 32f), ReadFloat(MetricsAddress + 0x00));
+        Assert.Equal(Q(0.60f * 32f), ReadFloat(MetricsAddress + 0x10));
         // OrbisFontRenderOutput: stage null, SurfaceImage echoing the caller's
-        // surface, empty UpdateRect (nothing drawn), metrics-derived advance.
+        // surface, clipped UpdateRect, and metrics-derived advance.
         Assert.True(_ctx.TryReadUInt64(RenderResultAddress + 0x00, out var stage));
         Assert.Equal(0UL, stage);
         Assert.True(_ctx.TryReadUInt64(RenderResultAddress + 0x08, out var image));
@@ -456,18 +458,23 @@ public sealed class FontExportsTests
         Assert.Equal(256u, pitch);
         Assert.True(_ctx.TryReadUInt32(RenderResultAddress + 0x14, out var pixelSize));
         Assert.Equal(1u, pixelSize);
-        for (var offset = 0x18; offset < 0x28; offset += sizeof(uint))
-        {
-            Assert.True(_ctx.TryReadUInt32(RenderResultAddress + (ulong)offset, out var rect));
-            Assert.Equal(0u, rect);
-        }
+        Assert.True(_ctx.TryReadUInt32(RenderResultAddress + 0x18, out var updateX));
+        Assert.True(_ctx.TryReadUInt32(RenderResultAddress + 0x1C, out var updateY));
+        Assert.True(_ctx.TryReadUInt32(RenderResultAddress + 0x20, out var updateWidth));
+        Assert.True(_ctx.TryReadUInt32(RenderResultAddress + 0x24, out var updateHeight));
+        Assert.Equal(13u, updateX);
+        Assert.Equal(0u, updateY);
+        Assert.Equal(0u, updateWidth);
+        Assert.Equal(0u, updateHeight);
 
-        Assert.Equal(0.04f * 32f, ReadFloat(RenderResultAddress + 0x28)); // bearingX
-        Assert.Equal(0.72f * 32f, ReadFloat(RenderResultAddress + 0x2C)); // bearingY
-        Assert.Equal(0.60f * 32f, ReadFloat(RenderResultAddress + 0x30)); // advance > 0
-        Assert.Equal(0.60f * 32f, ReadFloat(RenderResultAddress + 0x34)); // stride
-        Assert.True(_ctx.TryReadUInt64(RenderResultAddress + 0x38, out var imageDims));
-        Assert.Equal(0UL, imageDims);
+        Assert.Equal(1f, ReadFloat(RenderResultAddress + 0x28)); // snapped bearingX
+        Assert.Equal(24f, ReadFloat(RenderResultAddress + 0x2C)); // snapped bearingY
+        Assert.Equal(20f, ReadFloat(RenderResultAddress + 0x30)); // snapped advance > 0
+        Assert.Equal(20f, ReadFloat(RenderResultAddress + 0x34)); // stride
+        Assert.True(_ctx.TryReadUInt32(RenderResultAddress + 0x38, out var imageWidth));
+        Assert.True(_ctx.TryReadUInt32(RenderResultAddress + 0x3C, out var imageHeight));
+        Assert.Equal(18u, imageWidth);
+        Assert.Equal(24u, imageHeight);
     }
 
     [Fact]

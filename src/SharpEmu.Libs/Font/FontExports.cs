@@ -8,18 +8,9 @@ using SharpEmu.Libs.Kernel;
 namespace SharpEmu.Libs.Font;
 
 /// <summary>
-/// First-cut HLE for libSceFont. This is enough of the initialization surface
-/// to let a title's font/text subsystem set up without dereferencing a null
-/// library, renderer, or font object: creation and open calls hand back a
-/// non-null, zero-filled scratch object; everything else reports success.
-///
-/// It does NOT render real glyphs yet — text will be blank until the renderer
-/// and glyph paths are implemented. The metrics/layout queries return
-/// synthetic but self-consistent values derived from the pixel scale the game
-/// set, so text layout completes and the frame loop keeps advancing. The
-/// out-parameter positions follow the public libSceFont signatures
-/// (out-handle is the trailing pointer argument); writes are guarded by
-/// TryWriteUInt64 so a wrong guess cannot corrupt memory.
+/// Synthetic libSceFont implementation used when the platform font modules
+/// are unavailable. It exposes a scale-aware monospace face and renders
+/// coverage rectangles into guest render surfaces.
 /// </summary>
 public static class FontExports
 {
@@ -35,15 +26,21 @@ public static class FontExports
     private const uint FontErrorInvalidGlyph = 0x80460006;
     private const uint FontErrorAllocationFailed = 0x80460010;
     private const uint FontErrorNoSupportCode = 0x80460041;
+    private const uint FontErrorNoSupportSurface = 0x80460050;
 
-    // Pixel scale per font handle, captured from sceFontSetScalePixel /
-    // sceFontSetupRenderScalePixel. Handles are the scratch-object guest
-    // addresses handed out above. 16px matches the sysfont default a title
-    // gets when it never sets a scale.
     private const float DefaultScalePixel = 16.0f;
-    private static readonly ConcurrentDictionary<ulong, (float W, float H)> ScalePixels = new();
+    private const float PointsPerInch = 72.0f;
+    private const ushort StyleFrameMagic = 0x0F09;
+    private readonly record struct FontScale(float W, float H, bool IsPoint, uint DpiX, uint DpiY);
+    private static readonly ConcurrentDictionary<ulong, FontScale> FontScales = new();
+    private static readonly byte[] CoveragePixel1 = [0xFF];
+    private static readonly byte[] CoveragePixel4 = [0xFF, 0xFF, 0xFF, 0xFF];
 
-    private static bool TryHandOutHandle(CpuContext ctx, ulong outPointer, out ulong handle)
+    private static bool TryHandOutHandle(
+        CpuContext ctx,
+        ulong outPointer,
+        out ulong handle,
+        FontScale? inheritedScale = null)
     {
         handle = 0;
         if (outPointer == 0 ||
@@ -52,8 +49,17 @@ public static class FontExports
             return false;
         }
 
-        return ctx.TryWriteUInt64(outPointer, handle);
+        if (!ctx.TryWriteUInt64(outPointer, handle))
+        {
+            return false;
+        }
+
+        FontScales[handle] = inheritedScale ?? DefaultFontScale;
+        return true;
     }
+
+    private static FontScale DefaultFontScale =>
+        new(DefaultScalePixel, DefaultScalePixel, false, 72, 72);
 
     [SysAbiExport(Nid = "whrS4oksXc4", ExportName = "sceFontMemoryInit",
         Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceFont")]
@@ -100,9 +106,15 @@ public static class FontExports
         Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceFont")]
     public static int FontOpenFontInstance(CpuContext ctx)
     {
-        // (library, openDetail, OrbisFontHandle* out) -> out in RDX, confirmed at
-        // the call site (mov rdx,<slot>; xor esi,esi).
-        _ = TryHandOutHandle(ctx, ctx[CpuRegister.Rdx], out _);
+        // (fontHandle, templateFont, OrbisFontHandle* out) -> out in RDX,
+        // confirmed at the call site (mov rdx,<slot>; xor esi,esi).
+        var source = ctx[CpuRegister.Rdi];
+        if (!FontScales.TryGetValue(source, out var inherited))
+        {
+            inherited = DefaultFontScale;
+        }
+
+        _ = TryHandOutHandle(ctx, ctx[CpuRegister.Rdx], out _, inherited);
         ctx[CpuRegister.Rax] = 0;
         return 0;
     }
@@ -118,9 +130,6 @@ public static class FontExports
         return 0;
     }
 
-    // Everything below sets up render state, queries layout, or tears objects
-    // down. Reporting success lets initialization proceed; real glyph output
-    // is future work.
     [SysAbiExport(Nid = "3OdRkSjOcog", ExportName = "sceFontBindRenderer",
         Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceFont")]
     public static int FontBindRenderer(CpuContext ctx) => Ok(ctx);
@@ -233,6 +242,36 @@ public static class FontExports
         return Ok(ctx);
     }
 
+    [SysAbiExport(Nid = "vRxf4d0ulPs", ExportName = "sceFontRenderSurfaceSetScissor",
+        Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceFont")]
+    public static int FontRenderSurfaceSetScissor(CpuContext ctx)
+    {
+        var surface = ctx[CpuRegister.Rdi];
+        if (surface == 0 ||
+            !ctx.TryReadInt32(surface + 0x10, out var surfaceWidth) ||
+            !ctx.TryReadInt32(surface + 0x14, out var surfaceHeight))
+        {
+            return Ok(ctx);
+        }
+
+        var x = (int)ctx[CpuRegister.Rsi];
+        var y = (int)ctx[CpuRegister.Rdx];
+        var width = (int)ctx[CpuRegister.Rcx];
+        var height = (int)ctx[CpuRegister.R8];
+        var x0 = ClampLongToRange(x, 0, Math.Max(surfaceWidth, 0));
+        var y0 = ClampLongToRange(y, 0, Math.Max(surfaceHeight, 0));
+        var x1 = ClampLongToRange((long)x + Math.Max(width, 0), 0, Math.Max(surfaceWidth, 0));
+        var y1 = ClampLongToRange((long)y + Math.Max(height, 0), 0, Math.Max(surfaceHeight, 0));
+        _ = ctx.TryWriteUInt32(surface + 0x18, (uint)x0)
+            && ctx.TryWriteUInt32(surface + 0x1C, (uint)y0)
+            && ctx.TryWriteUInt32(surface + 0x20, (uint)Math.Max(x1, x0))
+            && ctx.TryWriteUInt32(surface + 0x24, (uint)Math.Max(y1, y0));
+        return Ok(ctx);
+    }
+
+    private static int ClampLongToRange(long value, int minimum, int maximum) =>
+        (int)Math.Clamp(value, minimum, maximum);
+
     [SysAbiExport(Nid = "oaJ1BpN2FQk", ExportName = "sceFontTextSourceInit",
         Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceFont")]
     public static int FontTextSourceInit(CpuContext ctx) => Ok(ctx);
@@ -251,24 +290,58 @@ public static class FontExports
 
     [SysAbiExport(Nid = "N1EBMeGhf7E", ExportName = "sceFontSetScalePixel",
         Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceFont")]
-    public static int FontSetScalePixel(CpuContext ctx) => RecordScalePixel(ctx);
+    public static int FontSetScalePixel(CpuContext ctx) => RecordScale(ctx, isPoint: false);
 
     [SysAbiExport(Nid = "6vGCkkQJOcI", ExportName = "sceFontSetupRenderScalePixel",
         Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceFont")]
-    public static int FontSetupRenderScalePixel(CpuContext ctx) => RecordScalePixel(ctx);
+    public static int FontSetupRenderScalePixel(CpuContext ctx) => RecordScale(ctx, isPoint: false);
 
-    private static int RecordScalePixel(CpuContext ctx)
+    [SysAbiExport(Nid = "sw65+7wXCKE", ExportName = "sceFontSetScalePoint",
+        Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceFont")]
+    public static int FontSetScalePoint(CpuContext ctx) => RecordScale(ctx, isPoint: true);
+
+    [SysAbiExport(Nid = "nMZid4oDfi4", ExportName = "sceFontSetupRenderScalePoint",
+        Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceFont")]
+    public static int FontSetupRenderScalePoint(CpuContext ctx) => RecordScale(ctx, isPoint: true);
+
+    [SysAbiExport(Nid = "I1acwR7Qp8E", ExportName = "sceFontSetResolutionDpi",
+        Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceFont")]
+    public static int FontSetResolutionDpi(CpuContext ctx)
     {
-        // (OrbisFontHandle handle, float w, float h) -> handle in RDI, the two
-        // floats in XMM0/XMM1. The scale feeds the synthetic glyph metrics.
+        var handle = ctx[CpuRegister.Rdi];
+        if (handle == 0)
+        {
+            return Error(ctx, FontErrorInvalidFontHandle);
+        }
+
+        var scale = FontScales.GetOrAdd(handle, DefaultFontScale);
+        var dpiX = (uint)ctx[CpuRegister.Rsi];
+        var dpiY = (uint)ctx[CpuRegister.Rdx];
+        FontScales[handle] = scale with
+        {
+            DpiX = dpiX == 0 ? 72u : dpiX,
+            DpiY = dpiY == 0 ? 72u : dpiY,
+        };
+        return Ok(ctx);
+    }
+
+    private static int RecordScale(CpuContext ctx, bool isPoint)
+    {
         var handle = ctx[CpuRegister.Rdi];
         var w = ReadXmmFloat(ctx, 0);
         var h = ReadXmmFloat(ctx, 1);
-        if (handle != 0 && float.IsFinite(w) && float.IsFinite(h) && w > 0f && h > 0f)
+        if (handle == 0)
         {
-            ScalePixels[handle] = (w, h);
+            return Error(ctx, FontErrorInvalidFontHandle);
         }
 
+        if (!float.IsFinite(w) || !float.IsFinite(h) || w <= 0f || h <= 0f)
+        {
+            return Error(ctx, FontErrorInvalidParameter);
+        }
+
+        var previous = FontScales.GetOrAdd(handle, DefaultFontScale);
+        FontScales[handle] = new FontScale(w, h, isPoint, previous.DpiX, previous.DpiY);
         return Ok(ctx);
     }
 
@@ -280,22 +353,18 @@ public static class FontExports
         Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceFont")]
     public static int FontGetCharGlyphMetrics(CpuContext ctx) => FillGlyphMetrics(ctx);
 
-    // Both metrics queries share one body: titles call the Render variant first
-    // and fall back to the plain one on any error, so both must exist and both
-    // report the same synthetic metrics.
-    //
-    // OrbisFontGlyphMetrics is 8 consecutive floats (32 bytes): width, height,
-    // Horizontal { bearingX, bearingY, advance }, Vertical { bearingX,
-    // bearingY, advance }. The Vertical block is written as zero even on
-    // success, matching the real library's horizontal-only fill.
-    //
-    // Without a real charmap we treat every nonzero codepoint as supported and
-    // return metrics derived from the handle's pixel scale. A per-codepoint
-    // NO_SUPPORT_GLYPH here would be arbitrary, and a zero advance stalls the
-    // caller's pen-advance loop, so printable glyphs always get advance > 0.
+    private readonly record struct GlyphMetrics(
+        float Width,
+        float Height,
+        float HorizontalBearingX,
+        float HorizontalBearingY,
+        float HorizontalAdvance,
+        float VerticalBearingX,
+        float VerticalBearingY,
+        float VerticalAdvance);
+
     private static int FillGlyphMetrics(CpuContext ctx)
     {
-        // (OrbisFontHandle handle, u32 code, OrbisFontGlyphMetrics* metrics)
         return FillGlyphMetricsAt(
             ctx, ctx[CpuRegister.Rdi], (uint)ctx[CpuRegister.Rsi], ctx[CpuRegister.Rdx]);
     }
@@ -308,7 +377,7 @@ public static class FontExports
             return Error(ctx, FontErrorInvalidFontHandle);
         }
 
-        if (code == 0)
+        if (!IsSupportedCode(code))
         {
             ZeroGuestStruct(ctx, metrics, 0x20);
             return Error(ctx, FontErrorNoSupportCode);
@@ -320,33 +389,52 @@ public static class FontExports
         }
 
         var (scaleW, scaleH) = GetScalePixel(handle);
-        var isSpace = code is 0x20 or 0x09 or 0xA0 or 0x3000;
-        var width = isSpace ? 0f : 0.55f * scaleW;
-        var height = isSpace ? 0f : 0.72f * scaleH;
-        var bearingX = isSpace ? 0f : 0.04f * scaleW;
-        var bearingY = height; // glyph top sits bearingY above the baseline, inside the 0.88h ascent
-        var advance = code == 0x3000 ? scaleW : (isSpace ? 0.30f * scaleW : 0.60f * scaleW);
-
-        var ok = TryWriteFloat(ctx, metrics + 0x00, width)
-            && TryWriteFloat(ctx, metrics + 0x04, height)
-            && TryWriteFloat(ctx, metrics + 0x08, bearingX)
-            && TryWriteFloat(ctx, metrics + 0x0C, bearingY)
-            && TryWriteFloat(ctx, metrics + 0x10, advance)
-            && TryWriteFloat(ctx, metrics + 0x14, 0f)
-            && TryWriteFloat(ctx, metrics + 0x18, 0f)
-            && TryWriteFloat(ctx, metrics + 0x1C, 0f);
+        var values = BuildGlyphMetrics(code, scaleW, scaleH);
+        var ok = WriteGlyphMetrics(ctx, metrics, values);
         return ok ? Ok(ctx) : Error(ctx, FontErrorInvalidParameter);
     }
+
+    private static GlyphMetrics BuildGlyphMetrics(uint code, float scaleW, float scaleH)
+    {
+        var isSpace = IsWhiteSpace(code);
+        var width = isSpace ? 0f : Quantize26Dot6(0.55f * scaleW);
+        var height = isSpace ? 0f : Quantize26Dot6(0.72f * scaleH);
+        var horizontalBearingX = isSpace ? 0f : Quantize26Dot6(0.04f * scaleW);
+        var horizontalAdvance = Quantize26Dot6(0.60f * scaleW);
+        var verticalAdvance = Quantize26Dot6(scaleH);
+        return new GlyphMetrics(
+            width,
+            height,
+            horizontalBearingX,
+            height,
+            horizontalAdvance,
+            isSpace ? 0f : Quantize26Dot6(width * 0.5f),
+            isSpace ? 0f : Quantize26Dot6(0.14f * scaleH),
+            verticalAdvance);
+    }
+
+    private static bool WriteGlyphMetrics(CpuContext ctx, ulong address, GlyphMetrics metrics) =>
+        TryWriteFloat(ctx, address + 0x00, metrics.Width)
+        && TryWriteFloat(ctx, address + 0x04, metrics.Height)
+        && TryWriteFloat(ctx, address + 0x08, metrics.HorizontalBearingX)
+        && TryWriteFloat(ctx, address + 0x0C, metrics.HorizontalBearingY)
+        && TryWriteFloat(ctx, address + 0x10, metrics.HorizontalAdvance)
+        && TryWriteFloat(ctx, address + 0x14, metrics.VerticalBearingX)
+        && TryWriteFloat(ctx, address + 0x18, metrics.VerticalBearingY)
+        && TryWriteFloat(ctx, address + 0x1C, metrics.VerticalAdvance);
+
+    private static bool IsSupportedCode(uint code) =>
+        code is > 0 and <= 0x10FFFF && code is not (>= 0xD800 and <= 0xDFFF);
+
+    private static bool IsWhiteSpace(uint code) => code is 0x09 or 0x0A or 0x0D or 0x20 or 0xA0 or 0x3000;
+
+    private static float Quantize26Dot6(float value) => MathF.Round(value * 64f) / 64f;
 
     [SysAbiExport(Nid = "imxVx8lm+KM", ExportName = "sceFontGetHorizontalLayout",
         Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceFont")]
     public static int FontGetHorizontalLayout(CpuContext ctx)
     {
         // (OrbisFontHandle handle, OrbisFontHorizontalLayout* layout).
-        // Three floats: baselineOffset (line top to baseline), lineAdvance
-        // (full line height), decorationExtent (effect height, none here).
-        // Values stay consistent with the glyph metrics above: bearingY
-        // (0.72h) <= baselineOffset (0.88h) < lineAdvance (1.18h).
         var handle = ctx[CpuRegister.Rdi];
         var layout = ctx[CpuRegister.Rsi];
 
@@ -362,10 +450,55 @@ public static class FontExports
         }
 
         var (_, scaleH) = GetScalePixel(handle);
-        var ok = TryWriteFloat(ctx, layout + 0x00, 0.88f * scaleH)
-            && TryWriteFloat(ctx, layout + 0x04, 1.18f * scaleH)
+        var ascender = Quantize26Dot6(0.88f * scaleH);
+        var descender = Quantize26Dot6(0.30f * scaleH);
+        var ok = TryWriteFloat(ctx, layout + 0x00, ascender)
+            && TryWriteFloat(ctx, layout + 0x04, ascender + descender)
             && TryWriteFloat(ctx, layout + 0x08, 0f);
         return ok ? Ok(ctx) : Error(ctx, FontErrorInvalidParameter);
+    }
+
+    [SysAbiExport(Nid = "3BrWWFU+4ts", ExportName = "sceFontGetVerticalLayout",
+        Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceFont")]
+    public static int FontGetVerticalLayout(CpuContext ctx)
+    {
+        var handle = ctx[CpuRegister.Rdi];
+        var layout = ctx[CpuRegister.Rsi];
+        if (handle == 0)
+        {
+            ZeroGuestStruct(ctx, layout, 0x0C);
+            return Error(ctx, FontErrorInvalidFontHandle);
+        }
+
+        if (layout == 0)
+        {
+            return Error(ctx, FontErrorInvalidParameter);
+        }
+
+        var (scaleW, _) = GetScalePixel(handle);
+        var columnAdvance = Quantize26Dot6(scaleW);
+        var ok = TryWriteFloat(ctx, layout + 0x00, Quantize26Dot6(columnAdvance * 0.5f))
+            && TryWriteFloat(ctx, layout + 0x04, columnAdvance)
+            && TryWriteFloat(ctx, layout + 0x08, 0f);
+        return ok ? Ok(ctx) : Error(ctx, FontErrorInvalidParameter);
+    }
+
+    [SysAbiExport(Nid = "OINC0X9HGBY", ExportName = "sceFontGetCharGlyphCode",
+        Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceFont")]
+    public static int FontGetCharGlyphCode(CpuContext ctx)
+    {
+        // The public prototype and output ownership for this export remain
+        // unreconstructed. Register the NID and avoid speculative guest writes.
+        return Ok(ctx);
+    }
+
+    [SysAbiExport(Nid = "lVSR5ftvNag", ExportName = "sceFontCharactersRefersTextCodes",
+        Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceFont")]
+    public static int FontCharactersRefersTextCodes(CpuContext ctx)
+    {
+        // The public prototype and output ownership for this export remain
+        // unreconstructed. Register the NID and avoid speculative guest writes.
+        return Ok(ctx);
     }
 
     // ----- Glyph objects (sceFontGenerateCharGlyph .. sceFontDeleteGlyph) -----
@@ -455,12 +588,18 @@ public static class FontExports
 
     [SysAbiExport(Nid = "kAenWy1Zw5o", ExportName = "sceFontRenderCharGlyphImageHorizontal",
         Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceFont")]
-    public static int FontRenderCharGlyphImageHorizontal(CpuContext ctx)
+    public static int FontRenderCharGlyphImageHorizontal(CpuContext ctx) => RenderCharGlyphImage(ctx);
+
+    [SysAbiExport(Nid = "3G4zhgKuxE8", ExportName = "sceFontRenderCharGlyphImage",
+        Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceFont")]
+    public static int FontRenderCharGlyphImage(CpuContext ctx) => RenderCharGlyphImage(ctx);
+
+    [SysAbiExport(Nid = "i6UNdSig1uE", ExportName = "sceFontRenderCharGlyphImageVertical",
+        Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceFont")]
+    public static int FontRenderCharGlyphImageVertical(CpuContext ctx) => RenderCharGlyphImage(ctx);
+
+    private static int RenderCharGlyphImage(CpuContext ctx)
     {
-        // (OrbisFontHandle handle, u32 code, OrbisFontRenderSurface* surf,
-        //  float x, float y, OrbisFontGlyphMetrics* metrics,
-        //  OrbisFontRenderOutput* result). x/y ride XMM0/XMM1, so the
-        // integer-class args land in RDI, ESI, RDX, RCX, R8.
         var handle = ctx[CpuRegister.Rdi];
         var code = (uint)ctx[CpuRegister.Rsi];
         var surf = ctx[CpuRegister.Rdx];
@@ -475,7 +614,7 @@ public static class FontExports
             return Error(ctx, FontErrorInvalidFontHandle);
         }
 
-        if (code == 0)
+        if (!IsSupportedCode(code))
         {
             ClearRenderOutputs(ctx, metrics, result);
             return Error(ctx, FontErrorNoSupportCode);
@@ -487,26 +626,31 @@ public static class FontExports
             return Error(ctx, FontErrorInvalidParameter);
         }
 
-        // Same synthetic metrics as the metrics queries so layout and render
-        // agree on advances; no pixels are written yet (blank glyphs).
-        _ = FillGlyphMetricsAt(ctx, handle, code, metrics);
-        if (ctx[CpuRegister.Rax] != 0)
+        var (scaleW, scaleH) = GetRenderScalePixel(ctx, handle, surf);
+        var glyphMetrics = BuildGlyphMetrics(code, scaleW, scaleH);
+        if (!WriteGlyphMetrics(ctx, metrics, glyphMetrics))
         {
             ClearRenderOutputs(ctx, metrics, result);
-            return Error(ctx, (uint)ctx[CpuRegister.Rax]);
+            return Error(ctx, FontErrorInvalidParameter);
         }
 
-        _ = ctx.TryReadUInt32(metrics + 0x08, out var bearingXBits);
-        _ = ctx.TryReadUInt32(metrics + 0x0C, out var bearingYBits);
-        _ = ctx.TryReadUInt32(metrics + 0x10, out var advanceBits);
-        _ = ctx.TryReadUInt64(surf + 0x00, out var surfBuffer);
-        _ = ctx.TryReadUInt32(surf + 0x08, out var surfWidthByte);
-        _ = ctx.TryReadUInt32(surf + 0x0C, out var surfPixelWord);
+        if (!TryReadRenderSurface(
+                ctx,
+                surf,
+                out var surfBuffer,
+                out var surfWidthByte,
+                out var pixelSize,
+                out var surfaceWidth,
+                out var surfaceHeight,
+                out var scissorX0,
+                out var scissorY0,
+                out var scissorX1,
+                out var scissorY1))
+        {
+            ClearRenderOutputs(ctx, metrics, result);
+            return Error(ctx, FontErrorInvalidParameter);
+        }
 
-        // Defense in depth for surfaces that bypassed sceFontRenderSurfaceInit:
-        // never hand the caller a null image base, or its own blit computes
-        // src = null + penY*stride + penX and faults. The shared arena is
-        // mapped, zero-filled, and large enough for any in-surface offset.
         if (surfBuffer == 0)
         {
             surfBuffer = GetBlankGlyphArena(ctx);
@@ -515,30 +659,91 @@ public static class FontExports
                 surfWidthByte = FallbackSurfaceWidthByte;
             }
 
-            if ((surfPixelWord & 0xFF) == 0)
+            if (pixelSize == 0)
             {
-                surfPixelWord = 1;
+                pixelSize = 1;
             }
         }
 
-        // OrbisFontRenderOutput (0x40 bytes): stage @+0x00, SurfaceImage
-        // { address @+0x08, widthByte @+0x10, pixelSizeByte/pixelFormat/pad
-        // @+0x14 }, UpdateRect { x,y,w,h } @+0x18, ImageMetrics { bearingX,
-        // bearingY, advance, stride @+0x28.., width/height @+0x38 }. An empty
-        // 0x0 UpdateRect and 0x0 image tell the caller "nothing was drawn",
-        // while address still points at the caller's own surface buffer so a
-        // blind copy-out cannot fault.
+        if (surfBuffer == 0 || pixelSize is not (1 or 4) ||
+            surfWidthByte == 0 || surfaceWidth < 0 || surfaceHeight < 0)
+        {
+            ClearRenderOutputs(ctx, metrics, result);
+            return Error(ctx, FontErrorNoSupportSurface);
+        }
+
+        if (surfBuffer == _blankGlyphArena)
+        {
+            surfaceHeight = Math.Min(surfaceHeight, (int)(BlankGlyphArenaSize / surfWidthByte));
+        }
+
+        var writableWidth = (int)Math.Min((uint)surfaceWidth, surfWidthByte / pixelSize);
+        var clipX0 = Math.Clamp((int)Math.Min(scissorX0, int.MaxValue), 0, writableWidth);
+        var clipY0 = Math.Clamp((int)Math.Min(scissorY0, int.MaxValue), 0, surfaceHeight);
+        var clipX1 = Math.Clamp((int)Math.Min(scissorX1, int.MaxValue), 0, writableWidth);
+        var clipY1 = Math.Clamp((int)Math.Min(scissorY1, int.MaxValue), 0, surfaceHeight);
+
+        var x = ReadXmmFloat(ctx, 0);
+        var y = ReadXmmFloat(ctx, 1);
+        if (!float.IsFinite(x) || !float.IsFinite(y))
+        {
+            ClearRenderOutputs(ctx, metrics, result);
+            return Error(ctx, FontErrorInvalidParameter);
+        }
+
+        var glyphWidth = SaturatingCeilingToNonNegativeInt(glyphMetrics.Width);
+        var glyphHeight = SaturatingCeilingToNonNegativeInt(glyphMetrics.Height);
+        var destinationX = SaturatingAdd(
+            SaturatingFloorToInt(x),
+            SaturatingFloorToInt(glyphMetrics.HorizontalBearingX));
+        var destinationY = SaturatingSubtract(
+            SaturatingFloorToInt(y),
+            SaturatingCeilingToNonNegativeInt(glyphMetrics.HorizontalBearingY));
+        var updateX = Math.Max(destinationX, clipX0);
+        var updateY = Math.Max(destinationY, clipY0);
+        var updateRight = Math.Min(SaturatingAdd(destinationX, glyphWidth), clipX1);
+        var updateBottom = Math.Min(SaturatingAdd(destinationY, glyphHeight), clipY1);
+        var updateWidth = Math.Max(0, updateRight - updateX);
+        var updateHeight = Math.Max(0, updateBottom - updateY);
+
+        if (!IsWhiteSpace(code) && !WriteCoverageRectangle(
+                ctx,
+                surfBuffer,
+                surfWidthByte,
+                pixelSize,
+                updateX,
+                updateY,
+                updateWidth,
+                updateHeight))
+        {
+            ClearRenderOutputs(ctx, metrics, result);
+            return Error(ctx, FontErrorNoSupportSurface);
+        }
+
+        var left = MathF.Floor(x + glyphMetrics.HorizontalBearingX);
+        var top = MathF.Ceiling(y + glyphMetrics.HorizontalBearingY);
+        var right = MathF.Ceiling(x + glyphMetrics.HorizontalBearingX + glyphMetrics.Width);
+        var bottom = MathF.Floor(y + glyphMetrics.HorizontalBearingY - glyphMetrics.Height);
+        var snappedAdvance = MathF.Ceiling(x + glyphMetrics.HorizontalAdvance) - x;
+        var imageWidth = (uint)Math.Max(0f, right - left);
+        var imageHeight = (uint)Math.Max(0f, top - bottom);
+
+        // SurfaceImage.address remains the surface base for compatibility with
+        // titles that derive their atlas source pointer from this field.
         var ok = ctx.TryWriteUInt64(result + 0x00, 0)
             && ctx.TryWriteUInt64(result + 0x08, surfBuffer)
             && ctx.TryWriteUInt32(result + 0x10, surfWidthByte)
-            && ctx.TryWriteUInt32(result + 0x14, surfPixelWord & 0xFF)
-            && ctx.TryWriteUInt64(result + 0x18, 0)
-            && ctx.TryWriteUInt64(result + 0x20, 0)
-            && ctx.TryWriteUInt32(result + 0x28, bearingXBits)
-            && ctx.TryWriteUInt32(result + 0x2C, bearingYBits)
-            && ctx.TryWriteUInt32(result + 0x30, advanceBits)
-            && ctx.TryWriteUInt32(result + 0x34, advanceBits)
-            && ctx.TryWriteUInt64(result + 0x38, 0);
+            && ctx.TryWriteUInt32(result + 0x14, pixelSize)
+            && ctx.TryWriteUInt32(result + 0x18, (uint)updateX)
+            && ctx.TryWriteUInt32(result + 0x1C, (uint)updateY)
+            && ctx.TryWriteUInt32(result + 0x20, (uint)updateWidth)
+            && ctx.TryWriteUInt32(result + 0x24, (uint)updateHeight)
+            && TryWriteFloat(ctx, result + 0x28, left - x)
+            && TryWriteFloat(ctx, result + 0x2C, top - y)
+            && TryWriteFloat(ctx, result + 0x30, snappedAdvance)
+            && TryWriteFloat(ctx, result + 0x34, MathF.Max(snappedAdvance, right - x))
+            && ctx.TryWriteUInt32(result + 0x38, imageWidth)
+            && ctx.TryWriteUInt32(result + 0x3C, imageHeight);
         if (!ok)
         {
             ClearRenderOutputs(ctx, metrics, result);
@@ -547,6 +752,82 @@ public static class FontExports
 
         return Ok(ctx);
     }
+
+    private static bool TryReadRenderSurface(
+        CpuContext ctx,
+        ulong surface,
+        out ulong buffer,
+        out uint widthByte,
+        out uint pixelSize,
+        out int width,
+        out int height,
+        out uint scissorX0,
+        out uint scissorY0,
+        out uint scissorX1,
+        out uint scissorY1)
+    {
+        buffer = 0;
+        widthByte = 0;
+        width = 0;
+        height = 0;
+        scissorX0 = 0;
+        scissorY0 = 0;
+        scissorX1 = 0;
+        scissorY1 = 0;
+        uint pixelWord = 0;
+        var ok = ctx.TryReadUInt64(surface + 0x00, out buffer);
+        ok &= ctx.TryReadUInt32(surface + 0x08, out widthByte);
+        ok &= ctx.TryReadUInt32(surface + 0x0C, out pixelWord);
+        ok &= ctx.TryReadInt32(surface + 0x10, out width);
+        ok &= ctx.TryReadInt32(surface + 0x14, out height);
+        ok &= ctx.TryReadUInt32(surface + 0x18, out scissorX0);
+        ok &= ctx.TryReadUInt32(surface + 0x1C, out scissorY0);
+        ok &= ctx.TryReadUInt32(surface + 0x20, out scissorX1);
+        ok &= ctx.TryReadUInt32(surface + 0x24, out scissorY1);
+        pixelSize = pixelWord & 0xFF;
+        return ok;
+    }
+
+    private static bool WriteCoverageRectangle(
+        CpuContext ctx,
+        ulong buffer,
+        uint widthByte,
+        uint pixelSize,
+        int x,
+        int y,
+        int width,
+        int height)
+    {
+        var pixel = pixelSize == 1 ? CoveragePixel1 : CoveragePixel4;
+        for (var row = 0; row < height; row++)
+        {
+            var rowOffset = checked((ulong)(y + row) * widthByte);
+            for (var column = 0; column < width; column++)
+            {
+                var columnOffset = checked((ulong)(x + column) * pixelSize);
+                if (rowOffset > ulong.MaxValue - buffer ||
+                    columnOffset > ulong.MaxValue - buffer - rowOffset ||
+                    !ctx.Memory.TryWrite(buffer + rowOffset + columnOffset, pixel))
+                {
+                    return false;
+                }
+            }
+        }
+
+        return true;
+    }
+
+    private static int SaturatingFloorToInt(float value) =>
+        value <= int.MinValue ? int.MinValue : value >= int.MaxValue ? int.MaxValue : (int)MathF.Floor(value);
+
+    private static int SaturatingCeilingToNonNegativeInt(float value) =>
+        value <= 0f ? 0 : value >= int.MaxValue ? int.MaxValue : (int)MathF.Ceiling(value);
+
+    private static int SaturatingAdd(int left, int right) =>
+        left > int.MaxValue - right ? int.MaxValue : left + right;
+
+    private static int SaturatingSubtract(int left, int right) =>
+        left < int.MinValue + right ? int.MinValue : left - right;
 
     [SysAbiExport(Nid = "LHDoRWVFGqk", ExportName = "sceFontDeleteGlyph",
         Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceFont")]
@@ -603,10 +884,51 @@ public static class FontExports
             ? (ushort)Math.Min(value, ushort.MaxValue)
             : (ushort)0;
 
-    private static (float W, float H) GetScalePixel(ulong handle) =>
-        ScalePixels.TryGetValue(handle, out var scale) && scale.W > 0f && scale.H > 0f
-            ? scale
-            : (DefaultScalePixel, DefaultScalePixel);
+    private static (float W, float H) GetScalePixel(ulong handle)
+    {
+        var scale = FontScales.TryGetValue(handle, out var stored) ? stored : DefaultFontScale;
+        if (!scale.IsPoint)
+        {
+            return (scale.W, scale.H);
+        }
+
+        return (
+            scale.W * (scale.DpiX == 0 ? 72u : scale.DpiX) / PointsPerInch,
+            scale.H * (scale.DpiY == 0 ? 72u : scale.DpiY) / PointsPerInch);
+    }
+
+    private static (float W, float H) GetRenderScalePixel(CpuContext ctx, ulong handle, ulong surface)
+    {
+        var scale = GetScalePixel(handle);
+        if (!ctx.TryReadByte(surface + 0x0E, out var styleFlag) || (styleFlag & 1) == 0 ||
+            !ctx.TryReadUInt64(surface + 0x28, out var styleFrame) || styleFrame == 0 ||
+            !ctx.TryReadUInt16(styleFrame + 0x00, out var magic) || magic != StyleFrameMagic ||
+            !ctx.TryReadByte(styleFrame + 0x02, out var flags) || (flags & 1) == 0 ||
+            !ctx.TryReadUInt32(styleFrame + 0x0C, out var unit) ||
+            !ctx.TryReadUInt32(styleFrame + 0x14, out var widthBits) ||
+            !ctx.TryReadUInt32(styleFrame + 0x18, out var heightBits))
+        {
+            return scale;
+        }
+
+        var width = BitConverter.UInt32BitsToSingle(widthBits);
+        var height = BitConverter.UInt32BitsToSingle(heightBits);
+        if (!float.IsFinite(width) || !float.IsFinite(height) || width <= 0f || height <= 0f)
+        {
+            return scale;
+        }
+
+        if (unit == 0)
+        {
+            return (width, height);
+        }
+
+        _ = ctx.TryReadUInt32(styleFrame + 0x04, out var dpiX);
+        _ = ctx.TryReadUInt32(styleFrame + 0x08, out var dpiY);
+        return (
+            width * (dpiX == 0 ? 72u : dpiX) / PointsPerInch,
+            height * (dpiY == 0 ? 72u : dpiY) / PointsPerInch);
+    }
 
     private static float ReadXmmFloat(CpuContext ctx, int registerIndex)
     {
@@ -632,6 +954,86 @@ public static class FontExports
         }
     }
 
+    [SysAbiExport(Nid = "la2AOWnHEAc", ExportName = "sceFontStyleFrameInit",
+        Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceFont")]
+    public static int FontStyleFrameInit(CpuContext ctx)
+    {
+        var styleFrame = ctx[CpuRegister.Rdi];
+        if (styleFrame == 0)
+        {
+            return Error(ctx, FontErrorInvalidParameter);
+        }
+
+        ZeroGuestStruct(ctx, styleFrame, 0x60);
+        var ok = ctx.TryWriteUInt16(styleFrame + 0x00, StyleFrameMagic)
+            && ctx.TryWriteUInt32(styleFrame + 0x04, 72)
+            && ctx.TryWriteUInt32(styleFrame + 0x08, 72);
+        return ok ? Ok(ctx) : Error(ctx, FontErrorInvalidParameter);
+    }
+
+    [SysAbiExport(Nid = "da4rQ4-+p-4", ExportName = "sceFontStyleFrameSetScalePixel",
+        Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceFont")]
+    public static int FontStyleFrameSetScalePixel(CpuContext ctx) =>
+        SetStyleFrameScale(ctx, isPoint: false);
+
+    [SysAbiExport(Nid = "O997laxY-Ys", ExportName = "sceFontStyleFrameSetScalePoint",
+        Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceFont")]
+    public static int FontStyleFrameSetScalePoint(CpuContext ctx) =>
+        SetStyleFrameScale(ctx, isPoint: true);
+
+    private static int SetStyleFrameScale(CpuContext ctx, bool isPoint)
+    {
+        var styleFrame = ctx[CpuRegister.Rdi];
+        var width = ReadXmmFloat(ctx, 0);
+        var height = ReadXmmFloat(ctx, 1);
+        if (styleFrame == 0 ||
+            !ctx.TryReadUInt16(styleFrame + 0x00, out var magic) || magic != StyleFrameMagic ||
+            !float.IsFinite(width) || !float.IsFinite(height) || width <= 0f || height <= 0f ||
+            !ctx.TryReadByte(styleFrame + 0x02, out var flags))
+        {
+            return Error(ctx, FontErrorInvalidParameter);
+        }
+
+        var ok = WriteByte(ctx, styleFrame + 0x02, (byte)(flags | 1))
+            && ctx.TryWriteUInt32(styleFrame + 0x0C, isPoint ? 1u : 0u)
+            && TryWriteFloat(ctx, styleFrame + 0x14, width)
+            && TryWriteFloat(ctx, styleFrame + 0x18, height);
+        return ok ? Ok(ctx) : Error(ctx, FontErrorInvalidParameter);
+    }
+
+    [SysAbiExport(Nid = "0hr-w30SjiI", ExportName = "sceFontRenderSurfaceSetStyleFrame",
+        Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceFont")]
+    public static int FontRenderSurfaceSetStyleFrame(CpuContext ctx)
+    {
+        var surface = ctx[CpuRegister.Rdi];
+        var styleFrame = ctx[CpuRegister.Rsi];
+        if (surface == 0 || !ctx.TryReadByte(surface + 0x0E, out var styleFlag))
+        {
+            return Error(ctx, FontErrorInvalidParameter);
+        }
+
+        if (styleFrame == 0)
+        {
+            var cleared = WriteByte(ctx, surface + 0x0E, (byte)(styleFlag & ~1))
+                && ctx.TryWriteUInt64(surface + 0x28, 0)
+                && ctx.TryWriteUInt64(surface + 0x30, 0);
+            return cleared ? Ok(ctx) : Error(ctx, FontErrorInvalidParameter);
+        }
+
+        if (!ctx.TryReadUInt16(styleFrame + 0x00, out var magic) || magic != StyleFrameMagic)
+        {
+            return Error(ctx, FontErrorInvalidParameter);
+        }
+
+        var ok = WriteByte(ctx, surface + 0x0E, (byte)(styleFlag | 1))
+            && ctx.TryWriteUInt64(surface + 0x28, styleFrame)
+            && ctx.TryWriteUInt64(surface + 0x30, 0);
+        return ok ? Ok(ctx) : Error(ctx, FontErrorInvalidParameter);
+    }
+
+    private static bool WriteByte(CpuContext ctx, ulong address, byte value) =>
+        ctx.Memory.TryWrite(address, [value]);
+
     [SysAbiExport(Nid = "TMtqoFQjjbA", ExportName = "sceFontSetEffectSlant",
         Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceFont")]
     public static int FontSetEffectSlant(CpuContext ctx) => Ok(ctx);
@@ -654,7 +1056,11 @@ public static class FontExports
 
     [SysAbiExport(Nid = "vzHs3C8lWJk", ExportName = "sceFontCloseFont",
         Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceFont")]
-    public static int FontCloseFont(CpuContext ctx) => Ok(ctx);
+    public static int FontCloseFont(CpuContext ctx)
+    {
+        FontScales.TryRemove(ctx[CpuRegister.Rdi], out _);
+        return Ok(ctx);
+    }
 
     [SysAbiExport(Nid = "exAxkyVLt0s", ExportName = "sceFontDestroyRenderer",
         Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceFont")]
@@ -672,7 +1078,7 @@ public static class FontExports
         return 0;
     }
 
-    internal static void ResetScaleForTests() => ScalePixels.Clear();
+    internal static void ResetScaleForTests() => FontScales.Clear();
 
     internal static void ResetGlyphStateForTests()
     {
