@@ -17,12 +17,8 @@ public static class CommonDialogExports
         LibraryName = "libSceCommonDialog")]
     public static int CommonDialogInitialize(CpuContext ctx)
     {
-        // Games can initialize the common-dialog service defensively from more than one
-        // subsystem. Keeping this HLE initialization idempotent avoids turning an error
-        // reporting path into a second, unrelated failure.
         Interlocked.Exchange(ref _initialized, 1);
-        ctx[CpuRegister.Rax] = 0;
-        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+        return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
     }
 
     [SysAbiExport(
@@ -32,7 +28,8 @@ public static class CommonDialogExports
         LibraryName = "libSceCommonDialog")]
     public static int CommonDialogIsUsed(CpuContext ctx)
     {
-        ctx[CpuRegister.Rax] = 0;
-        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+        return ctx.SetReturn(MsgDialogExports.IsUsed ? 1 : 0);
     }
+
+    internal static void ResetForTests() => Interlocked.Exchange(ref _initialized, 0);
 }

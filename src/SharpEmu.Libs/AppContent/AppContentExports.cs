@@ -1,16 +1,20 @@
 // Copyright (C) 2026 SharpEmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-using SharpEmu.HLE;
 using System.Buffers.Binary;
 using System.Text;
 using System.Text.Json;
+using SharpEmu.HLE;
 
 namespace SharpEmu.Libs.AppContent;
 
 public static class AppContentExports
 {
-    private const ulong BootParamAttrOffset = 4;
+    private const int AppContentErrorParameter = unchecked((int)0x80D90002);
+    private const int AppContentErrorDrmNoEntitlement = unchecked((int)0x80D90007);
+    private const int BootParamSize = 40;
+    private const int MountPointSize = 16;
+    private const int AddcontInfoSize = 24;
     private const string Temp0MountPoint = "/temp0";
     private const uint AppParamSkuFlag = 0;
     private const int AppParamSkuFlagFull = 3;
@@ -26,18 +30,17 @@ public static class AppContentExports
         var bootParamAddress = ctx[CpuRegister.Rsi];
         if (initParamAddress == 0 || bootParamAddress == 0)
         {
-            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+            return ctx.SetReturn(AppContentErrorParameter);
         }
 
-        Span<byte> attrBytes = stackalloc byte[sizeof(uint)];
-        BinaryPrimitives.WriteUInt32LittleEndian(attrBytes, 0);
-        if (!ctx.Memory.TryWrite(bootParamAddress + BootParamAttrOffset, attrBytes))
+        Span<byte> bootParam = stackalloc byte[BootParamSize];
+        bootParam.Clear();
+        if (!ctx.Memory.TryWrite(bootParamAddress, bootParam))
         {
-            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
         }
 
-        ctx[CpuRegister.Rax] = 0;
-        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+        return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
     }
 
     [SysAbiExport(
@@ -47,19 +50,45 @@ public static class AppContentExports
         LibraryName = "libSceAppContent")]
     public static int AppContentGetAddcontInfoList(CpuContext ctx)
     {
+        var listAddress = ctx[CpuRegister.Rsi];
+        var listCount = (uint)ctx[CpuRegister.Rdx];
         var hitCountAddress = ctx[CpuRegister.Rcx];
-        if (hitCountAddress != 0)
+
+        if ((listAddress == 0 || listCount == 0) && hitCountAddress == 0)
         {
-            Span<byte> hitCountBytes = stackalloc byte[sizeof(uint)];
-            BinaryPrimitives.WriteUInt32LittleEndian(hitCountBytes, 0);
-            if (!ctx.Memory.TryWrite(hitCountAddress, hitCountBytes))
-            {
-                return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
-            }
+            return ctx.SetReturn(AppContentErrorParameter);
         }
 
-        ctx[CpuRegister.Rax] = 0;
-        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+        if (hitCountAddress != 0 && !ctx.TryWriteUInt32(hitCountAddress, 0))
+        {
+            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
+    }
+
+    [SysAbiExport(
+        Nid = "m47juOmH0VE",
+        ExportName = "sceAppContentGetAddcontInfo",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceAppContent")]
+    public static int AppContentGetAddcontInfo(CpuContext ctx)
+    {
+        var entitlementLabelAddress = ctx[CpuRegister.Rsi];
+        var infoAddress = ctx[CpuRegister.Rdx];
+        if (entitlementLabelAddress == 0 || infoAddress == 0)
+        {
+            return ctx.SetReturn(AppContentErrorParameter);
+        }
+
+        Span<byte> info = stackalloc byte[AddcontInfoSize];
+        info.Clear();
+        if (!ctx.Memory.TryWrite(infoAddress, info))
+        {
+            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        return ctx.SetReturn(AppContentErrorDrmNoEntitlement);
     }
 
     [SysAbiExport(
@@ -73,7 +102,7 @@ public static class AppContentExports
         var valueAddress = ctx[CpuRegister.Rsi];
         if (valueAddress == 0)
         {
-            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+            return ctx.SetReturn(AppContentErrorParameter);
         }
 
         int value;
@@ -83,12 +112,10 @@ public static class AppContentExports
         }
         else if (!TryReadUserDefinedParam(paramId, out value))
         {
-            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+            return ctx.SetReturn(AppContentErrorParameter);
         }
 
-        Span<byte> valueBytes = stackalloc byte[sizeof(int)];
-        BinaryPrimitives.WriteInt32LittleEndian(valueBytes, value);
-        if (!ctx.Memory.TryWrite(valueAddress, valueBytes))
+        if (!ctx.TryWriteInt32(valueAddress, value))
         {
             return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
         }
@@ -104,24 +131,76 @@ public static class AppContentExports
         LibraryName = "libSceAppContent")]
     public static int AppContentTemporaryDataMount2(CpuContext ctx)
     {
+        var option = (uint)ctx[CpuRegister.Rdi];
         var mountPointAddress = ctx[CpuRegister.Rsi];
         if (mountPointAddress == 0)
         {
-            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+            return ctx.SetReturn(AppContentErrorParameter);
         }
 
-        Directory.CreateDirectory(ResolveTemp0Root());
-        var mountPointBytes = Encoding.ASCII.GetBytes($"{Temp0MountPoint}\0");
-        if (!ctx.Memory.TryWrite(mountPointAddress, mountPointBytes))
+        try
         {
-            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+            var root = ResolveTemp0Root();
+            if ((option & 1) != 0)
+            {
+                FormatDirectory(root);
+            }
+            else
+            {
+                Directory.CreateDirectory(root);
+            }
+        }
+        catch (IOException)
+        {
+            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_PERMISSION_DENIED);
         }
 
-        ctx[CpuRegister.Rax] = 0;
-        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+        Span<byte> mountPoint = stackalloc byte[MountPointSize];
+        mountPoint.Clear();
+        Encoding.ASCII.GetBytes(Temp0MountPoint, mountPoint);
+        if (!ctx.Memory.TryWrite(mountPointAddress, mountPoint))
+        {
+            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
     }
 
-    private static bool TryReadUserDefinedParam(uint paramId, out int value)
+    [SysAbiExport(
+        Nid = "CN7EbEV7MFU",
+        ExportName = "sceAppContentDownloadDataFormat",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceAppContent")]
+    public static int AppContentDownloadDataFormat(CpuContext ctx)
+    {
+        var mountPointAddress = ctx[CpuRegister.Rdi];
+        if (!TryReadMountPoint(ctx, mountPointAddress, out var mountPoint) ||
+            mountPoint is not ("/download0" or "/download1"))
+        {
+            return ctx.SetReturn(AppContentErrorParameter);
+        }
+
+        try
+        {
+            FormatDirectory(Path.Combine(ResolveDownloadDataRoot(), mountPoint[1..]));
+        }
+        catch (IOException)
+        {
+            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_PERMISSION_DENIED);
+        }
+
+        return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
+    }
+
+    internal static bool TryReadUserDefinedParam(uint paramId, out int value)
     {
         value = 0;
         if (paramId is < 1 or > 4)
@@ -136,6 +215,11 @@ public static class AppContentExports
         }
 
         var paramJsonPath = Path.Combine(app0Root, "sce_sys", "param.json");
+        if (!File.Exists(paramJsonPath))
+        {
+            paramJsonPath = Path.Combine(app0Root, "param.json");
+        }
+
         if (!File.Exists(paramJsonPath))
         {
             return true;
@@ -168,25 +252,83 @@ public static class AppContentExports
         }
     }
 
-    private static void TraceAppContent(string message)
+    private static bool TryReadMountPoint(CpuContext ctx, ulong address, out string mountPoint)
     {
-        if (!string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_APP_CONTENT"), "1", StringComparison.Ordinal))
+        mountPoint = string.Empty;
+        if (address == 0)
         {
-            return;
+            return false;
         }
 
-        Console.Error.WriteLine($"[LOADER][TRACE] app_content.{message}");
+        Span<byte> bytes = stackalloc byte[MountPointSize];
+        if (!ctx.Memory.TryRead(address, bytes))
+        {
+            return false;
+        }
+
+        var end = bytes.IndexOf((byte)0);
+        if (end < 0)
+        {
+            end = bytes.Length;
+        }
+
+        mountPoint = Encoding.ASCII.GetString(bytes[..end]);
+        return true;
+    }
+
+    private static void FormatDirectory(string path)
+    {
+        if (Directory.Exists(path))
+        {
+            foreach (var entry in Directory.EnumerateFileSystemEntries(path))
+            {
+                var attributes = File.GetAttributes(entry);
+                if ((attributes & FileAttributes.Directory) != 0 &&
+                    (attributes & FileAttributes.ReparsePoint) == 0)
+                {
+                    Directory.Delete(entry, recursive: true);
+                }
+                else
+                {
+                    File.Delete(entry);
+                }
+            }
+        }
+
+        Directory.CreateDirectory(path);
+    }
+
+    private static void TraceAppContent(string message)
+    {
+        if (string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_APP_CONTENT"), "1", StringComparison.Ordinal))
+        {
+            Console.Error.WriteLine($"[LOADER][TRACE] app_content.{message}");
+        }
     }
 
     private static string ResolveTemp0Root()
     {
-        const string temp0VariableName = "SHARPEMU_TEMP0_DIR";
-        var configuredRoot = Environment.GetEnvironmentVariable(temp0VariableName);
+        var configuredRoot = Environment.GetEnvironmentVariable("SHARPEMU_TEMP0_DIR");
         if (!string.IsNullOrWhiteSpace(configuredRoot))
         {
             return Path.GetFullPath(configuredRoot);
         }
 
+        var root = Path.Combine(ResolveTitleDataRoot(), "temp0");
+        Environment.SetEnvironmentVariable("SHARPEMU_TEMP0_DIR", root);
+        return root;
+    }
+
+    private static string ResolveDownloadDataRoot()
+    {
+        var configuredRoot = Environment.GetEnvironmentVariable("SHARPEMU_DOWNLOAD_DATA_DIR");
+        return !string.IsNullOrWhiteSpace(configuredRoot)
+            ? Path.GetFullPath(configuredRoot)
+            : Path.Combine(ResolveTitleDataRoot(), "download-data");
+    }
+
+    private static string ResolveTitleDataRoot()
+    {
         var app0Root = Environment.GetEnvironmentVariable("SHARPEMU_APP0_DIR");
         var appName = string.IsNullOrWhiteSpace(app0Root)
             ? "default"
@@ -198,8 +340,6 @@ public static class AppContentExports
 
         var invalidChars = Path.GetInvalidFileNameChars();
         appName = new string(appName.Select(ch => invalidChars.Contains(ch) ? '_' : ch).ToArray());
-        var root = Path.Combine(Path.GetTempPath(), "SharpEmu", appName, "temp0");
-        Environment.SetEnvironmentVariable(temp0VariableName, root);
-        return root;
+        return Path.Combine(Path.GetTempPath(), "SharpEmu", appName);
     }
 }
