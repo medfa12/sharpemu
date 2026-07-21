@@ -253,6 +253,18 @@ internal static unsafe class VulkanVideoPresenter
             Environment.GetEnvironmentVariable("SHARPEMU_DRAW_TIMING"),
             "1",
             StringComparison.Ordinal);
+    // SHARPEMU_REUSE_GUEST_IMAGE_MEMORY: pool retired guest-image device-memory
+    // blocks and rent them back for later same-size allocations instead of
+    // vkFreeMemory + vkAllocateMemory churning a fresh block every draw. A block
+    // is only pooled while the GPU is idle w.r.t. it (no pending submission or
+    // present in flight and not mid-reclaim), so a rented block can never alias
+    // in-flight work. Default unset keeps the byte-identical free-every-time
+    // path. See ReleaseGuestImageMemory / TryRentPooledDeviceMemory.
+    private static readonly bool _reuseGuestImageMemory =
+        string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_REUSE_GUEST_IMAGE_MEMORY"),
+            "1",
+            StringComparison.Ordinal);
 
     private const uint DefaultWindowWidth = 1280;
     private const uint DefaultWindowHeight = 720;
@@ -2400,6 +2412,10 @@ internal static unsafe class VulkanVideoPresenter
         public bool IsDepth;
         public ulong CpuContentFingerprint;
         public ulong MemorySize;
+        // Memory type the backing block was allocated from. Together with
+        // MemorySize this keys the device-memory reuse pool so a freed block is
+        // only rented back for an allocation with identical bind requirements.
+        public uint MemoryTypeIndex;
         public ulong LastUseStamp;
 
         // Monotonic stamp of the last COMPLETED content write (render-target
@@ -3040,6 +3056,22 @@ internal static unsafe class VulkanVideoPresenter
         private int _directPresentationCount;
         private readonly GuestSurfaceCache _guestImages = new();
         private readonly VulkanDeviceMemoryLedger _deviceMemoryLedger = new();
+        // Free-list of retired guest-image device-memory blocks eligible for
+        // reuse (SHARPEMU_REUSE_GUEST_IMAGE_MEMORY). Keyed by the exact
+        // (allocation size, memory type) so a rented block satisfies the new
+        // image's bind requirements without reallocating. Only blocks freed
+        // while the GPU is idle w.r.t. them are pooled, so nothing here is ever
+        // referenced by in-flight work. Render-thread state, no locking (same
+        // as _guestImages). Trimmed to MaxPooledDeviceMemoryBytes and fully
+        // drained on OOM/reclaim/dispose.
+        private readonly Dictionary<(ulong Size, uint MemoryTypeIndex), Stack<DeviceMemory>>
+            _freeDeviceMemoryPool = new();
+        private int _pooledDeviceMemoryBlockCount;
+        private ulong _pooledDeviceMemoryBytes;
+        // Cap the reuse pool so it cannot itself grow unbounded and hold VRAM
+        // hostage. With a ~700MB live guest-image set this headroom is enough to
+        // absorb the create/destroy churn while keeping real VRAM ~= live+cap.
+        private const ulong MaxPooledDeviceMemoryBytes = 1024UL * 1024 * 1024;
         private PhysicalDeviceMemoryProperties _memoryProperties;
         private int _deviceLocalHeapIndex = -1;
         private int _hostVisibleHeapIndex = -1;
@@ -6804,6 +6836,7 @@ internal static unsafe class VulkanVideoPresenter
                     IsCpuBacked = true,
                     CpuContentFingerprint = contentFingerprint,
                     MemorySize = imageRequirements.Size,
+                    MemoryTypeIndex = memoryInfo.MemoryTypeIndex,
                     LastUseStamp = _useStamp,
                 };
                 _guestImages.Add(guestImage);
@@ -7720,6 +7753,9 @@ internal static unsafe class VulkanVideoPresenter
                     $"[LOADER][VKMEM] {tag} size={size / (1024 * 1024)}MB gross={gross / (1024 * 1024)}MB " +
                     $"live={_deviceMemoryLedger.LiveDeviceLocalBytes / (1024 * 1024)}MB " +
                     $"live_host={_deviceMemoryLedger.LiveHostVisibleBytes / (1024 * 1024)}MB " +
+                    (_reuseGuestImageMemory
+                        ? $"pool={_pooledDeviceMemoryBytes / (1024 * 1024)}MB/{_pooledDeviceMemoryBlockCount} "
+                        : string.Empty) +
                     $"alloc#{n} images={_guestImages.Count}");
             }
         }
@@ -7727,6 +7763,19 @@ internal static unsafe class VulkanVideoPresenter
         private DeviceMemory AllocateDeviceMemory(MemoryAllocateInfo allocationInfo, string tag)
         {
             var deviceLocal = IsDeviceLocalMemoryType(allocationInfo.MemoryTypeIndex);
+            if (_reuseGuestImageMemory && deviceLocal &&
+                TryRentPooledDeviceMemory(
+                    allocationInfo.AllocationSize,
+                    allocationInfo.MemoryTypeIndex,
+                    out var pooled))
+            {
+                // Rented an idle, already-allocated block of the exact size and
+                // type. It was untracked from the live ledger when pooled, so
+                // re-track it here; no vkAllocateMemory (and no gross growth).
+                _deviceMemoryLedger.Track(pooled.Handle, allocationInfo.AllocationSize, deviceLocal: true);
+                return pooled;
+            }
+
             if (deviceLocal && _deviceMemoryLedger.WouldExceedBudget(allocationInfo.AllocationSize))
             {
                 EvictLeastRecentlyUsedGuestImages(
@@ -7764,6 +7813,9 @@ internal static unsafe class VulkanVideoPresenter
                         "[LOADER][VKMEM] memory panic: diagnostics readbacks disabled");
                 }
 
+                // The reuse pool is holding real VRAM the driver could hand
+                // back; return every idle block before falling back to eviction.
+                DrainFreeDeviceMemoryPool();
                 if (deviceLocal)
                 {
                     EvictLeastRecentlyUsedGuestImages(ulong.MaxValue);
@@ -7795,6 +7847,91 @@ internal static unsafe class VulkanVideoPresenter
 
             _deviceMemoryLedger.Untrack(memory.Handle);
             _vk.FreeMemory(_device, memory, null);
+        }
+
+        // Frees a guest image's backing block, returning it to the reuse pool
+        // instead of vkFreeMemory when reuse is enabled and it is provably safe.
+        // Clears resource.Memory so a double release is a no-op.
+        private void ReleaseGuestImageMemory(GuestImageResource resource)
+        {
+            var memory = resource.Memory;
+            resource.Memory = default;
+            if (memory.Handle == 0)
+            {
+                return;
+            }
+
+            // Pool only when: reuse is on; we know the block's size/type; we are
+            // not already reclaiming under memory pressure (then really free to
+            // relieve it); the pool has headroom; and the GPU is idle w.r.t.
+            // this block -- no guest submission or present in flight can still
+            // reference it, so a future rent can never alias live GPU work.
+            if (_reuseGuestImageMemory &&
+                resource.MemorySize != 0 &&
+                IsDeviceLocalMemoryType(resource.MemoryTypeIndex) &&
+                !_reclaimInProgress &&
+                _pendingGuestSubmissions.Count == 0 &&
+                !_presentationInFlight &&
+                _pooledDeviceMemoryBytes + resource.MemorySize <= MaxPooledDeviceMemoryBytes)
+            {
+                // Reserved, no longer live: drop it from the live ledger but keep
+                // the VkDeviceMemory alive for reuse.
+                _deviceMemoryLedger.Untrack(memory.Handle);
+                var key = (resource.MemorySize, resource.MemoryTypeIndex);
+                if (!_freeDeviceMemoryPool.TryGetValue(key, out var stack))
+                {
+                    stack = new Stack<DeviceMemory>();
+                    _freeDeviceMemoryPool[key] = stack;
+                }
+
+                stack.Push(memory);
+                _pooledDeviceMemoryBlockCount++;
+                _pooledDeviceMemoryBytes += resource.MemorySize;
+                return;
+            }
+
+            FreeDeviceMemory(memory);
+        }
+
+        private bool TryRentPooledDeviceMemory(
+            ulong size,
+            uint memoryTypeIndex,
+            out DeviceMemory memory)
+        {
+            if (_freeDeviceMemoryPool.TryGetValue((size, memoryTypeIndex), out var stack) &&
+                stack.Count != 0)
+            {
+                memory = stack.Pop();
+                _pooledDeviceMemoryBlockCount--;
+                _pooledDeviceMemoryBytes -= size;
+                return true;
+            }
+
+            memory = default;
+            return false;
+        }
+
+        // Really frees every pooled block (vkFreeMemory). Called when the driver
+        // is under memory pressure or at teardown, where the reserved VRAM must
+        // be handed back to the driver rather than kept for reuse.
+        private void DrainFreeDeviceMemoryPool()
+        {
+            if (_freeDeviceMemoryPool.Count == 0)
+            {
+                return;
+            }
+
+            foreach (var stack in _freeDeviceMemoryPool.Values)
+            {
+                while (stack.Count != 0)
+                {
+                    _vk.FreeMemory(_device, stack.Pop(), null);
+                }
+            }
+
+            _freeDeviceMemoryPool.Clear();
+            _pooledDeviceMemoryBlockCount = 0;
+            _pooledDeviceMemoryBytes = 0;
         }
 
         private void EvictLeastRecentlyUsedGuestImages(ulong bytesToFree)
@@ -9042,6 +9179,7 @@ internal static unsafe class VulkanVideoPresenter
                 Image = image,
                 Memory = memory,
                 MemorySize = allocationInfo.AllocationSize,
+                MemoryTypeIndex = allocationInfo.MemoryTypeIndex,
                 CurrentLayout = ImageLayout.Undefined,
                 LastUseStamp = _useStamp,
             };
@@ -9303,6 +9441,7 @@ internal static unsafe class VulkanVideoPresenter
                 RenderPass = renderPass,
                 Framebuffer = framebuffer,
                 MemorySize = allocationInfo.AllocationSize,
+                MemoryTypeIndex = allocationInfo.MemoryTypeIndex,
                 LastUseStamp = _useStamp,
             };
             var debugName = GuestImageDebugName(target, format);
@@ -9428,6 +9567,7 @@ internal static unsafe class VulkanVideoPresenter
                 // aliasing them here would double-free.
                 MipViews = [],
                 MemorySize = allocationInfo.AllocationSize,
+                MemoryTypeIndex = allocationInfo.MemoryTypeIndex,
                 LastUseStamp = _useStamp,
                 IsDepth = true,
             };
@@ -9595,7 +9735,7 @@ internal static unsafe class VulkanVideoPresenter
                 _vk.DestroyImage(_device, resource.Image, null);
             }
 
-            FreeDeviceMemory(resource.Memory);
+            ReleaseGuestImageMemory(resource);
         }
 
         private static uint GetGuestTextureFormat(Format format) =>
@@ -12581,6 +12721,10 @@ internal static unsafe class VulkanVideoPresenter
             }
             _guestImageVersions.Clear();
             _capturedGuestFlipVersions.Clear();
+            // Destroying the images above may have parked their blocks in the
+            // reuse pool (GPU is idle here); really free them before the device
+            // goes away so no VkDeviceMemory outlives vkDestroyDevice.
+            DrainFreeDeviceMemoryPool();
             DrainRetiredGuestFlipSnapshots();
             lock (_gate)
             {
