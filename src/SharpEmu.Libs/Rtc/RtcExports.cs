@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using System.Buffers.Binary;
+using System.Globalization;
 using SharpEmu.HLE;
 
 namespace SharpEmu.Libs.Rtc;
@@ -641,6 +642,239 @@ public static class RtcExports
         return TryWriteRtcDateTime(ctx, timeAddress, time)
             ? ctx.SetReturn(0)
             : ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+    }
+
+    [SysAbiExport(
+        Nid = "eiuobaF-hK4",
+        ExportName = "sceRtcFormatRFC2822",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceRtc")]
+    public static int RtcFormatRfc2822(CpuContext ctx) =>
+        FormatRfc2822(ctx, unchecked((int)ctx[CpuRegister.Rdx]));
+
+    [SysAbiExport(
+        Nid = "AxHBk3eat04",
+        ExportName = "sceRtcFormatRFC2822LocalTime",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceRtc")]
+    public static int RtcFormatRfc2822LocalTime(CpuContext ctx) =>
+        FormatRfc2822(ctx, GetLocalOffsetMinutes(ctx, ctx[CpuRegister.Rsi]));
+
+    [SysAbiExport(
+        Nid = "WJ3rqFwymew",
+        ExportName = "sceRtcFormatRFC3339",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceRtc")]
+    public static int RtcFormatRfc3339(CpuContext ctx) =>
+        FormatRfc3339(ctx, unchecked((int)ctx[CpuRegister.Rdx]), precise: false);
+
+    [SysAbiExport(
+        Nid = "DwuHIlLGW8I",
+        ExportName = "sceRtcFormatRFC3339LocalTime",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceRtc")]
+    public static int RtcFormatRfc3339LocalTime(CpuContext ctx) =>
+        FormatRfc3339(ctx, GetLocalOffsetMinutes(ctx, ctx[CpuRegister.Rsi]), precise: false);
+
+    [SysAbiExport(
+        Nid = "lja0nNPWojg",
+        ExportName = "sceRtcFormatRFC3339Precise",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceRtc")]
+    public static int RtcFormatRfc3339Precise(CpuContext ctx) =>
+        FormatRfc3339(ctx, unchecked((int)ctx[CpuRegister.Rdx]), precise: true);
+
+    [SysAbiExport(
+        Nid = "tOZ6fwwHZOA",
+        ExportName = "sceRtcFormatRFC3339PreciseLocalTime",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceRtc")]
+    public static int RtcFormatRfc3339PreciseLocalTime(CpuContext ctx) =>
+        FormatRfc3339(ctx, GetLocalOffsetMinutes(ctx, ctx[CpuRegister.Rsi]), precise: true);
+
+    [SysAbiExport(
+        Nid = "NxEI1KByvCI",
+        ExportName = "sceRtcParseDateTime",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceRtc")]
+    public static int RtcParseDateTime(CpuContext ctx) => ParseDateTime(ctx, rfc3339Only: false);
+
+    [SysAbiExport(
+        Nid = "99bMGglFW3I",
+        ExportName = "sceRtcParseRFC3339",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceRtc")]
+    public static int RtcParseRfc3339(CpuContext ctx) => ParseDateTime(ctx, rfc3339Only: true);
+
+    [SysAbiExport(
+        Nid = "fFLgmNUpChg",
+        ExportName = "sceRtcSetConf",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceRtc")]
+    public static int RtcSetConf(CpuContext ctx)
+    {
+        Volatile.Write(ref _configuredMinutesWest, unchecked((int)ctx[CpuRegister.Rdx]));
+        Volatile.Write(ref _configuredDstTime, unchecked((int)ctx[CpuRegister.Rcx]));
+        return ctx.SetReturn(0);
+    }
+
+    [SysAbiExport(Nid = "sV2tK+yOhBU", ExportName = "sceRtcSetCurrentAdNetworkTick", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceRtc")]
+    public static int RtcSetCurrentAdNetworkTick(CpuContext ctx) => SetCurrentClockTick(ctx);
+
+    [SysAbiExport(Nid = "VLDUPKmw5L8", ExportName = "sceRtcSetCurrentDebugNetworkTick", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceRtc")]
+    public static int RtcSetCurrentDebugNetworkTick(CpuContext ctx) => SetCurrentClockTick(ctx);
+
+    [SysAbiExport(Nid = "qhDBtIo+auw", ExportName = "sceRtcSetCurrentNetworkTick", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceRtc")]
+    public static int RtcSetCurrentNetworkTick(CpuContext ctx) => SetCurrentClockTick(ctx);
+
+    [SysAbiExport(Nid = "d4fHLCGmY80", ExportName = "sceRtcSetCurrentTick", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceRtc")]
+    public static int RtcSetCurrentTick(CpuContext ctx) => SetCurrentClockTick(ctx);
+
+    private static int _configuredMinutesWest;
+    private static int _configuredDstTime;
+
+    private static int FormatRfc2822(CpuContext ctx, int offsetMinutes)
+    {
+        if (!TryGetFormatDateTime(ctx, offsetMinutes, out var time, out var error))
+        {
+            return ctx.SetReturn(error);
+        }
+
+        var text = time.ToString("ddd, dd MMM yyyy HH:mm:ss zzz", CultureInfo.InvariantCulture)
+            .Remove(29, 1);
+        return WriteDateTimeString(ctx, ctx[CpuRegister.Rdi], text);
+    }
+
+    private static int FormatRfc3339(CpuContext ctx, int offsetMinutes, bool precise)
+    {
+        if (!TryGetFormatDateTime(ctx, offsetMinutes, out var time, out var error))
+        {
+            return ctx.SetReturn(error);
+        }
+
+        var format = precise ? "yyyy-MM-dd'T'HH:mm:ss.ffffff" : "yyyy-MM-dd'T'HH:mm:ss";
+        var suffix = time.Offset == TimeSpan.Zero
+            ? "Z"
+            : time.ToString("zzz", CultureInfo.InvariantCulture);
+        var text = time.ToString(format, CultureInfo.InvariantCulture) + suffix;
+        return WriteDateTimeString(ctx, ctx[CpuRegister.Rdi], text);
+    }
+
+    private static bool TryGetFormatDateTime(
+        CpuContext ctx,
+        int offsetMinutes,
+        out DateTimeOffset time,
+        out int error)
+    {
+        time = default;
+        if (ctx[CpuRegister.Rdi] == 0)
+        {
+            error = RtcErrorInvalidPointer;
+            return false;
+        }
+
+        var tickAddress = ctx[CpuRegister.Rsi];
+        ulong tick;
+        if (tickAddress == 0)
+        {
+            tick = ToTick(DateTime.UtcNow);
+        }
+        else if (!ctx.TryReadUInt64(tickAddress, out tick))
+        {
+            error = (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+            return false;
+        }
+
+        if (!TryConvertTickToDateTime(tick, DateTimeKind.Utc, out var utcTime) ||
+            offsetMinutes is < -1439 or > 1439)
+        {
+            error = RtcErrorInvalidValue;
+            return false;
+        }
+
+        var offset = TimeSpan.FromMinutes(offsetMinutes);
+        time = new DateTimeOffset(utcTime).ToOffset(offset);
+        error = 0;
+        return true;
+    }
+
+    private static int WriteDateTimeString(CpuContext ctx, ulong address, string value)
+    {
+        var bytes = System.Text.Encoding.ASCII.GetBytes(value + '\0');
+        return ctx.Memory.TryWrite(address, bytes)
+            ? ctx.SetReturn(0)
+            : ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+    }
+
+    private static int ParseDateTime(CpuContext ctx, bool rfc3339Only)
+    {
+        var tickAddress = ctx[CpuRegister.Rdi];
+        var textAddress = ctx[CpuRegister.Rsi];
+        if (tickAddress == 0 || textAddress == 0)
+        {
+            return ctx.SetReturn(RtcErrorInvalidPointer);
+        }
+        if (!ctx.TryReadNullTerminatedUtf8(textAddress, 128, out var text))
+        {
+            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        DateTimeOffset parsed;
+        var styles = DateTimeStyles.AllowWhiteSpaces | DateTimeStyles.AssumeUniversal;
+        var parsedOk = rfc3339Only
+            ? DateTimeOffset.TryParseExact(
+                text,
+                new[]
+                {
+                    "yyyy-MM-dd'T'HH:mm:ssK",
+                    "yyyy-MM-dd'T'HH:mm:ss.FFFFFFK",
+                },
+                CultureInfo.InvariantCulture,
+                styles,
+                out parsed)
+            : DateTimeOffset.TryParse(text, CultureInfo.InvariantCulture, styles, out parsed);
+        if (!parsedOk)
+        {
+            return ctx.SetReturn(RtcErrorInvalidValue);
+        }
+
+        var tick = unchecked((ulong)(parsed.UtcDateTime.Ticks / (long)DateTimeTicksPerMicrosecond));
+        return ctx.TryWriteUInt64(tickAddress, tick)
+            ? ctx.SetReturn(0)
+            : ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+    }
+
+    private static int SetCurrentClockTick(CpuContext ctx)
+    {
+        var tickAddress = ctx[CpuRegister.Rdi];
+        if (tickAddress == 0)
+        {
+            return ctx.SetReturn(RtcErrorInvalidPointer);
+        }
+        if (!ctx.TryReadUInt64(tickAddress, out var tick))
+        {
+            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+        return ctx.SetReturn(tick <= UnixEpochTicks || tick > MaximumRtcTick
+            ? RtcErrorInvalidValue
+            : 0);
+    }
+
+    private static int GetLocalOffsetMinutes(CpuContext ctx, ulong tickAddress)
+    {
+        if (Volatile.Read(ref _configuredMinutesWest) != 0 || Volatile.Read(ref _configuredDstTime) != 0)
+        {
+            return -Volatile.Read(ref _configuredMinutesWest) +
+                   (Volatile.Read(ref _configuredDstTime) != 0 ? 60 : 0);
+        }
+
+        if (tickAddress != 0 &&
+            ctx.TryReadUInt64(tickAddress, out var tick) &&
+            TryConvertTickToDateTime(tick, DateTimeKind.Utc, out var utcTime))
+        {
+            return (int)TimeZoneInfo.Local.GetUtcOffset(utcTime).TotalMinutes;
+        }
+        return (int)TimeZoneInfo.Local.GetUtcOffset(DateTime.UtcNow).TotalMinutes;
     }
 
     private static int GetCurrentNetworkTick(CpuContext ctx)
