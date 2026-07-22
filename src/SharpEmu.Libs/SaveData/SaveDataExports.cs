@@ -1191,7 +1191,39 @@ public static class SaveDataExports
         ExportName = "sceSaveDataTransferringMount",
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libSceSaveData")]
-    public static int SaveDataTransferringMount(CpuContext ctx) => ctx.SetReturn(ErrorNotFound);
+    public static int SaveDataTransferringMount(CpuContext ctx)
+    {
+        var mountAddress = ctx[CpuRegister.Rdi];
+        var resultAddress = ctx[CpuRegister.Rsi];
+        if (mountAddress == 0 || resultAddress == 0)
+        {
+            return ctx.SetReturn(ErrorParameter);
+        }
+
+        if (!ctx.TryReadInt32(mountAddress, out var userId) ||
+            !ctx.TryReadUInt64(mountAddress + 0x08, out var titleIdAddress) ||
+            !ctx.TryReadUInt64(mountAddress + 0x10, out var dirNameAddress) ||
+            titleIdAddress == 0 ||
+            dirNameAddress == 0 ||
+            !TryReadFixedAscii(ctx, titleIdAddress, TitleIdSize, out var titleId))
+        {
+            return ctx.SetReturn(MemoryFault);
+        }
+
+        if (string.IsNullOrWhiteSpace(titleId))
+        {
+            return ctx.SetReturn(ErrorParameter);
+        }
+
+        return Mount(ctx, resultAddress, userId, dirNameAddress, 0, MountModeReadOnly, titleId.Trim());
+    }
+
+    [SysAbiExport(
+        Nid = "RjMlsR8EXrw",
+        ExportName = "sceSaveDataTransferringMountPs4",
+        Target = Generation.Gen5,
+        LibraryName = "libSceSaveData")]
+    public static int SaveDataTransferringMountPs4(CpuContext ctx) => SaveDataTransferringMount(ctx);
 
     internal static string BuildTitleSaveRoot(string root, int userId, string titleId) =>
         Path.Combine(

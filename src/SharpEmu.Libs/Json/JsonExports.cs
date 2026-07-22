@@ -211,6 +211,12 @@ public static class JsonExports
         return ctx.SetReturn(0);
     }
 
+    // Title-captured alias NID for the same callback setter (not in ps5_names.txt).
+    [SysAbiExport(Nid = "00oCq0RwSAY", ExportName = "_ZN3sce4Json11Initializer27setGlobalNullAccessCallbackEPFRKNS0_5ValueENS0_9ValueTypeEPS3_PvES7_",
+        Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceJson")]
+    public static int InitializerSetGlobalNullAccessCallbackAlt(CpuContext ctx) =>
+        InitializerSetGlobalNullAccessCallback(ctx);
+
     [SysAbiExport(Nid = "WSOuge5IsCg", ExportName = "_ZN3sce4Json14InitParameter2C1Ev",
         Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceJson2")]
     public static int InitParameter2Constructor(CpuContext ctx)
