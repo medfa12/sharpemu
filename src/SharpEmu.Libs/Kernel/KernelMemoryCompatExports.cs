@@ -5065,7 +5065,7 @@ public static class KernelMemoryCompatExports
                 !guestPath.StartsWith("/", StringComparison.Ordinal) &&
                 !guestPath.StartsWith("\\", StringComparison.Ordinal))
             {
-                var relative = guestPath.Replace('/', Path.DirectorySeparatorChar);
+                var relative = NormalizeMountRelativePath(guestPath);
                 return Path.Combine(app0Root, relative);
             }
         }
@@ -5138,10 +5138,31 @@ public static class KernelMemoryCompatExports
 
     private static string NormalizeMountRelativePath(string relativePath)
     {
-        return relativePath
-            .TrimStart('/', '\\')
-            .Replace('/', Path.DirectorySeparatorChar)
-            .Replace('\\', Path.DirectorySeparatorChar);
+        var segments = relativePath.Split(
+            new[] { '/', '\\' },
+            StringSplitOptions.RemoveEmptyEntries);
+        var resolved = new List<string>(segments.Length);
+        foreach (var segment in segments)
+        {
+            if (segment == ".")
+            {
+                continue;
+            }
+
+            if (segment == "..")
+            {
+                if (resolved.Count > 0)
+                {
+                    resolved.RemoveAt(resolved.Count - 1);
+                }
+
+                continue;
+            }
+
+            resolved.Add(segment);
+        }
+
+        return string.Join(Path.DirectorySeparatorChar, resolved);
     }
 
     private static string ResolveDevlogAppRoot()
