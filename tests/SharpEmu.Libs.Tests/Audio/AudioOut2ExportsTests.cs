@@ -20,6 +20,8 @@ public sealed class AudioOut2ExportsTests
     private const ulong OutPortAddress = MemoryBase + 0x100;
     private const ulong StateAddress = MemoryBase + 0x200;
     private const ulong InfoAddress = MemoryBase + 0x300;
+    private const ulong OutContextAddress = MemoryBase + 0x380;
+    private const ulong OutUserAddress = MemoryBase + 0x390;
 
     private static CpuContext CreateContext()
     {
@@ -48,14 +50,31 @@ public sealed class AudioOut2ExportsTests
     private static ulong CreatePort(CpuContext ctx, ushort portType, uint dataFormat)
     {
         using var scope = new SndzEnabledScope();
+        ctx[CpuRegister.Rdi] = 0;
+        ctx[CpuRegister.Rsi] = OutUserAddress;
+        Assert.Equal(0, AudioOut2Exports.AudioOut2UserCreate(ctx));
+        Assert.True(ctx.TryReadUInt64(OutUserAddress, out var user));
+
+        Assert.True(ctx.Memory.TryWrite(ParamAddress, new byte[0x40]));
+        Assert.True(ctx.TryWriteUInt32(ParamAddress + 0x00, 8));
+        Assert.True(ctx.TryWriteUInt32(ParamAddress + 0x0C, 4));
+        Assert.True(ctx.TryWriteUInt32(ParamAddress + 0x10, 512));
+        ctx[CpuRegister.Rdi] = ParamAddress;
+        ctx[CpuRegister.Rsi] = MemoryBase + 0x800;
+        ctx[CpuRegister.Rdx] = 0x10000;
+        ctx[CpuRegister.Rcx] = OutContextAddress;
+        Assert.Equal(0, AudioOut2Exports.AudioOut2ContextCreate(ctx));
+        Assert.True(ctx.TryReadUInt64(OutContextAddress, out var context));
+
         Span<byte> param = stackalloc byte[0x30];
         param.Clear();
         BinaryPrimitives.WriteUInt16LittleEndian(param, portType);
         BinaryPrimitives.WriteUInt32LittleEndian(param[0x04..], dataFormat);
         BinaryPrimitives.WriteUInt32LittleEndian(param[0x08..], 48000);
+        BinaryPrimitives.WriteUInt64LittleEndian(param[0x10..], user);
         Assert.True(ctx.Memory.TryWrite(ParamAddress, param));
 
-        ctx[CpuRegister.Rdi] = 2; // context handle
+        ctx[CpuRegister.Rdi] = context;
         ctx[CpuRegister.Rsi] = ParamAddress;
         ctx[CpuRegister.Rdx] = OutPortAddress;
         ctx[CpuRegister.Rcx] = 0; // not an argument; must not be validated
@@ -81,7 +100,7 @@ public sealed class AudioOut2ExportsTests
     public void PortCreate_ReadsParamFromRsi_AndWritesHandleToRdx()
     {
         var ctx = CreateContext();
-        var handle = CreatePort(ctx, portType: 0, dataFormat: 0xC00);
+        var handle = CreatePort(ctx, portType: 0, dataFormat: 0x800);
 
         // Distinct ports must get distinct handles.
         var second = CreatePort(ctx, portType: 3, dataFormat: 0x100);
@@ -92,12 +111,11 @@ public sealed class AudioOut2ExportsTests
     public void PortGetState_MainPort_ReportsChannelsFromDataFormat()
     {
         var ctx = CreateContext();
-        // Astro Bot's main port: type 0, float 12-channel bed (0xC00).
-        var handle = CreatePort(ctx, portType: 0, dataFormat: 0xC00);
+        var handle = CreatePort(ctx, portType: 0, dataFormat: 0x800);
         var state = GetState(ctx, handle);
 
         Assert.Equal(0x01, BinaryPrimitives.ReadUInt16LittleEndian(state)); // output: main
-        Assert.Equal(12, state[0x02]); // channels = (0xC00 >> 8) & 0xFF
+        Assert.Equal(8, state[0x02]);
         Assert.Equal(127, BinaryPrimitives.ReadInt16LittleEndian(state.AsSpan(0x04)));
         Assert.Equal(0u, BinaryPrimitives.ReadUInt32LittleEndian(state.AsSpan(0x08))); // flags
     }
@@ -119,22 +137,21 @@ public sealed class AudioOut2ExportsTests
     {
         var ctx = CreateContext();
         // Object port bit (0x100) with main output in the low byte.
-        var handle = CreatePort(ctx, portType: 0x100, dataFormat: 0);
+        var handle = CreatePort(ctx, portType: 0x100, dataFormat: 0x100);
         var state = GetState(ctx, handle);
 
         Assert.Equal(0x01, BinaryPrimitives.ReadUInt16LittleEndian(state));
-        Assert.Equal(2, state[0x02]); // format channels 0 means stereo
+        Assert.Equal(1, state[0x02]);
     }
 
     [Fact]
-    public void PortGetState_UnknownHandle_DefaultsToStereoMain()
+    public void PortGetState_UnknownHandle_ReturnsInvalidPort()
     {
         var ctx = CreateContext();
-        var state = GetState(ctx, 0xDEAD_BEEFUL);
+        ctx[CpuRegister.Rdi] = 0xDEAD_BEEFUL;
+        ctx[CpuRegister.Rsi] = StateAddress;
 
-        Assert.Equal(0x01, BinaryPrimitives.ReadUInt16LittleEndian(state));
-        Assert.Equal(2, state[0x02]);
-        Assert.Equal(127, BinaryPrimitives.ReadInt16LittleEndian(state.AsSpan(0x04)));
+        Assert.Equal(unchecked((int)0x80268009), AudioOut2Exports.AudioOut2PortGetState(ctx));
     }
 
     [Fact]
