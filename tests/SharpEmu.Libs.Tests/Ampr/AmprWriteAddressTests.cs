@@ -68,8 +68,7 @@ public sealed class AmprWriteAddressTests
     private static ModuleManager CreateManagerWithExport(string nid, string exportName)
     {
         var manager = new ModuleManager();
-        manager.RegisterExports(
-            SharpEmu.Generated.SysAbiExportRegistry.CreateExports(Generation.Gen5));
+        manager.RegisterFromAssembly(typeof(AmprExports).Assembly, Generation.Gen5);
 
         Assert.True(manager.TryGetExport(nid, out var export), $"NID {nid} did not register.");
         Assert.Equal(exportName, export.Name);
