@@ -224,6 +224,24 @@ internal sealed record VulkanOrderedGuestFlip(
 
 internal static unsafe partial class VulkanVideoPresenter
 {
+    internal static float? ParseForcedExposureSetting(
+        string? raw,
+        bool astroTonemapFix)
+    {
+        if (string.IsNullOrEmpty(raw))
+        {
+            return astroTonemapFix ? 0.25f : null;
+        }
+
+        return float.TryParse(
+            raw,
+            NumberStyles.Float,
+            CultureInfo.InvariantCulture,
+            out var value) && value != 0f
+            ? value
+            : 0.25f;
+    }
+
     // Env-gated performance flags. Read ONCE at type load; when unset the
     // higher caps / phase-timing paths are never taken and the presenter
     // behaves byte-for-byte as before. Defined ahead of the caps below so
@@ -2948,21 +2966,12 @@ internal static unsafe partial class VulkanVideoPresenter
         private GuestImageResource? _forcedExposureImage;
 
         private static float? ParseForcedExposure()
-        {
-            var raw = Environment.GetEnvironmentVariable("SHARPEMU_FORCE_EXPOSURE");
-            if (string.IsNullOrEmpty(raw))
-            {
-                return null;
-            }
-
-            return float.TryParse(
-                raw,
-                System.Globalization.NumberStyles.Float,
-                System.Globalization.CultureInfo.InvariantCulture,
-                out var value) && value != 0f
-                ? value
-                : 0.25f;
-        }
+            => VulkanVideoPresenter.ParseForcedExposureSetting(
+                Environment.GetEnvironmentVariable("SHARPEMU_FORCE_EXPOSURE"),
+                string.Equals(
+                    Environment.GetEnvironmentVariable("SHARPEMU_ASTRO_TONEMAP_FIX"),
+                    "1",
+                    StringComparison.Ordinal));
 
         private int _frameDumpBudget = 24;
         private bool _swapchainReadbackPending;

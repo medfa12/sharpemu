@@ -10,6 +10,29 @@ internal static partial class Gen5SpirvTranslator
     private const uint LdsDwordCount = 8192;
     private const uint RdnaWaveLaneCount = 32;
 
+    internal static bool TrySelectNearestScalarMemoryBinding(
+        uint instructionPc,
+        IReadOnlyList<(uint Pc, int BindingIndex)> candidates,
+        out uint sourcePc,
+        out int bindingIndex)
+    {
+        sourcePc = 0;
+        bindingIndex = -1;
+        if (candidates.Count == 0)
+        {
+            return false;
+        }
+
+        var nearest = candidates
+            .OrderBy(candidate => Math.Abs(
+                (long)candidate.Pc - instructionPc))
+            .ThenByDescending(candidate => candidate.Pc <= instructionPc)
+            .First();
+        sourcePc = nearest.Pc;
+        bindingIndex = nearest.BindingIndex;
+        return true;
+    }
+
     public static bool TryCompilePixelShader(
         Gen5ShaderState state,
         Gen5ShaderEvaluation evaluation,
@@ -244,6 +267,10 @@ internal static partial class Gen5SpirvTranslator
             Environment.GetEnvironmentVariable("SHARPEMU_RECOVER_UNBOUND_SMEM"),
             "1",
             StringComparison.Ordinal);
+        private static readonly bool _astroTonemapFix = string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_ASTRO_TONEMAP_FIX"),
+            "1",
+            StringComparison.Ordinal);
         // Attributes touched by V_INTERP_MOV_F32: their P0/P10/P20 hardware
         // interpolation coefficients are reconstructed in the entry block and
         // the guest's manual interpolation sequence replays them.
@@ -265,45 +292,6 @@ internal static partial class Gen5SpirvTranslator
         private static readonly bool _forcePackedStoreExecValues =
             Environment.GetEnvironmentVariable(
                 "SHARPEMU_FORCE_PACKED_STORE_EXEC_VALUES") == "1";
-        // Emits the raw HDR sample from the Astro Bot tonemap shader directly
-        // to MRT0. This separates image-coordinate/binding failures from the
-        // shader's downstream colour-grade and transfer-function ALU.
-        private static readonly bool _debugTonemapSampleOutput =
-            Environment.GetEnvironmentVariable(
-                "SHARPEMU_PS_DEBUG_TONEMAP_SAMPLE") == "1";
-        private static readonly bool _debugTonemapGradeOutput =
-            Environment.GetEnvironmentVariable(
-                "SHARPEMU_PS_DEBUG_TONEMAP_GRADE") == "1";
-        private static readonly bool _debugTonemapCoreOutput =
-            Environment.GetEnvironmentVariable(
-                "SHARPEMU_PS_DEBUG_TONEMAP_CORE") == "1";
-        private static readonly bool _debugTonemapCurveOutput =
-            Environment.GetEnvironmentVariable(
-                "SHARPEMU_PS_DEBUG_TONEMAP_CURVE") == "1";
-        private static readonly bool _debugTonemapGamutOutput =
-            Environment.GetEnvironmentVariable(
-                "SHARPEMU_PS_DEBUG_TONEMAP_GAMUT") == "1";
-        private static readonly bool _debugTonemapGamutBaseOutput =
-            Environment.GetEnvironmentVariable(
-                "SHARPEMU_PS_DEBUG_TONEMAP_GAMUT_BASE") == "1";
-        private static readonly bool _debugTonemapGamutDenominatorOutput =
-            Environment.GetEnvironmentVariable(
-                "SHARPEMU_PS_DEBUG_TONEMAP_GAMUT_DENOM") == "1";
-        private static readonly bool _debugTonemapGamutScalarOutput =
-            Environment.GetEnvironmentVariable(
-                "SHARPEMU_PS_DEBUG_TONEMAP_GAMUT_SCALAR") == "1";
-        private static readonly bool _debugTonemapTransferOutput =
-            Environment.GetEnvironmentVariable(
-                "SHARPEMU_PS_DEBUG_TONEMAP_TRANSFER") == "1";
-        private static readonly bool _debugTonemapAbsoluteOutput =
-            Environment.GetEnvironmentVariable(
-                "SHARPEMU_PS_DEBUG_TONEMAP_ABS") == "1";
-        private static readonly bool _debugTonemapNanOutput =
-            Environment.GetEnvironmentVariable(
-                "SHARPEMU_PS_DEBUG_TONEMAP_NAN") == "1";
-        private static readonly bool _debugTonemapExecOutput =
-            Environment.GetEnvironmentVariable(
-                "SHARPEMU_PS_DEBUG_TONEMAP_EXEC") == "1";
         // SHARPEMU_PS_FORCE_EXPOSURE_SCALAR=1 (high-probability toggle): for
         // the tonemap/composite pixel shader at PixelShaderAddress
         // 0x0000000500640200 only, force the exposure-scale S_BUFFER_LOAD_DWORD
@@ -1849,121 +1837,7 @@ internal static partial class Gen5SpirvTranslator
                 return true;
             }
 
-            var emitted = TryEmitVectorAlu(instruction, out error);
-            if (emitted && IsKnownTonemapShader())
-            {
-                if (_debugTonemapGamutScalarOutput)
-                {
-                    if (instruction.Pc == 0x538u)
-                    {
-                        StoreV(240, LoadS(0));
-                        StoreV(241, LoadS(1));
-                        StoreV(242, LoadS(2));
-                    }
-                }
-                else if (_debugTonemapGamutDenominatorOutput)
-                {
-                    CaptureTonemapCheckpoint(
-                        instruction.Pc,
-                        0x538u, 10,
-                        0x53Cu, 9,
-                        0x540u, 7);
-                }
-                else if (_debugTonemapGamutBaseOutput)
-                {
-                    CaptureTonemapCheckpoint(
-                        instruction.Pc,
-                        0x564u, 10,
-                        0x57Cu, 12,
-                        0x598u, 14);
-                }
-                else if (_debugTonemapGamutOutput)
-                {
-                    if (instruction.Pc == 0x604u)
-                    {
-                        var active = _module.AddInstruction(
-                            SpirvOp.Select,
-                            _uintType,
-                            Load(_boolType, _exec),
-                            UInt(0x3F80_0000),
-                            UInt(0));
-                        StoreV(
-                            240,
-                            _debugTonemapExecOutput ? active : LoadV(10),
-                            guardWithExec: false);
-                        StoreV(
-                            241,
-                            _debugTonemapExecOutput ? active : LoadV(12),
-                            guardWithExec: false);
-                        StoreV(
-                            242,
-                            _debugTonemapExecOutput ? active : LoadV(9),
-                            guardWithExec: false);
-                    }
-                }
-                else if (_debugTonemapCurveOutput)
-                {
-                    // 0x538 is the first vector instruction after all three
-                    // conditional curve branches restore EXEC at 0x52C. Take
-                    // every component there so lanes that skipped a branch are
-                    // represented by their pass-through value, not probe zero.
-                    if (instruction.Pc == 0x538u)
-                    {
-                        StoreV(240, LoadV(0));
-                        StoreV(241, LoadV(2));
-                        StoreV(242, LoadV(1));
-                    }
-                }
-                else if (_debugTonemapCoreOutput)
-                {
-                    CaptureTonemapCheckpoint(
-                        instruction.Pc,
-                        0x4ACu, 6,
-                        0x4B0u, 5,
-                        0x4B4u, 4);
-                }
-                else if (_debugTonemapGradeOutput)
-                {
-                    CaptureTonemapCheckpoint(
-                        instruction.Pc,
-                        0x634u, 10,
-                        0x638u, 12,
-                        0x63Cu, 9);
-                }
-                else if (_debugTonemapTransferOutput)
-                {
-                    CaptureTonemapCheckpoint(
-                        instruction.Pc,
-                        0x764u, 10,
-                        0x768u, 12,
-                        0x76Cu, 9);
-                }
-            }
-
-            return emitted;
-        }
-
-        private void CaptureTonemapCheckpoint(
-            uint pc,
-            uint redPc,
-            uint redRegister,
-            uint greenPc,
-            uint greenRegister,
-            uint bluePc,
-            uint blueRegister)
-        {
-            if (pc == redPc)
-            {
-                StoreV(240, LoadV(redRegister));
-            }
-            else if (pc == greenPc)
-            {
-                StoreV(241, LoadV(greenRegister));
-            }
-            else if (pc == bluePc)
-            {
-                StoreV(242, LoadV(blueRegister));
-            }
+            return TryEmitVectorAlu(instruction, out error);
         }
 
         private bool TryEmitDataShare(
@@ -2670,7 +2544,8 @@ internal static partial class Gen5SpirvTranslator
             out int bindingIndex)
         {
             bindingIndex = -1;
-            if (!_recoverUnboundSmem ||
+            if ((!_recoverUnboundSmem &&
+                 !(_astroTonemapFix && IsKnownTonemapShader())) ||
                 instruction.Sources.Count == 0 ||
                 instruction.Sources[0] is not
                 {
@@ -2684,18 +2559,21 @@ internal static partial class Gen5SpirvTranslator
                 return false;
             }
 
-            var nearest = candidates
-                .OrderBy(candidate => Math.Abs(
-                    (long)candidate.Pc - instruction.Pc))
-                .ThenByDescending(candidate => candidate.Pc <= instruction.Pc)
-                .First();
-            bindingIndex = nearest.BindingIndex;
+            if (!TrySelectNearestScalarMemoryBinding(
+                    instruction.Pc,
+                    candidates,
+                    out var sourcePc,
+                    out bindingIndex))
+            {
+                return false;
+            }
+
             if (IsKnownTonemapShader())
             {
                 Console.Error.WriteLine(
                     $"[AGC][SMEM-RECOVER] shader=0x{_pixelShaderAddress:X16} " +
                     $"pc=0x{instruction.Pc:X} saddr=s{scalarBase.Value} " +
-                    $"from_pc=0x{nearest.Pc:X} binding={bindingIndex}");
+                    $"from_pc=0x{sourcePc:X} binding={bindingIndex}");
             }
 
             return true;
@@ -3286,13 +3164,6 @@ internal static partial class Gen5SpirvTranslator
                     _ => Bitcast(_uintType, value),
                 };
                 StoreV(image.VectorData + output++, raw);
-                if (_debugTonemapSampleOutput &&
-                    IsKnownTonemapShader() &&
-                    instruction.Pc == 0x2Cu &&
-                    output <= 3)
-                {
-                    StoreV(240u + output - 1u, raw);
-                }
             }
 
             return true;
@@ -3848,43 +3719,6 @@ internal static partial class Gen5SpirvTranslator
             if (_forcePackedExportOne)
             {
                 return Float(1f);
-            }
-
-            if ((_debugTonemapSampleOutput ||
-                 _debugTonemapGamutOutput ||
-                 _debugTonemapGamutBaseOutput ||
-                 _debugTonemapGamutDenominatorOutput ||
-                 _debugTonemapGamutScalarOutput ||
-                 _debugTonemapCurveOutput ||
-                 _debugTonemapCoreOutput ||
-                 _debugTonemapGradeOutput ||
-                 _debugTonemapTransferOutput) &&
-                IsKnownTonemapShader())
-            {
-                if (component >= 3)
-                {
-                    return Float(1f);
-                }
-
-                var value = Bitcast(
-                    _floatType,
-                    LoadV(240u + (uint)component));
-                if (_debugTonemapNanOutput)
-                {
-                    return _module.AddInstruction(
-                        SpirvOp.Select,
-                        _floatType,
-                        _module.AddInstruction(
-                            SpirvOp.IsNan,
-                            _boolType,
-                            value),
-                        Float(1f),
-                        Float(0f));
-                }
-
-                return _debugTonemapAbsoluteOutput
-                    ? Ext(4, _floatType, value)
-                    : value;
             }
 
             var packed = LoadV(instruction.Sources[component >> 1].Value);

@@ -16,7 +16,9 @@ default-off unless noted.
 |---|---|
 | `SHARPEMU_NP_FAKE_SIGNED_IN=1` | NP state=SIGNED_IN, reachability=Reachable, fires registered state callbacks. Without it the title loops at online-init. |
 | `SHARPEMU_NP_FAKE_USERCTX=1` | sceNpWebApi2CreateUserContext returns a synthetic context instead of NOT_SIGNED_IN. Set together with the above. |
+| `SHARPEMU_ASTRO_TONEMAP_FIX=1` | Enables the paired Astro Bot display fix: recover cbuffer loads omitted from scalar-evaluator binding discovery, and substitute 0.25 for its unwritten 1x1 auto-exposure texture. VM capture changes the tonemap target from fully black to fully nonblack. |
 | `SHARPEMU_PS_FORCE_EXPOSURE_SCALAR=<float>` | Pins the tonemap shader's (ps=0x500640200) cbuffer exposure scalar (reads 0 otherwise → black frame). 0.5 is a sane start; 1.0 over-saturates. |
+| `SHARPEMU_RECOVER_UNBOUND_SMEM=1` | Generic diagnostic form of the cbuffer recovery used by `SHARPEMU_ASTRO_TONEMAP_FIX`; applies nearest same-descriptor recovery to every shader. |
 
 ## Diagnostics (each proved its worth; costs noted)
 

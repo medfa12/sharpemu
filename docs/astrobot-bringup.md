@@ -9,22 +9,22 @@ Working state of the Astro Bot bring-up effort on this fork. Read this before
 touching the boot/render path — the "eliminated" table below exists so nobody
 re-runs a dead hypothesis.
 
-## Current state (2026-07-21)
+## Current state (2026-07-22)
 
 - Boots stable, soft-continues past engine asserts (audio-propagation, font).
 - Loads ALL menu assets (title_screen, worldmap/hub, pause menus) in ~15 min.
 - Renders real scene-mesh geometry (vtx=24192 draws, 100%-content 4K HDR
   targets) since the condvar deadlock fix — previously only fullscreen
   post-passes ever ran.
-- NOT yet reached: the interactive menu (libScePad never loads, no
-  scePadReadState). Presented swapchain frame is still black/gradient even
-  when the scene target has content (present-election picks a black buffer).
+- The tonemap/display path produces a content-bearing display buffer with
+  `SHARPEMU_ASTRO_TONEMAP_FIX=1`. Interactive-menu/input progress is still
+  under investigation.
 
 ## Fixed root causes (keep these in mind, they were hard-won)
 
 | Fix | Commit | Mechanism |
 |---|---|---|
-| Tonemap outputs black | `a55d1c9`+`8bdc546` | ps=0x500640200 multiplies the scene by a cbuffer exposure scalar (S_BUFFER_LOAD, user-SGPR reg 125, byte offset 116) that reads 0. `SHARPEMU_PS_FORCE_EXPOSURE_SCALAR=<float>` pins it. Root feed (why the guest never writes it) still unknown. |
+| Tonemap outputs black | current `gpu/tonemap` work | The executing placement is ps=0x500641900. Scalar evaluation discovers only its pc=0x38 cbuffer load; later loads such as pc=0x2F0 have no per-PC binding and are translated as zero even though the s28 cbuffer contains valid data. Recovering those loads exposes the second blocker: the unwritten 1x1 auto-exposure texture makes the grade cancel to zero. `SHARPEMU_ASTRO_TONEMAP_FIX=1` enables both targeted fallbacks. |
 | Online-init loop | `ec0de11`+`dafb50a` | NP state machine reported SIGNED_OUT via 4 coupled signals; the title retries forever. `SHARPEMU_NP_FAKE_SIGNED_IN=1` + `SHARPEMU_NP_FAKE_USERCTX=1` make it coherently signed-in (incl. firing the registered state callback). |
 | Post-load total deadlock | `8ab12f4` | Condvar signal-stealing lost-wakeup in PthreadCondWaitCore: a thread signaling then immediately re-waiting on the same cond consumed the token meant for an older waiter (DrawThread/Draw-Extra-Geometry handshake). Fixed default-on with an epoch guard; covered by KernelPthreadCondvarTests. |
 | APR resolve batch-abort | `691b790` | One missing `~~N` variant file aborted registration of a whole resolve batch. Now registers what resolves. |
@@ -34,9 +34,9 @@ re-runs a dead hypothesis.
 Rendering-black (each disproven by measurement, mostly via
 `SHARPEMU_CAPTURE_DRAWS=1` per-draw VkImage readback):
 geometry/transform collapse; s107/VRcp NaN; EXEC mask zero at export
-(measured TRUE via forced select); exposure 1x1 TEXTURE at 0x532830000
-(forcing it non-zero changed nothing — the scalar is a CBUFFER value);
-HDR10 A2R10G10B10 output format; unbound-smem zeroing; cbuffer re-read race;
+(measured TRUE via forced select); either the exposure texture or missing
+cbuffer binding as a standalone fix (both blockers must be fixed together);
+HDR10 A2R10G10B10 output format; cbuffer re-read race;
 viewport 1x1 clip; post-draw clear; input aliasing; present-selection as the
 cause of the black tonemap output.
 
@@ -64,21 +64,11 @@ fences, buffers destroyed every draw). `capFence=0`: the GPU itself is fast.
    (rent-hit/miss/park/trim per class) — check it FIRST on the verification
    boot, then compare capReap. Storage-scratch images and
    ownership-transferring first-uploads are deliberately excluded.
-2. Present-election black: DIAGNOSED (code-read, high conf) — the election
-   is NOT broken. The game flips 0x507410000/0x5093F0000, written only by the
-   tonemap ps=0x500640200, which multiplies by the zero exposure scalar; with
-   `SHARPEMU_PS_FORCE_EXPOSURE_SCALAR` unset the elected buffer is
-   legitimately black and faithfully blitted (the nodeadlock1/scene1 boots
-   did not set the flag). The scene target 0x520440000 is an intermediate
-   that never enters the election. Discriminating boot (NOT a perf boot):
-   `SHARPEMU_PS_FORCE_EXPOSURE_SCALAR=0.1` + `SHARPEMU_CAPTURE_DRAWS=1` +
-   `SHARPEMU_DUMP_SWAPCHAIN=1`; grep `[CAPTURE].*ps=0x0000000500640200` for
-   in0/out0 addr+nonblack (in0 stale/black => tonemap input rebinding; out0
-   nonblack but swapchain black => election/staleness), then
-   `vk.submit_call|vk.flip_redirect|vk.submit_guest_image_unknown`, then
-   FRAMEDUMP.
-3. Find why the exposure cbuffer scalar is 0 (proper fix for the tonemap
-   force) and why libScePad never loads (what gates the interactive gamemode).
+2. Replace the targeted scalar-memory recovery with path-complete resource
+   discovery in `Gen5ShaderScalarEvaluator`: all reachable SMEM instructions
+   need bindings even when the evaluator's selected scalar branch skips them.
+3. Implement the producer for the 1x1 auto-exposure surface, then remove its
+   constant fallback. Separately, find why libScePad never loads.
 4. Watch run-to-run variance — if threads park again, use
    `SHARPEMU_LOG_SYNC=1` (see methodology) to find the next lost wakeup.
 

@@ -24,6 +24,43 @@ public sealed class Gen5ShaderTranslatorTests
     private const uint ComputeUserData = 0x240;
     private const uint ComputePgmRsrc2 = 0x213;
 
+    [Fact]
+    public void ScalarMemoryBindingRecovery_SelectsNearestSameDescriptorUse()
+    {
+        var candidates = new (uint Pc, int BindingIndex)[]
+        {
+            (0x038, 2),
+            (0x300, 7),
+            (0x700, 9),
+        };
+
+        Assert.True(Gen5SpirvTranslator.TrySelectNearestScalarMemoryBinding(
+            0x2F0,
+            candidates,
+            out var sourcePc,
+            out var bindingIndex));
+        Assert.Equal(0x300u, sourcePc);
+        Assert.Equal(7, bindingIndex);
+    }
+
+    [Fact]
+    public void ScalarMemoryBindingRecovery_PrefersPrecedingUseOnTie()
+    {
+        var candidates = new (uint Pc, int BindingIndex)[]
+        {
+            (0x100, 3),
+            (0x120, 4),
+        };
+
+        Assert.True(Gen5SpirvTranslator.TrySelectNearestScalarMemoryBinding(
+            0x110,
+            candidates,
+            out var sourcePc,
+            out var bindingIndex));
+        Assert.Equal(0x100u, sourcePc);
+        Assert.Equal(3, bindingIndex);
+    }
+
     private static Dictionary<uint, uint> ComputeRegisters(uint userSgprCount = 0) => new()
     {
         [ComputePgmRsrc2] = userSgprCount << 1,
