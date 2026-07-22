@@ -283,6 +283,9 @@ internal static partial class Gen5SpirvTranslator
         private static readonly bool _debugTonemapAbsoluteOutput =
             Environment.GetEnvironmentVariable(
                 "SHARPEMU_PS_DEBUG_TONEMAP_ABS") == "1";
+        private static readonly bool _debugTonemapNanOutput =
+            Environment.GetEnvironmentVariable(
+                "SHARPEMU_PS_DEBUG_TONEMAP_NAN") == "1";
         // SHARPEMU_PS_FORCE_EXPOSURE_SCALAR=1 (high-probability toggle): for
         // the tonemap/composite pixel shader at PixelShaderAddress
         // 0x0000000500640200 only, force the exposure-scale S_BUFFER_LOAD_DWORD
@@ -3756,6 +3759,19 @@ internal static partial class Gen5SpirvTranslator
                 var value = Bitcast(
                     _floatType,
                     LoadV(240u + (uint)component));
+                if (_debugTonemapNanOutput)
+                {
+                    return _module.AddInstruction(
+                        SpirvOp.Select,
+                        _floatType,
+                        _module.AddInstruction(
+                            SpirvOp.IsNan,
+                            _boolType,
+                            value),
+                        Float(1f),
+                        Float(0f));
+                }
+
                 return _debugTonemapAbsoluteOutput
                     ? Ext(4, _floatType, value)
                     : value;
