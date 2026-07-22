@@ -12,6 +12,11 @@ namespace SharpEmu.Tests;
 public sealed class AjmNgs2Tests
 {
     private const int AjmErrorMalformedBatch = unchecked((int)0x80930011);
+    private const int Ngs2InvalidGrainSamples = unchecked((int)0x804A0051);
+    private const int Ngs2InvalidSampleRate = unchecked((int)0x804A0201);
+    private const int Ngs2InvalidBufferAddress = unchecked((int)0x804A0207);
+    private const int Ngs2InvalidVoiceHandle = unchecked((int)0x804A0300);
+    private const int Ngs2InvalidGeomFlag = unchecked((int)0x804A0923);
 
     private static CpuContext NewContext(out SparseGuestMemory memory)
     {
@@ -122,7 +127,9 @@ public sealed class AjmNgs2Tests
         var rack = CreateNgs2Rack(ctx, memory, system);
         var voice = GetNgs2Voice(ctx, rack);
 
-        WriteVoiceParameter(memory, 0x5000, 8, 0, 0x1000_0001, 0);
+        WriteVoiceParameter(memory, 0x5000, 0x28, 0, 0x1000_0000, 0x12);
+        Assert.True(ctx.TryWriteUInt32(0x500C, 2));
+        Assert.True(ctx.TryWriteUInt32(0x5010, 48000));
         ctx[CpuRegister.Rdi] = voice;
         ctx[CpuRegister.Rsi] = 0x5000;
         Ngs2Exports.Ngs2VoiceControl(ctx);
@@ -138,7 +145,7 @@ public sealed class AjmNgs2Tests
 
         Assert.True(ctx.TryWriteUInt64(0x6000, 0x7000));
         Assert.True(ctx.TryWriteUInt64(0x6008, 0x400));
-        Assert.True(ctx.TryWriteUInt32(0x6010, 0x80));
+        Assert.True(ctx.TryWriteUInt32(0x6010, 0x12));
         Assert.True(ctx.TryWriteUInt32(0x6014, 2));
         Assert.True(memory.TryWrite(0x7000, Enumerable.Repeat((byte)0xCC, 0x400).ToArray()));
         ctx[CpuRegister.Rdi] = system;
@@ -153,11 +160,13 @@ public sealed class AjmNgs2Tests
         Assert.All(rendered, value => Assert.Equal(0, value));
         ctx[CpuRegister.Rdi] = voice;
         ctx[CpuRegister.Rsi] = 0x7200;
-        ctx[CpuRegister.Rdx] = 48;
+        ctx[CpuRegister.Rdx] = 8;
         Ngs2Exports.Ngs2VoiceGetState(ctx);
         Assert.Equal(0, Result(ctx));
-        Assert.True(ctx.TryReadUInt64(0x7210, out var samples));
-        Assert.Equal(256UL, samples);
+        Assert.True(ctx.TryReadUInt32(0x7200, out var stateFlags));
+        Assert.Equal(3u, stateFlags);
+        Assert.True(ctx.TryReadUInt32(0x7204, out var stateError));
+        Assert.Equal(0u, stateError);
 
         WriteVoiceParameter(memory, 0x5100, 12, 0, 6, 2);
         ctx[CpuRegister.Rdi] = voice;
@@ -167,16 +176,104 @@ public sealed class AjmNgs2Tests
         ctx[CpuRegister.Rsi] = 0x6000;
         ctx[CpuRegister.Rdx] = 1;
         Ngs2Exports.Ngs2SystemRender(ctx);
-        Assert.Equal(0xBu, GetVoiceFlags(ctx, voice));
+        Assert.Equal(9u, GetVoiceFlags(ctx, voice));
+    }
+
+    [Fact]
+    public void Ngs2CompatibilityOptionsAndSystemInfo_MatchFirmwareLayout()
+    {
+        var memory = new AllocatingGuestMemory();
+        var ctx = new CpuContext(memory, Generation.Gen5);
+
+        ctx[CpuRegister.Rdi] = 0x8000;
+        Ngs2Exports.Ngs2SystemResetOption(ctx);
+        Assert.Equal(0, Result(ctx));
+        Assert.True(ctx.TryReadUInt64(0x8000, out var optionSize));
+        Assert.Equal(0x40UL, optionSize);
+        Assert.True(ctx.TryReadUInt32(0x801C, out var maximumGrain));
+        Assert.Equal(512u, maximumGrain);
+        Assert.True(ctx.TryReadUInt32(0x8020, out var grain));
+        Assert.Equal(256u, grain);
+        Assert.True(ctx.TryReadUInt32(0x8024, out var sampleRate));
+        Assert.Equal(48000u, sampleRate);
+
+        var system = CreateNgs2System(ctx, memory);
+        _ = CreateNgs2Rack(ctx, memory, system);
+        Assert.True(memory.TryWrite(0x9000, new byte[0x88]));
+        ctx[CpuRegister.Rdi] = system;
+        ctx[CpuRegister.Rsi] = 0x9000;
+        ctx[CpuRegister.Rdx] = 0x88;
+        Ngs2Exports.Ngs2SystemGetInfo(ctx);
+        Assert.Equal(0, Result(ctx));
+        Assert.True(ctx.TryReadUInt32(0x905C, out var minimumGrain));
+        Assert.Equal(64u, minimumGrain);
+        Assert.True(ctx.TryReadUInt32(0x9064, out var systemFlags));
+        Assert.Equal(1u, systemFlags);
+        Assert.True(ctx.TryReadUInt32(0x9068, out var rackCount));
+        Assert.Equal(1u, rackCount);
+    }
+
+    [Fact]
+    public void Ngs2SettersAndRender_UseDiscreteFirmwareValidation()
+    {
+        var memory = new AllocatingGuestMemory();
+        var ctx = new CpuContext(memory, Generation.Gen5);
+        var system = CreateNgs2System(ctx, memory);
+
+        ctx[CpuRegister.Rdi] = system;
+        ctx[CpuRegister.Rsi] = 65;
+        Ngs2Exports.Ngs2SystemSetGrainSamples(ctx);
+        Assert.Equal(Ngs2InvalidGrainSamples, Result(ctx));
+        ctx[CpuRegister.Rsi] = 64;
+        Ngs2Exports.Ngs2SystemSetGrainSamples(ctx);
+        Assert.Equal(0, Result(ctx));
+
+        ctx[CpuRegister.Rdi] = system;
+        ctx[CpuRegister.Rsi] = 32000;
+        Ngs2Exports.Ngs2SystemSetSampleRate(ctx);
+        Assert.Equal(Ngs2InvalidSampleRate, Result(ctx));
+        ctx[CpuRegister.Rsi] = 44100;
+        Ngs2Exports.Ngs2SystemSetSampleRate(ctx);
+        Assert.Equal(0, Result(ctx));
+
+        ctx[CpuRegister.Rdi] = system;
+        ctx[CpuRegister.Rsi] = 0;
+        ctx[CpuRegister.Rdx] = 0;
+        Ngs2Exports.Ngs2SystemRender(ctx);
+        Assert.Equal(Ngs2InvalidBufferAddress, Result(ctx));
+    }
+
+    [Fact]
+    public void Ngs2VoiceFlagsAndGeomApply_ReturnOracleErrorsAndWrites()
+    {
+        var memory = new AllocatingGuestMemory();
+        var ctx = new CpuContext(memory, Generation.Gen5);
+        Assert.True(ctx.TryWriteUInt32(0xA000, uint.MaxValue));
+        ctx[CpuRegister.Rdi] = 0xDEAD;
+        ctx[CpuRegister.Rsi] = 0xA000;
+        Ngs2Exports.Ngs2VoiceGetStateFlags(ctx);
+        Assert.Equal(Ngs2InvalidVoiceHandle, Result(ctx));
+        Assert.True(ctx.TryReadUInt32(0xA000, out var invalidFlags));
+        Assert.Equal(0u, invalidFlags);
+
+        Assert.True(memory.TryWrite(0xB000, new byte[0x60]));
+        Assert.True(memory.TryWrite(0xB100, new byte[0x68]));
+        Assert.True(memory.TryWrite(0xB200, new byte[0x134]));
+        ctx[CpuRegister.Rdi] = 0xB000;
+        ctx[CpuRegister.Rsi] = 0xB100;
+        ctx[CpuRegister.Rdx] = 0xB200;
+        ctx[CpuRegister.Rcx] = 0;
+        Ngs2Exports.Ngs2GeomApply(ctx);
+        Assert.Equal(Ngs2InvalidGeomFlag, Result(ctx));
     }
 
     private static ulong CreateNgs2System(CpuContext ctx, ICpuMemory memory)
     {
-        var option = new byte[0x90];
-        BinaryPrimitives.WriteUInt64LittleEndian(option, 0x90);
-        BinaryPrimitives.WriteUInt32LittleEndian(option.AsSpan(0x6C), 512);
-        BinaryPrimitives.WriteUInt32LittleEndian(option.AsSpan(0x70), 256);
-        BinaryPrimitives.WriteUInt32LittleEndian(option.AsSpan(0x74), 48000);
+        var option = new byte[0x40];
+        BinaryPrimitives.WriteUInt64LittleEndian(option, 0x40);
+        BinaryPrimitives.WriteUInt32LittleEndian(option.AsSpan(0x1C), 512);
+        BinaryPrimitives.WriteUInt32LittleEndian(option.AsSpan(0x20), 256);
+        BinaryPrimitives.WriteUInt32LittleEndian(option.AsSpan(0x24), 48000);
         Assert.True(memory.TryWrite(0x1000, option));
         Assert.True(ctx.TryWriteUInt64(0x2000, 1));
         Assert.True(ctx.TryWriteUInt64(0x2008, 2));
@@ -192,12 +289,12 @@ public sealed class AjmNgs2Tests
 
     private static ulong CreateNgs2Rack(CpuContext ctx, ICpuMemory memory, ulong system)
     {
-        var option = new byte[0xD4];
-        BinaryPrimitives.WriteUInt64LittleEndian(option, 0xD4);
-        BinaryPrimitives.WriteUInt32LittleEndian(option.AsSpan(0x4C), 512);
-        BinaryPrimitives.WriteUInt32LittleEndian(option.AsSpan(0x50), 4);
-        BinaryPrimitives.WriteUInt32LittleEndian(option.AsSpan(0x58), 1);
-        BinaryPrimitives.WriteUInt32LittleEndian(option.AsSpan(0x5C), 8);
+        var option = new byte[0xA4];
+        BinaryPrimitives.WriteUInt64LittleEndian(option, 0xA4);
+        BinaryPrimitives.WriteUInt32LittleEndian(option.AsSpan(0x1C), 512);
+        BinaryPrimitives.WriteUInt32LittleEndian(option.AsSpan(0x20), 4);
+        BinaryPrimitives.WriteUInt32LittleEndian(option.AsSpan(0x28), 1);
+        BinaryPrimitives.WriteUInt32LittleEndian(option.AsSpan(0x2C), 8);
         Assert.True(memory.TryWrite(0x3000, option));
         Assert.True(ctx.TryWriteUInt64(0x4000, 1));
         Assert.True(ctx.TryWriteUInt64(0x4008, 2));
