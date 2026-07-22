@@ -231,11 +231,17 @@ internal static partial class Gen5SpirvTranslator
         private readonly List<SpirvImageResource> _imageResources = [];
         private readonly Dictionary<uint, int> _imageBindingByPc = [];
         private readonly Dictionary<uint, int> _bufferBindingByPc = [];
+        private readonly Dictionary<uint, List<(uint Pc, int BindingIndex)>>
+            _bufferBindingsByScalarAddress = [];
 
         // SHARPEMU_KEEP_UNBOUND_SMEM=1: don't zero the destinations of a scalar
         // load with no buffer binding; leave whatever an earlier bound load wrote.
         private static readonly bool _keepUnboundSmem = string.Equals(
             Environment.GetEnvironmentVariable("SHARPEMU_KEEP_UNBOUND_SMEM"),
+            "1",
+            StringComparison.Ordinal);
+        private static readonly bool _recoverUnboundSmem = string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_RECOVER_UNBOUND_SMEM"),
             "1",
             StringComparison.Ordinal);
         // Attributes touched by V_INTERP_MOV_F32: their P0/P10/P20 hardware
@@ -757,9 +763,21 @@ internal static partial class Gen5SpirvTranslator
         {
             for (var index = 0; index < _evaluation.GlobalMemoryBindings.Count; index++)
             {
-                foreach (var pc in _evaluation.GlobalMemoryBindings[index].InstructionPcs)
+                var binding = _evaluation.GlobalMemoryBindings[index];
+                if (!_bufferBindingsByScalarAddress.TryGetValue(
+                        binding.ScalarAddress,
+                        out var scalarBindings))
+                {
+                    scalarBindings = [];
+                    _bufferBindingsByScalarAddress.Add(
+                        binding.ScalarAddress,
+                        scalarBindings);
+                }
+
+                foreach (var pc in binding.InstructionPcs)
                 {
                     _bufferBindingByPc.TryAdd(pc, _globalBufferBase + index);
+                    scalarBindings.Add((pc, _globalBufferBase + index));
                 }
             }
 
@@ -2584,7 +2602,8 @@ internal static partial class Gen5SpirvTranslator
             out string error)
         {
             error = string.Empty;
-            if (!_bufferBindingByPc.TryGetValue(instruction.Pc, out var bindingIndex))
+            if (!_bufferBindingByPc.TryGetValue(instruction.Pc, out var bindingIndex) &&
+                !TryRecoverScalarMemoryBinding(instruction, out bindingIndex))
             {
                 // SHARPEMU_KEEP_UNBOUND_SMEM=1: a later unbound duplicate scalar
                 // load can clobber a valid earlier bound load into the same
@@ -2641,6 +2660,42 @@ internal static partial class Gen5SpirvTranslator
                     ? UInt(_forceExposureScalarBits)
                     : LoadBufferWord(bindingIndex, address);
                 StoreS(destination.Value, value);
+            }
+
+            return true;
+        }
+
+        private bool TryRecoverScalarMemoryBinding(
+            Gen5ShaderInstruction instruction,
+            out int bindingIndex)
+        {
+            bindingIndex = -1;
+            if (!_recoverUnboundSmem ||
+                instruction.Sources.Count == 0 ||
+                instruction.Sources[0] is not
+                {
+                    Kind: Gen5OperandKind.ScalarRegister,
+                } scalarBase ||
+                !_bufferBindingsByScalarAddress.TryGetValue(
+                    scalarBase.Value,
+                    out var candidates) ||
+                candidates.Count == 0)
+            {
+                return false;
+            }
+
+            var nearest = candidates
+                .OrderBy(candidate => Math.Abs(
+                    (long)candidate.Pc - instruction.Pc))
+                .ThenByDescending(candidate => candidate.Pc <= instruction.Pc)
+                .First();
+            bindingIndex = nearest.BindingIndex;
+            if (IsKnownTonemapShader())
+            {
+                Console.Error.WriteLine(
+                    $"[AGC][SMEM-RECOVER] shader=0x{_pixelShaderAddress:X16} " +
+                    $"pc=0x{instruction.Pc:X} saddr=s{scalarBase.Value} " +
+                    $"from_pc=0x{nearest.Pc:X} binding={bindingIndex}");
             }
 
             return true;
