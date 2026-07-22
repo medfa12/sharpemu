@@ -971,12 +971,6 @@ internal static partial class Gen5SpirvTranslator
                 return false;
             }
 
-            if (control.Clamp)
-            {
-                error = $"unsupported vop3p modifiers (clamp) for {instruction.Opcode}";
-                return false;
-            }
-
             var sourceCount = instruction.Opcode == "VPkFmaF16" ? 3 : 2;
             for (var index = 0; index < sourceCount; index++)
             {
@@ -1110,6 +1104,9 @@ internal static partial class Gen5SpirvTranslator
         }
 
         // Computes one result lane (low or high) as a packed 16-bit f16 value.
+        // Clamp is applied to the f32 result before narrowing. Since the bounds
+        // are exact f16 values and the clamp is monotonic, this produces the same
+        // f16 result as clamping after the conversion.
         private uint EmitPackedF16Lane(
             Gen5ShaderInstruction instruction,
             Gen5Vop3pControl control,
@@ -1117,21 +1114,30 @@ internal static partial class Gen5SpirvTranslator
         {
             var left = EmitPackedF16Operand(instruction, control, 0, highLane);
             var right = EmitPackedF16Operand(instruction, control, 1, highLane);
+            uint value;
             if (instruction.Opcode == "VPkFmaF16")
             {
                 var addend = EmitPackedF16Operand(instruction, control, 2, highLane);
-                return EmitFloatToHalf(EmitPackedF16FusedMultiplyAdd(left, right, addend));
+                value = EmitPackedF16FusedMultiplyAdd(left, right, addend);
+            }
+            else
+            {
+                value = Bitcast(_uintType, instruction.Opcode switch
+                {
+                    "VPkAddF16" => _module.AddInstruction(SpirvOp.FAdd, _floatType, left, right),
+                    "VPkMulF16" => _module.AddInstruction(SpirvOp.FMul, _floatType, left, right),
+                    "VPkMinF16" => EmitPackedF16MinMax(left, right, isMax: false),
+                    "VPkMaxF16" => EmitPackedF16MinMax(left, right, isMax: true),
+                    _ => left,
+                });
             }
 
-            var value = instruction.Opcode switch
+            if (control.Clamp)
             {
-                "VPkAddF16" => _module.AddInstruction(SpirvOp.FAdd, _floatType, left, right),
-                "VPkMulF16" => _module.AddInstruction(SpirvOp.FMul, _floatType, left, right),
-                "VPkMinF16" => EmitPackedF16MinMax(left, right, isMax: false),
-                "VPkMaxF16" => EmitPackedF16MinMax(left, right, isMax: true),
-                _ => left,
-            };
-            return EmitFloatToHalf(Bitcast(_uintType, value));
+                value = EmitClampToUnitInterval(value);
+            }
+
+            return EmitFloatToHalf(value);
         }
 
         // Fused f16 multiply-add with a single rounding, emulated in f32 without the
