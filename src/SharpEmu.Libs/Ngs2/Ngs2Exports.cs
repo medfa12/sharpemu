@@ -21,6 +21,8 @@ public static class Ngs2Exports
     private const int ErrorInvalidSampleRate = unchecked((int)0x804A0201);
     private const int ErrorInvalidBufferInfo = unchecked((int)0x804A0206);
     private const int ErrorInvalidBufferAllocator = unchecked((int)0x804A020A);
+    private const int ErrorInvalidReportHandler = unchecked((int)0x804A0203);
+    private const int ErrorInvalidReportHandle = unchecked((int)0x804A0204);
     private const int ErrorInvalidSystemHandle = unchecked((int)0x804A0230);
     private const int ErrorInvalidRackId = unchecked((int)0x804A0260);
     private const int ErrorInvalidRackHandle = unchecked((int)0x804A0261);
@@ -53,6 +55,8 @@ public static class Ngs2Exports
     private static readonly Dictionary<ulong, SystemState> Systems = new();
     private static readonly Dictionary<ulong, RackState> Racks = new();
     private static readonly Dictionary<ulong, VoiceState> Voices = new();
+    private static readonly Dictionary<ulong, StreamState> Streams = new();
+    private static readonly HashSet<ulong> ReportHandles = new();
     private static long _nextUid;
     private static long _renderCount;
 
@@ -109,6 +113,11 @@ public static class Ngs2Exports
         public VoiceEvent PendingEvent;
         public ulong DecodedSamples;
         public ulong DecodedBytes;
+    }
+
+    private sealed class StreamState
+    {
+        public ulong SystemHandle { get; init; }
     }
 
     private readonly record struct SystemOption(
@@ -976,6 +985,409 @@ public static class Ngs2Exports
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libSceNgs2")]
     public static int Ngs2GeomResetListenerParam(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "6qN1zaEZuN0", ExportName = "sceNgs2CustomRackGetModuleInfo", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceNgs2")]
+    public static int Ngs2CustomRackGetModuleInfo(CpuContext ctx)
+    {
+        var rackHandle = ctx[CpuRegister.Rdi];
+        var moduleIndex = unchecked((uint)ctx[CpuRegister.Rsi]);
+        var outAddress = ctx[CpuRegister.Rdx];
+        var outSize = ctx[CpuRegister.Rcx];
+        lock (StateGate)
+        {
+            if (!Racks.ContainsKey(rackHandle))
+            {
+                return ctx.SetReturn(ErrorInvalidRackHandle);
+            }
+        }
+        if (moduleIndex >= 24)
+        {
+            return ctx.SetReturn(unchecked((int)0x804A0B00));
+        }
+        if (outAddress == 0)
+        {
+            return ctx.SetReturn(ErrorInvalidOutAddress);
+        }
+        if (outSize < 0x20 || outSize > 0x1000)
+        {
+            return ctx.SetReturn(unchecked((int)0x804A0B01));
+        }
+        return ctx.SetReturn(TryClearGuestBuffer(ctx, outAddress, outSize)
+            ? 0
+            : (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+    }
+
+    [SysAbiExport(Nid = "Kg1MA5j7KFk", ExportName = "sceNgs2FftInit", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceNgs2")]
+    public static int Ngs2FftInit(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "D8eCqBxSojA", ExportName = "sceNgs2FftProcess", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceNgs2")]
+    public static int Ngs2FftProcess(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "-YNfTO6KOMY", ExportName = "sceNgs2FftQuerySize", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceNgs2")]
+    public static int Ngs2FftQuerySize(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "eF8yRCC6W64", ExportName = "sceNgs2GeomApply", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceNgs2")]
+    public static int Ngs2GeomApply(CpuContext ctx)
+    {
+        var listenerAddress = ctx[CpuRegister.Rdi];
+        var sourceAddress = ctx[CpuRegister.Rsi];
+        var outputAddress = ctx[CpuRegister.Rdx];
+        if (listenerAddress == 0)
+        {
+            return ctx.SetReturn(unchecked((int)0x804A0921));
+        }
+        if (sourceAddress == 0)
+        {
+            return ctx.SetReturn(unchecked((int)0x804A0922));
+        }
+        if (outputAddress == 0)
+        {
+            return ctx.SetReturn(ErrorInvalidOutAddress);
+        }
+        Span<byte> attribute = stackalloc byte[0x134];
+        attribute.Clear();
+        BinaryPrimitives.WriteInt32LittleEndian(attribute, BitConverter.SingleToInt32Bits(1.0f));
+        return ctx.Memory.TryWrite(outputAddress, attribute)
+            ? ctx.SetReturn(0)
+            : ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+    }
+
+    [SysAbiExport(Nid = "BcoPfWfpvVI", ExportName = "sceNgs2JobSchedulerResetOption", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceNgs2")]
+    public static int Ngs2JobSchedulerResetOption(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "EEemGEQCjO8", ExportName = "sceNgs2ModuleArrayEnumItems", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceNgs2")]
+    public static int Ngs2ModuleArrayEnumItems(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "TaoNtmMKkXQ", ExportName = "sceNgs2ModuleEnumConfigs", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceNgs2")]
+    public static int Ngs2ModuleEnumConfigs(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "ve6bZi+1sYQ", ExportName = "sceNgs2ModuleQueueEnumItems", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceNgs2")]
+    public static int Ngs2ModuleQueueEnumItems(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "gbMKV+8Enuo", ExportName = "sceNgs2PanGetVolumeMatrix", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceNgs2")]
+    public static int Ngs2PanGetVolumeMatrix(CpuContext ctx)
+    {
+        if (ctx[CpuRegister.Rdi] == 0 || ctx[CpuRegister.Rsi] == 0)
+        {
+            return ctx.SetReturn(unchecked((int)0x804A0914));
+        }
+        var outputAddress = ctx[CpuRegister.R8];
+        if (outputAddress == 0)
+        {
+            return ctx.SetReturn(ErrorInvalidOutAddress);
+        }
+        Span<byte> matrix = stackalloc byte[8 * 8 * sizeof(float)];
+        matrix.Clear();
+        return ctx.Memory.TryWrite(outputAddress, matrix)
+            ? ctx.SetReturn(0)
+            : ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+    }
+
+    [SysAbiExport(Nid = "iprCTXPVWMI", ExportName = "sceNgs2ParseWaveformFile", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceNgs2")]
+    public static int Ngs2ParseWaveformFile(CpuContext ctx)
+    {
+        if (!ctx.TryReadNullTerminatedUtf8(ctx[CpuRegister.Rdi], 4096, out _))
+        {
+            return ctx.SetReturn(ErrorInvalidWaveformAddress);
+        }
+        return WriteEmptyWaveformInfo(ctx, ctx[CpuRegister.Rdx]);
+    }
+
+    [SysAbiExport(Nid = "t9T0QM17Kvo", ExportName = "sceNgs2ParseWaveformUser", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceNgs2")]
+    public static int Ngs2ParseWaveformUser(CpuContext ctx)
+    {
+        if (ctx[CpuRegister.Rdi] == 0)
+        {
+            return ctx.SetReturn(ErrorInvalidWaveformAddress);
+        }
+        return WriteEmptyWaveformInfo(ctx, ctx[CpuRegister.Rdx]);
+    }
+
+    [SysAbiExport(Nid = "TZqb8E-j3dY", ExportName = "sceNgs2RackQueryInfo", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceNgs2")]
+    public static int Ngs2RackQueryInfo(CpuContext ctx) => Ngs2RackGetInfo(ctx);
+
+    [SysAbiExport(Nid = "MI2VmBx2RbM", ExportName = "sceNgs2RackRunCommands", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceNgs2")]
+    public static int Ngs2RackRunCommands(CpuContext ctx) => ValidateRack(ctx);
+
+    [SysAbiExport(Nid = "uBIN24Tv2MI", ExportName = "sceNgs2ReportRegisterHandler", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceNgs2")]
+    public static int Ngs2ReportRegisterHandler(CpuContext ctx)
+    {
+        var handler = ctx[CpuRegister.Rsi];
+        var outAddress = ctx[CpuRegister.Rcx];
+        if (handler == 0)
+        {
+            return ctx.SetReturn(ErrorInvalidReportHandler);
+        }
+        if (outAddress == 0)
+        {
+            return ctx.SetReturn(ErrorInvalidOutAddress);
+        }
+        if (!TryCreateHandle(ctx, 4, 0, out var handle) || !ctx.TryWriteUInt64(outAddress, handle))
+        {
+            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+        lock (StateGate)
+        {
+            ReportHandles.Add(handle);
+        }
+        return ctx.SetReturn(0);
+    }
+
+    [SysAbiExport(Nid = "nPzb7Ly-VjE", ExportName = "sceNgs2ReportUnregisterHandler", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceNgs2")]
+    public static int Ngs2ReportUnregisterHandler(CpuContext ctx)
+    {
+        lock (StateGate)
+        {
+            return ctx.SetReturn(ReportHandles.Remove(ctx[CpuRegister.Rdi]) ? 0 : ErrorInvalidReportHandle);
+        }
+    }
+
+    [SysAbiExport(Nid = "sU2St3agdjg", ExportName = "sceNgs2StreamCreate", Target = Generation.Gen5, LibraryName = "libSceNgs2")]
+    public static int Ngs2StreamCreate(CpuContext ctx) => CreateStream(ctx, withAllocator: false);
+
+    [SysAbiExport(Nid = "I+RLwaauggA", ExportName = "sceNgs2StreamCreateWithAllocator", Target = Generation.Gen5, LibraryName = "libSceNgs2")]
+    public static int Ngs2StreamCreateWithAllocator(CpuContext ctx) => CreateStream(ctx, withAllocator: true);
+
+    [SysAbiExport(Nid = "bfoMXnTRtwE", ExportName = "sceNgs2StreamDestroy", Target = Generation.Gen5, LibraryName = "libSceNgs2")]
+    public static int Ngs2StreamDestroy(CpuContext ctx)
+    {
+        lock (StateGate)
+        {
+            if (!Streams.Remove(ctx[CpuRegister.Rdi]))
+            {
+                return ctx.SetReturn(ErrorInvalidHandle);
+            }
+        }
+        var outInfoAddress = ctx[CpuRegister.Rsi];
+        if (outInfoAddress != 0 && !TryClearGuestBuffer(ctx, outInfoAddress, ContextBufferInfoSize))
+        {
+            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+        return ctx.SetReturn(0);
+    }
+
+    [SysAbiExport(Nid = "dxulc33msHM", ExportName = "sceNgs2StreamQueryBufferSize", Target = Generation.Gen5, LibraryName = "libSceNgs2")]
+    public static int Ngs2StreamQueryBufferSize(CpuContext ctx) =>
+        WriteContextBufferInfo(ctx, ctx[CpuRegister.Rsi], HandleStorageSize);
+
+    [SysAbiExport(Nid = "rfw6ufRsmow", ExportName = "sceNgs2StreamQueryInfo", Target = Generation.Gen5, LibraryName = "libSceNgs2")]
+    public static int Ngs2StreamQueryInfo(CpuContext ctx)
+    {
+        var handle = ctx[CpuRegister.Rdi];
+        var outAddress = ctx[CpuRegister.Rsi];
+        var outSize = ctx[CpuRegister.Rdx];
+        lock (StateGate)
+        {
+            if (!Streams.TryGetValue(handle, out var stream))
+            {
+                return ctx.SetReturn(ErrorInvalidHandle);
+            }
+            if (outAddress == 0)
+            {
+                return ctx.SetReturn(ErrorInvalidOutAddress);
+            }
+            if (outSize < 0x20 || outSize > 0x1000)
+            {
+                return ctx.SetReturn(ErrorInvalidOutSize);
+            }
+            var info = new byte[checked((int)outSize)];
+            BinaryPrimitives.WriteUInt64LittleEndian(info.AsSpan(0x08), handle);
+            BinaryPrimitives.WriteUInt64LittleEndian(info.AsSpan(0x10), stream.SystemHandle);
+            return ctx.Memory.TryWrite(outAddress, info)
+                ? ctx.SetReturn(0)
+                : ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+    }
+
+    [SysAbiExport(Nid = "q+2W8YdK0F8", ExportName = "sceNgs2StreamResetOption", Target = Generation.Gen5, LibraryName = "libSceNgs2")]
+    public static int Ngs2StreamResetOption(CpuContext ctx)
+    {
+        var address = ctx[CpuRegister.Rdi];
+        if (address == 0)
+        {
+            return ctx.SetReturn(ErrorInvalidOptionAddress);
+        }
+        Span<byte> option = stackalloc byte[0x80];
+        option.Clear();
+        BinaryPrimitives.WriteUInt64LittleEndian(option, 0x80);
+        return ctx.Memory.TryWrite(address, option)
+            ? ctx.SetReturn(0)
+            : ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+    }
+
+    [SysAbiExport(Nid = "qQHCi9pjDps", ExportName = "sceNgs2StreamRunCommands", Target = Generation.Gen5, LibraryName = "libSceNgs2")]
+    public static int Ngs2StreamRunCommands(CpuContext ctx) => ValidateStream(ctx);
+
+    [SysAbiExport(Nid = "vubFP0T6MP0", ExportName = "sceNgs2SystemEnumHandles", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceNgs2")]
+    public static int Ngs2SystemEnumHandles(CpuContext ctx)
+    {
+        ulong[] handles;
+        lock (StateGate)
+        {
+            handles = Systems.Keys.OrderBy(static handle => handle).ToArray();
+        }
+        return WriteHandleArray(ctx, ctx[CpuRegister.Rdi], unchecked((uint)ctx[CpuRegister.Rsi]), handles);
+    }
+
+    [SysAbiExport(Nid = "U-+7HsswcIs", ExportName = "sceNgs2SystemEnumRackHandles", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceNgs2")]
+    public static int Ngs2SystemEnumRackHandles(CpuContext ctx)
+    {
+        var systemHandle = ctx[CpuRegister.Rdi];
+        ulong[] handles;
+        lock (StateGate)
+        {
+            if (!Systems.ContainsKey(systemHandle))
+            {
+                return ctx.SetReturn(ErrorInvalidSystemHandle);
+            }
+            handles = Racks.Where(pair => pair.Value.SystemHandle == systemHandle)
+                .Select(pair => pair.Key)
+                .OrderBy(static handle => handle)
+                .ToArray();
+        }
+        return WriteHandleArray(ctx, ctx[CpuRegister.Rsi], unchecked((uint)ctx[CpuRegister.Rdx]), handles);
+    }
+
+    [SysAbiExport(Nid = "3oIK7y7O4k0", ExportName = "sceNgs2SystemQueryInfo", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceNgs2")]
+    public static int Ngs2SystemQueryInfo(CpuContext ctx) => Ngs2SystemGetInfo(ctx);
+
+    [SysAbiExport(Nid = "gXiormHoZZ4", ExportName = "sceNgs2SystemRunCommands", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceNgs2")]
+    public static int Ngs2SystemRunCommands(CpuContext ctx) => ValidateSystem(ctx);
+
+    [SysAbiExport(Nid = "Wdlx0ZFTV9s", ExportName = "sceNgs2SystemSetLoudThreshold", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceNgs2")]
+    public static int Ngs2SystemSetLoudThreshold(CpuContext ctx) => ValidateSystem(ctx);
+
+    [SysAbiExport(Nid = "jjBVvPN9964", ExportName = "sceNgs2VoiceGetMatrixInfo", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceNgs2")]
+    public static int Ngs2VoiceGetMatrixInfo(CpuContext ctx)
+    {
+        if (!TryValidateVoiceOutput(ctx, 0x104, out var outAddress, out var error))
+        {
+            return ctx.SetReturn(error);
+        }
+        Span<byte> info = stackalloc byte[0x104];
+        info.Clear();
+        return ctx.Memory.TryWrite(outAddress, info)
+            ? ctx.SetReturn(0)
+            : ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+    }
+
+    [SysAbiExport(Nid = "WCayTgob7-o", ExportName = "sceNgs2VoiceGetPortInfo", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceNgs2")]
+    public static int Ngs2VoiceGetPortInfo(CpuContext ctx)
+    {
+        if (!TryValidateVoiceOutput(ctx, 0x18, out var outAddress, out var error))
+        {
+            return ctx.SetReturn(error);
+        }
+        Span<byte> info = stackalloc byte[0x18];
+        info.Clear();
+        BinaryPrimitives.WriteUInt32LittleEndian(info, uint.MaxValue);
+        return ctx.Memory.TryWrite(outAddress, info)
+            ? ctx.SetReturn(0)
+            : ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+    }
+
+    [SysAbiExport(Nid = "9eic4AmjGVI", ExportName = "sceNgs2VoiceQueryInfo", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceNgs2")]
+    public static int Ngs2VoiceQueryInfo(CpuContext ctx) => Ngs2VoiceGetState(ctx);
+
+    private static int CreateStream(CpuContext ctx, bool withAllocator)
+    {
+        var systemHandle = ctx[CpuRegister.Rdi];
+        var storageAddress = ctx[CpuRegister.Rdx];
+        var outAddress = ctx[CpuRegister.Rcx];
+        lock (StateGate)
+        {
+            if (!Systems.ContainsKey(systemHandle))
+            {
+                return ctx.SetReturn(ErrorInvalidSystemHandle);
+            }
+        }
+        if (outAddress == 0)
+        {
+            return ctx.SetReturn(ErrorInvalidOutAddress);
+        }
+        if (withAllocator && !TryValidateAllocator(ctx, storageAddress))
+        {
+            return ctx.SetReturn(ErrorInvalidBufferAllocator);
+        }
+        if (!withAllocator && (storageAddress == 0 || !ctx.TryReadUInt64(storageAddress, out var buffer) || buffer == 0))
+        {
+            return ctx.SetReturn(ErrorInvalidBufferInfo);
+        }
+        if (!TryCreateHandle(ctx, 5, systemHandle, out var handle) || !ctx.TryWriteUInt64(outAddress, handle))
+        {
+            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+        lock (StateGate)
+        {
+            Streams.Add(handle, new StreamState { SystemHandle = systemHandle });
+        }
+        return ctx.SetReturn(0);
+    }
+
+    private static int ValidateStream(CpuContext ctx)
+    {
+        lock (StateGate)
+        {
+            return ctx.SetReturn(Streams.ContainsKey(ctx[CpuRegister.Rdi]) ? 0 : ErrorInvalidHandle);
+        }
+    }
+
+    private static int WriteHandleArray(CpuContext ctx, ulong outAddress, uint maximumHandles, ReadOnlySpan<ulong> handles)
+    {
+        if (maximumHandles != 0 && outAddress == 0)
+        {
+            return ctx.SetReturn(ErrorInvalidOutAddress);
+        }
+        var count = Math.Min(checked((int)Math.Min(maximumHandles, int.MaxValue)), handles.Length);
+        for (var index = 0; index < count; index++)
+        {
+            if (!ctx.TryWriteUInt64(outAddress + unchecked((ulong)index * sizeof(ulong)), handles[index]))
+            {
+                return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+            }
+        }
+        return ctx.SetReturn(count);
+    }
+
+    private static int WriteEmptyWaveformInfo(CpuContext ctx, ulong outAddress)
+    {
+        if (outAddress == 0)
+        {
+            return ctx.SetReturn(ErrorInvalidOutAddress);
+        }
+        var info = new byte[WaveformInfoSize];
+        BinaryPrimitives.WriteUInt32LittleEndian(info.AsSpan(0), 0x80);
+        BinaryPrimitives.WriteUInt32LittleEndian(info.AsSpan(4), 1);
+        BinaryPrimitives.WriteUInt32LittleEndian(info.AsSpan(8), DefaultSampleRate);
+        return ctx.Memory.TryWrite(outAddress, info)
+            ? ctx.SetReturn(0)
+            : ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+    }
+
+    private static bool TryValidateVoiceOutput(CpuContext ctx, ulong requiredSize, out ulong outAddress, out int error)
+    {
+        outAddress = ctx[CpuRegister.Rdx];
+        lock (StateGate)
+        {
+            if (!Voices.ContainsKey(ctx[CpuRegister.Rdi]))
+            {
+                error = ErrorInvalidVoiceHandle;
+                return false;
+            }
+        }
+        if (outAddress == 0)
+        {
+            error = ErrorInvalidOutAddress;
+            return false;
+        }
+        if (ctx[CpuRegister.Rcx] < requiredSize)
+        {
+            error = ErrorInvalidOutSize;
+            return false;
+        }
+        error = 0;
+        return true;
+    }
 
     private static int CreateSystem(CpuContext ctx, SystemOption option, ulong outHandleAddress)
     {

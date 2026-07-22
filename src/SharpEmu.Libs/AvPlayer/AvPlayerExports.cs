@@ -84,6 +84,8 @@ public static class AvPlayerExports
         public bool Looping { get; set; }
         public bool EndOfStream { get; set; }
         public bool SyntheticFrameDelivered { get; set; }
+        public HashSet<uint> DisabledStreams { get; } = new();
+        public int TrickSpeed { get; set; } = 1;
         public Process? Decoder { get; set; }
         public Stream? DecoderOutput { get; set; }
         public Process? AudioDecoder { get; set; }
@@ -429,6 +431,56 @@ public static class AvPlayerExports
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libSceAvPlayer")]
     public static int AvPlayerEnableStream(CpuContext ctx) => ValidatePlayer(ctx);
+
+    [SysAbiExport(
+        Nid = "buMCiJftcfw",
+        ExportName = "sceAvPlayerChangeStream",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceAvPlayer")]
+    public static int AvPlayerChangeStream(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(
+        Nid = "BOVKAzRmuTQ",
+        ExportName = "sceAvPlayerDisableStream",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceAvPlayer")]
+    public static int AvPlayerDisableStream(CpuContext ctx)
+    {
+        lock (StateGate)
+        {
+            if (!Players.TryGetValue(ctx[CpuRegister.Rdi], out var player))
+            {
+                return ctx.SetReturn(InvalidParameters);
+            }
+            player.DisabledStreams.Add(unchecked((uint)ctx[CpuRegister.Rsi]));
+            return ctx.SetReturn(0);
+        }
+    }
+
+    [SysAbiExport(
+        Nid = "agig-iDRrTE",
+        ExportName = "sceAvPlayerPrintf",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceAvPlayer")]
+    public static int AvPlayerPrintf(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(
+        Nid = "av8Z++94rs0",
+        ExportName = "sceAvPlayerSetTrickSpeed",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceAvPlayer")]
+    public static int AvPlayerSetTrickSpeed(CpuContext ctx)
+    {
+        lock (StateGate)
+        {
+            if (!Players.TryGetValue(ctx[CpuRegister.Rdi], out var player))
+            {
+                return ctx.SetReturn(InvalidParameters);
+            }
+            player.TrickSpeed = unchecked((int)ctx[CpuRegister.Rsi]);
+            return ctx.SetReturn(0);
+        }
+    }
 
     [SysAbiExport(
         Nid = "k-q+xOxdc3E",

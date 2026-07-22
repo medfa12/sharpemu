@@ -289,6 +289,7 @@ public static class VideoOutExports
         public uint OutputHeight { get; set; } = 1080;
         public uint RefreshRate { get; set; } = 60;
         public float Gamma { get; set; } = 1.0f;
+        public ulong BufferLabelAddress { get; set; }
         public VideoOutBufferGroup?[] Groups { get; } = new VideoOutBufferGroup?[MaxDisplayBufferGroups];
         public VideoOutBufferSlot[] BufferSlots { get; } = CreateBufferSlots();
         public List<FlipEventRegistration> VblankEvents { get; } = new();
@@ -692,6 +693,256 @@ public static class VideoOutExports
 
         TraceVideoOut($"videoout.add_flip_event eq=0x{equeue:X16} handle={handle} udata=0x{userData:X16}");
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "N1bEoJ4SRw4",
+        ExportName = "sceVideoOutConfigureOutputMode_",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceVideoOut")]
+    public static int VideoOutConfigureOutputMode(CpuContext ctx)
+    {
+        var handle = unchecked((int)ctx[CpuRegister.Rdi]);
+        var reserved = unchecked((uint)ctx[CpuRegister.Rsi]);
+        var modeAddress = ctx[CpuRegister.Rdx];
+        if (!TryGetPort(handle, out _))
+        {
+            return ctx.SetReturn(OrbisVideoOutErrorInvalidHandle);
+        }
+        if (reserved != 0)
+        {
+            return ctx.SetReturn(OrbisVideoOutErrorInvalidValue);
+        }
+        if (modeAddress == 0)
+        {
+            return ctx.SetReturn(OrbisVideoOutErrorInvalidAddress);
+        }
+        if (!ctx.TryReadByte(modeAddress + 0x06, out var colorimetry))
+        {
+            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+        return ctx.SetReturn(colorimetry is 0xFF or 12 ? 0 : OrbisVideoOutErrorInvalidValue);
+    }
+
+    [SysAbiExport(
+        Nid = "-Ozn0F1AFRg",
+        ExportName = "sceVideoOutDeleteFlipEvent",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceVideoOut")]
+    public static int VideoOutDeleteFlipEvent(CpuContext ctx) => DeleteDisplayEvent(ctx, flip: true);
+
+    [SysAbiExport(
+        Nid = "oNOQn3knW6s",
+        ExportName = "sceVideoOutDeleteVblankEvent",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceVideoOut")]
+    public static int VideoOutDeleteVblankEvent(CpuContext ctx) => DeleteDisplayEvent(ctx, flip: false);
+
+    [SysAbiExport(
+        Nid = "OcQybQejHEY",
+        ExportName = "sceVideoOutGetBufferLabelAddress",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceVideoOut")]
+    public static int VideoOutGetBufferLabelAddress(CpuContext ctx)
+    {
+        var handle = unchecked((int)ctx[CpuRegister.Rdi]);
+        var outAddress = ctx[CpuRegister.Rsi];
+        if (outAddress == 0)
+        {
+            return ctx.SetReturn(OrbisVideoOutErrorInvalidAddress);
+        }
+        if (!TryGetPort(handle, out var port))
+        {
+            return ctx.SetReturn(OrbisVideoOutErrorInvalidHandle);
+        }
+
+        lock (_stateGate)
+        {
+            if (port.BufferLabelAddress == 0)
+            {
+                if (!KernelMemoryCompatExports.TryAllocateHleData(ctx, MaxDisplayBuffers * sizeof(ulong), 8, out var labelAddress))
+                {
+                    return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+                }
+                var labels = new byte[MaxDisplayBuffers * sizeof(ulong)];
+                if (!ctx.Memory.TryWrite(labelAddress, labels))
+                {
+                    return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+                }
+                port.BufferLabelAddress = labelAddress;
+            }
+
+            if (!ctx.TryWriteUInt64(outAddress, port.BufferLabelAddress))
+            {
+                return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+            }
+        }
+        return ctx.SetReturn(MaxDisplayBuffers);
+    }
+
+    [SysAbiExport(
+        Nid = "kGVLc3htQE8",
+        ExportName = "sceVideoOutGetDeviceCapabilityInfo",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceVideoOut")]
+    public static int VideoOutGetDeviceCapabilityInfo(CpuContext ctx)
+    {
+        var handle = unchecked((int)ctx[CpuRegister.Rdi]);
+        var infoAddress = ctx[CpuRegister.Rsi];
+        if (infoAddress == 0)
+        {
+            return ctx.SetReturn(OrbisVideoOutErrorInvalidAddress);
+        }
+        if (!TryGetPort(handle, out _))
+        {
+            return ctx.SetReturn(OrbisVideoOutErrorInvalidHandle);
+        }
+        return ctx.TryWriteUInt64(infoAddress, 0)
+            ? ctx.SetReturn(0)
+            : ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+    }
+
+    [SysAbiExport(
+        Nid = "Mt4QHHkxkOc",
+        ExportName = "sceVideoOutGetEventCount",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceVideoOut")]
+    public static int VideoOutGetEventCount(CpuContext ctx)
+    {
+        var eventAddress = ctx[CpuRegister.Rdi];
+        if (eventAddress == 0)
+        {
+            return ctx.SetReturn(OrbisVideoOutErrorInvalidAddress);
+        }
+        if (!ctx.TryReadUInt64(eventAddress, out var ident) ||
+            !TryReadInt16(ctx, eventAddress + 0x08, out var filter) ||
+            !ctx.TryReadUInt64(eventAddress + 0x10, out var data))
+        {
+            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+        if (filter != OrbisKernelEventFilterVideoOut ||
+            ident is not (SceVideoOutInternalEventVblank or SceVideoOutInternalEventFlip))
+        {
+            return ctx.SetReturn(OrbisVideoOutErrorInvalidEvent);
+        }
+        return ctx.SetReturn(unchecked((int)((data >> 12) & 0xF)));
+    }
+
+    [SysAbiExport(
+        Nid = "6kPnj51T62Y",
+        ExportName = "sceVideoOutGetResolutionStatus",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceVideoOut")]
+    public static int VideoOutGetResolutionStatus(CpuContext ctx)
+    {
+        var handle = unchecked((int)ctx[CpuRegister.Rdi]);
+        var statusAddress = ctx[CpuRegister.Rsi];
+        if (statusAddress == 0)
+        {
+            return ctx.SetReturn(OrbisVideoOutErrorInvalidAddress);
+        }
+        if (!TryGetPort(handle, out var port))
+        {
+            return ctx.SetReturn(OrbisVideoOutErrorInvalidHandle);
+        }
+
+        Span<byte> status = stackalloc byte[0x30];
+        status.Clear();
+        BinaryPrimitives.WriteUInt32LittleEndian(status[0x00..], port.OutputWidth);
+        BinaryPrimitives.WriteUInt32LittleEndian(status[0x04..], port.OutputHeight);
+        BinaryPrimitives.WriteUInt32LittleEndian(status[0x08..], port.OutputWidth);
+        BinaryPrimitives.WriteUInt32LittleEndian(status[0x0C..], port.OutputHeight);
+        BinaryPrimitives.WriteUInt64LittleEndian(status[0x10..], port.RefreshRate >= 100 ? 13UL : 3UL);
+        BinaryPrimitives.WriteInt32LittleEndian(status[0x18..], BitConverter.SingleToInt32Bits(50.0f));
+        return ctx.Memory.TryWrite(statusAddress, status)
+            ? ctx.SetReturn(0)
+            : ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+    }
+
+    [SysAbiExport(
+        Nid = "pjkDsgxli6c",
+        ExportName = "sceVideoOutModeSetAny_",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceVideoOut")]
+    public static int VideoOutModeSetAny(CpuContext ctx)
+    {
+        var modeAddress = ctx[CpuRegister.Rdi];
+        var size = unchecked((uint)ctx[CpuRegister.Rsi]);
+        if (modeAddress == 0)
+        {
+            return ctx.SetReturn(OrbisVideoOutErrorInvalidAddress);
+        }
+        if (size < sizeof(uint) || size > 0x1000)
+        {
+            return ctx.SetReturn(OrbisVideoOutErrorInvalidValue);
+        }
+        var mode = new byte[checked((int)size)];
+        mode.AsSpan().Fill(0xFF);
+        BinaryPrimitives.WriteUInt32LittleEndian(mode, size);
+        return ctx.Memory.TryWrite(modeAddress, mode)
+            ? ctx.SetReturn(0)
+            : ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+    }
+
+    [SysAbiExport(
+        Nid = "IOdgHlCGU-k",
+        ExportName = "sceVideoOutSubmitChangeBufferAttribute",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceVideoOut")]
+    public static int VideoOutSubmitChangeBufferAttribute(CpuContext ctx)
+    {
+        var handle = unchecked((int)ctx[CpuRegister.Rdi]);
+        var attributeIndex = unchecked((int)ctx[CpuRegister.Rsi]);
+        var attributeAddress = ctx[CpuRegister.Rdx];
+        if (!TryGetPort(handle, out var port))
+        {
+            return ctx.SetReturn(OrbisVideoOutErrorInvalidHandle);
+        }
+        if (attributeAddress == 0)
+        {
+            return ctx.SetReturn(OrbisVideoOutErrorInvalidAddress);
+        }
+        if (!TryReadBufferAttribute(ctx, attributeAddress, false, out var attribute))
+        {
+            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        lock (_stateGate)
+        {
+            if (attributeIndex < 0 || attributeIndex >= port.Groups.Length || port.Groups[attributeIndex] is null)
+            {
+                return ctx.SetReturn(OrbisVideoOutErrorInvalidValue);
+            }
+            port.Groups[attributeIndex] = new VideoOutBufferGroup { Index = attributeIndex, Attribute = attribute };
+            port.OutputWidth = attribute.Width;
+            port.OutputHeight = attribute.Height;
+        }
+        return ctx.SetReturn(0);
+    }
+
+    private static int DeleteDisplayEvent(CpuContext ctx, bool flip)
+    {
+        var equeue = ctx[CpuRegister.Rdi];
+        var handle = unchecked((int)ctx[CpuRegister.Rsi]);
+        if (!TryGetPort(handle, out var port))
+        {
+            return ctx.SetReturn(OrbisVideoOutErrorInvalidHandle);
+        }
+        if (!KernelEventQueueCompatExports.IsValidEqueue(equeue))
+        {
+            return ctx.SetReturn(OrbisVideoOutErrorInvalidEventQueue);
+        }
+
+        lock (_stateGate)
+        {
+            var registrations = flip ? port.FlipEvents : port.VblankEvents;
+            registrations.RemoveAll(registration => registration.Equeue == equeue);
+        }
+        _ = KernelEventQueueCompatExports.DeleteRegisteredEvent(
+            equeue,
+            flip ? SceVideoOutInternalEventFlip : SceVideoOutInternalEventVblank,
+            OrbisKernelEventFilterVideoOut);
+        return ctx.SetReturn(0);
     }
 
     [SysAbiExport(
