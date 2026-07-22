@@ -1815,11 +1815,16 @@ internal static partial class Gen5SpirvTranslator
             {
                 if (_debugTonemapCurveOutput)
                 {
-                    CaptureTonemapCheckpoint(
-                        instruction.Pc,
-                        0x4D8u, 0,
-                        0x500u, 2,
-                        0x528u, 1);
+                    // 0x538 is the first vector instruction after all three
+                    // conditional curve branches restore EXEC at 0x52C. Take
+                    // every component there so lanes that skipped a branch are
+                    // represented by their pass-through value, not probe zero.
+                    if (instruction.Pc == 0x538u)
+                    {
+                        StoreV(240, LoadV(0));
+                        StoreV(241, LoadV(2));
+                        StoreV(242, LoadV(1));
+                    }
                 }
                 else if (_debugTonemapCoreOutput)
                 {
