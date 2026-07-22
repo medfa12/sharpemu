@@ -283,6 +283,9 @@ internal static partial class Gen5SpirvTranslator
         private static readonly bool _debugTonemapGamutDenominatorOutput =
             Environment.GetEnvironmentVariable(
                 "SHARPEMU_PS_DEBUG_TONEMAP_GAMUT_DENOM") == "1";
+        private static readonly bool _debugTonemapGamutScalarOutput =
+            Environment.GetEnvironmentVariable(
+                "SHARPEMU_PS_DEBUG_TONEMAP_GAMUT_SCALAR") == "1";
         private static readonly bool _debugTonemapTransferOutput =
             Environment.GetEnvironmentVariable(
                 "SHARPEMU_PS_DEBUG_TONEMAP_TRANSFER") == "1";
@@ -1831,7 +1834,16 @@ internal static partial class Gen5SpirvTranslator
             var emitted = TryEmitVectorAlu(instruction, out error);
             if (emitted && IsKnownTonemapShader())
             {
-                if (_debugTonemapGamutDenominatorOutput)
+                if (_debugTonemapGamutScalarOutput)
+                {
+                    if (instruction.Pc == 0x538u)
+                    {
+                        StoreV(240, LoadS(0));
+                        StoreV(241, LoadS(1));
+                        StoreV(242, LoadS(2));
+                    }
+                }
+                else if (_debugTonemapGamutDenominatorOutput)
                 {
                     CaptureTonemapCheckpoint(
                         instruction.Pc,
@@ -3787,6 +3799,7 @@ internal static partial class Gen5SpirvTranslator
                  _debugTonemapGamutOutput ||
                  _debugTonemapGamutBaseOutput ||
                  _debugTonemapGamutDenominatorOutput ||
+                 _debugTonemapGamutScalarOutput ||
                  _debugTonemapCurveOutput ||
                  _debugTonemapCoreOutput ||
                  _debugTonemapGradeOutput ||
