@@ -29,6 +29,78 @@ public static class MouseExports
     private static int _initialized;
     private static int _openPorts;
 
+    private static int Ok(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(
+        Nid = "Ymyy1HSSJLQ",
+        ExportName = "sceMouseConnectPort",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceMouse")]
+    public static int MouseConnectPort(CpuContext ctx) => Ok(ctx);
+
+    [SysAbiExport(
+        Nid = "BRXOoXQtb+k",
+        ExportName = "sceMouseDebugGetDeviceId",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceMouse")]
+    public static int MouseDebugGetDeviceId(CpuContext ctx) => Ok(ctx);
+
+    [SysAbiExport(
+        Nid = "WiGKINCZWkc",
+        ExportName = "sceMouseDeviceOpen",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceMouse")]
+    public static int MouseDeviceOpen(CpuContext ctx) => Ok(ctx);
+
+    [SysAbiExport(
+        Nid = "eDQTFHbgeTU",
+        ExportName = "sceMouseDisconnectDevice",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceMouse")]
+    public static int MouseDisconnectDevice(CpuContext ctx) => Ok(ctx);
+
+    [SysAbiExport(
+        Nid = "jJP1vYMEPd4",
+        ExportName = "sceMouseDisconnectPort",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceMouse")]
+    public static int MouseDisconnectPort(CpuContext ctx) => Ok(ctx);
+
+    [SysAbiExport(
+        Nid = "QA9Qupz3Zjw",
+        ExportName = "sceMouseGetDeviceInfo",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceMouse")]
+    public static int MouseGetDeviceInfo(CpuContext ctx) => Ok(ctx);
+
+    [SysAbiExport(
+        Nid = "1FeceR5YhAo",
+        ExportName = "sceMouseMbusInit",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceMouse")]
+    public static int MouseMbusInit(CpuContext ctx) => Ok(ctx);
+
+    [SysAbiExport(
+        Nid = "crkFfp-cmFo",
+        ExportName = "sceMouseSetHandType",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceMouse")]
+    public static int MouseSetHandType(CpuContext ctx) => Ok(ctx);
+
+    [SysAbiExport(
+        Nid = "ghLUU2Z5Lcg",
+        ExportName = "sceMouseSetPointerSpeed",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceMouse")]
+    public static int MouseSetPointerSpeed(CpuContext ctx) => Ok(ctx);
+
+    [SysAbiExport(
+        Nid = "6aANndpS0Wo",
+        ExportName = "sceMouseSetProcessPrivilege",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceMouse")]
+    public static int MouseSetProcessPrivilege(CpuContext ctx) => Ok(ctx);
+
     // This NID was previously misbound as an sceNgs2VoiceGetState alias.
     [SysAbiExport(
         Nid = "Qs0wWulgl7U",
