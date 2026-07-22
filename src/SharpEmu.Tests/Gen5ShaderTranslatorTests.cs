@@ -116,6 +116,25 @@ public sealed class Gen5ShaderTranslatorTests
         Assert.Equal("SWaitcntVscnt", wait.Opcode);
     }
 
+    [Fact]
+    public void Decode_SmemNullSoffset_IsConstantZero()
+    {
+        // s_buffer_load_dword s106, s[28:31], null offset:0x74. GFX10 operand
+        // 125 is architectural NULL; treating it as mutable s125 can offset
+        // every constant-buffer read in a shader.
+        var program = Decode(0xF420_1A8E, 0xFA00_0074, SEndpgm);
+
+        var load = program.Instructions[0];
+        Assert.Equal("SBufferLoadDword", load.Opcode);
+        Assert.Equal(Gen5Operand.Scalar(28), load.Sources[0]);
+        Assert.Equal(
+            new Gen5Operand(Gen5OperandKind.EncodedConstant, 125),
+            load.Sources[1]);
+        var control = Assert.IsType<Gen5ScalarMemoryControl>(load.Control);
+        Assert.Equal(116, control.ImmediateOffsetBytes);
+        Assert.Null(control.DynamicOffsetRegister);
+    }
+
     [Theory]
     [InlineData(0x0Fu, "ImageAtomicSwap")]
     [InlineData(0x11u, "ImageAtomicAdd")]

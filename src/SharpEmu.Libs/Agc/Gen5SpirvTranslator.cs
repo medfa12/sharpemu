@@ -262,7 +262,7 @@ internal static partial class Gen5SpirvTranslator
         // SHARPEMU_PS_FORCE_EXPOSURE_SCALAR=1 (high-probability toggle): for
         // the tonemap/composite pixel shader at PixelShaderAddress
         // 0x0000000500640200 only, force the exposure-scale S_BUFFER_LOAD_DWORD
-        // (descriptor base = user-SGPR reg 125, immediate byte offset 116) to
+        // (descriptor in s28 and NULL SOFFSET, immediate byte offset 116) to
         // return float 1.0 instead of the runtime cbuffer value. That scalar
         // feeds the first tonemap FMul against the in0 sample; when it reads 0
         // every channel multiplies to 0 and the menu presents black.
@@ -293,12 +293,12 @@ internal static partial class Gen5SpirvTranslator
                 ? BitConverter.SingleToUInt32Bits(value)
                 : 0x3F800000u;
         }
-        // The specific tonemap/composite pixel shader whose exposure scalar the
-        // toggle above pins to 1.0. Scoped so default codegen is byte-identical.
+        // Known placements of the same tonemap/composite pixel shader. The game
+        // upload address moves when preceding shader allocations change.
         private const ulong ExposureScalarShaderAddress = 0x0000000500640200UL;
-        // The exposure-scale S_BUFFER_LOAD_DWORD in that shader: descriptor base
-        // in user-SGPR reg 125, immediate byte offset 0x74 (116).
-        private const uint ExposureScalarBaseRegister = 125;
+        private const ulong RelocatedExposureScalarShaderAddress = 0x0000000500641900UL;
+        // The exposure-scale S_BUFFER_LOAD_DWORD in that shader uses
+        // architectural NULL for SOFFSET and immediate byte offset 0x74 (116).
         private const int ExposureScalarOffsetBytes = 116;
         private uint _voidType;
         private uint _boolType;
@@ -2455,13 +2455,14 @@ internal static partial class Gen5SpirvTranslator
 
             // SHARPEMU_PS_FORCE_EXPOSURE_SCALAR: pin the exposure-scale scalar of
             // the ts/composite shader (its S_BUFFER_LOAD reads the cbuffer at
-            // reg-125-descriptor + 116 bytes) to float 1.0 so a zero exposure
+            // descriptor + NULL SOFFSET + 116 bytes) to float 1.0 so a zero exposure
             // value cannot multiply the tonemap output to black.
             var forceExposureScalar =
                 _forceExposureScalar &&
                 _stage == Gen5SpirvStage.Pixel &&
-                _pixelShaderAddress == ExposureScalarShaderAddress &&
-                control.DynamicOffsetRegister == ExposureScalarBaseRegister &&
+                (_pixelShaderAddress == ExposureScalarShaderAddress ||
+                 _pixelShaderAddress == RelocatedExposureScalarShaderAddress) &&
+                control.DynamicOffsetRegister is null &&
                 control.ImmediateOffsetBytes == ExposureScalarOffsetBytes;
 
             var dynamicOffset = control.DynamicOffsetRegister is { } register
