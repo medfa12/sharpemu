@@ -42,11 +42,11 @@ ehthumbs.db
 .idea/
 
 # Local inspiration/reference material
-inspiration/
+inspiration
 
 .claude/
 
 # Local game dumps / packages (never commit copyrighted content)
-games/
+games
 *.pkg
 __pycache__/
