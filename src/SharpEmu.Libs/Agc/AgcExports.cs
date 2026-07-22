@@ -32,6 +32,7 @@ public static class AgcExports
     private const uint ItIndirectBuffer = 0x3F;
     private const uint ItEventWrite = 0x46;
     private const uint ItDmaData = 0x50;
+    private const uint ItAcquireMem = 0x58;
     private const uint ItSetContextReg = 0x69;
     private const uint ItSetShReg = 0x76;
     private const uint ItSetUconfigReg = 0x79;
@@ -138,6 +139,7 @@ public static class AgcExports
     private const ulong ResourceRegistrationBytesPerResource = 0x118;
     private const ulong ResourceRegistrationBytesPerOwner = 0x1E0;
     private const int ResourceRegistrationMaxNameLength = 256;
+    private const int AgcErrorInvalidPacket = unchecked((int)0x8A6C000C);
 
     private const ulong ShaderUserDataOffset = 0x08;
     private const ulong ShaderCodeOffset = 0x10;
@@ -815,7 +817,7 @@ public static class AgcExports
         Target = Generation.Gen5,
         LibraryName = "libSceAgc")]
     public static int SetCxRegIndirectPatchSetAddress(CpuContext ctx) =>
-        SetIndirectPatchAddress(ctx, "cx");
+        SetIndirectPatchAddress(ctx, 0x9F, "cx");
 
     [SysAbiExport(
         Nid = "Qrj4c+61z4A",
@@ -823,7 +825,7 @@ public static class AgcExports
         Target = Generation.Gen5,
         LibraryName = "libSceAgc")]
     public static int SetShRegIndirectPatchSetAddress(CpuContext ctx) =>
-        SetIndirectPatchAddress(ctx, "sh");
+        SetIndirectPatchAddress(ctx, 0x63, "sh");
 
     [SysAbiExport(
         Nid = "6lNcCp+fxi4",
@@ -831,7 +833,15 @@ public static class AgcExports
         Target = Generation.Gen5,
         LibraryName = "libSceAgc")]
     public static int SetUcRegIndirectPatchSetAddress(CpuContext ctx) =>
-        SetIndirectPatchAddress(ctx, "uc");
+        SetIndirectPatchAddress(ctx, 0x64, "uc");
+
+    [SysAbiExport(
+        Nid = "YWTKOju587o",
+        ExportName = "sceAgcCondExecPatchSetCommandAddress",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int CondExecPatchSetCommandAddress(CpuContext ctx) =>
+        SetPacketAddressPreservingLowBits(ctx, 0x22, "cond_exec");
 
     [SysAbiExport(
         Nid = "d-6uF9sZDIU",
@@ -1126,6 +1136,60 @@ public static class AgcExports
     }
 
     [SysAbiExport(
+        Nid = "CQsSq6l6+kA",
+        ExportName = "sceAgcGetDataPacketPayloadAddress",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int GetSetRegRangeDirectPayloadAddress(CpuContext ctx)
+    {
+        var outputAddress = ctx[CpuRegister.Rdi];
+        var commandAddress = ctx[CpuRegister.Rsi];
+        var payloadAddress = commandAddress + (ctx[CpuRegister.Rdx] == 0 ? 4UL : 8UL);
+
+        return ctx.TryWriteUInt64(outputAddress, payloadAddress)
+            ? ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK)
+            : ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+    }
+
+    [SysAbiExport(
+        Nid = "s+VGAMDQ0AQ",
+        ExportName = "sceAgcGetDataPacketPayloadRange",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int GetDataPacketPayloadRange(CpuContext ctx)
+    {
+        var outputAddress = ctx[CpuRegister.Rdi];
+        var commandAddress = ctx[CpuRegister.Rsi];
+        if (!ctx.TryReadUInt32(commandAddress, out var header))
+        {
+            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        ulong payloadAddress;
+        ulong payloadSize;
+        if (ctx[CpuRegister.Rdx] != 0)
+        {
+            payloadAddress = commandAddress + 8;
+            payloadSize = (header >> 14) & 0xFFFCu;
+        }
+        else if ((header & 0x3FFF_0000u) == 0x3FFF_0000u)
+        {
+            payloadAddress = 0;
+            payloadSize = 0;
+        }
+        else
+        {
+            payloadAddress = commandAddress + 4;
+            payloadSize = (((header >> 16) & 0x3FFFu) * sizeof(uint)) + sizeof(uint);
+        }
+
+        return ctx.TryWriteUInt64(outputAddress, payloadAddress) &&
+               ctx.TryWriteUInt64(outputAddress + sizeof(ulong), payloadSize)
+            ? ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK)
+            : ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+    }
+
+    [SysAbiExport(
         Nid = "LtTouSCZjHM",
         ExportName = "sceAgcCbNop",
         Target = Generation.Gen5,
@@ -1318,31 +1382,46 @@ public static class AgcExports
         var baseAddress = ctx[CpuRegister.Rdx];
         var sizeBytes = ctx[CpuRegister.Rcx];
         var pollCycles = (uint)ctx[CpuRegister.R8];
-        var noSize = sizeBytes == ulong.MaxValue;
-        if (commandBufferAddress == 0 ||
-            (!noSize && (sizeBytes & 0xFF) != 0) ||
-            (!noSize && (sizeBytes >> 40) != 0) ||
-            (baseAddress & 0xFF) != 0 ||
-            (baseAddress >> 40) != 0)
+        ulong firstCommandAddress = 0;
+        if (NeedsAcquireMemCompatibilityPacket(gcrControl))
+        {
+            if (!TryAllocateAcquireMemPacket(ctx, commandBufferAddress, out firstCommandAddress) ||
+                !WriteAcbAcquireMemCompatibilityPacket(ctx, firstCommandAddress, pollCycles))
+            {
+                return ReturnPointer(ctx, 0);
+            }
+
+            gcrControl &= ~0x100u;
+        }
+        else if ((gcrControl & 0x108u) == 0x108u)
+        {
+            gcrControl &= ~0xCu;
+        }
+
+        if (!TryAllocateAcquireMemPacket(ctx, commandBufferAddress, out var commandAddress) ||
+            !WriteAcquireMemPacket(
+                ctx,
+                commandAddress,
+                engine: 0,
+                cbDbOperation: 0,
+                gcrControl,
+                baseAddress,
+                sizeBytes,
+                pollCycles))
         {
             return ReturnPointer(ctx, 0);
         }
 
-        if (!TryAllocateCommandDwords(ctx, commandBufferAddress, 8, out var commandAddress) ||
-            !ctx.TryWriteUInt32(commandAddress, Pm4(8, ItNop, RAcquireMem)) ||
-            !ctx.TryWriteUInt32(commandAddress + 4, 0x8000_0000u) ||
-            !ctx.TryWriteUInt32(commandAddress + 8, noSize ? 0 : (uint)(sizeBytes >> 8)) ||
-            !ctx.TryWriteUInt32(commandAddress + 12, 0) ||
-            !ctx.TryWriteUInt32(commandAddress + 16, (uint)(baseAddress >> 8)) ||
-            !ctx.TryWriteUInt32(commandAddress + 20, 0) ||
-            !ctx.TryWriteUInt32(commandAddress + 24, pollCycles / 40) ||
-            !ctx.TryWriteUInt32(commandAddress + 28, gcrControl))
-        {
-            return ReturnPointer(ctx, 0);
-        }
-
-        return ReturnPointer(ctx, commandAddress);
+        return ReturnPointer(ctx, firstCommandAddress != 0 ? firstCommandAddress : commandAddress);
     }
+
+    [SysAbiExport(
+        Nid = "ewobAQeMo5k",
+        ExportName = "sceAgcAcbAcquireMemGetSize",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int AcbAcquireMemGetSize(CpuContext ctx) =>
+        ReturnValue(ctx, 64);
 
     [SysAbiExport(
         Nid = "htn36gPnBk4",
@@ -1812,26 +1891,41 @@ public static class AgcExports
             return ReturnPointer(ctx, 0);
         }
 
-        var noSize = sizeBytes == ulong.MaxValue;
-        if (commandBufferAddress == 0 ||
-            engine > 1 ||
-            (!noSize && (sizeBytes & 0xFF) != 0) ||
-            (!noSize && (sizeBytes >> 40) != 0) ||
-            (baseAddress & 0xFF) != 0 ||
-            (baseAddress >> 40) != 0)
+        ulong firstCommandAddress = 0;
+        if (NeedsAcquireMemCompatibilityPacket(gcrControl))
         {
-            return ReturnPointer(ctx, 0);
+            if (!TryAllocateAcquireMemPacket(ctx, commandBufferAddress, out firstCommandAddress) ||
+                !WriteAcquireMemPacket(
+                    ctx,
+                    firstCommandAddress,
+                    engine,
+                    cbDbOp,
+                    0x100,
+                    baseAddress,
+                    sizeBytes,
+                    pollCycles))
+            {
+                return ReturnPointer(ctx, 0);
+            }
+
+            cbDbOp = 0;
+            gcrControl &= ~0x100u;
+        }
+        else if ((gcrControl & 0x108u) == 0x108u)
+        {
+            gcrControl &= ~0xCu;
         }
 
-        if (!TryAllocateCommandDwords(ctx, commandBufferAddress, 8, out var commandAddress) ||
-            !ctx.TryWriteUInt32(commandAddress, Pm4(8, ItNop, RAcquireMem)) ||
-            !ctx.TryWriteUInt32(commandAddress + 4, (engine << 31) | cbDbOp) ||
-            !ctx.TryWriteUInt32(commandAddress + 8, noSize ? 0 : (uint)(sizeBytes >> 8)) ||
-            !ctx.TryWriteUInt32(commandAddress + 12, 0) ||
-            !ctx.TryWriteUInt32(commandAddress + 16, (uint)(baseAddress >> 8)) ||
-            !ctx.TryWriteUInt32(commandAddress + 20, 0) ||
-            !ctx.TryWriteUInt32(commandAddress + 24, pollCycles / 40) ||
-            !ctx.TryWriteUInt32(commandAddress + 28, gcrControl))
+        if (!TryAllocateAcquireMemPacket(ctx, commandBufferAddress, out var commandAddress) ||
+            !WriteAcquireMemPacket(
+                ctx,
+                commandAddress,
+                engine,
+                cbDbOp,
+                gcrControl,
+                baseAddress,
+                sizeBytes,
+                pollCycles))
         {
             return ReturnPointer(ctx, 0);
         }
@@ -1839,8 +1933,16 @@ public static class AgcExports
         TraceAgc(
             $"agc.dcb_acquire_mem buf=0x{commandBufferAddress:X16} cmd=0x{commandAddress:X16} " +
             $"engine={engine} cbdb=0x{cbDbOp:X8} gcr=0x{gcrControl:X8} base=0x{baseAddress:X16} size=0x{sizeBytes:X16}");
-        return ReturnPointer(ctx, commandAddress);
+        return ReturnPointer(ctx, firstCommandAddress != 0 ? firstCommandAddress : commandAddress);
     }
+
+    [SysAbiExport(
+        Nid = "-vnlTPPXPrw",
+        ExportName = "sceAgcDcbAcquireMemGetSize",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int DcbAcquireMemGetSize(CpuContext ctx) =>
+        ReturnValue(ctx, 64);
 
     [SysAbiExport(
         Nid = "i1jyy49AjXU",
@@ -2181,6 +2283,29 @@ public static class AgcExports
     }
 
     [SysAbiExport(
+        Nid = "cdDRpqcFGbU",
+        ExportName = "sceAgcDmaDataPatchSetSrcAddressOrOffsetOrImmediate",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int DmaDataPatchSetSrcAddressOrOffsetOrImmediate(CpuContext ctx)
+    {
+        var commandAddress = ctx[CpuRegister.Rdi];
+        if (!ctx.TryReadByte(commandAddress + 1, out var opcode))
+        {
+            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        if (opcode != ItDmaData)
+        {
+            return ReturnAgcInvalidPacket(ctx);
+        }
+
+        return ctx.TryWriteUInt64(commandAddress + 8, ctx[CpuRegister.Rsi])
+            ? ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK)
+            : ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+    }
+
+    [SysAbiExport(
         Nid = "3KDcnM3lrcU",
         ExportName = "sceAgcWaitRegMemPatchAddress",
         Target = Generation.Gen5,
@@ -2189,25 +2314,68 @@ public static class AgcExports
     {
         var commandAddress = ctx[CpuRegister.Rdi];
         var address = ctx[CpuRegister.Rsi];
-        if (!TryGetPacketIdentity(ctx, commandAddress, out var op, out var register))
+        if (!ctx.TryReadUInt32(commandAddress, out var header))
         {
-            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
         }
 
-        var fieldOffset = op == ItWaitRegMem
-            ? 8UL
-            : op == ItNop && register is RWaitMem32 or RWaitMem64
-                ? 4UL
-                : 0;
-        if (fieldOffset == 0)
+        var nextPacketDwords = (header & 0x3FFF_FF00u) == 0x3FFF_1000u
+            ? 1u
+            : ((header >> 16) & 0x3FFFu) + 2u;
+        if (((header >> 8) & 0xFFu) != 0x79 || nextPacketDwords != 4)
         {
-            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+            return ReturnAgcInvalidPacket(ctx);
         }
 
-        return ctx.TryWriteUInt64(commandAddress + fieldOffset, address)
-            ? ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK)
-            : ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        var nextPacketAddress = commandAddress + (nextPacketDwords * sizeof(uint));
+        if (!ctx.TryWriteUInt16(commandAddress + 8, (ushort)(address >> 32)) ||
+            !ctx.TryWriteUInt32(commandAddress + 12, (uint)address) ||
+            !ctx.TryReadByte(nextPacketAddress + 1, out var nextOpcode))
+        {
+            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        var lowAlignmentMask = ((uint)nextOpcode) switch
+        {
+            ItWaitRegMem => ~3u,
+            0x93 => ~7u,
+            _ => 0u,
+        };
+        if (lowAlignmentMask == 0)
+        {
+            return ReturnAgcInvalidPacket(ctx);
+        }
+
+        if (!ctx.TryReadUInt32(nextPacketAddress + 8, out var oldLow) ||
+            !ctx.TryReadUInt32(nextPacketAddress + 12, out var oldHigh) ||
+            !ctx.TryWriteUInt32(
+                nextPacketAddress + 8,
+                (oldLow & ~lowAlignmentMask) | ((uint)address & lowAlignmentMask)) ||
+            !ctx.TryWriteUInt32(
+                nextPacketAddress + 12,
+                (oldHigh & 0xFFFC_0000u) | ((uint)(address >> 32) & 0x3_FFFFu)))
+        {
+            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
     }
+
+    [SysAbiExport(
+        Nid = "43WJ08sSugE",
+        ExportName = "sceAgcDcbWaitOnAddressGetSize",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int DcbWaitOnAddressGetSize(CpuContext ctx) =>
+        ReturnWaitOnAddressSize(ctx);
+
+    [SysAbiExport(
+        Nid = "idlaArvdXEs",
+        ExportName = "sceAgcAcbWaitOnAddressGetSize",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int AcbWaitOnAddressGetSize(CpuContext ctx) =>
+        ReturnWaitOnAddressSize(ctx);
 
     [SysAbiExport(
         Nid = "0fWWK5uG9rQ",
@@ -2218,14 +2386,33 @@ public static class AgcExports
     {
         var commandAddress = ctx[CpuRegister.Rdi];
         var address = ctx[CpuRegister.Rsi];
-        if (!TryGetPacketIdentity(ctx, commandAddress, out var op, out var register) ||
-            op != ItNop ||
-            register != RReleaseMem)
+        if (!ctx.TryReadByte(commandAddress + 1, out var opcode))
         {
-            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
         }
 
-        return ctx.TryWriteUInt64(commandAddress + 12, address)
+        if (opcode != 0x49)
+        {
+            return ReturnAgcInvalidPacket(ctx);
+        }
+
+        if (!ctx.TryReadUInt64(commandAddress + 4, out var control))
+        {
+            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        if ((control & 0x0700_0000_0000_0000UL) == 0x0400_0000_0000_0000UL)
+        {
+            return ReturnAgcInvalidPacket(ctx);
+        }
+
+        if (!ctx.TryReadUInt32(commandAddress + 12, out var oldLow))
+        {
+            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        return ctx.TryWriteUInt32(commandAddress + 12, (oldLow & 3u) | ((uint)address & ~3u)) &&
+               ctx.TryWriteUInt32(commandAddress + 16, (uint)(address >> 32))
             ? ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK)
             : ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
     }
@@ -8234,24 +8421,115 @@ public static class AgcExports
     private static bool IsEsGeometryShaderType(byte shaderType) =>
         shaderType is 2 or 4 or 6;
 
-    private static int SetIndirectPatchAddress(CpuContext ctx, string registerSpace)
+    private static int SetIndirectPatchAddress(
+        CpuContext ctx,
+        byte expectedOpcode,
+        string registerSpace) =>
+        SetPacketAddressPreservingLowBits(ctx, expectedOpcode, registerSpace);
+
+    private static int SetPacketAddressPreservingLowBits(
+        CpuContext ctx,
+        byte expectedOpcode,
+        string packetName)
     {
         var commandAddress = ctx[CpuRegister.Rdi];
-        var registersAddress = ctx[CpuRegister.Rsi];
-        if (commandAddress == 0 || registersAddress == 0)
-        {
-            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
-        }
-
-        if (!ctx.TryWriteUInt32(commandAddress + 8, (uint)(registersAddress & 0xFFFF_FFFFUL)) ||
-            !ctx.TryWriteUInt32(commandAddress + 12, (uint)(registersAddress >> 32)))
+        var address = ctx[CpuRegister.Rsi];
+        if (!ctx.TryReadByte(commandAddress + 1, out var opcode))
         {
             return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
         }
 
-        TraceAgc($"agc.patch_{registerSpace}_addr cmd=0x{commandAddress:X16} regs=0x{registersAddress:X16}");
+        if (opcode != expectedOpcode)
+        {
+            return ReturnAgcInvalidPacket(ctx);
+        }
+
+        if (!ctx.TryReadUInt32(commandAddress + 4, out var oldLow) ||
+            !ctx.TryWriteUInt32(commandAddress + 4, (oldLow & 3u) | ((uint)address & ~3u)) ||
+            !ctx.TryWriteUInt32(commandAddress + 8, (uint)(address >> 32)))
+        {
+            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        TraceAgc($"agc.patch_{packetName}_addr cmd=0x{commandAddress:X16} addr=0x{address:X16}");
         ctx[CpuRegister.Rax] = 0;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    private static bool TryAllocateAcquireMemPacket(
+        CpuContext ctx,
+        ulong commandBufferAddress,
+        out ulong commandAddress)
+    {
+        commandAddress = 0;
+        if (!ctx.TryReadUInt64(commandBufferAddress + CommandBufferCursorUpOffset, out var cursorUp) ||
+            !ctx.TryReadUInt64(commandBufferAddress + CommandBufferCursorDownOffset, out var cursorDown) ||
+            !ctx.TryReadUInt32(commandBufferAddress + CommandBufferReservedDwOffset, out var reservedDwords))
+        {
+            return false;
+        }
+
+        var availableDwords = cursorDown >= cursorUp
+            ? (uint)Math.Min((cursorDown - cursorUp) / sizeof(uint), uint.MaxValue)
+            : 0;
+        var remainingDwords = Math.Max(availableDwords, reservedDwords) - reservedDwords;
+        if (remainingDwords < 8)
+        {
+            return false;
+        }
+
+        // libSceAgc.sprx 0x30d9-0x30e5: allocateBottomUp(32, 4).
+        commandAddress = (cursorUp + 3) & ~3UL;
+        return ctx.TryWriteUInt64(
+            commandBufferAddress + CommandBufferCursorUpOffset,
+            commandAddress + 32);
+    }
+
+    private static bool NeedsAcquireMemCompatibilityPacket(uint gcrControl) =>
+        (gcrControl & 0x108u) == 0x108u && (gcrControl & 0x2A0u) != 0;
+
+    private static bool WriteAcbAcquireMemCompatibilityPacket(
+        CpuContext ctx,
+        ulong commandAddress,
+        uint pollCycles)
+    {
+        var pollInterval = Math.Min(pollCycles >> 4, 0xFFFFu);
+        return ctx.TryWriteUInt32(commandAddress, Pm4(8, ItAcquireMem, 0)) &&
+               ctx.TryWriteUInt32(commandAddress + 4, 0) &&
+               ctx.TryWriteUInt32(commandAddress + 8, 0) &&
+               ctx.TryWriteUInt32(commandAddress + 12, 0) &&
+               ctx.TryWriteUInt32(commandAddress + 16, 0) &&
+               ctx.TryWriteUInt32(commandAddress + 20, 0) &&
+               ctx.TryWriteUInt32(commandAddress + 24, pollInterval) &&
+               ctx.TryWriteUInt32(commandAddress + 28, 0x100);
+    }
+
+    private static bool WriteAcquireMemPacket(
+        CpuContext ctx,
+        ulong commandAddress,
+        uint engine,
+        uint cbDbOperation,
+        uint gcrControl,
+        ulong baseAddress,
+        ulong sizeBytes,
+        uint pollCycles)
+    {
+        const ulong fortyEightBitMask = 0x0000_FFFF_FFFF_FFFFUL;
+        var maximumRange = 0x0000_FFFF_FFFF_FF00UL - baseAddress;
+        var requestedRange = (sizeBytes & fortyEightBitMask) + 0xFF;
+        var range = Math.Min(requestedRange, maximumRange);
+        var pollInterval = Math.Min(pollCycles >> 4, 0xFFFFu);
+
+        return ctx.TryWriteUInt32(commandAddress, Pm4(8, ItAcquireMem, 0)) &&
+               ctx.TryWriteUInt32(
+                   commandAddress + 4,
+                   ((engine & 1u) << 31) | (cbDbOperation & 0x0600_7FC0u)) &&
+               ctx.TryWriteUInt32(commandAddress + 8, (uint)(range >> 8)) &&
+               ctx.TryWriteUInt32(commandAddress + 12, (byte)(range >> 40)) &&
+               ctx.TryWriteUInt32(commandAddress + 16, (uint)(baseAddress >> 8)) &&
+               ctx.TryWriteUInt32(commandAddress + 20, (uint)(baseAddress >> 40)) &&
+               ctx.TryWriteUInt32(commandAddress + 24, pollInterval) &&
+               ctx.TryWriteUInt32(commandAddress + 28, gcrControl & 0x7_FFFFu);
     }
 
     private static int AddIndirectPatchRegisters(CpuContext ctx, string registerSpace)
@@ -8508,6 +8786,30 @@ public static class AgcExports
     {
         ctx[CpuRegister.Rax] = pointer;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    private static int ReturnValue(CpuContext ctx, ulong value)
+    {
+        ctx[CpuRegister.Rax] = value;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    private static int ReturnWaitOnAddressSize(CpuContext ctx)
+    {
+        var size = ((byte)ctx[CpuRegister.Rdi]) switch
+        {
+            0 => 56UL,
+            1 => 64UL,
+            _ => 0UL,
+        };
+        return ReturnValue(ctx, size);
+    }
+
+    private static int ReturnAgcInvalidPacket(CpuContext ctx)
+    {
+        // Firmware loads the 32-bit SCE_AGC invalid-packet value into EAX.
+        ctx[CpuRegister.Rax] = unchecked((uint)AgcErrorInvalidPacket);
+        return AgcErrorInvalidPacket;
     }
 
     private static uint Pm4(uint lengthDwords, uint op, uint register) =>
