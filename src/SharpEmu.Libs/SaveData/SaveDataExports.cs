@@ -44,8 +44,13 @@ public static class SaveDataExports
     private static readonly HashSet<(int UserId, uint SlotId)> ReadyMemorySlots = [];
     private static readonly HashSet<int> TransactionResources = [];
     private static readonly HashSet<int> PreparedTransactionResources = [];
+    private static readonly Queue<SaveDataEventValue> PendingEvents = [];
     private static string? _titleId;
     private static int _nextTransactionResource;
+    private static int _saveDataLibraryUser;
+    private static uint _autoUploadSetting;
+    private static float _backupProgress;
+    private static ulong _eventCallback;
 
     internal readonly record struct SaveDataParamValue(
         string Title,
@@ -81,6 +86,8 @@ public static class SaveDataExports
         ulong FreeBlocks);
 
     private readonly record struct MemoryData(ulong BufferAddress, ulong BufferSize, long Offset);
+
+    private readonly record struct SaveDataEventValue(uint Type, int UserId, string TitleId, string DirName);
 
     public static void ConfigureApplicationInfo(string? titleId)
     {
@@ -1702,6 +1709,730 @@ public static class SaveDataExports
             char.IsAsciiLetterOrDigit(character) || character is '-' or '_' or '.' ? character : '_').ToArray();
         var sanitized = new string(chars);
         return string.IsNullOrWhiteSpace(sanitized) || sanitized is "." or ".." ? "default" : sanitized;
+    }
+
+    [SysAbiExport(Nid = "dQ2GohUHXzk", ExportName = "sceSaveDataAbort", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSaveData")]
+    public static int SaveDataAbort(CpuContext ctx)
+    {
+        lock (StateGate)
+        {
+            _backupProgress = 0;
+        }
+
+        return ctx.SetReturn(0);
+    }
+
+    [SysAbiExport(Nid = "z1JA8-iJt3k", ExportName = "sceSaveDataBackup", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSaveData")]
+    public static int SaveDataBackup(CpuContext ctx) => BackupOrRestore(ctx, restore: false);
+
+    [SysAbiExport(Nid = "kLJQ3XioYiU", ExportName = "sceSaveDataBindPsnAccount", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSaveData")]
+    public static int SaveDataBindPsnAccount(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "hHHCPRqA3+g", ExportName = "sceSaveDataBindPsnAccountForSystemBackup", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSaveData")]
+    public static int SaveDataBindPsnAccountForSystemBackup(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "ykwIZfVD08s", ExportName = "sceSaveDataChangeDatabase", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSaveData")]
+    public static int SaveDataChangeDatabase(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "G0hFeOdRCUs", ExportName = "sceSaveDataChangeInternal", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSaveData")]
+    public static int SaveDataChangeInternal(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "RQOqDbk3bSU", ExportName = "sceSaveDataCheckBackupData", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSaveData")]
+    public static int SaveDataCheckBackupData(CpuContext ctx) => CheckBackupData(ctx);
+
+    [SysAbiExport(Nid = "rYvLW1z2poM", ExportName = "sceSaveDataCheckBackupDataForCdlg", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSaveData")]
+    public static int SaveDataCheckBackupDataForCdlg(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "v1TrX+3ZB10", ExportName = "sceSaveDataCheckBackupDataInternal", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSaveData")]
+    public static int SaveDataCheckBackupDataInternal(CpuContext ctx) => CheckBackupData(ctx);
+
+    [SysAbiExport(Nid = "-eczr5e4dsI", ExportName = "sceSaveDataCheckCloudData", Target = Generation.Gen5, LibraryName = "libSceSaveData")]
+    public static int SaveDataCheckCloudData(CpuContext ctx) => ZeroOptionalOutput(ctx, ctx[CpuRegister.Rsi], 0x20);
+
+    [SysAbiExport(Nid = "4OPOZxfVkHA", ExportName = "sceSaveDataCheckIpmiIfSize", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSaveData")]
+    public static int SaveDataCheckIpmiIfSize(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "1i0rfc+mfa8", ExportName = "sceSaveDataCheckSaveDataBroken", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSaveData")]
+    public static int SaveDataCheckSaveDataBroken(CpuContext ctx) => WriteOptionalUInt32(ctx, ctx[CpuRegister.Rsi], 0);
+
+    [SysAbiExport(Nid = "p6A1adyQi3E", ExportName = "sceSaveDataCheckSaveDataVersion", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSaveData")]
+    public static int SaveDataCheckSaveDataVersion(CpuContext ctx) => WriteOptionalUInt32(ctx, ctx[CpuRegister.Rsi], 0);
+
+    [SysAbiExport(Nid = "S49B+I96kpk", ExportName = "sceSaveDataCheckSaveDataVersionLatest", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSaveData")]
+    public static int SaveDataCheckSaveDataVersionLatest(CpuContext ctx) => WriteOptionalUInt32(ctx, ctx[CpuRegister.Rsi], 1);
+
+    [SysAbiExport(Nid = "Wz-4JZfeO9g", ExportName = "sceSaveDataClearProgress", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSaveData")]
+    public static int SaveDataClearProgress(CpuContext ctx)
+    {
+        lock (StateGate)
+        {
+            _backupProgress = 0;
+        }
+
+        return ctx.SetReturn(0);
+    }
+
+    [SysAbiExport(Nid = "kbIIP9aXK9A", ExportName = "sceSaveDataCreateUploadData", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSaveData")]
+    public static int SaveDataCreateUploadData(CpuContext ctx) => ZeroOptionalOutput(ctx, ctx[CpuRegister.Rsi], 0x20);
+
+    [SysAbiExport(Nid = "gW6G4HxBBXA", ExportName = "sceSaveDataDebug", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSaveData")]
+    public static int SaveDataDebug(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "bYCnxLexU7M", ExportName = "sceSaveDataDebugCleanMount", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSaveData")]
+    public static int SaveDataDebugCleanMount(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "hVDqYB8+jkk", ExportName = "sceSaveDataDebugCompiledSdkVersion", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSaveData")]
+    public static int SaveDataDebugCompiledSdkVersion(CpuContext ctx) => WriteOptionalUInt32(ctx, ctx[CpuRegister.Rdi], 0x08000000);
+
+    [SysAbiExport(Nid = "K9gXXlrVLNI", ExportName = "sceSaveDataDebugCreateSaveDataRoot", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSaveData")]
+    public static int SaveDataDebugCreateSaveDataRoot(CpuContext ctx)
+    {
+        try
+        {
+            Directory.CreateDirectory(ResolveSaveDataRoot());
+            return ctx.SetReturn(0);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return ctx.SetReturn(ErrorInternal);
+        }
+    }
+
+    [SysAbiExport(Nid = "5yHFvMwZX2o", ExportName = "sceSaveDataDebugGetThreadId", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSaveData")]
+    public static int SaveDataDebugGetThreadId(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "UGTldPVEdB4", ExportName = "sceSaveDataDebugRemoveSaveDataRoot", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSaveData")]
+    public static int SaveDataDebugRemoveSaveDataRoot(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "AYBQmnRplrg", ExportName = "sceSaveDataDebugTarget", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSaveData")]
+    public static int SaveDataDebugTarget(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "SQWusLoK8Pw", ExportName = "sceSaveDataDelete5", Target = Generation.Gen5, LibraryName = "libSceSaveData")]
+    public static int SaveDataDelete5(CpuContext ctx) => SaveDataDelete(ctx);
+
+    [SysAbiExport(Nid = "pJrlpCgR8h4", ExportName = "sceSaveDataDeleteAllUser", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSaveData")]
+    public static int SaveDataDeleteAllUser(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "fU43mJUgKcM", ExportName = "sceSaveDataDeleteCloudData", Target = Generation.Gen5, LibraryName = "libSceSaveData")]
+    public static int SaveDataDeleteCloudData(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "uZqc4JpFdeY", ExportName = "sceSaveDataDeleteUser", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSaveData")]
+    public static int SaveDataDeleteUser(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "xJ5NFWC3m+k", ExportName = "sceSaveDataDirNameSearchInternal", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSaveData")]
+    public static int SaveDataDirNameSearchInternal(CpuContext ctx) => SaveDataDirNameSearch(ctx);
+
+    [SysAbiExport(Nid = "h1nP9EYv3uc", ExportName = "sceSaveDataDownload", Target = Generation.Gen5, LibraryName = "libSceSaveData")]
+    public static int SaveDataDownload(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "A1ThglSGUwA", ExportName = "sceSaveDataGetAllSize", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSaveData")]
+    public static int SaveDataGetAllSize(CpuContext ctx) => ZeroOptionalOutput(ctx, ctx[CpuRegister.Rsi], 0x20);
+
+    [SysAbiExport(Nid = "KuXcrMAQIMQ", ExportName = "sceSaveDataGetAppLaunchedUser", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSaveData")]
+    public static int SaveDataGetAppLaunchedUser(CpuContext ctx)
+    {
+        int userId;
+        lock (StateGate)
+        {
+            userId = _saveDataLibraryUser;
+        }
+
+        return WriteOptionalUInt32(ctx, ctx[CpuRegister.Rdi], unchecked((uint)userId));
+    }
+
+    [SysAbiExport(Nid = "itZ46iH14Vs", ExportName = "sceSaveDataGetAutoUploadConditions", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSaveData")]
+    public static int SaveDataGetAutoUploadConditions(CpuContext ctx) => ZeroOptionalOutput(ctx, ctx[CpuRegister.Rsi], 0x20);
+
+    [SysAbiExport(Nid = "PL20kjAXZZ4", ExportName = "sceSaveDataGetAutoUploadRequestInfo", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSaveData")]
+    public static int SaveDataGetAutoUploadRequestInfo(CpuContext ctx) => ZeroOptionalOutput(ctx, ctx[CpuRegister.Rsi], 0x20);
+
+    [SysAbiExport(Nid = "G12foE0S77E", ExportName = "sceSaveDataGetAutoUploadSetting", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSaveData")]
+    public static int SaveDataGetAutoUploadSetting(CpuContext ctx)
+    {
+        uint setting;
+        lock (StateGate)
+        {
+            setting = _autoUploadSetting;
+        }
+
+        return WriteOptionalUInt32(ctx, ctx[CpuRegister.Rsi], setting);
+    }
+
+    [SysAbiExport(Nid = "PzDtD6eBXIM", ExportName = "sceSaveDataGetBoundPsnAccountCount", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSaveData")]
+    public static int SaveDataGetBoundPsnAccountCount(CpuContext ctx) => WriteOptionalUInt32(ctx, ctx[CpuRegister.Rsi], 0);
+
+    [SysAbiExport(Nid = "tu0SDPl+h88", ExportName = "sceSaveDataGetClientThreadPriority", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSaveData")]
+    public static int SaveDataGetClientThreadPriority(CpuContext ctx) => WriteOptionalUInt32(ctx, ctx[CpuRegister.Rdi], 700);
+
+    [SysAbiExport(Nid = "6lZYZqQPfkY", ExportName = "sceSaveDataGetCloudQuotaInfo", Target = Generation.Gen5, LibraryName = "libSceSaveData")]
+    public static int SaveDataGetCloudQuotaInfo(CpuContext ctx) => ZeroOptionalOutput(ctx, ctx[CpuRegister.Rsi], 0x30);
+
+    [SysAbiExport(Nid = "CWlBd2Ay1M4", ExportName = "sceSaveDataGetDataBaseFilePath", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSaveData")]
+    public static int SaveDataGetDataBaseFilePath(CpuContext ctx) =>
+        WriteOptionalPath(ctx, ctx[CpuRegister.Rdi], ctx[CpuRegister.Rsi], Path.Combine(ResolveSaveDataRoot(), "savedata.db"));
+
+    [SysAbiExport(Nid = "eBSSNIG6hMk", ExportName = "sceSaveDataGetEventInfo", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSaveData")]
+    public static int SaveDataGetEventInfo(CpuContext ctx)
+    {
+        uint count;
+        lock (StateGate)
+        {
+            count = checked((uint)PendingEvents.Count);
+        }
+
+        return WriteOptionalUInt32(ctx, ctx[CpuRegister.Rdi], count);
+    }
+
+    [SysAbiExport(Nid = "j8xKtiFj0SY", ExportName = "sceSaveDataGetEventResult", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSaveData")]
+    public static int SaveDataGetEventResult(CpuContext ctx)
+    {
+        var eventAddress = ctx[CpuRegister.Rsi];
+        if (eventAddress == 0)
+        {
+            return ctx.SetReturn(ErrorParameter);
+        }
+
+        SaveDataEventValue value;
+        lock (StateGate)
+        {
+            if (!PendingEvents.TryDequeue(out value))
+            {
+                return ctx.SetReturn(ErrorNotFound);
+            }
+        }
+
+        var result = PackSaveDataEvent(value.Type, value.UserId, value.TitleId, value.DirName);
+        return ctx.Memory.TryWrite(eventAddress, result)
+            ? ctx.SetReturn(0)
+            : ctx.SetReturn(MemoryFault);
+    }
+
+    [SysAbiExport(Nid = "UMpxor4AlKQ", ExportName = "sceSaveDataGetFormat", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSaveData")]
+    public static int SaveDataGetFormat(CpuContext ctx) => WriteOptionalUInt32(ctx, ctx[CpuRegister.Rdi], 0);
+
+    [SysAbiExport(Nid = "pc4guaUPVqA", ExportName = "sceSaveDataGetMountedSaveDataCount", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSaveData")]
+    public static int SaveDataGetMountedSaveDataCount(CpuContext ctx)
+    {
+        uint count;
+        lock (StateGate)
+        {
+            count = checked((uint)Mounts.Count);
+        }
+
+        return WriteOptionalUInt32(ctx, ctx[CpuRegister.Rdi], count);
+    }
+
+    [SysAbiExport(Nid = "ANmSWUiyyGQ", ExportName = "sceSaveDataGetProgress", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSaveData")]
+    public static int SaveDataGetProgress(CpuContext ctx)
+    {
+        var progressAddress = ctx[CpuRegister.Rdi];
+        if (progressAddress == 0)
+        {
+            return ctx.SetReturn(ErrorParameter);
+        }
+
+        float progress;
+        lock (StateGate)
+        {
+            progress = _backupProgress;
+        }
+
+        return ctx.TryWriteUInt32(progressAddress, unchecked((uint)BitConverter.SingleToInt32Bits(progress)))
+            ? ctx.SetReturn(0)
+            : ctx.SetReturn(MemoryFault);
+    }
+
+    [SysAbiExport(Nid = "SN7rTPHS+Cg", ExportName = "sceSaveDataGetSaveDataCount", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSaveData")]
+    public static int SaveDataGetSaveDataCount(CpuContext ctx)
+    {
+        var countAddress = ctx[CpuRegister.Rsi];
+        if (countAddress == 0)
+        {
+            return ctx.SetReturn(0);
+        }
+
+        var userId = unchecked((int)(uint)ctx[CpuRegister.Rdi]);
+        uint count = 0;
+        try
+        {
+            var root = BuildTitleSaveRoot(ResolveSaveDataRoot(), userId, ResolveConfiguredTitleId());
+            if (Directory.Exists(root))
+            {
+                count = checked((uint)EnumerateSaveDirectories(root, "%").Count);
+            }
+
+            return WriteOptionalUInt32(ctx, countAddress, count);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return ctx.SetReturn(ErrorInternal);
+        }
+    }
+
+    [SysAbiExport(Nid = "+bRDRotfj0Y", ExportName = "sceSaveDataGetSaveDataRootDir", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSaveData")]
+    public static int SaveDataGetSaveDataRootDir(CpuContext ctx) =>
+        WriteOptionalPath(ctx, ctx[CpuRegister.Rdi], ctx[CpuRegister.Rsi], ResolveSaveDataRoot());
+
+    [SysAbiExport(Nid = "3luF0xq0DkQ", ExportName = "sceSaveDataGetSaveDataRootPath", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSaveData")]
+    public static int SaveDataGetSaveDataRootPath(CpuContext ctx) =>
+        WriteOptionalPath(ctx, ctx[CpuRegister.Rdi], ctx[CpuRegister.Rsi], ResolveSaveDataRoot());
+
+    [SysAbiExport(Nid = "DwAvlQGvf1o", ExportName = "sceSaveDataGetSaveDataRootUsbPath", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSaveData")]
+    public static int SaveDataGetSaveDataRootUsbPath(CpuContext ctx) =>
+        WriteOptionalPath(ctx, ctx[CpuRegister.Rdi], ctx[CpuRegister.Rsi], Path.Combine(ResolveSaveDataRoot(), "usb"));
+
+    [SysAbiExport(Nid = "kb24-4DLyNo", ExportName = "sceSaveDataGetSavePoint", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSaveData")]
+    public static int SaveDataGetSavePoint(CpuContext ctx) => WriteOptionalUInt32(ctx, ctx[CpuRegister.Rsi], 0);
+
+    [SysAbiExport(Nid = "OYmnApJ9q+U", ExportName = "sceSaveDataGetUpdatedDataCount", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSaveData")]
+    public static int SaveDataGetUpdatedDataCount(CpuContext ctx) => WriteOptionalUInt32(ctx, ctx[CpuRegister.Rsi], 0);
+
+    [SysAbiExport(Nid = "ZkZhskCPXFw", ExportName = "sceSaveDataInitialize", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSaveData")]
+    public static int SaveDataInitialize(CpuContext ctx) => SaveDataInitialize3(ctx);
+
+    [SysAbiExport(Nid = "l1NmDeDpNGU", ExportName = "sceSaveDataInitialize2", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSaveData")]
+    public static int SaveDataInitialize2(CpuContext ctx) => SaveDataInitialize3(ctx);
+
+    [SysAbiExport(Nid = "g9uwUI3BlQ8", ExportName = "sceSaveDataInitializeForCdlg", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSaveData")]
+    public static int SaveDataInitializeForCdlg(CpuContext ctx) => SaveDataInitialize3(ctx);
+
+    [SysAbiExport(Nid = "voAQW45oKuo", ExportName = "sceSaveDataIsDeletingUsbDb", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSaveData")]
+    public static int SaveDataIsDeletingUsbDb(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "ieP6jP138Qo", ExportName = "sceSaveDataIsMounted", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSaveData")]
+    public static int SaveDataIsMounted(CpuContext ctx)
+    {
+        if (!TryReadFixedAscii(ctx, ctx[CpuRegister.Rdi], MountPointSize, out var mountPoint))
+        {
+            return ctx.SetReturn(0);
+        }
+
+        lock (StateGate)
+        {
+            return ctx.SetReturn(Mounts.ContainsKey(mountPoint) ? 1 : 0);
+        }
+    }
+
+    [SysAbiExport(Nid = "xz0YMi6BfNk", ExportName = "sceSaveDataMount5", Target = Generation.Gen5, LibraryName = "libSceSaveData")]
+    public static int SaveDataMount5(CpuContext ctx) => SaveDataMount3(ctx);
+
+    [SysAbiExport(Nid = "msCER7Iibm8", ExportName = "sceSaveDataMountInternal", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSaveData")]
+    public static int SaveDataMountInternal(CpuContext ctx) => SaveDataMount3(ctx);
+
+    [SysAbiExport(Nid = "-XYmdxjOqyA", ExportName = "sceSaveDataMountSys", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSaveData")]
+    public static int SaveDataMountSys(CpuContext ctx)
+    {
+        var resultAddress = ctx[CpuRegister.Rsi];
+        if (resultAddress == 0)
+        {
+            return ctx.SetReturn(ErrorParameter);
+        }
+
+        return ZeroOptionalOutput(ctx, resultAddress, MountResultSize);
+    }
+
+    [SysAbiExport(Nid = "uNu7j3pL2mQ", ExportName = "sceSaveDataPromote5", Target = Generation.Gen5, LibraryName = "libSceSaveData")]
+    public static int SaveDataPromote5(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "SgIY-XYA2Xg", ExportName = "sceSaveDataRebuildDatabase", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSaveData")]
+    public static int SaveDataRebuildDatabase(CpuContext ctx)
+    {
+        try
+        {
+            Directory.CreateDirectory(ResolveSaveDataRoot());
+            return ctx.SetReturn(0);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return ctx.SetReturn(ErrorInternal);
+        }
+    }
+
+    [SysAbiExport(Nid = "hsKd5c21sQc", ExportName = "sceSaveDataRegisterEventCallback", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSaveData")]
+    public static int SaveDataRegisterEventCallback(CpuContext ctx)
+    {
+        lock (StateGate)
+        {
+            _eventCallback = ctx[CpuRegister.Rdi];
+        }
+
+        return ctx.SetReturn(0);
+    }
+
+    [SysAbiExport(Nid = "lU9YRFsgwSU", ExportName = "sceSaveDataRestoreBackupData", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSaveData")]
+    public static int SaveDataRestoreBackupData(CpuContext ctx) => BackupOrRestore(ctx, restore: true);
+
+    [SysAbiExport(Nid = "HuToUt1GQ8w", ExportName = "sceSaveDataRestoreBackupDataForCdlg", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSaveData")]
+    public static int SaveDataRestoreBackupDataForCdlg(CpuContext ctx) => BackupOrRestore(ctx, restore: true);
+
+    [SysAbiExport(Nid = "aoZKKNjlq3Y", ExportName = "sceSaveDataRestoreLoadSaveDataMemory", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSaveData")]
+    public static int SaveDataRestoreLoadSaveDataMemory(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "0VFHv-Fa4w8", ExportName = "sceSaveDataSetAutoUploadSetting", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSaveData")]
+    public static int SaveDataSetAutoUploadSetting(CpuContext ctx)
+    {
+        lock (StateGate)
+        {
+            _autoUploadSetting = unchecked((uint)ctx[CpuRegister.Rsi]);
+        }
+
+        return ctx.SetReturn(0);
+    }
+
+    [SysAbiExport(Nid = "52pL2GKkdjA", ExportName = "sceSaveDataSetEventInfo", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSaveData")]
+    public static int SaveDataSetEventInfo(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "v3vg2+cooYw", ExportName = "sceSaveDataSetSaveDataLibraryUser", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSaveData")]
+    public static int SaveDataSetSaveDataLibraryUser(CpuContext ctx)
+    {
+        lock (StateGate)
+        {
+            _saveDataLibraryUser = unchecked((int)(uint)ctx[CpuRegister.Rdi]);
+        }
+
+        return ctx.SetReturn(0);
+    }
+
+    [SysAbiExport(Nid = "zMgXM79jRhw", ExportName = "sceSaveDataShutdownStart", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSaveData")]
+    public static int SaveDataShutdownStart(CpuContext ctx)
+    {
+        lock (StateGate)
+        {
+            _eventCallback = 0;
+            PendingEvents.Clear();
+        }
+
+        return ctx.SetReturn(0);
+    }
+
+    [SysAbiExport(Nid = "+orZm32HB1s", ExportName = "sceSaveDataSupportedFakeBrokenStatus", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSaveData")]
+    public static int SaveDataSupportedFakeBrokenStatus(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "LMSQUTxmGVg", ExportName = "sceSaveDataSyncCloudList", Target = Generation.Gen5, LibraryName = "libSceSaveData")]
+    public static int SaveDataSyncCloudList(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "2-8NWLS8QSA", ExportName = "sceSaveDataUmountSys", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSaveData")]
+    public static int SaveDataUmountSys(CpuContext ctx)
+    {
+        var mountPointAddress = ctx[CpuRegister.Rdi];
+        return mountPointAddress == 0 ? ctx.SetReturn(0) : Umount(ctx, mountPointAddress);
+    }
+
+    [SysAbiExport(Nid = "VwadwBBBJ80", ExportName = "sceSaveDataUmountWithBackup", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSaveData")]
+    public static int SaveDataUmountWithBackup(CpuContext ctx)
+    {
+        var mountPointAddress = ctx[CpuRegister.Rdi];
+        if (!TryGetMountedSave(ctx, mountPointAddress, out var mounted, out var error))
+        {
+            return ctx.SetReturn(error);
+        }
+
+        try
+        {
+            CreateSaveBackup(mounted.HostPath);
+            lock (StateGate)
+            {
+                _backupProgress = 1.0f;
+            }
+
+            return Umount(ctx, mountPointAddress);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return ctx.SetReturn(ErrorInternal);
+        }
+    }
+
+    [SysAbiExport(Nid = "v-AK1AxQhS0", ExportName = "sceSaveDataUnregisterEventCallback", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSaveData")]
+    public static int SaveDataUnregisterEventCallback(CpuContext ctx)
+    {
+        lock (StateGate)
+        {
+            _eventCallback = 0;
+        }
+
+        return ctx.SetReturn(0);
+    }
+
+    [SysAbiExport(Nid = "COwz3WBj+5s", ExportName = "sceSaveDataUpload", Target = Generation.Gen5, LibraryName = "libSceSaveData")]
+    public static int SaveDataUpload(CpuContext ctx) => ctx.SetReturn(0);
+
+    private static int BackupOrRestore(CpuContext ctx, bool restore)
+    {
+        var requestAddress = ctx[CpuRegister.Rdi];
+        if (requestAddress == 0)
+        {
+            return ctx.SetReturn(ErrorParameter);
+        }
+
+        if (!ctx.TryReadInt32(requestAddress, out var userId) ||
+            !ctx.TryReadUInt64(requestAddress + 0x08, out var titleIdAddress) ||
+            !ctx.TryReadUInt64(requestAddress + 0x10, out var dirNameAddress))
+        {
+            return ctx.SetReturn(MemoryFault);
+        }
+
+        if (userId < 0 || dirNameAddress == 0)
+        {
+            return ctx.SetReturn(ErrorParameter);
+        }
+
+        if (!TryReadOptionalTitleId(ctx, titleIdAddress, out var titleId) ||
+            !TryReadFixedAscii(ctx, dirNameAddress, DirNameSize, out var dirName))
+        {
+            return ctx.SetReturn(MemoryFault);
+        }
+
+        if (string.IsNullOrWhiteSpace(dirName))
+        {
+            return ctx.SetReturn(ErrorParameter);
+        }
+
+        var savePath = BuildSaveDirectoryPath(ResolveSaveDataRoot(), userId, titleId, dirName);
+        lock (StateGate)
+        {
+            if (Mounts.Values.Any(mount => PathsEqual(mount.HostPath, savePath)))
+            {
+                return ctx.SetReturn(ErrorBusy);
+            }
+        }
+
+        try
+        {
+            if (!Directory.Exists(savePath))
+            {
+                return ctx.SetReturn(ErrorNotFound);
+            }
+
+            if (restore)
+            {
+                if (!RestoreSaveBackup(savePath))
+                {
+                    return ctx.SetReturn(ErrorNotFound);
+                }
+            }
+            else
+            {
+                CreateSaveBackup(savePath);
+            }
+
+            lock (StateGate)
+            {
+                _backupProgress = 1.0f;
+                PendingEvents.Enqueue(new SaveDataEventValue(restore ? 0u : 2u, userId, titleId, dirName));
+                while (PendingEvents.Count > 20)
+                {
+                    PendingEvents.Dequeue();
+                }
+            }
+
+            return ctx.SetReturn(0);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return ctx.SetReturn(ErrorInternal);
+        }
+    }
+
+    private static int CheckBackupData(CpuContext ctx)
+    {
+        var requestAddress = ctx[CpuRegister.Rdi];
+        if (requestAddress == 0)
+        {
+            return ctx.SetReturn(ErrorParameter);
+        }
+
+        if (!ctx.TryReadInt32(requestAddress, out var userId) ||
+            !ctx.TryReadUInt64(requestAddress + 0x08, out var titleIdAddress) ||
+            !ctx.TryReadUInt64(requestAddress + 0x10, out var dirNameAddress) ||
+            !ctx.TryReadUInt64(requestAddress + 0x18, out var paramAddress) ||
+            !ctx.TryReadUInt64(requestAddress + 0x20, out var iconAddress))
+        {
+            return ctx.SetReturn(MemoryFault);
+        }
+
+        if (userId < 0 || dirNameAddress == 0)
+        {
+            return ctx.SetReturn(ErrorParameter);
+        }
+
+        if (!TryReadOptionalTitleId(ctx, titleIdAddress, out var titleId) ||
+            !TryReadFixedAscii(ctx, dirNameAddress, DirNameSize, out var dirName))
+        {
+            return ctx.SetReturn(MemoryFault);
+        }
+
+        try
+        {
+            var savePath = BuildSaveDirectoryPath(ResolveSaveDataRoot(), userId, titleId, dirName);
+            var backupPath = GetSaveBackupPath(savePath);
+            if (!Directory.Exists(backupPath))
+            {
+                return ctx.SetReturn(ErrorNotFound);
+            }
+
+            if (paramAddress != 0)
+            {
+                var packed = PackSaveDataParam(LoadParam(backupPath, dirName));
+                if (!ctx.Memory.TryWrite(paramAddress, packed))
+                {
+                    return ctx.SetReturn(MemoryFault);
+                }
+            }
+
+            if (iconAddress != 0 && File.Exists(GetIconPath(backupPath)))
+            {
+                return LoadIcon(ctx, iconAddress, GetIconPath(backupPath));
+            }
+
+            return ctx.SetReturn(0);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return ctx.SetReturn(ErrorInternal);
+        }
+    }
+
+    internal static string GetSaveBackupPath(string savePath) => Path.Combine(savePath, "sce_backup");
+
+    internal static void CreateSaveBackup(string savePath)
+    {
+        var backupPath = GetSaveBackupPath(savePath);
+        var temporaryPath = Path.Combine(savePath, "sce_backup_tmp");
+        var previousPath = Path.Combine(savePath, "sce_backup_old");
+        if (Directory.Exists(temporaryPath))
+        {
+            Directory.Delete(temporaryPath, recursive: true);
+        }
+
+        if (Directory.Exists(previousPath))
+        {
+            Directory.Delete(previousPath, recursive: true);
+        }
+
+        Directory.CreateDirectory(temporaryPath);
+        foreach (var entry in Directory.EnumerateFileSystemEntries(savePath))
+        {
+            var name = Path.GetFileName(entry);
+            if (name is "sce_backup" or "sce_backup_tmp" or "sce_backup_old")
+            {
+                continue;
+            }
+
+            var destination = Path.Combine(temporaryPath, name);
+            if (Directory.Exists(entry))
+            {
+                CopySaveDirectory(entry, destination);
+            }
+            else
+            {
+                File.Copy(entry, destination, overwrite: true);
+            }
+        }
+
+        if (Directory.Exists(backupPath))
+        {
+            Directory.Move(backupPath, previousPath);
+        }
+
+        Directory.Move(temporaryPath, backupPath);
+        if (Directory.Exists(previousPath))
+        {
+            Directory.Delete(previousPath, recursive: true);
+        }
+    }
+
+    internal static bool RestoreSaveBackup(string savePath)
+    {
+        var backupPath = GetSaveBackupPath(savePath);
+        if (!Directory.Exists(backupPath))
+        {
+            return false;
+        }
+
+        foreach (var entry in Directory.EnumerateFileSystemEntries(savePath).ToArray())
+        {
+            if (PathsEqual(entry, backupPath))
+            {
+                continue;
+            }
+
+            if (Directory.Exists(entry))
+            {
+                Directory.Delete(entry, recursive: true);
+            }
+            else
+            {
+                File.Delete(entry);
+            }
+        }
+
+        foreach (var entry in Directory.EnumerateFileSystemEntries(backupPath))
+        {
+            var destination = Path.Combine(savePath, Path.GetFileName(entry));
+            if (Directory.Exists(entry))
+            {
+                CopySaveDirectory(entry, destination);
+            }
+            else
+            {
+                File.Copy(entry, destination, overwrite: true);
+            }
+        }
+
+        return true;
+    }
+
+    internal static byte[] PackSaveDataEvent(uint type, int userId, string titleId, string dirName)
+    {
+        var result = new byte[0x68];
+        BinaryPrimitives.WriteUInt32LittleEndian(result, type);
+        BinaryPrimitives.WriteInt32LittleEndian(result.AsSpan(0x08), userId);
+        WriteAscii(result.AsSpan(0x10, TitleIdSize), titleId);
+        WriteAscii(result.AsSpan(0x1A, DirNameSize), dirName);
+        return result;
+    }
+
+    private static int ZeroOptionalOutput(CpuContext ctx, ulong address, int size)
+    {
+        if (address == 0)
+        {
+            return ctx.SetReturn(0);
+        }
+
+        return ctx.Memory.TryWrite(address, new byte[size])
+            ? ctx.SetReturn(0)
+            : ctx.SetReturn(MemoryFault);
+    }
+
+    private static int WriteOptionalUInt32(CpuContext ctx, ulong address, uint value)
+    {
+        if (address == 0)
+        {
+            return ctx.SetReturn(0);
+        }
+
+        return ctx.TryWriteUInt32(address, value)
+            ? ctx.SetReturn(0)
+            : ctx.SetReturn(MemoryFault);
+    }
+
+    private static int WriteOptionalPath(CpuContext ctx, ulong address, ulong bufferSize, string value)
+    {
+        if (address == 0)
+        {
+            return ctx.SetReturn(0);
+        }
+
+        if (bufferSize == 0)
+        {
+            return ctx.SetReturn(ErrorParameter);
+        }
+
+        var encoded = EncodeAsciiString(value, bufferSize);
+        return ctx.Memory.TryWrite(address, encoded)
+            ? ctx.SetReturn(0)
+            : ctx.SetReturn(MemoryFault);
     }
 
     private static bool TryReadFixedAscii(CpuContext ctx, ulong address, int length, out string value) =>
