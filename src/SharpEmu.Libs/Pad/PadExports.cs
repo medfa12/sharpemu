@@ -259,6 +259,360 @@ public static class PadExports
             : ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
     }
 
+    [SysAbiExport(Nid = "kazv1NzSB8c", ExportName = "scePadConnectPort", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libScePad")]
+    public static int PadConnectPort(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "AcslpN1jHR8", ExportName = "scePadDeviceClassGetExtendedInformation", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libScePad")]
+    public static int PadDeviceClassGetExtendedInformation(CpuContext ctx)
+    {
+        var handle = unchecked((int)ctx[CpuRegister.Rdi]);
+        var informationAddress = ctx[CpuRegister.Rsi];
+        if (handle != PrimaryPadHandle)
+        {
+            return ctx.SetReturn(OrbisPadErrorInvalidHandle);
+        }
+
+        if (informationAddress == 0)
+        {
+            return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        Span<byte> information = stackalloc byte[20];
+        information.Clear();
+        return ctx.Memory.TryWrite(informationAddress, information)
+            ? ctx.SetReturn(0)
+            : ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+    }
+
+    [SysAbiExport(Nid = "IHPqcbc0zCA", ExportName = "scePadDeviceClassParseData", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libScePad")]
+    public static int PadDeviceClassParseData(CpuContext ctx)
+    {
+        var handle = unchecked((int)ctx[CpuRegister.Rdi]);
+        var dataAddress = ctx[CpuRegister.Rsi];
+        var classDataAddress = ctx[CpuRegister.Rdx];
+        if (handle != PrimaryPadHandle)
+        {
+            return ctx.SetReturn(OrbisPadErrorInvalidHandle);
+        }
+
+        if (dataAddress == 0 || classDataAddress == 0)
+        {
+            return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        Span<byte> classData = stackalloc byte[24];
+        classData.Clear();
+        return ctx.Memory.TryWrite(classDataAddress, classData)
+            ? ctx.SetReturn(0)
+            : ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+    }
+
+    [SysAbiExport(Nid = "d7bXuEBycDI", ExportName = "scePadDeviceOpen", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libScePad")]
+    public static int PadDeviceOpen(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "0aziJjRZxqQ", ExportName = "scePadDisableVibration", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libScePad")]
+    public static int PadDisableVibration(CpuContext ctx)
+    {
+        DualSenseReader.SetRumble(0, 0);
+        XInputReader.SetRumble(0, 0);
+        return ctx.SetReturn(0);
+    }
+
+    [SysAbiExport(Nid = "pnZXireDoeI", ExportName = "scePadDisconnectDevice", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libScePad")]
+    public static int PadDisconnectDevice(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "9ez71nWSvD0", ExportName = "scePadDisconnectPort", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libScePad")]
+    public static int PadDisconnectPort(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "77ooWxGOIVs", ExportName = "scePadEnableAutoDetect", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libScePad")]
+    public static int PadEnableAutoDetect(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "+cE4Jx431wc", ExportName = "scePadEnableExtensionPort", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libScePad")]
+    public static int PadEnableExtensionPort(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "E1KEw5XMGQQ", ExportName = "scePadEnableSpecificDeviceClass", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libScePad")]
+    public static int PadEnableSpecificDeviceClass(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "DD-KiRLBqkQ", ExportName = "scePadEnableUsbConnection", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libScePad")]
+    public static int PadEnableUsbConnection(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "Q66U8FdrMaw", ExportName = "scePadGetBluetoothAddress", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libScePad")]
+    public static int PadGetBluetoothAddress(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "qtasqbvwgV4", ExportName = "scePadGetCapability", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libScePad")]
+    public static int PadGetCapability(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "Uq6LgTJEmQs", ExportName = "scePadGetDataInternal", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libScePad")]
+    public static int PadGetDataInternal(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "hDgisSGkOgw", ExportName = "scePadGetDeviceId", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libScePad")]
+    public static int PadGetDeviceId(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "4rS5zG7RFaM", ExportName = "scePadGetDeviceInfo", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libScePad")]
+    public static int PadGetDeviceInfo(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "1DmZjZAuzEM", ExportName = "scePadGetExtensionUnitInfo", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libScePad")]
+    public static int PadGetExtensionUnitInfo(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "PZSoY8j0Pko", ExportName = "scePadGetFeatureReport", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libScePad")]
+    public static int PadGetFeatureReport(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "u1GRHp+oWoY", ExportName = "scePadGetHandle", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libScePad")]
+    public static int PadGetHandle(CpuContext ctx)
+    {
+        var userId = unchecked((int)ctx[CpuRegister.Rdi]);
+        var type = unchecked((int)ctx[CpuRegister.Rsi]);
+        var index = unchecked((int)ctx[CpuRegister.Rdx]);
+        if (!_initialized)
+        {
+            return ctx.SetReturn(OrbisPadErrorNotInitialized);
+        }
+
+        if (userId == -1)
+        {
+            return ctx.SetReturn(OrbisPadErrorDeviceNoHandle);
+        }
+
+        return userId == PrimaryUserId && type == StandardPortType && index == 0
+            ? ctx.SetReturn(PrimaryPadHandle)
+            : ctx.SetReturn(OrbisPadErrorDeviceNoHandle);
+    }
+
+    [SysAbiExport(Nid = "kiA9bZhbnAg", ExportName = "scePadGetIdleCount", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libScePad")]
+    public static int PadGetIdleCount(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "1Odcw19nADw", ExportName = "scePadGetInfo", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libScePad")]
+    public static int PadGetInfo(CpuContext ctx) => WritePadInfo(ctx, ctx[CpuRegister.Rdi]);
+
+    [SysAbiExport(Nid = "4x5Im8pr0-4", ExportName = "scePadGetInfoByPortType", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libScePad")]
+    public static int PadGetInfoByPortType(CpuContext ctx)
+    {
+        var portType = unchecked((int)ctx[CpuRegister.Rdi]);
+        return portType == StandardPortType
+            ? WritePadInfo(ctx, ctx[CpuRegister.Rsi])
+            : ctx.SetReturn(OrbisPadErrorDeviceNotConnected);
+    }
+
+    [SysAbiExport(Nid = "vegw8qax5MI", ExportName = "scePadGetLicenseControllerInformation", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libScePad")]
+    public static int PadGetLicenseControllerInformation(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "WPIB7zBWxVE", ExportName = "scePadGetMotionSensorPosition", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libScePad")]
+    public static int PadGetMotionSensorPosition(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "k4+nDV9vbT0", ExportName = "scePadGetMotionTimerUnit", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libScePad")]
+    public static int PadGetMotionTimerUnit(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "do-JDWX+zRs", ExportName = "scePadGetSphereRadius", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libScePad")]
+    public static int PadGetSphereRadius(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "QuOaoOcSOw0", ExportName = "scePadGetVersionInfo", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libScePad")]
+    public static int PadGetVersionInfo(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "bi0WNvZ1nug", ExportName = "scePadIsBlasterConnected", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libScePad")]
+    public static int PadIsBlasterConnected(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "mEC+xJKyIjQ", ExportName = "scePadIsDS4Connected", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libScePad")]
+    public static int PadIsDs4Connected(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "d2Qk-i8wGak", ExportName = "scePadIsLightBarBaseBrightnessControllable", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libScePad")]
+    public static int PadIsLightBarBaseBrightnessControllable(CpuContext ctx) => ctx.SetReturn(1);
+
+    [SysAbiExport(Nid = "4y9RNPSBsqg", ExportName = "scePadIsMoveConnected", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libScePad")]
+    public static int PadIsMoveConnected(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "9e56uLgk5y0", ExportName = "scePadIsMoveReproductionModel", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libScePad")]
+    public static int PadIsMoveReproductionModel(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "pFTi-yOrVeQ", ExportName = "scePadIsValidHandle", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libScePad")]
+    public static int PadIsValidHandle(CpuContext ctx) =>
+        ctx.SetReturn(unchecked((int)ctx[CpuRegister.Rdi]) == PrimaryPadHandle ? 1 : 0);
+
+    [SysAbiExport(Nid = "CfwUlQtCFi4", ExportName = "scePadMbusInit", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libScePad")]
+    public static int PadMbusInit(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "s7CvzS+9ZIs", ExportName = "scePadMbusTerm", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libScePad")]
+    public static int PadMbusTerm(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "71E9e6n+2R8", ExportName = "scePadOpenExt2", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libScePad")]
+    public static int PadOpenExt2(CpuContext ctx) => PadOpenCore(ctx, extended: true);
+
+    [SysAbiExport(Nid = "DrUu8cPrje8", ExportName = "scePadOutputReport", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libScePad")]
+    public static int PadOutputReport(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "fm1r2vv5+OU", ExportName = "scePadReadBlasterForTracker", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libScePad")]
+    public static int PadReadBlasterForTracker(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "QjwkT2Ycmew", ExportName = "scePadReadExt", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libScePad")]
+    public static int PadReadExt(CpuContext ctx) => ReadNeutralPadData(ctx, multiple: true);
+
+    [SysAbiExport(Nid = "2NhkFTRnXHk", ExportName = "scePadReadForTracker", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libScePad")]
+    public static int PadReadForTracker(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "3u4M8ck9vJM", ExportName = "scePadReadHistory", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libScePad")]
+    public static int PadReadHistory(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "5Wf4q349s+Q", ExportName = "scePadReadStateExt", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libScePad")]
+    public static int PadReadStateExt(CpuContext ctx) => ReadNeutralPadData(ctx, multiple: false);
+
+    [SysAbiExport(Nid = "+4c9xRLmiXQ", ExportName = "scePadResetLightBarAll", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libScePad")]
+    public static int PadResetLightBarAll(CpuContext ctx)
+    {
+        DualSenseReader.ResetLightbar();
+        return ctx.SetReturn(0);
+    }
+
+    [SysAbiExport(Nid = "+Yp6+orqf1M", ExportName = "scePadResetLightBarAllByPortType", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libScePad")]
+    public static int PadResetLightBarAllByPortType(CpuContext ctx)
+    {
+        DualSenseReader.ResetLightbar();
+        return ctx.SetReturn(0);
+    }
+
+    [SysAbiExport(Nid = "rIZnR6eSpvk", ExportName = "scePadResetOrientation", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libScePad")]
+    public static int PadResetOrientation(CpuContext ctx) => ReturnForPrimaryHandle(ctx);
+
+    [SysAbiExport(Nid = "jbAqAvLEP4A", ExportName = "scePadResetOrientationForTracker", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libScePad")]
+    public static int PadResetOrientationForTracker(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "KLmYx9ij2h0", ExportName = "scePadSetAngularVelocityBiasCorrectionState", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libScePad")]
+    public static int PadSetAngularVelocityBiasCorrectionState(CpuContext ctx) => ReturnForPrimaryHandle(ctx);
+
+    [SysAbiExport(Nid = "r44mAxdSG+U", ExportName = "scePadSetAngularVelocityDeadbandState", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libScePad")]
+    public static int PadSetAngularVelocityDeadbandState(CpuContext ctx) => ReturnForPrimaryHandle(ctx);
+
+    [SysAbiExport(Nid = "ew647HuKi2Y", ExportName = "scePadSetAutoPowerOffCount", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libScePad")]
+    public static int PadSetAutoPowerOffCount(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "MbTt1EHYCTg", ExportName = "scePadSetButtonRemappingInfo", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libScePad")]
+    public static int PadSetButtonRemappingInfo(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "MLA06oNfF+4", ExportName = "scePadSetConnection", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libScePad")]
+    public static int PadSetConnection(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "bsbHFI0bl5s", ExportName = "scePadSetExtensionReport", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libScePad")]
+    public static int PadSetExtensionReport(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "xqgVCEflEDY", ExportName = "scePadSetFeatureReport", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libScePad")]
+    public static int PadSetFeatureReport(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "lrjFx4xWnY8", ExportName = "scePadSetForceIntercepted", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libScePad")]
+    public static int PadSetForceIntercepted(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "dhQXEvmrVNQ", ExportName = "scePadSetLightBarBaseBrightness", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libScePad")]
+    public static int PadSetLightBarBaseBrightness(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "etaQhgPHDRY", ExportName = "scePadSetLightBarBlinking", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libScePad")]
+    public static int PadSetLightBarBlinking(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "iHuOWdvQVpg", ExportName = "scePadSetLightBarForTracker", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libScePad")]
+    public static int PadSetLightBarForTracker(CpuContext ctx) => PadSetLightBar(ctx);
+
+    [SysAbiExport(Nid = "o-6Y99a8dKU", ExportName = "scePadSetLoginUserNumber", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libScePad")]
+    public static int PadSetLoginUserNumber(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "flYYxek1wy8", ExportName = "scePadSetProcessFocus", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libScePad")]
+    public static int PadSetProcessFocus(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "DmBx8K+jDWw", ExportName = "scePadSetProcessPrivilege", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libScePad")]
+    public static int PadSetProcessPrivilege(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "FbxEpTRDou8", ExportName = "scePadSetProcessPrivilegeOfButtonRemapping", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libScePad")]
+    public static int PadSetProcessPrivilegeOfButtonRemapping(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "yah8Bk4TcYY", ExportName = "scePadSetShareButtonMaskForRemotePlay", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libScePad")]
+    public static int PadSetShareButtonMaskForRemotePlay(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "z+GEemoTxOo", ExportName = "scePadSetUserColor", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libScePad")]
+    public static int PadSetUserColor(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "8BOObG94-tc", ExportName = "scePadSetVibrationForce", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libScePad")]
+    public static int PadSetVibrationForce(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "--jrY4SHfm8", ExportName = "scePadSetVrTrackingMode", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libScePad")]
+    public static int PadSetVrTrackingMode(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "zFJ35q3RVnY", ExportName = "scePadShareOutputData", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libScePad")]
+    public static int PadShareOutputData(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "80XdmVYsNPA", ExportName = "scePadStartRecording", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libScePad")]
+    public static int PadStartRecording(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "gAHvg6JPIic", ExportName = "scePadStopRecording", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libScePad")]
+    public static int PadStopRecording(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "Oi7FzRWFr0Y", ExportName = "scePadSwitchConnection", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libScePad")]
+    public static int PadSwitchConnection(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "0MB5x-ieRGI", ExportName = "scePadVertualDeviceAddDevice", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libScePad")]
+    public static int PadVertualDeviceAddDevice(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "N7tpsjWQ87s", ExportName = "scePadVirtualDeviceAddDevice", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libScePad")]
+    public static int PadVirtualDeviceAddDevice(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "PFec14-UhEQ", ExportName = "scePadVirtualDeviceDeleteDevice", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libScePad")]
+    public static int PadVirtualDeviceDeleteDevice(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "pjPCronWdxI", ExportName = "scePadVirtualDeviceDisableButtonRemapping", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libScePad")]
+    public static int PadVirtualDeviceDisableButtonRemapping(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "LKXfw7VJYqg", ExportName = "scePadVirtualDeviceGetRemoteSetting", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libScePad")]
+    public static int PadVirtualDeviceGetRemoteSetting(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(Nid = "IWOyO5jKuZg", ExportName = "scePadVirtualDeviceInsertData", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libScePad")]
+    public static int PadVirtualDeviceInsertData(CpuContext ctx) => ctx.SetReturn(0);
+
+    private static int ReturnForPrimaryHandle(CpuContext ctx) =>
+        unchecked((int)ctx[CpuRegister.Rdi]) == PrimaryPadHandle
+            ? ctx.SetReturn(0)
+            : ctx.SetReturn(OrbisPadErrorInvalidHandle);
+
+    private static int WritePadInfo(CpuContext ctx, ulong informationAddress)
+    {
+        if (informationAddress == 0)
+        {
+            return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        Span<byte> information = stackalloc byte[0x98];
+        information.Clear();
+        BinaryPrimitives.WriteUInt32LittleEndian(information[0x00..], 1);
+        BinaryPrimitives.WriteUInt32LittleEndian(information[0x08..], PrimaryPadHandle);
+        BinaryPrimitives.WriteUInt32LittleEndian(information[0x0C..], 0x00000101);
+        BinaryPrimitives.WriteUInt32LittleEndian(information[0x18..], 0x00FF0000);
+        return ctx.Memory.TryWrite(informationAddress, information)
+            ? ctx.SetReturn(0)
+            : ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+    }
+
+    private static int ReadNeutralPadData(CpuContext ctx, bool multiple)
+    {
+        var handle = unchecked((int)ctx[CpuRegister.Rdi]);
+        var dataAddress = ctx[CpuRegister.Rsi];
+        var count = multiple ? unchecked((int)ctx[CpuRegister.Rdx]) : 1;
+        if (handle != PrimaryPadHandle)
+        {
+            return ctx.SetReturn(OrbisPadErrorInvalidHandle);
+        }
+
+        if (dataAddress == 0 || count < 1 || count > 64)
+        {
+            return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        Span<byte> data = stackalloc byte[PadDataSize];
+        data.Clear();
+        data[0x04] = 128;
+        data[0x05] = 128;
+        data[0x06] = 128;
+        data[0x07] = 128;
+        BinaryPrimitives.WriteSingleLittleEndian(data[0x18..], 1.0f);
+        data[0x4C] = 1;
+        data[0x68] = 1;
+        return ctx.Memory.TryWrite(dataAddress, data)
+            ? ctx.SetReturn(multiple ? 1 : 0)
+            : ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+    }
+
     [SysAbiExport(
     Nid = "W2G-yoyMF5U",
     ExportName = "scePadSetVibrationMode",
