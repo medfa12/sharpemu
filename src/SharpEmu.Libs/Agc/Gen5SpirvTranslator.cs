@@ -1956,9 +1956,66 @@ internal static partial class Gen5SpirvTranslator
                     return true;
                 }
                 default:
+                    if (Gen5ShaderTranslator.IsDataShareAtomic(instruction.Opcode))
+                    {
+                        return TryEmitDataShareAtomic(instruction, control, out error);
+                    }
+
                     error = $"unsupported LDS opcode {instruction.Opcode}";
                     return false;
             }
+        }
+
+        private bool TryEmitDataShareAtomic(
+            Gen5ShaderInstruction instruction,
+            Gen5DataShareControl control,
+            out string error)
+        {
+            error = string.Empty;
+            var atomicOp = instruction.Opcode switch
+            {
+                "DsAddU32" or "DsAddRtnU32" => SpirvOp.AtomicIAdd,
+                "DsSubU32" or "DsSubRtnU32" => SpirvOp.AtomicISub,
+                "DsIncU32" or "DsIncRtnU32" => SpirvOp.AtomicIIncrement,
+                "DsDecU32" or "DsDecRtnU32" => SpirvOp.AtomicIDecrement,
+                "DsMinI32" or "DsMinRtnI32" => SpirvOp.AtomicSMin,
+                "DsMaxI32" or "DsMaxRtnI32" => SpirvOp.AtomicSMax,
+                "DsMinU32" or "DsMinRtnU32" => SpirvOp.AtomicUMin,
+                "DsMaxU32" or "DsMaxRtnU32" => SpirvOp.AtomicUMax,
+                "DsAndB32" or "DsAndRtnB32" => SpirvOp.AtomicAnd,
+                "DsOrB32" or "DsOrRtnB32" => SpirvOp.AtomicOr,
+                "DsXorB32" or "DsXorRtnB32" => SpirvOp.AtomicXor,
+                "DsWrxchgRtnB32" => SpirvOp.AtomicExchange,
+                "DsCmpstB32" or "DsCmpstRtnB32" => SpirvOp.AtomicCompareExchange,
+                _ => SpirvOp.Nop,
+            };
+            if (atomicOp == SpirvOp.Nop)
+            {
+                error = $"unsupported LDS opcode {instruction.Opcode}";
+                return false;
+            }
+
+            var address = GetRawSource(instruction, 0);
+            var pointer = LdsPointer(address, control.Offset0);
+            EmitExecConditional(() =>
+            {
+                var original = EmitAtomic(
+                    atomicOp,
+                    _uintType,
+                    pointer,
+                    scope: 2,
+                    semantics: 0x108,
+                    value: () => GetRawSource(
+                        instruction,
+                        atomicOp == SpirvOp.AtomicCompareExchange ? 2 : 1),
+                    comparator: () => GetRawSource(instruction, 1));
+                if (instruction.Destinations.Count > 0)
+                {
+                    StoreV(instruction.Destinations[0].Value, original);
+                }
+            });
+
+            return true;
         }
 
         private bool TryEmitDsLanePermute(
@@ -2535,17 +2592,24 @@ internal static partial class Gen5SpirvTranslator
                 return true;
             }
 
-            if (instruction.Opcode == "BufferAtomicAdd")
+            if (instruction.Opcode.StartsWith("BufferAtomic", StringComparison.Ordinal))
             {
+                if (!TryGetAtomicOp(instruction.Opcode["BufferAtomic".Length..], out var atomicOp))
+                {
+                    error = $"unsupported buffer opcode {instruction.Opcode}";
+                    return false;
+                }
+
                 EmitExecConditional(() =>
                 {
-                    var original = _module.AddInstruction(
-                        SpirvOp.AtomicIAdd,
+                    var original = EmitAtomic(
+                        atomicOp,
                         _uintType,
                         BufferWordPointer(bindingIndex, dwordAddress),
-                        UInt(1),
-                        UInt(0x48),
-                        LoadV(control.VectorData));
+                        scope: 1,
+                        semantics: 0x48,
+                        value: () => LoadV(control.VectorData),
+                        comparator: () => LoadV(control.VectorData + 1));
                     if (control.Glc)
                     {
                         StoreV(control.VectorData, original);
@@ -2802,10 +2866,12 @@ internal static partial class Gen5SpirvTranslator
                     uint LoadData(uint register) => signed
                         ? Bitcast(_intType, LoadV(register))
                         : LoadV(register);
-                    var original = EmitImageAtomic(
+                    var original = EmitAtomic(
                         atomicOp,
                         resource.ComponentType,
                         pointer,
+                        scope: 1,
+                        semantics: 0x808,
                         value: () => LoadData(image.VectorData),
                         // image_atomic_cmpswap packs src into vdata[0] and the
                         // comparand into vdata[1].
@@ -3114,37 +3180,45 @@ internal static partial class Gen5SpirvTranslator
             return op != SpirvOp.Nop;
         }
 
-        private uint EmitImageAtomic(
+        private uint EmitAtomic(
             SpirvOp op,
             uint type,
             uint pointer,
+            uint scope,
+            uint semantics,
             Func<uint> value,
             Func<uint> comparator)
         {
-            var scope = UInt(1);                       // Device
-            var semantics = UInt(0x808);               // AcquireRelease | ImageMemory
             if (op is SpirvOp.AtomicIIncrement or SpirvOp.AtomicIDecrement)
             {
-                return _module.AddInstruction(op, type, pointer, scope, semantics);
-            }
-
-            if (op == SpirvOp.AtomicCompareExchange)
-            {
-                // The unequal semantics must not be stronger than the equal
-                // semantics and cannot include Release.
-                var unequal = UInt(0x802);             // Acquire | ImageMemory
                 return _module.AddInstruction(
                     op,
                     type,
                     pointer,
-                    scope,
-                    semantics,
-                    unequal,
+                    UInt(scope),
+                    UInt(semantics));
+            }
+
+            if (op == SpirvOp.AtomicCompareExchange)
+            {
+                return _module.AddInstruction(
+                    op,
+                    type,
+                    pointer,
+                    UInt(scope),
+                    UInt(semantics),
+                    UInt((semantics & ~0x8u) | 0x2u),
                     value(),
                     comparator());
             }
 
-            return _module.AddInstruction(op, type, pointer, scope, semantics, value());
+            return _module.AddInstruction(
+                op,
+                type,
+                pointer,
+                UInt(scope),
+                UInt(semantics),
+                value());
         }
 
         private uint BuildIntegerCoordinates(Gen5ImageControl image, int start)

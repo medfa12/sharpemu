@@ -20,6 +20,9 @@ public sealed class Gen5Vop3pPackedF16Tests
     private const ulong ShaderAddress = 0x30000;
     private const uint ExecutionModelGLCompute = 5;
     private const ushort OpDecorate = 71;
+    private const ushort OpSelect = 169;
+    private const ushort OpFOrdLessThan = 184;
+    private const ushort OpFOrdGreaterThan = 186;
     private const uint DecorationNoContraction = 42;
     private const uint ComputePgmRsrc2 = 0x213;
     private const uint ComputeUserData = 0x240;
@@ -160,10 +163,8 @@ public sealed class Gen5Vop3pPackedF16Tests
     }
 
     [Fact]
-    public void Compile_PackedFma_WithClamp_FailsLoudly()
+    public void Compile_PackedFma_WithClamp_EmitsSaturation()
     {
-        // Clamp (word0[15]) is out of the first slice's scope; it must fail
-        // emission with a clear message rather than silently ignore saturation.
         var clampFma = new uint[]
         {
             0x7E0002FF, 0x41004100,
@@ -174,10 +175,17 @@ public sealed class Gen5Vop3pPackedF16Tests
         };
         var (state, evaluation) = DecodeAndEvaluate(clampFma);
 
-        var ok = Gen5SpirvTranslator.TryCompileComputeShader(
-            state, evaluation, 64, 1, 1, out _, out var error);
-        Assert.False(ok);
-        Assert.Contains("clamp", error);
+        Assert.True(Gen5SpirvTranslator.TryCompileComputeShader(
+            state, evaluation, 64, 1, 1, out var shader, out var error), error);
+
+        var module = SpirvModuleAssert.Parse(shader.Spirv);
+        Assert.Contains(
+            module.Instructions,
+            instruction => instruction.Opcode == OpFOrdGreaterThan);
+        Assert.Contains(
+            module.Instructions,
+            instruction => instruction.Opcode == OpFOrdLessThan);
+        Assert.Contains(module.Instructions, instruction => instruction.Opcode == OpSelect);
     }
 
     // ---- Single-rounding correctness of the round-to-odd FMA algorithm ----
