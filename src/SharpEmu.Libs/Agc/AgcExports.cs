@@ -123,6 +123,7 @@ public static class AgcExports
     private const uint Gen5TextureFormatR16G16B16A16Float = 12;
     private const uint Gen5TextureType1D = 8;
     private const uint Gen5TextureType2D = 9;
+    private const uint Gen5TextureType2DArray = 13;
     private const ulong MaxPresentedTextureBytes = 128UL * 1024UL * 1024UL;
     private const ulong VideoOutPixelFormatA8R8G8B8Srgb = 0x80000000;
     private const ulong VideoOutPixelFormatA8B8G8R8Srgb = 0x80002200;
@@ -495,25 +496,45 @@ public static class AgcExports
         uint BaseLevel,
         uint LastLevel,
         uint Pitch,
-        uint DstSelect)
+        uint DstSelect,
+        uint Depth = 1,
+        uint MaxMip = 0,
+        bool HasExtendedDescriptor = false)
     {
+        public uint ResourceMipLevels
+        {
+            get
+            {
+                var maximumMipLevels = GetMaximumMipLevels();
+                var resourceMipLevels = HasExtendedDescriptor
+                    ? MaxMip + 1
+                    : maximumMipLevels;
+                return Math.Min(Math.Max(resourceMipLevels, 1u), maximumMipLevels);
+            }
+        }
+
         public uint MipLevels
         {
             get
             {
-                var largestDimension = Math.Max(Width, Height);
-                uint maximumMipLevels = 1;
-                while (largestDimension > 1)
-                {
-                    largestDimension >>= 1;
-                    maximumMipLevels++;
-                }
-
                 var descriptorMipLevels = LastLevel >= BaseLevel
                     ? LastLevel - BaseLevel + 1
                     : 1;
-                return Math.Min(descriptorMipLevels, maximumMipLevels);
+                return Math.Min(descriptorMipLevels, ResourceMipLevels);
             }
+        }
+
+        private uint GetMaximumMipLevels()
+        {
+            var largestDimension = Math.Max(Width, Height);
+            uint maximumMipLevels = 1;
+            while (largestDimension > 1)
+            {
+                largestDimension >>= 1;
+                maximumMipLevels++;
+            }
+
+            return maximumMipLevels;
         }
     }
 
@@ -575,7 +596,8 @@ public static class AgcExports
         TextureDescriptor Descriptor,
         bool IsStorage,
         uint MipLevel,
-        IReadOnlyList<uint> SamplerDescriptor);
+        IReadOnlyList<uint> SamplerDescriptor,
+        bool IsArrayed = false);
 
     private readonly record struct RenderTargetWriter(
         ulong Sequence,
@@ -5043,7 +5065,8 @@ public static class AgcExports
                     texture,
                     Gen5ShaderTranslator.IsStorageImageOperation(binding.Opcode),
                     binding.MipLevel ?? 0,
-                    binding.SamplerDescriptor));
+                    binding.SamplerDescriptor,
+                    IsArrayedImageBinding(binding)));
         }
 
         var globalMemoryBindings = pixelEvaluation.GlobalMemoryBindings
@@ -5203,7 +5226,8 @@ public static class AgcExports
                 texture,
                 Gen5ShaderTranslator.IsStorageImageOperation(binding.Opcode),
                 binding.MipLevel ?? 0,
-                binding.SamplerDescriptor));
+                binding.SamplerDescriptor,
+                IsArrayedImageBinding(binding)));
         }
 
         var globalMemoryBindings = exportEvaluation.GlobalMemoryBindings
@@ -6212,6 +6236,7 @@ public static class AgcExports
                     binding.IsStorage,
                     binding.MipLevel,
                     binding.SamplerDescriptor,
+                    binding.IsArrayed,
                     out var texture))
             {
                 textures.Add(texture);
@@ -6223,6 +6248,24 @@ public static class AgcExports
         }
 
         return textures;
+    }
+
+    internal static bool TryCreateVulkanGuestDrawTexture(
+        CpuContext ctx,
+        IReadOnlyList<uint> descriptorFields,
+        bool isArrayed,
+        out VulkanGuestDrawTexture texture)
+    {
+        texture = default!;
+        return TryDecodeTextureDescriptor(descriptorFields, out var descriptor) &&
+            TryCreateVulkanGuestDrawTexture(
+                ctx,
+                descriptor,
+                isStorage: false,
+                mipLevel: 0,
+                samplerDescriptor: [],
+                isArrayed,
+                out texture);
     }
 
     private static IReadOnlyList<VulkanGuestMemoryBuffer> CreateVulkanGuestMemoryBuffers(
@@ -6281,19 +6324,25 @@ public static class AgcExports
         bool isStorage,
         uint mipLevel,
         IReadOnlyList<uint> samplerDescriptor,
+        bool isArrayed,
         out VulkanGuestDrawTexture texture)
     {
         texture = default!;
         // 1D descriptors decode with height 1 (the T# height field reads as
         // raw+1) and flow through the 2D upload/detile path unchanged.
         if ((descriptor.Type != Gen5TextureType1D &&
-             descriptor.Type != Gen5TextureType2D) ||
+             descriptor.Type != Gen5TextureType2D &&
+             descriptor.Type != Gen5TextureType2DArray) ||
             descriptor.Width == 0 ||
             descriptor.Height == 0 ||
             descriptor.Width > 8192 ||
             descriptor.Height > 8192)
         {
-            texture = CreateFallbackGuestDrawTexture(isStorage, descriptor.Format, descriptor.NumberType);
+            texture = CreateFallbackGuestDrawTexture(
+                isStorage,
+                descriptor.Format,
+                descriptor.NumberType,
+                isArrayed);
             return true;
         }
 
@@ -6317,29 +6366,68 @@ public static class AgcExports
                 out elementHeight,
                 out elementPitch,
                 out bytesPerElement);
+        var sourceByteCount = GetTextureByteCount(
+            descriptor.Format,
+            sourceWidth,
+            descriptor.Height);
         // Tiled surfaces occupy the pitch/height padded up to whole swizzle
         // blocks, so the guest read must cover the padded footprint; the
         // detiler then emits exactly Width x Height linear elements.
-        var sourceByteCount = detile
+        var physicalSourceByteCount = detile
             ? Gfx10Detiler.GetTiledByteCount(
                 descriptor.TileMode,
                 elementWidth,
                 elementHeight,
                 elementPitch,
                 bytesPerElement)
-            : GetTextureByteCount(
-                descriptor.Format,
-                sourceWidth,
-                descriptor.Height);
+            : sourceByteCount;
         if (sourceByteCount == 0 ||
             sourceByteCount > MaxPresentedTextureBytes ||
-            sourceByteCount > int.MaxValue)
+            sourceByteCount > int.MaxValue ||
+            physicalSourceByteCount == 0 ||
+            physicalSourceByteCount > MaxPresentedTextureBytes ||
+            physicalSourceByteCount > int.MaxValue)
         {
-            texture = CreateFallbackGuestDrawTexture(isStorage, descriptor.Format, descriptor.NumberType);
+            texture = CreateFallbackGuestDrawTexture(
+                isStorage,
+                descriptor.Format,
+                descriptor.NumberType,
+                isArrayed);
             return true;
         }
 
+        var baseMipByteOffset = 0UL;
+        var baseMipInTail = false;
+        var mipTailElementX = 0u;
+        var mipTailElementY = 0u;
+        var chainSliceBytes = physicalSourceByteCount;
+        if (detile &&
+            descriptor.HasExtendedDescriptor &&
+            descriptor.ResourceMipLevels > 1 &&
+            TryGetBaseMipPlacement(
+                descriptor.TileMode,
+                elementWidth,
+                elementHeight,
+                bytesPerElement,
+                descriptor.ResourceMipLevels,
+                out baseMipByteOffset,
+                out baseMipInTail,
+                out mipTailElementX,
+                out mipTailElementY,
+                out var placedChainSliceBytes))
+        {
+            chainSliceBytes = placedChainSliceBytes;
+        }
+
+        var wantsArrayUpload = isArrayed &&
+            !isStorage &&
+            descriptor.Address != 0 &&
+            descriptor.Type == Gen5TextureType2DArray &&
+            descriptor.Depth > 1;
+        var arrayUploadLayers = wantsArrayUpload ? descriptor.Depth : 1u;
+
         if (!isStorage &&
+            !wantsArrayUpload &&
             descriptor.Address != 0 &&
             VulkanVideoPresenter.ShouldDeferSampledGuestTexture(
                 descriptor.Address,
@@ -6360,7 +6448,8 @@ public static class AgcExports
                 Pitch: sourceWidth,
                 TileMode: descriptor.TileMode,
                 DstSelect: descriptor.DstSelect,
-                Sampler: ToVulkanSampler(samplerDescriptor));
+                Sampler: ToVulkanSampler(samplerDescriptor),
+                ArrayedView: isArrayed);
             return true;
         }
 
@@ -6369,18 +6458,26 @@ public static class AgcExports
             var initialPixels = Array.Empty<byte>();
             if (descriptor.Address != 0)
             {
-                var storageSource = new byte[(int)sourceByteCount];
-                if (TryReadTextureSource(ctx, descriptor, storageSource, detile) &&
+                var storageSource = new byte[(int)physicalSourceByteCount];
+                if (TryReadTextureSource(
+                        ctx,
+                        descriptor,
+                        storageSource,
+                        detile,
+                        baseMipByteOffset) &&
                     storageSource.AsSpan().IndexOfAnyExcept((byte)0) >= 0)
                 {
                     initialPixels = detile
-                        ? Gfx10Detiler.Detile(
+                        ? DetileTextureSource(
                             storageSource,
                             descriptor.TileMode,
                             elementWidth,
                             elementHeight,
                             elementPitch,
-                            bytesPerElement)
+                            bytesPerElement,
+                            baseMipInTail,
+                            mipTailElementX,
+                            mipTailElementY)
                         : storageSource;
                 }
             }
@@ -6399,14 +6496,86 @@ public static class AgcExports
                 Pitch: sourceWidth,
                 TileMode: descriptor.TileMode,
                 DstSelect: descriptor.DstSelect,
-                Sampler: ToVulkanSampler(samplerDescriptor));
+                Sampler: ToVulkanSampler(samplerDescriptor),
+                ArrayedView: isArrayed);
             return true;
         }
 
-        var source = new byte[(int)sourceByteCount];
-        if (!TryReadTextureSource(ctx, descriptor, source, detile))
+        if (wantsArrayUpload)
         {
-            texture = CreateFallbackGuestDrawTexture(isStorage, descriptor.Format, descriptor.NumberType);
+            var layerBytes = checked((int)sourceByteCount);
+            var physicalLayerBytes = checked((int)physicalSourceByteCount);
+            var totalBytes = (long)layerBytes * arrayUploadLayers;
+            if (totalBytes <= int.MaxValue)
+            {
+                var layered = new byte[totalBytes];
+                var uploadedLayers = 0u;
+                for (var layer = 0u; layer < arrayUploadLayers; layer++)
+                {
+                    var layerSource = new byte[physicalLayerBytes];
+                    if (!TryReadTextureSource(
+                            ctx,
+                            descriptor,
+                            layerSource,
+                            detile,
+                            layer * chainSliceBytes + baseMipByteOffset))
+                    {
+                        break;
+                    }
+
+                    var layerLinear = detile
+                        ? DetileTextureSource(
+                            layerSource,
+                            descriptor.TileMode,
+                            elementWidth,
+                            elementHeight,
+                            elementPitch,
+                            bytesPerElement,
+                            baseMipInTail,
+                            mipTailElementX,
+                            mipTailElementY)
+                        : layerSource;
+                    layerLinear.CopyTo(layered, checked((int)(layer * (uint)layerBytes)));
+                    uploadedLayers++;
+                }
+
+                if (uploadedLayers == arrayUploadLayers)
+                {
+                    texture = new VulkanGuestDrawTexture(
+                        descriptor.Address,
+                        descriptor.Width,
+                        descriptor.Height,
+                        descriptor.Format,
+                        descriptor.NumberType,
+                        layered,
+                        IsFallback: false,
+                        IsStorage: false,
+                        MipLevels: descriptor.MipLevels,
+                        MipLevel: mipLevel,
+                        Pitch: sourceWidth,
+                        TileMode: descriptor.TileMode,
+                        DstSelect: descriptor.DstSelect,
+                        Sampler: ToVulkanSampler(samplerDescriptor),
+                        ArrayedView: true,
+                        ArrayLayers: arrayUploadLayers);
+                    return true;
+                }
+            }
+        }
+
+        var source = new byte[(int)physicalSourceByteCount];
+        if (!TryReadTextureSource(
+                ctx,
+                descriptor,
+                source,
+                detile,
+                baseMipByteOffset))
+        {
+            texture = CreateFallbackGuestDrawTexture(
+                isStorage,
+                descriptor.Format,
+                descriptor.NumberType,
+                isArrayed);
             return true;
         }
 
@@ -6433,13 +6602,16 @@ public static class AgcExports
             $"bytes={source.Length} nonzero64={nonZero}");
 
         var rgba = detile
-            ? Gfx10Detiler.Detile(
+            ? DetileTextureSource(
                 source,
                 descriptor.TileMode,
                 elementWidth,
                 elementHeight,
                 elementPitch,
-                bytesPerElement)
+                bytesPerElement,
+                baseMipInTail,
+                mipTailElementX,
+                mipTailElementY)
             : source;
         texture = new VulkanGuestDrawTexture(
             descriptor.Address,
@@ -6455,14 +6627,16 @@ public static class AgcExports
             Pitch: sourceWidth,
             TileMode: descriptor.TileMode,
             DstSelect: descriptor.DstSelect,
-            Sampler: ToVulkanSampler(samplerDescriptor));
+            Sampler: ToVulkanSampler(samplerDescriptor),
+            ArrayedView: isArrayed);
         return true;
     }
 
     private static VulkanGuestDrawTexture CreateFallbackGuestDrawTexture(
         bool isStorage,
         uint format,
-        uint numberType)
+        uint numberType,
+        bool isArrayed = false)
     {
         var fallbackFormat = format == 0 ? 10u : format;
         var fallbackNumberType = numberType;
@@ -6476,7 +6650,8 @@ public static class AgcExports
             IsFallback: true,
             IsStorage: isStorage,
             MipLevels: 1,
-            MipLevel: 0);
+            MipLevel: 0,
+            ArrayedView: isArrayed);
     }
 
     private static void TraceTextureHash(TextureDescriptor descriptor, ReadOnlySpan<byte> source)
@@ -6669,7 +6844,8 @@ public static class AgcExports
                     texture,
                     isStorage,
                     binding.MipLevel ?? 0,
-                    binding.SamplerDescriptor));
+                    binding.SamplerDescriptor,
+                    IsArrayedImageBinding(binding)));
             hasStorageBinding |= isStorage;
 
             var descriptorState = descriptorValid ? string.Empty : "/invalid-desc";
@@ -7204,9 +7380,10 @@ public static class AgcExports
         CpuContext ctx,
         TextureDescriptor descriptor,
         byte[] destination,
-        bool paddedTiledRead)
+        bool paddedTiledRead,
+        ulong byteOffset = 0)
     {
-        if (ctx.Memory.TryRead(descriptor.Address, destination))
+        if (ctx.Memory.TryRead(descriptor.Address + byteOffset, destination))
         {
             return true;
         }
@@ -7227,8 +7404,217 @@ public static class AgcExports
         return unpaddedByteCount != 0 &&
             unpaddedByteCount < (ulong)destination.Length &&
             ctx.Memory.TryRead(
-                descriptor.Address,
+                descriptor.Address + byteOffset,
                 destination.AsSpan(0, (int)unpaddedByteCount));
+    }
+
+    private static byte[] DetileTextureSource(
+        byte[] source,
+        uint tileMode,
+        uint elementWidth,
+        uint elementHeight,
+        uint elementPitch,
+        uint bytesPerElement,
+        bool baseMipInTail,
+        uint tailElementX,
+        uint tailElementY)
+    {
+        if (!baseMipInTail ||
+            !TryGetBlockElementDimensions(
+                tileMode,
+                bytesPerElement,
+                out var blockWidth,
+                out var blockHeight))
+        {
+            return Gfx10Detiler.Detile(
+                source,
+                tileMode,
+                elementWidth,
+                elementHeight,
+                elementPitch,
+                bytesPerElement);
+        }
+
+        var blockLinear = Gfx10Detiler.Detile(
+            source,
+            tileMode,
+            blockWidth,
+            blockHeight,
+            blockWidth,
+            bytesPerElement);
+        var tailLinear = new byte[checked((int)(
+            (ulong)elementWidth * elementHeight * bytesPerElement))];
+        var rowBytes = checked((int)(elementWidth * bytesPerElement));
+        for (var y = 0u; y < elementHeight; y++)
+        {
+            var sourceOffset = checked((int)(
+                ((tailElementY + y) * blockWidth + tailElementX) * bytesPerElement));
+            blockLinear.AsSpan(sourceOffset, rowBytes)
+                .CopyTo(tailLinear.AsSpan(checked((int)y * rowBytes), rowBytes));
+        }
+
+        return tailLinear;
+    }
+
+    private static bool TryGetBaseMipPlacement(
+        uint tileMode,
+        uint elementWidth,
+        uint elementHeight,
+        uint bytesPerElement,
+        uint resourceMipLevels,
+        out ulong byteOffset,
+        out bool inMipTail,
+        out uint tailElementX,
+        out uint tailElementY,
+        out ulong chainSliceBytes)
+    {
+        byteOffset = 0;
+        inMipTail = false;
+        tailElementX = 0;
+        tailElementY = 0;
+        chainSliceBytes = 0;
+        if (resourceMipLevels <= 1 ||
+            elementWidth == 0 ||
+            elementHeight == 0 ||
+            !TryGetBlockElementDimensions(
+                tileMode,
+                bytesPerElement,
+                out var blockWidth,
+                out var blockHeight))
+        {
+            return false;
+        }
+
+        var blockBytes = tileMode == Gfx10Detiler.Sw4KbStandard
+            ? 4096u
+            : 65536u;
+        var blockSizeLog2 = blockBytes == 4096 ? 12 : 16;
+        var bytesPerElementLog2 = bytesPerElement switch
+        {
+            1 => 0,
+            2 => 1,
+            4 => 2,
+            8 => 3,
+            16 => 4,
+            _ => -1,
+        };
+        if (bytesPerElementLog2 < 0)
+        {
+            return false;
+        }
+
+        var mipLevels = (int)Math.Min(resourceMipLevels, 16u);
+        var maxMipsInTail = blockSizeLog2 <= 8 ? 0
+            : blockSizeLog2 <= 11
+                ? 1 + (1 << (blockSizeLog2 - 9))
+                : blockSizeLog2 - 4;
+        var tailWidth = (blockSizeLog2 & 1) != 0 ? blockWidth >> 1 : blockWidth;
+        var tailHeight = (blockSizeLog2 & 1) != 0 ? blockHeight : blockHeight >> 1;
+
+        var firstMipInTail = mipLevels;
+        var mipSizes = new ulong[mipLevels];
+        for (var i = 0; i < mipLevels; i++)
+        {
+            var mipWidth = Math.Max(elementWidth >> i, 1u);
+            var mipHeight = Math.Max(elementHeight >> i, 1u);
+            if (maxMipsInTail > 0 &&
+                mipWidth <= tailWidth &&
+                mipHeight <= tailHeight &&
+                mipLevels - i <= maxMipsInTail)
+            {
+                firstMipInTail = i;
+                break;
+            }
+
+            var alignedWidth = (mipWidth + blockWidth - 1) / blockWidth * blockWidth;
+            var alignedHeight = (mipHeight + blockHeight - 1) / blockHeight * blockHeight;
+            mipSizes[i] = (ulong)alignedWidth * alignedHeight * bytesPerElement;
+        }
+
+        if (firstMipInTail == 0)
+        {
+            var m = maxMipsInTail - 1;
+            var mipOffset = m > 6 ? 16 << m : m << 8;
+            var mipX = ((mipOffset >> 9) & 1) |
+                       ((mipOffset >> 10) & 2) |
+                       ((mipOffset >> 11) & 4) |
+                       ((mipOffset >> 12) & 8) |
+                       ((mipOffset >> 13) & 16) |
+                       ((mipOffset >> 14) & 32);
+            var mipY = ((mipOffset >> 8) & 1) |
+                       ((mipOffset >> 9) & 2) |
+                       ((mipOffset >> 10) & 4) |
+                       ((mipOffset >> 11) & 8) |
+                       ((mipOffset >> 12) & 16) |
+                       ((mipOffset >> 13) & 32);
+            if ((blockSizeLog2 & 1) != 0)
+            {
+                (mipX, mipY) = (mipY, mipX);
+                if ((bytesPerElementLog2 & 1) != 0)
+                {
+                    mipY = (mipY << 1) | (mipX & 1);
+                    mipX >>= 1;
+                }
+            }
+
+            var microElementCount = 256u >> bytesPerElementLog2;
+            var microWidth = 1u << ((31 - int.LeadingZeroCount((int)microElementCount) + 1) / 2);
+            var microHeight = microElementCount / microWidth;
+            tailElementX = (uint)mipX * microWidth;
+            tailElementY = (uint)mipY * microHeight;
+            if (tailElementX + elementWidth > blockWidth ||
+                tailElementY + elementHeight > blockHeight)
+            {
+                tailElementX = 0;
+                tailElementY = 0;
+                return false;
+            }
+
+            inMipTail = true;
+            chainSliceBytes = blockBytes;
+            return true;
+        }
+
+        byteOffset = firstMipInTail < mipLevels ? blockBytes : 0;
+        chainSliceBytes = byteOffset;
+        for (var i = firstMipInTail - 1; i >= 1; i--)
+        {
+            byteOffset += mipSizes[i];
+        }
+
+        for (var i = 0; i < firstMipInTail; i++)
+        {
+            chainSliceBytes += mipSizes[i];
+        }
+
+        return true;
+    }
+
+    private static bool TryGetBlockElementDimensions(
+        uint tileMode,
+        uint bytesPerElement,
+        out uint blockWidth,
+        out uint blockHeight)
+    {
+        blockWidth = 0;
+        blockHeight = 0;
+        var blockBytes = tileMode switch
+        {
+            Gfx10Detiler.Sw4KbStandard => 4096u,
+            Gfx10Detiler.Sw64KbDepth or Gfx10Detiler.Sw64KbRender => 65536u,
+            _ => 0u,
+        };
+        if (blockBytes == 0 ||
+            bytesPerElement is not (1 or 2 or 4 or 8 or 16))
+        {
+            return false;
+        }
+
+        var elementCount = blockBytes / bytesPerElement;
+        var elementCountLog2 = 31 - (int)uint.LeadingZeroCount(elementCount);
+        blockWidth = 1u << ((elementCountLog2 + 1) / 2);
+        blockHeight = elementCount / blockWidth;
+        return true;
     }
 
     private static uint GetLinearTexturePitch(uint pitch, uint format)
@@ -7499,7 +7885,7 @@ public static class AgcExports
             packetAddress +
             8 +
             ((ulong)(PsTextureUserDataRegister - startRegister) * sizeof(uint));
-        Span<uint> fields = stackalloc uint[4];
+        Span<uint> fields = stackalloc uint[8];
         for (var i = 0; i < fields.Length; i++)
         {
             if (!ctx.TryReadUInt32(descriptorAddress + ((ulong)i * sizeof(uint)), out fields[i]))
@@ -7549,6 +7935,12 @@ public static class AgcExports
         var type = (fields[3] >> 28) & 0xFu;
         var baseLevel = (fields[3] >> 12) & 0xFu;
         var lastLevel = (fields[3] >> 16) & 0xFu;
+        var word4 = fields.Count >= 5 ? fields[4] : 0u;
+        var depth = type == Gen5TextureType2DArray
+            ? (word4 & 0x1FFFu) + 1
+            : 1u;
+        var hasExtendedDescriptor = fields.Count >= 8;
+        var maxMip = fields.Count >= 6 ? (fields[5] >> 4) & 0xFu : 0u;
         // The 128-bit RDNA2 2D resource derives pitch[12:0] from width;
         // the optional extension word only supplies pitch[13].
         var pitch = width;
@@ -7573,7 +7965,10 @@ public static class AgcExports
             baseLevel,
             lastLevel,
             pitch,
-            dstSelect);
+            dstSelect,
+            depth,
+            maxMip,
+            hasExtendedDescriptor);
         return true;
     }
 
@@ -8328,11 +8723,16 @@ public static class AgcExports
             ? "none"
             : string.Join(',', values.Select(static value => $"{value:X8}"));
 
+    private static bool IsArrayedImageBinding(Gen5ImageBinding binding) =>
+        binding.Control.IsArray &&
+        (binding.Opcode.StartsWith("ImageSample", StringComparison.Ordinal) ||
+         binding.Opcode.StartsWith("ImageGather4", StringComparison.Ordinal));
+
     private static string FormatTextureDescriptor(TextureDescriptor descriptor) =>
         $"addr=0x{descriptor.Address:X16} {descriptor.Width}x{descriptor.Height} " +
         $"fmt={descriptor.Format} num={descriptor.NumberType} tile={descriptor.TileMode} " +
         $"type={descriptor.Type} levels={descriptor.BaseLevel}-{descriptor.LastLevel} " +
-        $"pitch={descriptor.Pitch} dst=0x{descriptor.DstSelect:X3}";
+        $"pitch={descriptor.Pitch} depth={descriptor.Depth} dst=0x{descriptor.DstSelect:X3}";
 
     private static void DumpSpirv(
         string stage,

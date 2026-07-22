@@ -48,7 +48,9 @@ internal sealed record VulkanGuestDrawTexture(
     uint Pitch = 0,
     uint TileMode = 0,
     uint DstSelect = 0xFAC,
-    VulkanGuestSampler Sampler = default);
+    VulkanGuestSampler Sampler = default,
+    bool ArrayedView = false,
+    uint ArrayLayers = 1);
 
 internal readonly record struct VulkanGuestSampler(
     uint Word0,
@@ -1698,6 +1700,12 @@ internal static unsafe partial class VulkanVideoPresenter
     internal static Format GetSampledTextureFormatForTests(uint format, uint numberType) =>
         Presenter.GetTextureFormat(format, numberType);
 
+    internal static uint GetSampledTextureLayerCount(VulkanGuestDrawTexture texture) =>
+        Math.Max(texture.ArrayLayers, 1);
+
+    internal static ImageViewType GetSampledTextureViewType(VulkanGuestDrawTexture texture) =>
+        texture.ArrayedView ? ImageViewType.Type2DArray : ImageViewType.Type2D;
+
     internal static bool TryResolveDisplayBufferSourceForTests(
         ulong flipAddress,
         out ulong sourceAddress)
@@ -3120,6 +3128,7 @@ internal static unsafe partial class VulkanVideoPresenter
             public uint Height;
             public uint RowLength;
             public uint DstSelect;
+            public uint Layers = 1;
             public bool NeedsUpload;
             public bool OwnsStorage;
             public bool IsStorage;
@@ -5823,7 +5832,8 @@ internal static unsafe partial class VulkanVideoPresenter
                 texture.Address != 0 &&
                 texture.Width <= 2 &&
                 texture.Height <= 2 &&
-                !texture.IsStorage)
+                !texture.IsStorage &&
+                !texture.ArrayedView)
             {
                 var lumImage = EnsureForcedExposureImage(exposure);
                 lumImage.LastUseStamp = _useStamp;
@@ -5846,6 +5856,7 @@ internal static unsafe partial class VulkanVideoPresenter
             // view directly so the sampler returns real depth in .r -- this is
             // what turns the black deferred-lighting output into sampled depth.
             if (texture.Address != 0 &&
+                !texture.ArrayedView &&
                 _guestImages.TryFindDepthAlias(texture.Address, out var depthImage))
             {
                 depthImage.LastUseStamp = _useStamp;
@@ -5864,6 +5875,7 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             if (texture.Address != 0 &&
+                !(texture.ArrayedView && texture.ArrayLayers > 1) &&
                 _guestImages.TryFindSampleAlias(texture, vkFormat, out var guestImage) &&
                 TryGetOrCreateGuestImageView(
                     guestImage,
@@ -5871,7 +5883,8 @@ internal static unsafe partial class VulkanVideoPresenter
                     mipLevel: 0,
                     levelCount: guestImage.MipLevels,
                     dstSelect: texture.DstSelect,
-                    out var view))
+                    out var view,
+                    arrayedView: texture.ArrayedView))
             {
                 guestImage.LastUseStamp = _useStamp;
                 if (ShouldTraceVulkanResources() &&
@@ -5927,6 +5940,7 @@ internal static unsafe partial class VulkanVideoPresenter
             // holds the real content -- prefer its native-format view over the
             // guest-memory upload rather than regressing to a black readback.
             if (texture.Address != 0 &&
+                !(texture.ArrayedView && texture.ArrayLayers > 1) &&
                 !texture.IsFallback &&
                 (texture.RgbaPixels.Length == 0 || ShouldUseFlipCompositeFix()) &&
                 _guestImages.TryFindNativeAlias(texture, vkFormat, out var renderedImage) &&
@@ -5936,7 +5950,8 @@ internal static unsafe partial class VulkanVideoPresenter
                     mipLevel: 0,
                     levelCount: renderedImage.MipLevels,
                     dstSelect: texture.DstSelect,
-                    out var nativeView))
+                    out var nativeView,
+                    arrayedView: texture.ArrayedView))
             {
                 renderedImage.LastUseStamp = _useStamp;
                 if (ShouldTracePresentedGuestImageContentsForDiagnostics() &&
@@ -5984,6 +5999,7 @@ internal static unsafe partial class VulkanVideoPresenter
             if (producer is { } gpuProducer &&
                 gpuProducer.Image.Handle != 0 &&
                 !texture.IsFallback &&
+                !texture.ArrayedView &&
                 !IsBlockCompressedFormat(vkFormat))
             {
                 return CreateCopyOnSampleTextureResource(texture, gpuProducer);
@@ -6400,6 +6416,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 : width;
             var vkFormat = GetTextureFormat(texture.Format, texture.NumberType);
 
+            var layers = GetSampledTextureLayerCount(texture);
             var expectedSize = GetTextureByteCount(texture.Format, rowLength, height);
             if (_tracedTextureUploads.Add((texture.Address, width, height, vkFormat)))
             {
@@ -6407,12 +6424,16 @@ internal static unsafe partial class VulkanVideoPresenter
                     $"[LOADER][TRACE] vk.texture addr=0x{texture.Address:X16} " +
                     $"fmt={texture.Format} num={texture.NumberType} vk={vkFormat} " +
                     $"size={width}x{height} row={rowLength} tile={texture.TileMode} " +
-                    $"dst=0x{texture.DstSelect:X3} " +
+                    $"layers={layers} dst=0x{texture.DstSelect:X3} " +
                     $"bytes={texture.RgbaPixels.Length} expected={expectedSize}");
             }
-            var pixels = texture.RgbaPixels.Length == (int)expectedSize
+            var pixels = texture.RgbaPixels.Length == (int)(expectedSize * layers)
                 ? texture.RgbaPixels
                 : CreateFallbackTexturePixels(texture.Format, rowLength, height, expectedSize);
+            if (!ReferenceEquals(pixels, texture.RgbaPixels))
+            {
+                layers = 1;
+            }
             DumpTextureUpload(texture, pixels, rowLength, width, height);
             var uploadPixels = texture.Format == 13
                 ? ExpandRgb32Pixels(pixels)
@@ -6434,7 +6455,7 @@ internal static unsafe partial class VulkanVideoPresenter
             // image (rented or freshly pooled) is never handed to the
             // registry regardless of what eviction did in between.
             var poolEligible = false;
-            if (_poolDrawObjects)
+            if (_poolDrawObjects && !texture.ArrayedView && layers == 1)
             {
                 if (texture.Address == 0)
                 {
@@ -6480,7 +6501,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     Format = vkFormat,
                     Extent = new Extent3D(width, height, 1),
                     MipLevels = 1,
-                    ArrayLayers = 1,
+                    ArrayLayers = layers,
                     Samples = SampleCountFlags.Count1Bit,
                     Tiling = ImageTiling.Optimal,
                     Usage = supportsAttachmentUsage
@@ -6513,10 +6534,10 @@ internal static unsafe partial class VulkanVideoPresenter
                     {
                         SType = StructureType.ImageViewCreateInfo,
                         Image = image,
-                        ViewType = ImageViewType.Type2D,
+                        ViewType = GetSampledTextureViewType(texture),
                         Format = vkFormat,
                         Components = ToVkComponentMapping(texture.DstSelect),
-                        SubresourceRange = ColorSubresourceRange(),
+                        SubresourceRange = ColorSubresourceRange(layerCount: layers),
                     };
                     Check(_vk.CreateImageView(_device, &viewInfo, null, out view), "vkCreateImageView(texture)");
                 }
@@ -6562,6 +6583,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 Height = height,
                 RowLength = rowLength,
                 DstSelect = texture.DstSelect,
+                Layers = layers,
                 NeedsUpload = true,
                 OwnsStorage = true,
                 PooledStorage = pooledEntry,
@@ -6594,6 +6616,8 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             if (texture.Address != 0 &&
+                !texture.ArrayedView &&
+                layers == 1 &&
                 !uploadIsLiveRenderTarget &&
                 !_guestImages.ContainsAddress(texture.Address) &&
                 pooledEntry == null)
@@ -9670,11 +9694,18 @@ internal static unsafe partial class VulkanVideoPresenter
             uint mipLevel,
             uint levelCount,
             uint dstSelect,
-            out ImageView view)
+            out ImageView view,
+            bool arrayedView = false)
         {
             try
             {
-                view = GetOrCreateGuestImageView(resource, format, mipLevel, levelCount, dstSelect);
+                view = GetOrCreateGuestImageView(
+                    resource,
+                    format,
+                    mipLevel,
+                    levelCount,
+                    dstSelect,
+                    arrayedView);
                 return true;
             }
             catch (Exception exception)
@@ -9692,7 +9723,8 @@ internal static unsafe partial class VulkanVideoPresenter
             Format format,
             uint mipLevel,
             uint levelCount,
-            uint dstSelect = 0xFAC)
+            uint dstSelect = 0xFAC,
+            bool arrayedView = false)
         {
             if (mipLevel >= resource.MipLevels)
             {
@@ -9709,7 +9741,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
             levelCount = Math.Max(levelCount, 1);
             levelCount = Math.Min(levelCount, resource.MipLevels - mipLevel);
-            if (format == resource.Format && dstSelect == 0xFAC)
+            if (format == resource.Format && dstSelect == 0xFAC && !arrayedView)
             {
                 if (mipLevel == 0 && levelCount == resource.MipLevels)
                 {
@@ -9728,7 +9760,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     $"Incompatible image view format {format} for image {resource.Format}.");
             }
 
-            var key = (format, mipLevel, levelCount, dstSelect);
+            var key = (format, mipLevel + (arrayedView ? 0x100u : 0), levelCount, dstSelect);
             if (resource.FormatViews.TryGetValue(key, out var existing))
             {
                 return existing;
@@ -9738,7 +9770,7 @@ internal static unsafe partial class VulkanVideoPresenter
             {
                 SType = StructureType.ImageViewCreateInfo,
                 Image = resource.Image,
-                ViewType = ImageViewType.Type2D,
+                ViewType = arrayedView ? ImageViewType.Type2DArray : ImageViewType.Type2D,
                 Format = format,
                 Components = ToVkComponentMapping(dstSelect),
                 SubresourceRange = ColorSubresourceRange(mipLevel, levelCount),
@@ -10949,7 +10981,7 @@ internal static unsafe partial class VulkanVideoPresenter
                         SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
                         DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
                         Image = texture.Image,
-                        SubresourceRange = ColorSubresourceRange(),
+                        SubresourceRange = ColorSubresourceRange(layerCount: texture.Layers),
                     };
                     _vk.CmdPipelineBarrier(
                         _commandBuffer,
@@ -10972,7 +11004,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     ImageSubresource = new ImageSubresourceLayers
                     {
                         AspectMask = ImageAspectFlags.ColorBit,
-                        LayerCount = 1,
+                        LayerCount = texture.Layers,
                     },
                     ImageExtent = new Extent3D(texture.Width, texture.Height, 1),
                 };
@@ -11004,7 +11036,7 @@ internal static unsafe partial class VulkanVideoPresenter
                         SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
                         DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
                         Image = texture.Image,
-                        SubresourceRange = ColorSubresourceRange(),
+                        SubresourceRange = ColorSubresourceRange(layerCount: texture.Layers),
                     };
                     _vk.CmdPipelineBarrier(
                         _commandBuffer,
@@ -12190,13 +12222,14 @@ internal static unsafe partial class VulkanVideoPresenter
 
         private static ImageSubresourceRange ColorSubresourceRange(
             uint baseMipLevel = 0,
-            uint levelCount = 1) =>
+            uint levelCount = 1,
+            uint layerCount = 1) =>
             new()
             {
                 AspectMask = ImageAspectFlags.ColorBit,
                 BaseMipLevel = baseMipLevel,
                 LevelCount = levelCount,
-                LayerCount = 1,
+                LayerCount = layerCount,
             };
 
         private static ImageSubresourceRange DepthSubresourceRange(
