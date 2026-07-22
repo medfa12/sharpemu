@@ -123,6 +123,7 @@ public static class AgcExports
     private const uint Gen5TextureFormatR16G16B16A16Float = 12;
     private const uint Gen5TextureType1D = 8;
     private const uint Gen5TextureType2D = 9;
+    private const uint Gen5TextureType2DArray = 13;
     private const ulong MaxPresentedTextureBytes = 128UL * 1024UL * 1024UL;
     private const ulong VideoOutPixelFormatA8R8G8B8Srgb = 0x80000000;
     private const ulong VideoOutPixelFormatA8B8G8R8Srgb = 0x80002200;
@@ -495,7 +496,8 @@ public static class AgcExports
         uint BaseLevel,
         uint LastLevel,
         uint Pitch,
-        uint DstSelect)
+        uint DstSelect,
+        uint Depth = 1)
     {
         public uint MipLevels
         {
@@ -575,7 +577,8 @@ public static class AgcExports
         TextureDescriptor Descriptor,
         bool IsStorage,
         uint MipLevel,
-        IReadOnlyList<uint> SamplerDescriptor);
+        IReadOnlyList<uint> SamplerDescriptor,
+        bool IsArrayed = false);
 
     private readonly record struct RenderTargetWriter(
         ulong Sequence,
@@ -5043,7 +5046,8 @@ public static class AgcExports
                     texture,
                     Gen5ShaderTranslator.IsStorageImageOperation(binding.Opcode),
                     binding.MipLevel ?? 0,
-                    binding.SamplerDescriptor));
+                    binding.SamplerDescriptor,
+                    IsArrayedImageBinding(binding)));
         }
 
         var globalMemoryBindings = pixelEvaluation.GlobalMemoryBindings
@@ -5203,7 +5207,8 @@ public static class AgcExports
                 texture,
                 Gen5ShaderTranslator.IsStorageImageOperation(binding.Opcode),
                 binding.MipLevel ?? 0,
-                binding.SamplerDescriptor));
+                binding.SamplerDescriptor,
+                IsArrayedImageBinding(binding)));
         }
 
         var globalMemoryBindings = exportEvaluation.GlobalMemoryBindings
@@ -6212,6 +6217,7 @@ public static class AgcExports
                     binding.IsStorage,
                     binding.MipLevel,
                     binding.SamplerDescriptor,
+                    binding.IsArrayed,
                     out var texture))
             {
                 textures.Add(texture);
@@ -6223,6 +6229,24 @@ public static class AgcExports
         }
 
         return textures;
+    }
+
+    internal static bool TryCreateVulkanGuestDrawTexture(
+        CpuContext ctx,
+        IReadOnlyList<uint> descriptorFields,
+        bool isArrayed,
+        out VulkanGuestDrawTexture texture)
+    {
+        texture = default!;
+        return TryDecodeTextureDescriptor(descriptorFields, out var descriptor) &&
+            TryCreateVulkanGuestDrawTexture(
+                ctx,
+                descriptor,
+                isStorage: false,
+                mipLevel: 0,
+                samplerDescriptor: [],
+                isArrayed,
+                out texture);
     }
 
     private static IReadOnlyList<VulkanGuestMemoryBuffer> CreateVulkanGuestMemoryBuffers(
@@ -6281,19 +6305,25 @@ public static class AgcExports
         bool isStorage,
         uint mipLevel,
         IReadOnlyList<uint> samplerDescriptor,
+        bool isArrayed,
         out VulkanGuestDrawTexture texture)
     {
         texture = default!;
         // 1D descriptors decode with height 1 (the T# height field reads as
         // raw+1) and flow through the 2D upload/detile path unchanged.
         if ((descriptor.Type != Gen5TextureType1D &&
-             descriptor.Type != Gen5TextureType2D) ||
+             descriptor.Type != Gen5TextureType2D &&
+             descriptor.Type != Gen5TextureType2DArray) ||
             descriptor.Width == 0 ||
             descriptor.Height == 0 ||
             descriptor.Width > 8192 ||
             descriptor.Height > 8192)
         {
-            texture = CreateFallbackGuestDrawTexture(isStorage, descriptor.Format, descriptor.NumberType);
+            texture = CreateFallbackGuestDrawTexture(
+                isStorage,
+                descriptor.Format,
+                descriptor.NumberType,
+                isArrayed);
             return true;
         }
 
@@ -6335,11 +6365,23 @@ public static class AgcExports
             sourceByteCount > MaxPresentedTextureBytes ||
             sourceByteCount > int.MaxValue)
         {
-            texture = CreateFallbackGuestDrawTexture(isStorage, descriptor.Format, descriptor.NumberType);
+            texture = CreateFallbackGuestDrawTexture(
+                isStorage,
+                descriptor.Format,
+                descriptor.NumberType,
+                isArrayed);
             return true;
         }
 
+        var wantsArrayUpload = isArrayed &&
+            !isStorage &&
+            descriptor.Address != 0 &&
+            descriptor.Type == Gen5TextureType2DArray &&
+            descriptor.Depth > 1;
+        var arrayUploadLayers = wantsArrayUpload ? descriptor.Depth : 1u;
+
         if (!isStorage &&
+            !wantsArrayUpload &&
             descriptor.Address != 0 &&
             VulkanVideoPresenter.ShouldDeferSampledGuestTexture(
                 descriptor.Address,
@@ -6360,7 +6402,8 @@ public static class AgcExports
                 Pitch: sourceWidth,
                 TileMode: descriptor.TileMode,
                 DstSelect: descriptor.DstSelect,
-                Sampler: ToVulkanSampler(samplerDescriptor));
+                Sampler: ToVulkanSampler(samplerDescriptor),
+                ArrayedView: isArrayed);
             return true;
         }
 
@@ -6399,14 +6442,77 @@ public static class AgcExports
                 Pitch: sourceWidth,
                 TileMode: descriptor.TileMode,
                 DstSelect: descriptor.DstSelect,
-                Sampler: ToVulkanSampler(samplerDescriptor));
+                Sampler: ToVulkanSampler(samplerDescriptor),
+                ArrayedView: isArrayed);
             return true;
+        }
+
+        if (wantsArrayUpload)
+        {
+            var layerBytes = checked((int)sourceByteCount);
+            var totalBytes = (long)layerBytes * arrayUploadLayers;
+            if (totalBytes <= int.MaxValue)
+            {
+                var layered = new byte[totalBytes];
+                var uploadedLayers = 0u;
+                for (var layer = 0u; layer < arrayUploadLayers; layer++)
+                {
+                    var layerSource = new byte[layerBytes];
+                    if (!TryReadTextureSource(
+                            ctx,
+                            descriptor,
+                            layerSource,
+                            detile,
+                            layer * sourceByteCount))
+                    {
+                        break;
+                    }
+
+                    var layerLinear = detile
+                        ? Gfx10Detiler.Detile(
+                            layerSource,
+                            descriptor.TileMode,
+                            elementWidth,
+                            elementHeight,
+                            elementPitch,
+                            bytesPerElement)
+                        : layerSource;
+                    layerLinear.CopyTo(layered, checked((int)(layer * (uint)layerBytes)));
+                    uploadedLayers++;
+                }
+
+                if (uploadedLayers == arrayUploadLayers)
+                {
+                    texture = new VulkanGuestDrawTexture(
+                        descriptor.Address,
+                        descriptor.Width,
+                        descriptor.Height,
+                        descriptor.Format,
+                        descriptor.NumberType,
+                        layered,
+                        IsFallback: false,
+                        IsStorage: false,
+                        MipLevels: descriptor.MipLevels,
+                        MipLevel: mipLevel,
+                        Pitch: sourceWidth,
+                        TileMode: descriptor.TileMode,
+                        DstSelect: descriptor.DstSelect,
+                        Sampler: ToVulkanSampler(samplerDescriptor),
+                        ArrayedView: true,
+                        ArrayLayers: arrayUploadLayers);
+                    return true;
+                }
+            }
         }
 
         var source = new byte[(int)sourceByteCount];
         if (!TryReadTextureSource(ctx, descriptor, source, detile))
         {
-            texture = CreateFallbackGuestDrawTexture(isStorage, descriptor.Format, descriptor.NumberType);
+            texture = CreateFallbackGuestDrawTexture(
+                isStorage,
+                descriptor.Format,
+                descriptor.NumberType,
+                isArrayed);
             return true;
         }
 
@@ -6455,14 +6561,16 @@ public static class AgcExports
             Pitch: sourceWidth,
             TileMode: descriptor.TileMode,
             DstSelect: descriptor.DstSelect,
-            Sampler: ToVulkanSampler(samplerDescriptor));
+            Sampler: ToVulkanSampler(samplerDescriptor),
+            ArrayedView: isArrayed);
         return true;
     }
 
     private static VulkanGuestDrawTexture CreateFallbackGuestDrawTexture(
         bool isStorage,
         uint format,
-        uint numberType)
+        uint numberType,
+        bool isArrayed = false)
     {
         var fallbackFormat = format == 0 ? 10u : format;
         var fallbackNumberType = numberType;
@@ -6476,7 +6584,8 @@ public static class AgcExports
             IsFallback: true,
             IsStorage: isStorage,
             MipLevels: 1,
-            MipLevel: 0);
+            MipLevel: 0,
+            ArrayedView: isArrayed);
     }
 
     private static void TraceTextureHash(TextureDescriptor descriptor, ReadOnlySpan<byte> source)
@@ -6669,7 +6778,8 @@ public static class AgcExports
                     texture,
                     isStorage,
                     binding.MipLevel ?? 0,
-                    binding.SamplerDescriptor));
+                    binding.SamplerDescriptor,
+                    IsArrayedImageBinding(binding)));
             hasStorageBinding |= isStorage;
 
             var descriptorState = descriptorValid ? string.Empty : "/invalid-desc";
@@ -7204,9 +7314,10 @@ public static class AgcExports
         CpuContext ctx,
         TextureDescriptor descriptor,
         byte[] destination,
-        bool paddedTiledRead)
+        bool paddedTiledRead,
+        ulong byteOffset = 0)
     {
-        if (ctx.Memory.TryRead(descriptor.Address, destination))
+        if (ctx.Memory.TryRead(descriptor.Address + byteOffset, destination))
         {
             return true;
         }
@@ -7227,7 +7338,7 @@ public static class AgcExports
         return unpaddedByteCount != 0 &&
             unpaddedByteCount < (ulong)destination.Length &&
             ctx.Memory.TryRead(
-                descriptor.Address,
+                descriptor.Address + byteOffset,
                 destination.AsSpan(0, (int)unpaddedByteCount));
     }
 
@@ -7499,7 +7610,7 @@ public static class AgcExports
             packetAddress +
             8 +
             ((ulong)(PsTextureUserDataRegister - startRegister) * sizeof(uint));
-        Span<uint> fields = stackalloc uint[4];
+        Span<uint> fields = stackalloc uint[8];
         for (var i = 0; i < fields.Length; i++)
         {
             if (!ctx.TryReadUInt32(descriptorAddress + ((ulong)i * sizeof(uint)), out fields[i]))
@@ -7549,6 +7660,10 @@ public static class AgcExports
         var type = (fields[3] >> 28) & 0xFu;
         var baseLevel = (fields[3] >> 12) & 0xFu;
         var lastLevel = (fields[3] >> 16) & 0xFu;
+        var word4 = fields.Count >= 5 ? fields[4] : 0u;
+        var depth = type == Gen5TextureType2DArray
+            ? (word4 & 0x1FFFu) + 1
+            : 1u;
         // The 128-bit RDNA2 2D resource derives pitch[12:0] from width;
         // the optional extension word only supplies pitch[13].
         var pitch = width;
@@ -7573,7 +7688,8 @@ public static class AgcExports
             baseLevel,
             lastLevel,
             pitch,
-            dstSelect);
+            dstSelect,
+            depth);
         return true;
     }
 
@@ -8328,11 +8444,16 @@ public static class AgcExports
             ? "none"
             : string.Join(',', values.Select(static value => $"{value:X8}"));
 
+    private static bool IsArrayedImageBinding(Gen5ImageBinding binding) =>
+        binding.Control.IsArray &&
+        (binding.Opcode.StartsWith("ImageSample", StringComparison.Ordinal) ||
+         binding.Opcode.StartsWith("ImageGather4", StringComparison.Ordinal));
+
     private static string FormatTextureDescriptor(TextureDescriptor descriptor) =>
         $"addr=0x{descriptor.Address:X16} {descriptor.Width}x{descriptor.Height} " +
         $"fmt={descriptor.Format} num={descriptor.NumberType} tile={descriptor.TileMode} " +
         $"type={descriptor.Type} levels={descriptor.BaseLevel}-{descriptor.LastLevel} " +
-        $"pitch={descriptor.Pitch} dst=0x{descriptor.DstSelect:X3}";
+        $"pitch={descriptor.Pitch} depth={descriptor.Depth} dst=0x{descriptor.DstSelect:X3}";
 
     private static void DumpSpirv(
         string stage,
