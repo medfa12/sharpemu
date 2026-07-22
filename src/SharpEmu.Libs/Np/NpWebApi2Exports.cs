@@ -347,7 +347,7 @@ public static class NpWebApi2Exports
         {
             return ctx.SetReturn(NpWebApi2ErrorRequestNotFound);
         }
-        return ctx.Memory.TryWrite(ctx[CpuRegister.Rdx], new byte[] { 0 })
+        return ctx.TryWriteUInt64(ctx[CpuRegister.Rdx], 0)
             ? ctx.SetReturn(0)
             : ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
     }

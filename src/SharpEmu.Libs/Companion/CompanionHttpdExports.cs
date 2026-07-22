@@ -37,7 +37,7 @@ public static class CompanionHttpdExports
     [SysAbiExport(Nid = "0SySxcuVNG0", ExportName = "sceCompanionHttpdGetUserId", Target = Generation.Gen5, LibraryName = "libSceCompanionHttpd")]
     public static int GetUserId(CpuContext ctx)
     {
-        var output = ctx[CpuRegister.Rsi];
+        var output = ctx[CpuRegister.Rdi];
         if (output == 0) return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
         return ctx.TryWriteInt32(output, 1000) ? Success(ctx) : ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
     }

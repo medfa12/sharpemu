@@ -7,6 +7,6 @@ namespace SharpEmu.Libs.AppContent;
 
 public static class AppContentBundleExports
 {
-    [SysAbiExport(Nid = "xZo2-418Wdo", ExportName = "Func_C59A36FF8D7C59DA", Target = Generation.Gen5, LibraryName = "libSceAppContentBundle")]
+    [SysAbiExport(Nid = "xZo2-418Wdo", ExportName = "Func_C59A36FB8D7C59DA", Target = Generation.Gen5, LibraryName = "libSceAppContentBundle")]
     public static int BundleFunction(CpuContext ctx) => ctx.SetReturn(0);
 }

@@ -418,7 +418,8 @@ public static class NpTrophyExports
     private static void WriteFixedUtf8(Span<byte> destination, string value)
     {
         destination.Clear();
-        var byteCount = Encoding.UTF8.GetByteCount(value);
-        Encoding.UTF8.GetBytes(value, destination[..Math.Min(byteCount, destination.Length - 1)]);
+        if (destination.Length <= 1) return;
+        var encoded = Encoding.UTF8.GetBytes(value);
+        encoded.AsSpan(0, Math.Min(encoded.Length, destination.Length - 1)).CopyTo(destination);
     }
 }

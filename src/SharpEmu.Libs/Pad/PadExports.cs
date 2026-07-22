@@ -382,7 +382,7 @@ public static class PadExports
     public static int PadGetIdleCount(CpuContext ctx) => ctx.SetReturn(0);
 
     [SysAbiExport(Nid = "1Odcw19nADw", ExportName = "scePadGetInfo", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libScePad")]
-    public static int PadGetInfo(CpuContext ctx) => WritePadInfo(ctx, ctx[CpuRegister.Rdi]);
+    public static int PadGetInfo(CpuContext ctx) => WritePadInfo(ctx, ctx[CpuRegister.Rsi]);
 
     [SysAbiExport(Nid = "4x5Im8pr0-4", ExportName = "scePadGetInfoByPortType", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libScePad")]
     public static int PadGetInfoByPortType(CpuContext ctx)

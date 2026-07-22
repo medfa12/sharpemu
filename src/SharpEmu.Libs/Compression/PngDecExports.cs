@@ -54,7 +54,8 @@ public static class PngDecExports
         if (!ctx.Memory.TryRead(pngAddress, png)) return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
         if (!PngCodec.TryDecodeRgba(png, out var metadata, out var rgba)) return ctx.SetReturn(ErrorInvalidData);
         var rowBytes = checked((int)metadata.Width * 4);
-        var stride = pitch == 0 ? rowBytes : checked((int)pitch);
+        if (pitch > int.MaxValue) return ctx.SetReturn(ErrorInvalidSize);
+        var stride = pitch == 0 ? rowBytes : (int)pitch;
         if (stride < rowBytes || (long)stride * metadata.Height > imageSize) return ctx.SetReturn(ErrorInvalidSize);
         var row = new byte[stride];
         for (var y = 0; y < (int)metadata.Height; y++)

@@ -72,7 +72,8 @@ public sealed class PadExtendedExportsTests
     {
         var memory = new SparseGuestMemory();
         var ctx = new CpuContext(memory, Generation.Gen5);
-        ctx[CpuRegister.Rdi] = DataAddress;
+        ctx[CpuRegister.Rdi] = unchecked((ulong)PrimaryPadHandle);
+        ctx[CpuRegister.Rsi] = DataAddress;
 
         PadExports.PadGetInfo(ctx);
 

@@ -274,7 +274,8 @@ public static class Audio3dExports
         var countAddress = ctx[CpuRegister.Rdx];
         if (countAddress == 0 || !ctx.TryReadUInt32(countAddress, out var capacity)) return ctx.SetReturn(InvalidParameter);
         var count = capabilities == 0 ? 3u : Math.Min(capacity, 3u);
-        for (uint i = 0; i < count; i++) if (!ctx.TryWriteUInt32(capabilities + i * 4, i == 0 ? 1u : i == 1 ? 3u : 9u)) return ctx.SetReturn(InvalidParameter);
+        if (capabilities != 0)
+            for (uint i = 0; i < count; i++) if (!ctx.TryWriteUInt32(capabilities + i * 4, i == 0 ? 1u : i == 1 ? 3u : 9u)) return ctx.SetReturn(InvalidParameter);
         return ctx.TryWriteUInt32(countAddress, count) ? Ok(ctx) : ctx.SetReturn(InvalidParameter);
     }
     [SysAbiExport(Nid = "SEggctIeTcI", ExportName = "sceAudio3dPortGetList", Target = Generation.Gen5, LibraryName = "libSceAudio3d")]

@@ -1232,7 +1232,8 @@ public static class HttpExports
         if (ctx[CpuRegister.R9] != 0
             || !TryReadUtf8Z(ctx, ctx[CpuRegister.Rsi], MaxStringLength, out var baseUrl)
             || !TryReadUtf8Z(ctx, ctx[CpuRegister.Rdx], MaxStringLength, out var relative)
-            || !Uri.TryCreate(new Uri(baseUrl, UriKind.Absolute), relative, out var merged))
+            || !Uri.TryCreate(baseUrl, UriKind.Absolute, out var baseUri)
+            || !Uri.TryCreate(baseUri, relative, out var merged))
         {
             return ctx.SetReturn(HttpErrorInvalidValue);
         }

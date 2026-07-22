@@ -283,7 +283,7 @@ public static class NetCtlExports
     public static int NetCtlGetEtherLinkMode(CpuContext ctx) => WriteRequiredUInt32(ctx, ctx[CpuRegister.Rdi], 1);
 
     [SysAbiExport(Nid = "teuK4QnJTGg", ExportName = "sceNetCtlGetIfStat", Target = Generation.Gen5, LibraryName = "libSceNetCtl")]
-    public static int NetCtlGetIfStat(CpuContext ctx) => ClearRequired(ctx, ctx[CpuRegister.Rsi], 64);
+    public static int NetCtlGetIfStat(CpuContext ctx) => ClearRequired(ctx, ctx[CpuRegister.Rdi], 64);
 
     [SysAbiExport(Nid = "xstcTqAhTys", ExportName = "sceNetCtlGetInfoIpcInt", Target = Generation.Gen5, LibraryName = "libSceNetCtl")]
     public static int NetCtlGetInfoIpcInt(CpuContext ctx) => NetCtlGetInfo(ctx);
