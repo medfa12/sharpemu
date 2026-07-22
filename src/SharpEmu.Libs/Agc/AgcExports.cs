@@ -3149,66 +3149,6 @@ public static class AgcExports
     LibraryName = "libSceAgc")]
     public static int DriverRegisterResource(CpuContext ctx)
     {
-        var resourceHandleAddress = ctx[CpuRegister.Rdi];
-        var owner = (uint)ctx[CpuRegister.Rsi];
-        var resourceAddress = ctx[CpuRegister.Rdx];
-        var resourceSize = ctx[CpuRegister.Rcx];
-        var nameAddress = ctx[CpuRegister.R8];
-        var type = (uint)ctx[CpuRegister.R9];
-        if (resourceHandleAddress == 0 || resourceAddress == 0 || resourceSize == 0 ||
-            !ctx.TryReadUInt32(ctx[CpuRegister.Rsp] + sizeof(ulong), out var flags) ||
-            !TryReadGuestCString(
-                ctx,
-                nameAddress,
-                ResourceRegistrationMaxNameLength,
-                out var nameBytes))
-        {
-            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
-        }
-
-        var state = _submittedGpuStates.GetValue(ctx.Memory, static _ => new SubmittedGpuState());
-        uint resourceHandle;
-        lock (state.Gate)
-        {
-            if (!state.ResourceRegistrationInitialized ||
-                owner != state.DefaultOwner &&
-                !state.ResourceOwners.ContainsKey(owner))
-            {
-                return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
-            }
-
-            resourceHandle = state.NextResource++;
-            if (resourceHandle == 0)
-            {
-                return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
-            }
-
-            state.RegisteredResources.Add(
-                resourceHandle,
-                new RegisteredAgcResource(
-                    owner,
-                    resourceAddress,
-                    resourceSize,
-                    System.Text.Encoding.UTF8.GetString(nameBytes),
-                    type,
-                    flags));
-        }
-
-        if (!ctx.TryWriteUInt32(resourceHandleAddress, resourceHandle))
-        {
-            lock (state.Gate)
-            {
-                state.RegisteredResources.Remove(resourceHandle);
-            }
-
-            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
-        }
-
-        TraceAgc(
-            $"agc.driver_register_resource handle={resourceHandle} owner={owner} " +
-            $"resource=0x{resourceAddress:X16} bytes=0x{resourceSize:X} " +
-            $"name={System.Text.Encoding.UTF8.GetString(nameBytes)} type={type} flags={flags}");
-
         return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
     }
 

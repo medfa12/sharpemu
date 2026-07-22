@@ -104,7 +104,9 @@ public sealed class AgcExportsTests
             AgcExports.DriverUnregisterResource(_ctx));
 
         _ctx[CpuRegister.Rdi] = secondResource;
-        Assert.Equal(0, AgcExports.DriverUnregisterResource(_ctx));
+        Assert.Equal(
+            (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT,
+            AgcExports.DriverUnregisterResource(_ctx));
 
         RegisterResource(firstOwner, "replacement resource");
     }
