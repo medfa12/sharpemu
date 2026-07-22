@@ -265,6 +265,12 @@ internal static partial class Gen5SpirvTranslator
         private static readonly bool _debugTonemapSampleOutput =
             Environment.GetEnvironmentVariable(
                 "SHARPEMU_PS_DEBUG_TONEMAP_SAMPLE") == "1";
+        private static readonly bool _debugTonemapGradeOutput =
+            Environment.GetEnvironmentVariable(
+                "SHARPEMU_PS_DEBUG_TONEMAP_GRADE") == "1";
+        private static readonly bool _debugTonemapTransferOutput =
+            Environment.GetEnvironmentVariable(
+                "SHARPEMU_PS_DEBUG_TONEMAP_TRANSFER") == "1";
         // SHARPEMU_PS_FORCE_EXPOSURE_SCALAR=1 (high-probability toggle): for
         // the tonemap/composite pixel shader at PixelShaderAddress
         // 0x0000000500640200 only, force the exposure-scale S_BUFFER_LOAD_DWORD
@@ -1798,7 +1804,40 @@ internal static partial class Gen5SpirvTranslator
                 return true;
             }
 
-            return TryEmitVectorAlu(instruction, out error);
+            var emitted = TryEmitVectorAlu(instruction, out error);
+            if (emitted && IsKnownTonemapShader())
+            {
+                if (_debugTonemapGradeOutput)
+                {
+                    CaptureTonemapCheckpoint(instruction.Pc, 0x634u, 0x638u, 0x63Cu);
+                }
+                else if (_debugTonemapTransferOutput)
+                {
+                    CaptureTonemapCheckpoint(instruction.Pc, 0x764u, 0x768u, 0x76Cu);
+                }
+            }
+
+            return emitted;
+        }
+
+        private void CaptureTonemapCheckpoint(
+            uint pc,
+            uint redPc,
+            uint greenPc,
+            uint bluePc)
+        {
+            if (pc == redPc)
+            {
+                StoreV(240, LoadV(10));
+            }
+            else if (pc == greenPc)
+            {
+                StoreV(241, LoadV(12));
+            }
+            else if (pc == bluePc)
+            {
+                StoreV(242, LoadV(9));
+            }
         }
 
         private bool TryEmitDataShare(
@@ -3648,7 +3687,10 @@ internal static partial class Gen5SpirvTranslator
                 return Float(1f);
             }
 
-            if (_debugTonemapSampleOutput && IsKnownTonemapShader())
+            if ((_debugTonemapSampleOutput ||
+                 _debugTonemapGradeOutput ||
+                 _debugTonemapTransferOutput) &&
+                IsKnownTonemapShader())
             {
                 return component < 3
                     ? Bitcast(_floatType, LoadV(240u + (uint)component))
