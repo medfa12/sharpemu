@@ -39,6 +39,8 @@ public static class KernelRuntimeCompatExports
     private const ulong TlsNewReplaceOffset = 0x300;
     private const int MallocReplaceSize = 0x70;
     private const int NewReplaceSize = 0x68;
+    private const int SysmoduleInvalidId = unchecked((int)0x805A1000);
+    private const int SysmoduleNotLoaded = unchecked((int)0x805A1001);
     private const int OrbisTimesecSize = sizeof(long) + sizeof(uint) + sizeof(uint);
     private const ulong ModuleInfoHandleOffset = 0x108;
     private const ulong ModuleInfoNameOffset = 0x10;
@@ -1996,5 +1998,127 @@ public static class KernelRuntimeCompatExports
     private static bool ShouldTraceVirtualMemory()
     {
         return string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_VIRTUAL_MEMORY"), "1", StringComparison.Ordinal);
+    }
+
+    [SysAbiExport(Nid = "D8cuU4d72xM", ExportName = "sceSysmoduleGetModuleHandleInternal", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSysmodule")]
+    public static int SysmoduleGetModuleHandleInternal(CpuContext ctx)
+    {
+        var moduleId = unchecked((int)ctx[CpuRegister.Rdi]);
+        if ((moduleId & 0x7FFFFFFF) == 0)
+        {
+            return ctx.SetReturn(SysmoduleInvalidId);
+        }
+
+        var loaded = KernelModuleRegistry.IsSysmoduleLoaded(moduleId);
+        lock (_stateGate)
+        {
+            loaded |= _loadedSysmodules.Contains(moduleId);
+        }
+
+        if (!loaded)
+        {
+            return ctx.SetReturn(SysmoduleNotLoaded);
+        }
+
+        var handleAddress = ctx[CpuRegister.Rsi];
+        if (handleAddress != 0)
+        {
+            var handle = KernelModuleRegistry.MarkSysmoduleLoaded(moduleId);
+            if (!ctx.TryWriteInt32(handleAddress, handle))
+            {
+                return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+            }
+        }
+
+        return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
+    }
+
+    [SysAbiExport(Nid = "4fU5yvOkVG4", ExportName = "sceSysmoduleGetModuleInfoForUnwind", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSysmodule")]
+    public static int SysmoduleGetModuleInfoForUnwind(CpuContext ctx) => KernelGetModuleInfoForUnwind(ctx);
+
+    [SysAbiExport(Nid = "ctfO7dQ7geg", ExportName = "sceSysmoduleIsCalledFromSysModule", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSysmodule")]
+    public static int SysmoduleIsCalledFromSysModule(CpuContext ctx) => ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
+
+    [SysAbiExport(Nid = "no6T3EfiS3E", ExportName = "sceSysmoduleIsCameraPreloaded", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSysmodule")]
+    public static int SysmoduleIsCameraPreloaded(CpuContext ctx) => ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
+
+    [SysAbiExport(Nid = "ynFKQ5bfGks", ExportName = "sceSysmoduleIsLoadedInternal", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSysmodule")]
+    public static int SysmoduleIsLoadedInternal(CpuContext ctx)
+    {
+        var moduleId = unchecked((int)ctx[CpuRegister.Rdi]);
+        if ((moduleId & 0x7FFFFFFF) == 0)
+        {
+            return ctx.SetReturn(SysmoduleInvalidId);
+        }
+
+        var loaded = KernelModuleRegistry.IsSysmoduleLoaded(moduleId);
+        lock (_stateGate)
+        {
+            loaded |= _loadedSysmodules.Contains(moduleId);
+        }
+
+        return ctx.SetReturn(loaded ? 0 : SysmoduleNotLoaded);
+    }
+
+    [SysAbiExport(Nid = "CU8m+Qs+HN4", ExportName = "sceSysmoduleLoadModuleByNameInternal", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSysmodule")]
+    public static int SysmoduleLoadModuleByNameInternal(CpuContext ctx) => ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
+
+    [SysAbiExport(Nid = "39iV5E1HoCk", ExportName = "sceSysmoduleLoadModuleInternal", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSysmodule")]
+    public static int SysmoduleLoadModuleInternal(CpuContext ctx)
+    {
+        var moduleId = unchecked((int)ctx[CpuRegister.Rdi]);
+        if ((moduleId & 0x7FFFFFFF) == 0)
+        {
+            return ctx.SetReturn(SysmoduleInvalidId);
+        }
+
+        _ = KernelModuleRegistry.MarkSysmoduleLoaded(moduleId);
+        lock (_stateGate)
+        {
+            _loadedSysmodules.Add(moduleId);
+        }
+
+        return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
+    }
+
+    [SysAbiExport(Nid = "lZ6RvVl0vo0", ExportName = "sceSysmoduleMapLibcForLibkernel", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSysmodule")]
+    public static int SysmoduleMapLibcForLibkernel(CpuContext ctx) => ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
+
+    [SysAbiExport(Nid = "DOO+zuW1lrE", ExportName = "sceSysmodulePreloadModuleForLibkernel", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSysmodule")]
+    public static int SysmodulePreloadModuleForLibkernel(CpuContext ctx) => ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
+
+    [SysAbiExport(Nid = "vpTHmA6Knvg", ExportName = "sceSysmoduleUnloadModuleByNameInternal", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSysmodule")]
+    public static int SysmoduleUnloadModuleByNameInternal(CpuContext ctx) => ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
+
+    [SysAbiExport(Nid = "vXZhrtJxkGc", ExportName = "sceSysmoduleUnloadModuleInternal", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSysmodule")]
+    public static int SysmoduleUnloadModuleInternal(CpuContext ctx) => UnloadSysmoduleInternal(ctx);
+
+    [SysAbiExport(Nid = "aKa6YfBKZs4", ExportName = "sceSysmoduleUnloadModuleInternalWithArg", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSysmodule")]
+    public static int SysmoduleUnloadModuleInternalWithArg(CpuContext ctx)
+    {
+        var resultAddress = ctx[CpuRegister.R8];
+        if (resultAddress != 0 && !ctx.TryWriteInt32(resultAddress, 0))
+        {
+            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        return UnloadSysmoduleInternal(ctx);
+    }
+
+    private static int UnloadSysmoduleInternal(CpuContext ctx)
+    {
+        var moduleId = unchecked((int)ctx[CpuRegister.Rdi]);
+        if ((moduleId & 0x7FFFFFFF) == 0)
+        {
+            return ctx.SetReturn(SysmoduleInvalidId);
+        }
+
+        KernelModuleRegistry.MarkSysmoduleUnloaded(moduleId);
+        lock (_stateGate)
+        {
+            _loadedSysmodules.Remove(moduleId);
+        }
+
+        return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
     }
 }
