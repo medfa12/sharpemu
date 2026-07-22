@@ -333,6 +333,54 @@ internal static unsafe partial class VulkanVideoPresenter
     private static bool _closed;
     private const string DebugUtilsExtensionName = "VK_EXT_debug_utils";
     private const uint NvidiaVendorId = 0x10DE;
+    private const uint AmdVendorId = 0x1002;
+    // Other GPU PCI vendor IDs, for reference when adding future rules:
+    // Intel 0x8086, Apple 0x106B, Qualcomm 0x5143 (Windows-on-ARM), Microsoft software 0x1414.
+    private const int LastResortPenalty = 1000;
+
+    internal static int ScorePhysicalDevice(
+        PhysicalDeviceProperties properties,
+        string name,
+        string? deviceOverride)
+    {
+        if (!string.IsNullOrWhiteSpace(deviceOverride))
+        {
+            return name.Contains(deviceOverride, StringComparison.OrdinalIgnoreCase) ? 1000 : -1000;
+        }
+
+        var score = properties.DeviceType switch
+        {
+            PhysicalDeviceType.DiscreteGpu => 300,
+            PhysicalDeviceType.VirtualGpu => 100,
+            PhysicalDeviceType.IntegratedGpu => 50,
+            PhysicalDeviceType.Cpu => 20,
+            _ => 10,
+        };
+
+        if (properties.VendorID == NvidiaVendorId)
+        {
+            score += 500;
+        }
+
+        score -= ComputeDevicePenalty(properties, OperatingSystem.IsWindows());
+
+        return score;
+    }
+
+    internal static int ComputeDevicePenalty(PhysicalDeviceProperties properties, bool isWindows)
+    {
+        var penalty = 0;
+
+        if (isWindows &&
+            properties.DeviceType == PhysicalDeviceType.IntegratedGpu &&
+            properties.VendorID == AmdVendorId)
+        {
+            penalty += LastResortPenalty;
+        }
+
+        return penalty;
+    }
+
     private static bool _splashHidden;
     private static long _enqueuedGuestWorkSequence;
     private static long _completedGuestWorkSequence;
@@ -3617,34 +3665,6 @@ internal static unsafe partial class VulkanVideoPresenter
                 $"[LOADER][INFO] Vulkan device: {selectedName} ({selected.DeviceType})");
             VideoOutExports.SetSelectedGpuName(selectedName);
             _window.Title = VideoOutExports.GetWindowTitle();
-        }
-
-        private static int ScorePhysicalDevice(
-            PhysicalDeviceProperties properties,
-            string name,
-            string? deviceOverride)
-        {
-            if (!string.IsNullOrWhiteSpace(deviceOverride))
-            {
-                return name.Contains(deviceOverride, StringComparison.OrdinalIgnoreCase) ? 1000 : -1000;
-            }
-
-            var score = properties.DeviceType switch
-            {
-                PhysicalDeviceType.DiscreteGpu => 300,
-                PhysicalDeviceType.VirtualGpu => 100,
-                PhysicalDeviceType.Cpu => 50,
-                // Last resort: only picked when nothing else can present.
-                PhysicalDeviceType.IntegratedGpu => -100,
-                _ => 10,
-            };
-
-            if (properties.VendorID == NvidiaVendorId)
-            {
-                score += 500;
-            }
-
-            return score;
         }
 
         private void CreateDevice()
