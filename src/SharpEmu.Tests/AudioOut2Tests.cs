@@ -52,47 +52,137 @@ public sealed class AudioOut2Tests
 
     private static int Result(CpuContext ctx) => unchecked((int)(uint)ctx[CpuRegister.Rax]);
 
+    private const int AudioOut2ErrorInvalidParam = unchecked((int)0x80268001);
+    private const int AudioOut2ErrorNotReady = unchecked((int)0x80268008);
+    private const int AudioOut2ErrorInvalidPort = unchecked((int)0x80268009);
+    private const int AudioOut2ErrorPortFull = unchecked((int)0x80268012);
+
+    private static ulong CreateUser(CpuContext ctx)
+    {
+        ctx[CpuRegister.Rdi] = 0;
+        ctx[CpuRegister.Rsi] = 0x3200;
+        AudioOut2Exports.AudioOut2UserCreate(ctx);
+        Assert.Equal(0, Result(ctx));
+        Assert.True(ctx.TryReadUInt64(0x3200, out var user));
+        return user;
+    }
+
     private static ulong CreatePort(CpuContext ctx)
     {
         // sceAudioOut2PortCreate(context, const PortParam*, out u64*): the
         // param struct carries the u16 port type at +0x00 and the u32 data
         // format at +0x04 (main port, stereo float here).
         using var _ = SndzEnabled();
+        var context = CreateContext(ctx);
+        var user = CreateUser(ctx);
         ctx.TryWriteUInt16(0x3000, 0); // port type: main
         ctx.TryWriteUInt32(0x3004, 0x200); // data format: 2-channel float
-        ctx[CpuRegister.Rdi] = 1; // context handle
+        ctx.TryWriteUInt32(0x3008, 48000);
+        ctx.TryWriteUInt32(0x300C, 0);
+        ctx.TryWriteUInt64(0x3010, user);
+        ctx[CpuRegister.Rdi] = context;
         ctx[CpuRegister.Rsi] = 0x3000; // param address
         ctx[CpuRegister.Rdx] = 0x3100; // out port address
         AudioOut2Exports.AudioOut2PortCreate(ctx);
-        ctx.TryReadUInt64(0x3100, out var port);
+        Assert.Equal(0, Result(ctx));
+        Assert.True(ctx.TryReadUInt64(0x3100, out var port));
         return port;
     }
 
     private static ulong CreateContext(CpuContext ctx)
     {
+        // SDK 4.00 SceAudioOut2ContextParam: maxPorts +0x00,
+        // queueDepth +0x0C, numGrains +0x10.
+        Assert.True(ctx.Memory.TryWrite(0x4000, new byte[0x40]));
+        ctx.TryWriteUInt32(0x4000, 8);
+        ctx.TryWriteUInt32(0x400C, 4);
+        ctx.TryWriteUInt32(0x4010, 512);
         ctx[CpuRegister.Rdi] = 0x4000; // param address
         ctx[CpuRegister.Rsi] = 0x5000; // memory address
-        ctx[CpuRegister.Rdx] = 0x10000; // memory size
+        ctx[CpuRegister.Rdx] = 0x20000; // memory size
         ctx[CpuRegister.Rcx] = 0x4100; // out context address
         AudioOut2Exports.AudioOut2ContextCreate(ctx);
-        ctx.TryReadUInt64(0x4100, out var context);
+        Assert.Equal(0, Result(ctx));
+        Assert.True(ctx.TryReadUInt64(0x4100, out var context));
+        Assert.NotEqual(0UL, context);
         return context;
     }
 
-    private const int AudioOut2ErrorPortFull = unchecked((int)0x80268012);
+    [Fact]
+    public void ContextResetParam_WritesSdkLayoutAndSize()
+    {
+        var ctx = NewContext(out _);
+        Assert.True(ctx.TryWriteUInt64(0x4040, 0xDEADBEEFCAFEF00D));
+        ctx[CpuRegister.Rdi] = 0x4000;
+
+        AudioOut2Exports.AudioOut2ContextResetParam(ctx);
+
+        Assert.Equal(0, Result(ctx));
+        Assert.True(ctx.TryReadUInt32(0x4000, out var maxPorts));
+        Assert.Equal(8u, maxPorts);
+        Assert.True(ctx.TryReadUInt32(0x400C, out var queueDepth));
+        Assert.Equal(1u, queueDepth);
+        Assert.True(ctx.TryReadUInt32(0x4010, out var numGrains));
+        Assert.Equal(0x100u, numGrains);
+        Assert.True(ctx.TryReadUInt64(0x4040, out var sentinel));
+        Assert.Equal(0xDEADBEEFCAFEF00D, sentinel);
+    }
+
+    [Fact]
+    public void ContextQueryMemory_DefaultShapeMatchesFirmwareSizing()
+    {
+        var ctx = NewContext(out _);
+        Assert.True(ctx.Memory.TryWrite(0x4000, new byte[0x40]));
+        ctx.TryWriteUInt32(0x4000, 8);
+        ctx.TryWriteUInt32(0x400C, 4);
+        ctx.TryWriteUInt32(0x4010, 512);
+        ctx[CpuRegister.Rdi] = 0x4000;
+        ctx[CpuRegister.Rsi] = 0x4100;
+
+        AudioOut2Exports.AudioOut2ContextQueryMemory(ctx);
+
+        Assert.Equal(0, Result(ctx));
+        Assert.True(ctx.TryReadUInt64(0x4100, out var memorySize));
+        Assert.Equal(0x14A0CUL, memorySize);
+    }
+
+    [Fact]
+    public void ContextCreate_RejectsShortBufferAndWritesInvalidHandle()
+    {
+        var ctx = NewContext(out _);
+        Assert.True(ctx.Memory.TryWrite(0x4000, new byte[0x40]));
+        ctx.TryWriteUInt32(0x4000, 8);
+        ctx.TryWriteUInt32(0x400C, 4);
+        ctx.TryWriteUInt32(0x4010, 512);
+        ctx.TryWriteUInt64(0x4100, 0);
+        ctx[CpuRegister.Rdi] = 0x4000;
+        ctx[CpuRegister.Rsi] = 0x5000;
+        ctx[CpuRegister.Rdx] = 0x14A0B;
+        ctx[CpuRegister.Rcx] = 0x4100;
+
+        AudioOut2Exports.AudioOut2ContextCreate(ctx);
+
+        Assert.Equal(AudioOut2ErrorInvalidParam, Result(ctx));
+        Assert.True(ctx.TryReadUInt64(0x4100, out var context));
+        Assert.Equal(ulong.MaxValue, context);
+    }
 
     [Fact]
     public void PortCreate_RefusedWhenParked_AndLeavesOutSlotUntouched()
     {
         using var scope = SndzDisabled("1");
         var ctx = NewContext(out _);
+        var context = CreateContext(ctx);
+        var user = CreateUser(ctx);
 
         // The Sndz wrapper keeps its port slot at -1 until PortCreate stores a
         // handle; a refused create must not write through the out pointer.
         ctx.TryWriteUInt64(0x3100, ulong.MaxValue);
         ctx.TryWriteUInt16(0x3000, 0);
         ctx.TryWriteUInt32(0x3004, 0x200);
-        ctx[CpuRegister.Rdi] = 1;
+        ctx.TryWriteUInt32(0x3008, 48000);
+        ctx.TryWriteUInt64(0x3010, user);
+        ctx[CpuRegister.Rdi] = context;
         ctx[CpuRegister.Rsi] = 0x3000;
         ctx[CpuRegister.Rdx] = 0x3100;
         AudioOut2Exports.AudioOut2PortCreate(ctx);
@@ -107,10 +197,14 @@ public sealed class AudioOut2Tests
     {
         using var scope = SndzDisabled("1");
         var ctx = NewContext(out _);
+        var context = CreateContext(ctx);
+        var user = CreateUser(ctx);
 
         ctx.TryWriteUInt16(0x3000, 0);
         ctx.TryWriteUInt32(0x3004, 0x200);
-        ctx[CpuRegister.Rdi] = 1;
+        ctx.TryWriteUInt32(0x3008, 48000);
+        ctx.TryWriteUInt64(0x3010, user);
+        ctx[CpuRegister.Rdi] = context;
         ctx[CpuRegister.Rsi] = 0x3000;
         ctx[CpuRegister.Rdx] = 0x3100;
         AudioOut2Exports.AudioOut2PortCreate(ctx);
@@ -129,7 +223,7 @@ public sealed class AudioOut2Tests
         ctx[CpuRegister.Rdx] = 0x3100;
         AudioOut2Exports.AudioOut2PortCreate(ctx);
 
-        Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT, Result(ctx));
+        Assert.Equal(AudioOut2ErrorInvalidParam, Result(ctx));
     }
 
     [Fact]
@@ -151,7 +245,7 @@ public sealed class AudioOut2Tests
 
         AudioOut2Exports.AudioOut2PortSetAttributes(ctx);
 
-        Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT, Result(ctx));
+        Assert.Equal(AudioOut2ErrorInvalidParam, Result(ctx));
     }
 
     [Fact]
@@ -160,7 +254,13 @@ public sealed class AudioOut2Tests
         var ctx = NewContext(out _);
         var port = CreatePort(ctx);
 
+        ctx.TryWriteUInt64(0x3400, 0x9000); // SceAudioOut2Pcm.data
+        ctx.TryWriteUInt32(0x3300, 0); // PCM attributeId
+        ctx.TryWriteUInt64(0x3308, 0x3400); // value
+        ctx.TryWriteUInt64(0x3310, 8); // valueSize
         ctx[CpuRegister.Rdi] = port;
+        ctx[CpuRegister.Rsi] = 0x3300;
+        ctx[CpuRegister.Rdx] = 1;
         AudioOut2Exports.AudioOut2PortSetAttributes(ctx);
 
         Assert.Equal(0, Result(ctx));
@@ -174,7 +274,7 @@ public sealed class AudioOut2Tests
 
         AudioOut2Exports.AudioOut2ContextPush(ctx);
 
-        Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT, Result(ctx));
+        Assert.Equal(AudioOut2ErrorInvalidParam, Result(ctx));
     }
 
     [Fact]
@@ -184,6 +284,7 @@ public sealed class AudioOut2Tests
         var context = CreateContext(ctx);
 
         ctx[CpuRegister.Rdi] = context;
+        ctx[CpuRegister.Rsi] = 0;
         AudioOut2Exports.AudioOut2ContextPush(ctx);
 
         Assert.Equal(0, Result(ctx));
@@ -197,7 +298,7 @@ public sealed class AudioOut2Tests
 
         AudioOut2Exports.AudioOut2ContextAdvance(ctx);
 
-        Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT, Result(ctx));
+        Assert.Equal(AudioOut2ErrorInvalidParam, Result(ctx));
     }
 
     [Fact]
@@ -221,12 +322,13 @@ public sealed class AudioOut2Tests
         ctx[CpuRegister.Rdi] = 0;
         ctx[CpuRegister.Rsi] = 0x6000;
         AudioOut2Exports.AudioOut2ContextGetQueueLevel(ctx);
-        Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT, Result(ctx));
+        Assert.Equal(AudioOut2ErrorInvalidParam, Result(ctx));
 
         ctx[CpuRegister.Rdi] = context;
         ctx[CpuRegister.Rsi] = 0;
+        ctx[CpuRegister.Rdx] = 0;
         AudioOut2Exports.AudioOut2ContextGetQueueLevel(ctx);
-        Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT, Result(ctx));
+        Assert.Equal(AudioOut2ErrorInvalidParam, Result(ctx));
     }
 
     [Fact]
@@ -259,6 +361,70 @@ public sealed class AudioOut2Tests
         AudioOut2Exports.AudioOut2ContextGetQueueLevel(ctx);
 
         Assert.Equal(0, Result(ctx));
+    }
+
+    [Fact]
+    public void ContextGetQueueLevel_ToleratesNullLevelOutput()
+    {
+        var ctx = NewContext(out _);
+        var context = CreateContext(ctx);
+
+        ctx[CpuRegister.Rdi] = context;
+        ctx[CpuRegister.Rsi] = 0;
+        ctx[CpuRegister.Rdx] = 0x6010;
+        AudioOut2Exports.AudioOut2ContextGetQueueLevel(ctx);
+
+        Assert.Equal(0, Result(ctx));
+        Assert.True(ctx.TryReadUInt32(0x6010, out var available));
+        Assert.Equal(4u, available);
+    }
+
+    [Fact]
+    public void LoContextSetAttributes_ValidatesRadiusRangeAndAttributeSize()
+    {
+        var ctx = NewContext(out _);
+        var context = CreateContext(ctx);
+        ctx.TryWriteUInt32(0x6200, unchecked((uint)BitConverter.SingleToInt32Bits(0.5f)));
+        ctx.TryWriteUInt32(0x6100, 0); // downmix spread radius
+        ctx.TryWriteUInt64(0x6108, 0x6200);
+        ctx.TryWriteUInt64(0x6110, 4);
+        ctx[CpuRegister.Rdi] = context;
+        ctx[CpuRegister.Rsi] = 0x6100;
+        ctx[CpuRegister.Rdx] = 1;
+
+        AudioOut2Exports.AudioOut2LoContextSetAttributes(ctx);
+        Assert.Equal(0, Result(ctx));
+
+        ctx.TryWriteUInt32(0x6200, unchecked((uint)BitConverter.SingleToInt32Bits(2.1f)));
+        AudioOut2Exports.AudioOut2LoContextSetAttributes(ctx);
+        Assert.Equal(AudioOut2ErrorInvalidParam, Result(ctx));
+
+        ctx.TryWriteUInt32(0x6200, unchecked((uint)BitConverter.SingleToInt32Bits(0.5f)));
+        ctx.TryWriteUInt64(0x6110, 8);
+        AudioOut2Exports.AudioOut2LoContextSetAttributes(ctx);
+        Assert.Equal(AudioOut2ErrorInvalidParam, Result(ctx));
+    }
+
+    [Fact]
+    public void PortSetAttributes_RejectsNullPcmAndUnknownPort()
+    {
+        var ctx = NewContext(out _);
+        var port = CreatePort(ctx);
+        ctx.TryWriteUInt64(0x3400, 0);
+        ctx.TryWriteUInt32(0x3300, 0);
+        ctx.TryWriteUInt64(0x3308, 0x3400);
+        ctx.TryWriteUInt64(0x3310, 8);
+        ctx[CpuRegister.Rdi] = port;
+        ctx[CpuRegister.Rsi] = 0x3300;
+        ctx[CpuRegister.Rdx] = 1;
+
+        AudioOut2Exports.AudioOut2PortSetAttributes(ctx);
+        Assert.Equal(AudioOut2ErrorInvalidParam, Result(ctx));
+
+        ctx.TryWriteUInt64(0x3400, 0x9000);
+        ctx[CpuRegister.Rdi] = 0xDEADBEEF;
+        AudioOut2Exports.AudioOut2PortSetAttributes(ctx);
+        Assert.Equal(AudioOut2ErrorInvalidPort, Result(ctx));
     }
 
     [Fact]
@@ -313,20 +479,24 @@ public sealed class AudioOut2Tests
     // One grain is 512 samples at 48kHz: 10666 microseconds.
     private const long GrainMicros = 512L * 1_000_000L / 48_000L;
 
-    private static uint ReadQueueLevel(CpuContext ctx, ulong context, out uint available)
+    private static uint ReadQueueLevel(
+        CpuContext ctx,
+        ulong context,
+        out uint available,
+        int expectedResult = 0)
     {
         ctx[CpuRegister.Rdi] = context;
         ctx[CpuRegister.Rsi] = 0x6000;
         ctx[CpuRegister.Rdx] = 0x6010;
         AudioOut2Exports.AudioOut2ContextGetQueueLevel(ctx);
-        Assert.Equal(0, Result(ctx));
+        Assert.Equal(expectedResult, Result(ctx));
         Assert.True(ctx.TryReadUInt32(0x6000, out var level));
         Assert.True(ctx.TryReadUInt32(0x6010, out available));
         return level;
     }
 
     [Fact]
-    public void ContextPush_QueuesGrains_AndWallClockDrainsThem()
+    public void ContextAdvance_StagesGrains_AndPushCommitsThemForDrain()
     {
         // The Sndz audio-out loop (eboot 0x800EB3800) is paced by
         // ContextPush(ctx, blocking=1): each pushed grain must take one grain
@@ -341,10 +511,14 @@ public sealed class AudioOut2Tests
             var context = CreateContext(ctx);
 
             ctx[CpuRegister.Rdi] = context;
-            ctx[CpuRegister.Rsi] = 1; // blocking, but the queue has room
-            AudioOut2Exports.AudioOut2ContextPush(ctx);
-            AudioOut2Exports.AudioOut2ContextPush(ctx);
+            AudioOut2Exports.AudioOut2ContextAdvance(ctx);
+            AudioOut2Exports.AudioOut2ContextAdvance(ctx);
             Assert.Equal(2u, ReadQueueLevel(ctx, context, out var available));
+            Assert.Equal(2u, available);
+
+            ctx[CpuRegister.Rsi] = 0; // commit without waiting
+            AudioOut2Exports.AudioOut2ContextPush(ctx);
+            Assert.Equal(2u, ReadQueueLevel(ctx, context, out available));
             Assert.Equal(2u, available);
 
             // One grain period of wall time drains exactly one grain.
@@ -364,7 +538,7 @@ public sealed class AudioOut2Tests
     }
 
     [Fact]
-    public void ContextPush_NonBlocking_ReportsNotReadyWhenFull_AndRecoversAfterDrain()
+    public void ContextAdvance_ReportsNotReadyWhenFull_AndRecoversAfterDrain()
     {
         long now = 1_000_000; // nonzero: 0 is the "clock unset" sentinel in the drain
         AudioOut2Exports.MicrosecondClockOverride = () => now;
@@ -377,20 +551,27 @@ public sealed class AudioOut2Tests
             ctx[CpuRegister.Rsi] = 0; // non-blocking
             for (var i = 0; i < 4; i++)
             {
+                AudioOut2Exports.AudioOut2ContextAdvance(ctx);
+                Assert.Equal(0, Result(ctx));
                 AudioOut2Exports.AudioOut2ContextPush(ctx);
                 Assert.Equal(0, Result(ctx));
             }
 
-            // Queue depth is 4: the fifth push with frozen time must fail
-            // with SCE_AUDIO_OUT2_ERROR_NOT_READY instead of succeeding.
-            AudioOut2Exports.AudioOut2ContextPush(ctx);
-            Assert.Equal(unchecked((int)0x80268008), Result(ctx));
+            Assert.Equal(4u, ReadQueueLevel(ctx, context, out var available, AudioOut2ErrorNotReady));
+            Assert.Equal(0u, available);
+
+            // Queue depth is 4: the fifth Advance with frozen time fails.
+            AudioOut2Exports.AudioOut2ContextAdvance(ctx);
+            Assert.Equal(AudioOut2ErrorNotReady, Result(ctx));
 
             // After one grain of wall time a slot frees up again.
             now += GrainMicros;
+            AudioOut2Exports.AudioOut2ContextAdvance(ctx);
+            Assert.Equal(0, Result(ctx));
+            ctx[CpuRegister.Rsi] = 0;
             AudioOut2Exports.AudioOut2ContextPush(ctx);
             Assert.Equal(0, Result(ctx));
-            Assert.Equal(4u, ReadQueueLevel(ctx, context, out _));
+            Assert.Equal(4u, ReadQueueLevel(ctx, context, out _, AudioOut2ErrorNotReady));
         }
         finally
         {
@@ -399,7 +580,7 @@ public sealed class AudioOut2Tests
     }
 
     [Fact]
-    public void ContextAdvance_DrainsQueueOnWallClock()
+    public void ContextGetQueueLevel_DrainsCommittedQueueOnWallClock()
     {
         long now = 1_000_000; // nonzero: 0 is the "clock unset" sentinel in the drain
         AudioOut2Exports.MicrosecondClockOverride = () => now;
@@ -410,14 +591,13 @@ public sealed class AudioOut2Tests
 
             ctx[CpuRegister.Rdi] = context;
             ctx[CpuRegister.Rsi] = 0;
-            AudioOut2Exports.AudioOut2ContextPush(ctx);
-            AudioOut2Exports.AudioOut2ContextPush(ctx);
-            AudioOut2Exports.AudioOut2ContextPush(ctx);
+            for (var index = 0; index < 3; index++)
+            {
+                AudioOut2Exports.AudioOut2ContextAdvance(ctx);
+                AudioOut2Exports.AudioOut2ContextPush(ctx);
+            }
 
             now += 2 * GrainMicros;
-            ctx[CpuRegister.Rdi] = context;
-            AudioOut2Exports.AudioOut2ContextAdvance(ctx);
-            Assert.Equal(0, Result(ctx));
             Assert.Equal(1u, ReadQueueLevel(ctx, context, out _));
         }
         finally
@@ -436,8 +616,10 @@ public sealed class AudioOut2Tests
 
         ctx[CpuRegister.Rdi] = context;
         ctx[CpuRegister.Rsi] = 1;
-        for (var i = 0; i < 5; i++)
+        for (var i = 0; i < 4; i++)
         {
+            AudioOut2Exports.AudioOut2ContextAdvance(ctx);
+            Assert.Equal(0, Result(ctx));
             AudioOut2Exports.AudioOut2ContextPush(ctx);
             Assert.Equal(0, Result(ctx));
         }
@@ -455,15 +637,17 @@ public sealed class AudioOut2Tests
 
             ctx[CpuRegister.Rdi] = context;
             ctx[CpuRegister.Rsi] = 0;
+            AudioOut2Exports.AudioOut2ContextAdvance(ctx);
             AudioOut2Exports.AudioOut2ContextPush(ctx);
 
             ctx[CpuRegister.Rdi] = context;
             AudioOut2Exports.AudioOut2ContextDestroy(ctx);
             Assert.Equal(0, Result(ctx));
 
-            // A stale handle reports an empty queue instead of leaking level.
-            Assert.Equal(0u, ReadQueueLevel(ctx, context, out var available));
-            Assert.Equal(4u, available);
+            ctx[CpuRegister.Rsi] = 0x6000;
+            ctx[CpuRegister.Rdx] = 0x6010;
+            AudioOut2Exports.AudioOut2ContextGetQueueLevel(ctx);
+            Assert.Equal(AudioOut2ErrorInvalidParam, Result(ctx));
         }
         finally
         {
