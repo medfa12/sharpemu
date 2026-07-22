@@ -99,7 +99,7 @@ public sealed class AudioOut2Tests
         ctx.TryWriteUInt32(0x4010, 512);
         ctx[CpuRegister.Rdi] = 0x4000; // param address
         ctx[CpuRegister.Rsi] = 0x5000; // memory address
-        ctx[CpuRegister.Rdx] = 0x10000; // memory size
+        ctx[CpuRegister.Rdx] = 0x20000; // memory size
         ctx[CpuRegister.Rcx] = 0x4100; // out context address
         AudioOut2Exports.AudioOut2ContextCreate(ctx);
         Assert.Equal(0, Result(ctx));
@@ -126,6 +126,45 @@ public sealed class AudioOut2Tests
         Assert.Equal(0x100u, numGrains);
         Assert.True(ctx.TryReadUInt64(0x4040, out var sentinel));
         Assert.Equal(0xDEADBEEFCAFEF00D, sentinel);
+    }
+
+    [Fact]
+    public void ContextQueryMemory_DefaultShapeMatchesFirmwareSizing()
+    {
+        var ctx = NewContext(out _);
+        Assert.True(ctx.Memory.TryWrite(0x4000, new byte[0x40]));
+        ctx.TryWriteUInt32(0x4000, 8);
+        ctx.TryWriteUInt32(0x400C, 4);
+        ctx.TryWriteUInt32(0x4010, 512);
+        ctx[CpuRegister.Rdi] = 0x4000;
+        ctx[CpuRegister.Rsi] = 0x4100;
+
+        AudioOut2Exports.AudioOut2ContextQueryMemory(ctx);
+
+        Assert.Equal(0, Result(ctx));
+        Assert.True(ctx.TryReadUInt64(0x4100, out var memorySize));
+        Assert.Equal(0x14A0CUL, memorySize);
+    }
+
+    [Fact]
+    public void ContextCreate_RejectsShortBufferAndWritesInvalidHandle()
+    {
+        var ctx = NewContext(out _);
+        Assert.True(ctx.Memory.TryWrite(0x4000, new byte[0x40]));
+        ctx.TryWriteUInt32(0x4000, 8);
+        ctx.TryWriteUInt32(0x400C, 4);
+        ctx.TryWriteUInt32(0x4010, 512);
+        ctx.TryWriteUInt64(0x4100, 0);
+        ctx[CpuRegister.Rdi] = 0x4000;
+        ctx[CpuRegister.Rsi] = 0x5000;
+        ctx[CpuRegister.Rdx] = 0x14A0B;
+        ctx[CpuRegister.Rcx] = 0x4100;
+
+        AudioOut2Exports.AudioOut2ContextCreate(ctx);
+
+        Assert.Equal(AudioOut2ErrorInvalidParam, Result(ctx));
+        Assert.True(ctx.TryReadUInt64(0x4100, out var context));
+        Assert.Equal(ulong.MaxValue, context);
     }
 
     [Fact]

@@ -61,7 +61,7 @@ public sealed class AudioOut2ExportsTests
         Assert.True(ctx.TryWriteUInt32(ParamAddress + 0x10, 512));
         ctx[CpuRegister.Rdi] = ParamAddress;
         ctx[CpuRegister.Rsi] = MemoryBase + 0x800;
-        ctx[CpuRegister.Rdx] = 0x10000;
+        ctx[CpuRegister.Rdx] = 0x20000;
         ctx[CpuRegister.Rcx] = OutContextAddress;
         Assert.Equal(0, AudioOut2Exports.AudioOut2ContextCreate(ctx));
         Assert.True(ctx.TryReadUInt64(OutContextAddress, out var context));

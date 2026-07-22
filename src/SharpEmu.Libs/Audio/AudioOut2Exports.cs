@@ -11,7 +11,6 @@ namespace SharpEmu.Libs.Audio;
 public static class AudioOut2Exports
 {
     private const int AudioOut2ContextParamSize = 0x40;
-    private const int AudioOut2ContextMemorySize = 0x10000;
     private const uint AudioOut2DefaultQueueDepth = 1;
     private const uint AudioOut2GrainSamples = 512;
     private const uint AudioOut2SampleRate = 48000;
@@ -158,6 +157,23 @@ public static class AudioOut2Exports
         }
 
         return guaranteeObjectPorts == 0 && flags is 1 or 2 && numGrains <= 0x400;
+    }
+
+    private static ulong ContextMemorySize(uint maxPorts, uint maxObjectPorts)
+    {
+        // The high-level path supplies 21 internal ports. The sizing routine
+        // at 0xB901-0xB985 adds their 0xB60-byte records, bitsets, and the
+        // 128-byte-aligned object-port table.
+        const uint internalPorts = 21;
+        var objectPorts = Math.Min(maxObjectPorts, 0x80u);
+        var totalPorts = maxPorts + internalPorts + objectPorts;
+        var bitsetSize = static (uint count) => 12u + 4u * ((count + 31u) >> 5);
+        var objectTableSize = (24ul * objectPorts + 0x7Ful) & ~0x7Ful;
+        return 0xB60ul * totalPorts +
+            bitsetSize(objectPorts) +
+            bitsetSize(maxPorts) +
+            bitsetSize(internalPorts) +
+            objectTableSize;
     }
 
     private static bool TryReadSingle(CpuContext ctx, ulong address, out float value)
@@ -452,11 +468,33 @@ public static class AudioOut2Exports
             return ctx.SetReturn(AudioOut2ErrorInvalidParam);
         }
 
-        // The caller expects a single u64 (required memory size) written back
-        // through rsi -- not a struct. The earlier 0x20-byte write overran the
-        // caller's slot and smashed whatever followed it.
-        Trace($"context_query_memory param=0x{paramAddress:X} size=0x{AudioOut2ContextMemorySize:X}");
-        return ctx.TryWriteUInt64(outMemorySizeAddress, AudioOut2ContextMemorySize)
+        if (!TryReadContextParam(
+                ctx,
+                paramAddress,
+                out var maxPorts,
+                out var maxObjectPorts,
+                out var guaranteeObjectPorts,
+                out var queueDepth,
+                out var numGrains,
+                out var flags))
+        {
+            return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        if (!ContextParamIsValid(
+                maxPorts,
+                maxObjectPorts,
+                guaranteeObjectPorts,
+                queueDepth,
+                numGrains,
+                flags))
+        {
+            return ctx.SetReturn(AudioOut2ErrorInvalidParam);
+        }
+
+        var memorySize = ContextMemorySize(maxPorts, maxObjectPorts);
+        Trace($"context_query_memory param=0x{paramAddress:X} size=0x{memorySize:X}");
+        return ctx.TryWriteUInt64(outMemorySizeAddress, memorySize)
             ? ctx.SetReturn(0)
             : ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
     }
@@ -504,6 +542,11 @@ public static class AudioOut2Exports
         if (!ctx.TryWriteUInt64(outContextAddress, ulong.MaxValue))
         {
             return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        if (memorySize < ContextMemorySize(maxPorts, maxObjectPorts))
+        {
+            return ctx.SetReturn(AudioOut2ErrorInvalidParam);
         }
 
         var handle = (ulong)Interlocked.Increment(ref _nextContextHandle);
