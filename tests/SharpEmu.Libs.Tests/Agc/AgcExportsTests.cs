@@ -61,7 +61,9 @@ public sealed class AgcExportsTests
         _ctx[CpuRegister.R9] = 0;
         _ctx[CpuRegister.Rsp] = StackAddress;
 
-        Assert.Equal(0, AgcExports.DriverRegisterResource(_ctx));
+        // Retail firmware returns SCE_AGC_ERROR_RESOURCE_REGISTRATION_NO_PA_DEBUG
+        // even though the internal registry the unregister exports use is populated.
+        Assert.Equal(unchecked((int)0x8A6C9018), AgcExports.DriverRegisterResource(_ctx));
         Assert.True(_ctx.TryReadUInt32(ResourceHandleAddress, out var resourceHandle));
         return resourceHandle;
     }

@@ -3338,8 +3338,9 @@ public static class AgcExports
     {
         // Retail firmware body is `mov eax, 0x8A6C9018; ret`
         // (SCE_AGC_ERROR_RESOURCE_REGISTRATION_NO_PA_DEBUG): resource
-        // registration is a no-op unless PA Debug is enabled, which retail
-        // consoles never are. The title tolerates this every call.
+        // registration only does anything when PA Debug is enabled, which
+        // retail consoles never are, so the call is a no-op that returns this
+        // value. The title tolerates it every call (Astro issues it ~512x/boot).
         return ctx.SetReturn(unchecked((int)0x8A6C9018));
     }
 
