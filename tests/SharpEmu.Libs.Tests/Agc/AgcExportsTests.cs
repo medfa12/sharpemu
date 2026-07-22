@@ -180,6 +180,27 @@ public sealed class AgcExportsTests
     }
 
     [Fact]
+    public void DcbAcquireMem_AdvancesOnePacketWhenCompatibilityPacketIsNotNeeded()
+    {
+        Assert.True(_ctx.TryWriteUInt64(CommandBufferAddress + 0x10, CommandAddress));
+        Assert.True(_ctx.TryWriteUInt64(CommandBufferAddress + 0x18, MemoryBase + 0x1700));
+        Assert.True(_ctx.TryWriteUInt32(CommandBufferAddress + 0x30, 0));
+        Assert.True(_ctx.TryWriteUInt32(StackAddress + sizeof(ulong), 400));
+        _ctx[CpuRegister.Rdi] = CommandBufferAddress;
+        _ctx[CpuRegister.Rsi] = 0;
+        _ctx[CpuRegister.Rdx] = 0;
+        _ctx[CpuRegister.Rcx] = 0;
+        _ctx[CpuRegister.R8] = 0;
+        _ctx[CpuRegister.R9] = 0;
+        _ctx[CpuRegister.Rsp] = StackAddress;
+
+        Assert.Equal(0, AgcExports.DcbAcquireMem(_ctx));
+        Assert.Equal(CommandAddress, _ctx[CpuRegister.Rax]);
+        Assert.Equal(CommandAddress + 32, ReadUInt64(CommandBufferAddress + 0x10));
+        Assert.Equal(25u, ReadUInt32(CommandAddress + 24));
+    }
+
+    [Fact]
     public void IndirectRegisterAddressPatches_UseSharpEmuLayoutWithoutOpcodeValidation()
     {
         var patches = new Func<CpuContext, int>[]
