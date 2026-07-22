@@ -618,6 +618,22 @@ public static class NpManagerExports
         }
     }
 
+    [SysAbiExport(Nid = "YIvqqvJyjEc", ExportName = "sceNpUnregisterStateCallbackForToolkit", Target = Generation.Gen5, LibraryName = "libSceNpManagerForToolkit")]
+    public static int NpUnregisterStateCallbackForToolkit(CpuContext ctx)
+    {
+        lock (_stateCallbacksLock)
+        {
+            var index = _stateCallbacks.FindIndex(callback => callback.Kind == NpStateCallbackKind.Simple);
+            if (index < 0)
+            {
+                return ctx.SetReturn(_fakeSignedIn ? NpErrorCallbackNotRegistered : 0);
+            }
+
+            _stateCallbacks.RemoveAt(index);
+            return ctx.SetReturn(0);
+        }
+    }
+
     internal static void ResetExtendedStateForTests()
     {
         lock (_extendedStateLock)

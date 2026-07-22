@@ -67,6 +67,27 @@ public static class KernelExports
     }
 
     [SysAbiExport(
+        Nid = "fFkhOgztiCA",
+        ExportName = "sceCoredumpUnregisterCoredumpHandler",
+        Target = Generation.Gen5,
+        LibraryName = "libSceCoredump")]
+    public static int CoredumpUnregisterHandler(CpuContext ctx)
+    {
+        lock (_coredumpGate)
+        {
+            if (_coredumpHandler == 0)
+            {
+                return ctx.SetReturn(unchecked((int)0x81180001));
+            }
+
+            _coredumpHandler = 0;
+            _coredumpHandlerContext = 0;
+        }
+
+        return ctx.SetReturn(0);
+    }
+
+    [SysAbiExport(
         Nid = "uMei1W9uyNo",
         ExportName = "exit",
         Target = Generation.Gen4 | Generation.Gen5,
