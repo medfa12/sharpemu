@@ -16,7 +16,10 @@ default-off unless noted.
 |---|---|
 | `SHARPEMU_NP_FAKE_SIGNED_IN=1` | NP state=SIGNED_IN, reachability=Reachable, fires registered state callbacks. Without it the title loops at online-init. |
 | `SHARPEMU_NP_FAKE_USERCTX=1` | sceNpWebApi2CreateUserContext returns a synthetic context instead of NOT_SIGNED_IN. Set together with the above. |
-| `SHARPEMU_PS_FORCE_EXPOSURE_SCALAR=<float>` | Pins the tonemap shader's (ps=0x500640200) cbuffer exposure scalar (reads 0 otherwise → black frame). 0.5 is a sane start; 1.0 over-saturates. |
+| `SHARPEMU_ASTRO_TONEMAP_FIX=1` | (branch `gpu/tonemap`, not yet on master) Title-scoped tonemap fix: decode GFX10 operand 125 as architectural NULL, recover the unbound SMEM cbuffer bindings the scalar evaluator zero-filled, and substitute a 0.25 auto-exposure. Turns the black display buffer fully non-black (VM-verified). Result is washed grey until real exposure lands — see `SHARPEMU_COMPUTE_WRITEBACK`. |
+| `SHARPEMU_COMPUTE_WRITEBACK=1` | (branch, not yet on master) After a guest compute dispatch runs, copy its small writable outputs (1x1 R16F auto-exposure image, ≤4 KB global buffers) back into guest memory so the tonemap reads a REAL exposure instead of the 0.25 stopgap. Captures the guest sink at submit time (render thread has no CpuContext). Logs `[LOADER][WRITEBACK]`. |
+| `SHARPEMU_RECOVER_UNBOUND_SMEM=1` | (branch) Generic form of the tonemap SMEM-binding recovery: bind reachable `s_buffer_load` PCs the scalar evaluator missed to the nearest same-descriptor binding instead of zero. `SHARPEMU_ASTRO_TONEMAP_FIX` applies it only to the known tonemap shader. |
+| `SHARPEMU_PS_FORCE_EXPOSURE_SCALAR=<float>` | Legacy stopgap: pins the tonemap exposure scalar. SUPERSEDED — the real cause is the s125-NULL + missing-SMEM-bindings (see `docs/astrobot-bringup.md` "Tonemap black — ROOT CAUSE"), addressed by the two flags above. |
 
 ## Diagnostics (each proved its worth; costs noted)
 
