@@ -570,6 +570,28 @@ public static class NpTrophy2Exports
         }
     }
 
+    internal static int GetLegacyRegistrySnapshot(
+        int contextId,
+        int handleId,
+        out string titleId,
+        out TrophyRecord[] trophies)
+    {
+        lock (StateGate)
+        {
+            var validation = ValidateContextAndHandle(contextId, handleId, requireRegistered: true, out var state);
+            if (validation != 0)
+            {
+                titleId = string.Empty;
+                trophies = [];
+                return ToLegacyTrophyError(validation);
+            }
+
+            titleId = state!.TitleId;
+            trophies = state.Trophies.Values.OrderBy(trophy => trophy.Id).ToArray();
+            return 0;
+        }
+    }
+
     private static int ValidateQuery(CpuContext ctx, out TrophyContextState? state) =>
         ValidateContextAndHandle(
             unchecked((int)ctx[CpuRegister.Rdi]),
