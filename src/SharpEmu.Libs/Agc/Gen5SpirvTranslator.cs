@@ -268,6 +268,9 @@ internal static partial class Gen5SpirvTranslator
         private static readonly bool _debugTonemapGradeOutput =
             Environment.GetEnvironmentVariable(
                 "SHARPEMU_PS_DEBUG_TONEMAP_GRADE") == "1";
+        private static readonly bool _debugTonemapCoreOutput =
+            Environment.GetEnvironmentVariable(
+                "SHARPEMU_PS_DEBUG_TONEMAP_CORE") == "1";
         private static readonly bool _debugTonemapTransferOutput =
             Environment.GetEnvironmentVariable(
                 "SHARPEMU_PS_DEBUG_TONEMAP_TRANSFER") == "1";
@@ -1807,13 +1810,29 @@ internal static partial class Gen5SpirvTranslator
             var emitted = TryEmitVectorAlu(instruction, out error);
             if (emitted && IsKnownTonemapShader())
             {
-                if (_debugTonemapGradeOutput)
+                if (_debugTonemapCoreOutput)
                 {
-                    CaptureTonemapCheckpoint(instruction.Pc, 0x634u, 0x638u, 0x63Cu);
+                    CaptureTonemapCheckpoint(
+                        instruction.Pc,
+                        0x4ACu, 6,
+                        0x4B0u, 5,
+                        0x4B4u, 4);
+                }
+                else if (_debugTonemapGradeOutput)
+                {
+                    CaptureTonemapCheckpoint(
+                        instruction.Pc,
+                        0x634u, 10,
+                        0x638u, 12,
+                        0x63Cu, 9);
                 }
                 else if (_debugTonemapTransferOutput)
                 {
-                    CaptureTonemapCheckpoint(instruction.Pc, 0x764u, 0x768u, 0x76Cu);
+                    CaptureTonemapCheckpoint(
+                        instruction.Pc,
+                        0x764u, 10,
+                        0x768u, 12,
+                        0x76Cu, 9);
                 }
             }
 
@@ -1823,20 +1842,23 @@ internal static partial class Gen5SpirvTranslator
         private void CaptureTonemapCheckpoint(
             uint pc,
             uint redPc,
+            uint redRegister,
             uint greenPc,
-            uint bluePc)
+            uint greenRegister,
+            uint bluePc,
+            uint blueRegister)
         {
             if (pc == redPc)
             {
-                StoreV(240, LoadV(10));
+                StoreV(240, LoadV(redRegister));
             }
             else if (pc == greenPc)
             {
-                StoreV(241, LoadV(12));
+                StoreV(241, LoadV(greenRegister));
             }
             else if (pc == bluePc)
             {
-                StoreV(242, LoadV(9));
+                StoreV(242, LoadV(blueRegister));
             }
         }
 
@@ -3688,6 +3710,7 @@ internal static partial class Gen5SpirvTranslator
             }
 
             if ((_debugTonemapSampleOutput ||
+                 _debugTonemapCoreOutput ||
                  _debugTonemapGradeOutput ||
                  _debugTonemapTransferOutput) &&
                 IsKnownTonemapShader())
