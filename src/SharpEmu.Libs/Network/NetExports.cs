@@ -35,10 +35,16 @@ public static class NetExports
     private static readonly ConcurrentDictionary<int, ResolverContext> Resolvers = new();
     private static readonly ConcurrentDictionary<int, SocketContext> Sockets = new();
     private static readonly ConcurrentDictionary<int, EpollContext> Epolls = new();
+    private static readonly ConcurrentDictionary<int, byte> DumpHandles = new();
+    private static readonly ConcurrentDictionary<int, byte> EventCallbackHandles = new();
+    private static readonly ConcurrentDictionary<int, byte> ResolverConnectHandles = new();
+    private static readonly ConcurrentDictionary<int, byte> SyncHandles = new();
+    private static readonly ConcurrentDictionary<ICpuMemory, ulong> ErrnoAddresses = new();
     private static int _nextPoolId;
     private static int _nextResolverId = 0x2000;
     private static int _nextSocketId = 0x100;
     private static int _nextEpollId = 0x3000;
+    private static int _nextAuxiliaryId = 0x4000;
     private static bool _initialized;
 
     private sealed record NetPool(string Name, int Size, int Flags);
@@ -673,6 +679,1024 @@ public static class NetExports
             resolver.LastError = TranslateSocketError(ex.SocketErrorCode);
             return ctx.SetReturn(resolver.LastError);
         }
+    }
+
+    [SysAbiExport(Nid = "ZRAJo-A-ukc", ExportName = "in6addr_any", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int In6AddrAny(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "XCuA-GqjA-k", ExportName = "in6addr_loopback", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int In6AddrLoopback(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "BTUvkWzrP68", ExportName = "sceNetAddrConfig6GetInfo", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetAddrConfig6GetInfo(CpuContext ctx) => ClearOptionalBuffer(ctx, ctx[CpuRegister.Rsi], 64);
+
+    [SysAbiExport(Nid = "3qG7UJy2Fq8", ExportName = "sceNetAddrConfig6Start", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetAddrConfig6Start(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "P+0ePpDfUAQ", ExportName = "sceNetAddrConfig6Stop", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetAddrConfig6Stop(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "PcdLABhYga4", ExportName = "sceNetAllocateAllRouteInfo", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetAllocateAllRouteInfo(CpuContext ctx) => ClearOptionalPointer(ctx, ctx[CpuRegister.Rdi]);
+
+    [SysAbiExport(Nid = "xHq87H78dho", ExportName = "sceNetBandwidthControlGetDataTraffic", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetBandwidthControlGetDataTraffic(CpuContext ctx) => ClearOptionalBuffer(ctx, ctx[CpuRegister.Rdx], 16);
+
+    [SysAbiExport(Nid = "c8IRpl4L74I", ExportName = "sceNetBandwidthControlGetDefaultParam", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetBandwidthControlGetDefaultParam(CpuContext ctx) => ClearOptionalBuffer(ctx, ctx[CpuRegister.Rdi], 32);
+
+    [SysAbiExport(Nid = "b9Ft65tqvLk", ExportName = "sceNetBandwidthControlGetIfParam", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetBandwidthControlGetIfParam(CpuContext ctx) => ClearOptionalBuffer(ctx, ctx[CpuRegister.Rsi], 32);
+
+    [SysAbiExport(Nid = "PDkapOwggRw", ExportName = "sceNetBandwidthControlGetPolicy", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetBandwidthControlGetPolicy(CpuContext ctx) => ClearOptionalBuffer(ctx, ctx[CpuRegister.Rdi], 32);
+
+    [SysAbiExport(Nid = "P4zZXE7bpsA", ExportName = "sceNetBandwidthControlSetDefaultParam", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetBandwidthControlSetDefaultParam(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "g4DKkzV2qC4", ExportName = "sceNetBandwidthControlSetIfParam", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetBandwidthControlSetIfParam(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "7Z1hhsEmkQU", ExportName = "sceNetBandwidthControlSetPolicy", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetBandwidthControlSetPolicy(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "eyLyLJrdEOU", ExportName = "sceNetClearDnsCache", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetClearDnsCache(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "Ea2NaVMQNO8", ExportName = "sceNetConfigAddArp", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetConfigAddArp(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "0g0qIuPN3ZQ", ExportName = "sceNetConfigAddArpWithInterface", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetConfigAddArpWithInterface(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "ge7g15Sqhks", ExportName = "sceNetConfigAddIfaddr", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetConfigAddIfaddr(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "FDHr4Iz7dQU", ExportName = "sceNetConfigAddMRoute", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetConfigAddMRoute(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "Cyjl1yzi1qY", ExportName = "sceNetConfigAddRoute", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetConfigAddRoute(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "Bu+L5r1lKRg", ExportName = "sceNetConfigAddRoute6", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetConfigAddRoute6(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "wIGold7Lro0", ExportName = "sceNetConfigAddRouteWithInterface", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetConfigAddRouteWithInterface(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "MzA1YrRE6rA", ExportName = "sceNetConfigCleanUpAllInterfaces", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetConfigCleanUpAllInterfaces(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "HJt+4x-CnY0", ExportName = "sceNetConfigDelArp", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetConfigDelArp(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "xTcttXJ3Utg", ExportName = "sceNetConfigDelArpWithInterface", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetConfigDelArpWithInterface(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "RuVwHEW6dM4", ExportName = "sceNetConfigDelDefaultRoute", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetConfigDelDefaultRoute(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "UMlVCy7RX1s", ExportName = "sceNetConfigDelDefaultRoute6", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetConfigDelDefaultRoute6(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "0239JNsI6PE", ExportName = "sceNetConfigDelIfaddr", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetConfigDelIfaddr(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "hvCXMwd45oc", ExportName = "sceNetConfigDelIfaddr6", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetConfigDelIfaddr6(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "5Yl1uuh5i-A", ExportName = "sceNetConfigDelMRoute", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetConfigDelMRoute(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "QO7+2E3cD-U", ExportName = "sceNetConfigDelRoute", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetConfigDelRoute(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "4wDGvfhmkmk", ExportName = "sceNetConfigDelRoute6", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetConfigDelRoute6(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "3WzWV86AJ3w", ExportName = "sceNetConfigDownInterface", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetConfigDownInterface(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "mOUkgTaSkJU", ExportName = "sceNetConfigEtherGetLinkMode", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetConfigEtherGetLinkMode(CpuContext ctx) => WriteRequiredUInt32(ctx, ctx[CpuRegister.Rdi], 1);
+
+    [SysAbiExport(Nid = "pF3Vy1iZ5bs", ExportName = "sceNetConfigEtherPostPlugInOutEvent", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetConfigEtherPostPlugInOutEvent(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "QltDK6wWqF0", ExportName = "sceNetConfigEtherSetLinkMode", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetConfigEtherSetLinkMode(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "18KNgSvYx+Y", ExportName = "sceNetConfigFlushRoute", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetConfigFlushRoute(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "lFJb+BlPK1c", ExportName = "sceNetConfigGetDefaultRoute", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetConfigGetDefaultRoute(CpuContext ctx) => WriteIpv4Sockaddr(ctx, ctx[CpuRegister.Rdi], [192, 168, 0, 1]);
+
+    [SysAbiExport(Nid = "mCLdiNIKtW0", ExportName = "sceNetConfigGetDefaultRoute6", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetConfigGetDefaultRoute6(CpuContext ctx) => ClearOptionalBuffer(ctx, ctx[CpuRegister.Rdi], 28);
+
+    [SysAbiExport(Nid = "ejwa0hWWhDs", ExportName = "sceNetConfigGetIfaddr", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetConfigGetIfaddr(CpuContext ctx) => WriteIpv4Sockaddr(ctx, ctx[CpuRegister.Rsi], [192, 168, 0, 2]);
+
+    [SysAbiExport(Nid = "FU6NK4RHQVE", ExportName = "sceNetConfigGetIfaddr6", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetConfigGetIfaddr6(CpuContext ctx) => ClearOptionalBuffer(ctx, ctx[CpuRegister.Rsi], 28);
+
+    [SysAbiExport(Nid = "vbZLomImmEE", ExportName = "sceNetConfigRoutingShowRoutingConfig", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetConfigRoutingShowRoutingConfig(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "a6sS6iSE0IA", ExportName = "sceNetConfigRoutingShowtCtlVar", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetConfigRoutingShowtCtlVar(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "eszLdtIMfQE", ExportName = "sceNetConfigRoutingStart", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetConfigRoutingStart(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "toi8xxcSfJ0", ExportName = "sceNetConfigRoutingStop", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetConfigRoutingStop(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "EAl7xvi7nXg", ExportName = "sceNetConfigSetDefaultRoute", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetConfigSetDefaultRoute(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "4zLOHbt3UFk", ExportName = "sceNetConfigSetDefaultRoute6", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetConfigSetDefaultRoute6(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "yaVAdLDxUj0", ExportName = "sceNetConfigSetDefaultScope", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetConfigSetDefaultScope(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "0sesmAYH3Lk", ExportName = "sceNetConfigSetIfFlags", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetConfigSetIfFlags(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "uNTluLfYgS8", ExportName = "sceNetConfigSetIfLinkLocalAddr6", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetConfigSetIfLinkLocalAddr6(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "8Kh+1eidI3c", ExportName = "sceNetConfigSetIfaddr", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetConfigSetIfaddr(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "QJbV3vfBQ8Q", ExportName = "sceNetConfigSetIfaddr6", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetConfigSetIfaddr6(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "POrSEl8zySw", ExportName = "sceNetConfigSetIfaddr6WithFlags", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetConfigSetIfaddr6WithFlags(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "s31rYkpIMMQ", ExportName = "sceNetConfigSetIfmtu", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetConfigSetIfmtu(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "tvdzQkm+UaY", ExportName = "sceNetConfigUnsetIfFlags", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetConfigUnsetIfFlags(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "oGEBX0eXGFs", ExportName = "sceNetConfigUpInterface", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetConfigUpInterface(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "6HNbayHPL7c", ExportName = "sceNetConfigUpInterfaceWithFlags", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetConfigUpInterfaceWithFlags(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "6A6EweB3Dto", ExportName = "sceNetConfigWlanAdhocClearWakeOnWlan", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetConfigWlanAdhocClearWakeOnWlan(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "ZLdJyQJUMkM", ExportName = "sceNetConfigWlanAdhocCreate", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetConfigWlanAdhocCreate(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "Yr3UeApLWTY", ExportName = "sceNetConfigWlanAdhocGetWakeOnWlanInfo", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetConfigWlanAdhocGetWakeOnWlanInfo(CpuContext ctx) => ClearOptionalBuffer(ctx, ctx[CpuRegister.Rdi], 32);
+
+    [SysAbiExport(Nid = "Xma8yHmV+TQ", ExportName = "sceNetConfigWlanAdhocJoin", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetConfigWlanAdhocJoin(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "K4o48GTNbSc", ExportName = "sceNetConfigWlanAdhocLeave", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetConfigWlanAdhocLeave(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "ZvKgNrrLCCQ", ExportName = "sceNetConfigWlanAdhocPspEmuClearWakeOnWlan", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetConfigWlanAdhocPspEmuClearWakeOnWlan(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "1j4DZ5dXbeQ", ExportName = "sceNetConfigWlanAdhocPspEmuGetWakeOnWlanInfo", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetConfigWlanAdhocPspEmuGetWakeOnWlanInfo(CpuContext ctx) => ClearOptionalBuffer(ctx, ctx[CpuRegister.Rdi], 32);
+
+    [SysAbiExport(Nid = "C-+JPjaEhdA", ExportName = "sceNetConfigWlanAdhocPspEmuSetWakeOnWlan", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetConfigWlanAdhocPspEmuSetWakeOnWlan(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "7xYdUWg1WdY", ExportName = "sceNetConfigWlanAdhocScanJoin", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetConfigWlanAdhocScanJoin(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "Q7ee2Uav5f8", ExportName = "sceNetConfigWlanAdhocSetExtInfoElement", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetConfigWlanAdhocSetExtInfoElement(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "xaOTiuxIQNY", ExportName = "sceNetConfigWlanAdhocSetWakeOnWlan", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetConfigWlanAdhocSetWakeOnWlan(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "QlRJWya+dtE", ExportName = "sceNetConfigWlanApStart", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetConfigWlanApStart(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "6uYcvVjH7Ms", ExportName = "sceNetConfigWlanApStop", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetConfigWlanApStop(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "MDbg-oAj8Aw", ExportName = "sceNetConfigWlanBackgroundScanQuery", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetConfigWlanBackgroundScanQuery(CpuContext ctx) => ClearOptionalBuffer(ctx, ctx[CpuRegister.Rdi], 32);
+
+    [SysAbiExport(Nid = "cMA8f6jI6s0", ExportName = "sceNetConfigWlanBackgroundScanStart", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetConfigWlanBackgroundScanStart(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "3T5aIe-7L84", ExportName = "sceNetConfigWlanBackgroundScanStop", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetConfigWlanBackgroundScanStop(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "+3KMyS93TOs", ExportName = "sceNetConfigWlanDiagGetDeviceInfo", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetConfigWlanDiagGetDeviceInfo(CpuContext ctx) => ClearOptionalBuffer(ctx, ctx[CpuRegister.Rdi], 64);
+
+    [SysAbiExport(Nid = "9oiOWQ5FMws", ExportName = "sceNetConfigWlanDiagSetAntenna", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetConfigWlanDiagSetAntenna(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "fHr45B97n0U", ExportName = "sceNetConfigWlanDiagSetTxFixedRate", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetConfigWlanDiagSetTxFixedRate(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "PNDDxnqqtk4", ExportName = "sceNetConfigWlanGetDeviceConfig", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetConfigWlanGetDeviceConfig(CpuContext ctx) => ClearOptionalBuffer(ctx, ctx[CpuRegister.Rdi], 64);
+
+    [SysAbiExport(Nid = "Pkx0lwWVzmQ", ExportName = "sceNetConfigWlanInfraGetRssiInfo", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetConfigWlanInfraGetRssiInfo(CpuContext ctx) => ClearOptionalBuffer(ctx, ctx[CpuRegister.Rdi], 16);
+
+    [SysAbiExport(Nid = "IkBCxG+o4Nk", ExportName = "sceNetConfigWlanInfraLeave", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetConfigWlanInfraLeave(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "273-I-zD8+8", ExportName = "sceNetConfigWlanInfraScanJoin", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetConfigWlanInfraScanJoin(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "-Mi5hNiWC4c", ExportName = "sceNetConfigWlanScan", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetConfigWlanScan(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "U1q6DrPbY6k", ExportName = "sceNetConfigWlanSetDeviceConfig", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetConfigWlanSetDeviceConfig(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "lDTIbqNs0ps", ExportName = "sceNetControl", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetControl(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "KhQxhlEslo0", ExportName = "sceNetDhcpGetAutoipInfo", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetDhcpGetAutoipInfo(CpuContext ctx) => ClearOptionalBuffer(ctx, ctx[CpuRegister.Rsi], 64);
+
+    [SysAbiExport(Nid = "ix4LWXd12F0", ExportName = "sceNetDhcpGetInfo", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetDhcpGetInfo(CpuContext ctx) => ClearOptionalBuffer(ctx, ctx[CpuRegister.Rsi], 128);
+
+    [SysAbiExport(Nid = "DrZuCQDnm3w", ExportName = "sceNetDhcpGetInfoEx", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetDhcpGetInfoEx(CpuContext ctx) => ClearOptionalBuffer(ctx, ctx[CpuRegister.Rsi], 256);
+
+    [SysAbiExport(Nid = "Wzv6dngR-DQ", ExportName = "sceNetDhcpStart", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetDhcpStart(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "6AN7OlSMWk0", ExportName = "sceNetDhcpStop", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetDhcpStop(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "Q6T-zIblNqk", ExportName = "sceNetDhcpdStart", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetDhcpdStart(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "xwWm8jzrpeM", ExportName = "sceNetDhcpdStop", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetDhcpdStop(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "+ezgWao0wo8", ExportName = "sceNetDumpAbort", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetDumpAbort(CpuContext ctx) => ValidateAuxiliaryHandle(ctx, DumpHandles);
+
+    [SysAbiExport(Nid = "bghgkeLKq1Q", ExportName = "sceNetDumpCreate", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetDumpCreate(CpuContext ctx) => CreateAuxiliaryHandle(ctx, DumpHandles);
+
+    [SysAbiExport(Nid = "xZ54Il-u1vs", ExportName = "sceNetDumpDestroy", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetDumpDestroy(CpuContext ctx) => DestroyAuxiliaryHandle(ctx, DumpHandles);
+
+    [SysAbiExport(Nid = "YWTpt45PxbI", ExportName = "sceNetDumpRead", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetDumpRead(CpuContext ctx)
+    {
+        if (!DumpHandles.ContainsKey(unchecked((int)ctx[CpuRegister.Rdi])))
+        {
+            return ctx.SetReturn(NetErrorBadFileDescriptor);
+        }
+
+        return ctx.SetReturn(0);
+    }
+
+    [SysAbiExport(Nid = "TwjkDIPdZ1Q", ExportName = "sceNetDuplicateIpStart", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetDuplicateIpStart(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "QCbvCx9HL30", ExportName = "sceNetDuplicateIpStop", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetDuplicateIpStop(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "w21YgGGNtBk", ExportName = "sceNetEpollAbort", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetEpollAbort(CpuContext ctx) => Epolls.ContainsKey(unchecked((int)ctx[CpuRegister.Rdi]))
+        ? ctx.SetReturn(0)
+        : ctx.SetReturn(NetErrorBadFileDescriptor);
+
+    [SysAbiExport(Nid = "HQOwnfMGipQ", ExportName = "sceNetErrnoLoc", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetErrnoLoc(CpuContext ctx)
+    {
+        if (!ErrnoAddresses.TryGetValue(ctx.Memory, out var address))
+        {
+            if (ctx.Memory is not IGuestMemoryAllocator allocator ||
+                !allocator.TryAllocateGuestMemory(sizeof(int), sizeof(int), out address) ||
+                !ctx.TryWriteInt32(address, 0))
+            {
+                return ctx.SetReturn(0);
+            }
+
+            address = ErrnoAddresses.GetOrAdd(ctx.Memory, address);
+        }
+
+        ctx[CpuRegister.Rax] = address;
+        return unchecked((int)address);
+    }
+
+    [SysAbiExport(Nid = "v6M4txecCuo", ExportName = "sceNetEtherNtostr", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetEtherNtostr(CpuContext ctx)
+    {
+        Span<byte> mac = stackalloc byte[6];
+        if (ctx[CpuRegister.Rdi] == 0 || ctx[CpuRegister.Rsi] == 0 || !ctx.Memory.TryRead(ctx[CpuRegister.Rdi], mac))
+        {
+            return ctx.SetReturn(NetErrorInvalidArgument);
+        }
+
+        var value = string.Join(':', mac.ToArray().Select(static item => item.ToString("x2"))) + '\0';
+        return ctx.Memory.TryWrite(ctx[CpuRegister.Rsi], Encoding.ASCII.GetBytes(value))
+            ? ctx.SetReturn(0)
+            : ctx.SetReturn(NetErrorMemoryFault);
+    }
+
+    [SysAbiExport(Nid = "b-bFZvNV59I", ExportName = "sceNetEtherStrton", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetEtherStrton(CpuContext ctx)
+    {
+        if (!TryReadUtf8Z(ctx, ctx[CpuRegister.Rdi], 18, out var text) || ctx[CpuRegister.Rsi] == 0)
+        {
+            return ctx.SetReturn(NetErrorInvalidArgument);
+        }
+
+        var parts = text.Split(':');
+        var bytes = new byte[6];
+        if (parts.Length != bytes.Length)
+        {
+            return ctx.SetReturn(NetErrorInvalidArgument);
+        }
+
+        for (var index = 0; index < parts.Length; index++)
+        {
+            if (!byte.TryParse(parts[index], System.Globalization.NumberStyles.HexNumber, null, out bytes[index]))
+            {
+                return ctx.SetReturn(NetErrorInvalidArgument);
+            }
+        }
+
+        return ctx.Memory.TryWrite(ctx[CpuRegister.Rsi], bytes)
+            ? ctx.SetReturn(0)
+            : ctx.SetReturn(NetErrorMemoryFault);
+    }
+
+    [SysAbiExport(Nid = "cWGGXoeZUzA", ExportName = "sceNetEventCallbackCreate", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetEventCallbackCreate(CpuContext ctx) => CreateAuxiliaryHandle(ctx, EventCallbackHandles);
+
+    [SysAbiExport(Nid = "jzP0MoZpYnI", ExportName = "sceNetEventCallbackDestroy", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetEventCallbackDestroy(CpuContext ctx) => DestroyAuxiliaryHandle(ctx, EventCallbackHandles);
+
+    [SysAbiExport(Nid = "tB3BB8AsrjU", ExportName = "sceNetEventCallbackGetError", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetEventCallbackGetError(CpuContext ctx)
+    {
+        if (!EventCallbackHandles.ContainsKey(unchecked((int)ctx[CpuRegister.Rdi])))
+        {
+            return ctx.SetReturn(NetErrorBadFileDescriptor);
+        }
+
+        return WriteRequiredInt32(ctx, ctx[CpuRegister.Rsi], 0);
+    }
+
+    [SysAbiExport(Nid = "5isaotjMWlA", ExportName = "sceNetEventCallbackWaitCB", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetEventCallbackWaitCB(CpuContext ctx) => ValidateAuxiliaryHandle(ctx, EventCallbackHandles);
+
+    [SysAbiExport(Nid = "2ee14ktE1lw", ExportName = "sceNetFreeAllRouteInfo", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetFreeAllRouteInfo(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "q8j9OSdnN1Y", ExportName = "sceNetGetArpInfo", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetGetArpInfo(CpuContext ctx) => ClearCountedResult(ctx);
+
+    [SysAbiExport(Nid = "wmoIm94hqik", ExportName = "sceNetGetDns6Info", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetGetDns6Info(CpuContext ctx) => ClearOptionalBuffer(ctx, ctx[CpuRegister.Rdi], 32);
+
+    [SysAbiExport(Nid = "nCL0NyZsd5A", ExportName = "sceNetGetDnsInfo", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetGetDnsInfo(CpuContext ctx)
+    {
+        Span<byte> dns = stackalloc byte[8];
+        dns[0] = 1;
+        dns[1] = 1;
+        dns[2] = 1;
+        dns[3] = 1;
+        dns[4] = 1;
+        dns[5] = 1;
+        dns[6] = 1;
+        dns[7] = 1;
+        return WriteOptionalBuffer(ctx, ctx[CpuRegister.Rdi], dns);
+    }
+
+    [SysAbiExport(Nid = "HoV-GJyx7YY", ExportName = "sceNetGetIfList", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetGetIfList(CpuContext ctx) => ClearCountedResult(ctx);
+
+    [SysAbiExport(Nid = "ahiOMqoYYMc", ExportName = "sceNetGetIfListOnce", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetGetIfListOnce(CpuContext ctx) => ClearCountedResult(ctx);
+
+    [SysAbiExport(Nid = "0MT2l3uIX7c", ExportName = "sceNetGetIfName", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetGetIfName(CpuContext ctx)
+    {
+        if (ctx[CpuRegister.Rsi] == 0)
+        {
+            return ctx.SetReturn(NetErrorInvalidArgument);
+        }
+
+        return ctx.Memory.TryWrite(ctx[CpuRegister.Rsi], Encoding.ASCII.GetBytes("eth0\0"))
+            ? ctx.SetReturn(0)
+            : ctx.SetReturn(NetErrorMemoryFault);
+    }
+
+    [SysAbiExport(Nid = "5lrSEHdqyos", ExportName = "sceNetGetIfnameNumList", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetGetIfnameNumList(CpuContext ctx)
+    {
+        if (ctx[CpuRegister.Rdi] != 0 && !ctx.TryWriteUInt32(ctx[CpuRegister.Rdi], 1))
+        {
+            return ctx.SetReturn(NetErrorMemoryFault);
+        }
+
+        return ctx[CpuRegister.Rsi] == 0 || ctx.TryWriteUInt32(ctx[CpuRegister.Rsi], 1)
+            ? ctx.SetReturn(0)
+            : ctx.SetReturn(NetErrorMemoryFault);
+    }
+
+    [SysAbiExport(Nid = "6Oc0bLsIYe0", ExportName = "sceNetGetMacAddress", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetGetMacAddress(CpuContext ctx) => WriteRequiredBuffer(ctx, ctx[CpuRegister.Rdi], [0x02, 0x53, 0x48, 0x41, 0x52, 0x50]);
+
+    [SysAbiExport(Nid = "rMyh97BU5pY", ExportName = "sceNetGetMemoryPoolStats", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetGetMemoryPoolStats(CpuContext ctx) => ClearOptionalBuffer(ctx, ctx[CpuRegister.Rdi], 64);
+
+    [SysAbiExport(Nid = "+S-2-jlpaBo", ExportName = "sceNetGetNameToIndex", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetGetNameToIndex(CpuContext ctx)
+    {
+        if (!TryReadUtf8Z(ctx, ctx[CpuRegister.Rdi], 32, out var name))
+        {
+            return ctx.SetReturn(NetErrorInvalidArgument);
+        }
+
+        return ReturnInt32(ctx, name is "eth0" or "en0" ? 1 : 0);
+    }
+
+    [SysAbiExport(Nid = "G3O2j9f5z00", ExportName = "sceNetGetRandom", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetGetRandom(CpuContext ctx)
+    {
+        if (!TryGetTransferLength(ctx[CpuRegister.Rsi], out var count) || (count != 0 && ctx[CpuRegister.Rdi] == 0))
+        {
+            return ctx.SetReturn(NetErrorInvalidArgument);
+        }
+
+        var bytes = new byte[count];
+        Random.Shared.NextBytes(bytes);
+        return count == 0 || ctx.Memory.TryWrite(ctx[CpuRegister.Rdi], bytes)
+            ? ctx.SetReturn(0)
+            : ctx.SetReturn(NetErrorMemoryFault);
+    }
+
+    [SysAbiExport(Nid = "6Nx1hIQL9h8", ExportName = "sceNetGetRouteInfo", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetGetRouteInfo(CpuContext ctx) => ClearCountedResult(ctx);
+
+    [SysAbiExport(Nid = "hLuXdjHnhiI", ExportName = "sceNetGetSockInfo", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetGetSockInfo(CpuContext ctx) => GetSocketInfoCore(ctx, 64);
+
+    [SysAbiExport(Nid = "Cidi9Y65mP8", ExportName = "sceNetGetSockInfo6", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetGetSockInfo6(CpuContext ctx) => GetSocketInfoCore(ctx, 96);
+
+    [SysAbiExport(Nid = "GA5ZDaLtUBE", ExportName = "sceNetGetStatisticsInfo", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetGetStatisticsInfo(CpuContext ctx) => ClearOptionalBuffer(ctx, ctx[CpuRegister.Rdi], 256);
+
+    [SysAbiExport(Nid = "9mIcUExH34w", ExportName = "sceNetGetStatisticsInfoInternal", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetGetStatisticsInfoInternal(CpuContext ctx) => ClearOptionalBuffer(ctx, ctx[CpuRegister.Rdi], 256);
+
+    [SysAbiExport(Nid = "p2vxsE2U3RQ", ExportName = "sceNetGetSystemTime", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetGetSystemTime(CpuContext ctx) => ReturnUInt32(ctx, unchecked((uint)Environment.TickCount64));
+
+    [SysAbiExport(Nid = "3CHi1K1wsCQ", ExportName = "sceNetHtonll", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetHtonll(CpuContext ctx) => ReturnUInt64(ctx, BinaryPrimitives.ReverseEndianness(ctx[CpuRegister.Rdi]));
+
+    [SysAbiExport(Nid = "Eh+Vqkrrc00", ExportName = "sceNetInetNtopWithScopeId", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetInetNtopWithScopeId(CpuContext ctx) => NetInetNtop(ctx);
+
+    [SysAbiExport(Nid = "Xn2TA2QhxHc", ExportName = "sceNetInetPtonEx", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetInetPtonEx(CpuContext ctx) => NetInetPton(ctx);
+
+    [SysAbiExport(Nid = "b+LixqREH6A", ExportName = "sceNetInetPtonWithScopeId", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetInetPtonWithScopeId(CpuContext ctx)
+    {
+        var result = NetInetPton(ctx);
+        if (result == 1 && ctx[CpuRegister.Rcx] != 0 && !ctx.TryWriteUInt32(ctx[CpuRegister.Rcx], 0))
+        {
+            return ctx.SetReturn(-1);
+        }
+
+        return result;
+    }
+
+    [SysAbiExport(Nid = "cYW1ISGlOmo", ExportName = "sceNetInfoDumpStart", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetInfoDumpStart(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "XfV-XBCuhDo", ExportName = "sceNetInfoDumpStop", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetInfoDumpStop(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "6MojQ8uFHEI", ExportName = "sceNetInitParam", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetInitParam(CpuContext ctx)
+    {
+        _initialized = true;
+        return ctx.SetReturn(0);
+    }
+
+    [SysAbiExport(Nid = "ghqRRVQxqKo", ExportName = "sceNetIoctl", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetIoctl(CpuContext ctx) => Sockets.ContainsKey(unchecked((int)ctx[CpuRegister.Rdi]))
+        ? ctx.SetReturn(0)
+        : ctx.SetReturn(NetErrorBadFileDescriptor);
+
+    [SysAbiExport(Nid = "HKIa-WH0AZ4", ExportName = "sceNetMemoryAllocate", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetMemoryAllocate(CpuContext ctx)
+    {
+        if (ctx[CpuRegister.Rdi] == 0 || ctx.Memory is not IGuestMemoryAllocator allocator ||
+            !allocator.TryAllocateGuestMemory(ctx[CpuRegister.Rdi], 16, out var address))
+        {
+            return ctx.SetReturn(0);
+        }
+
+        ctx[CpuRegister.Rax] = address;
+        return unchecked((int)address);
+    }
+
+    [SysAbiExport(Nid = "221fvqVs+sQ", ExportName = "sceNetMemoryFree", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetMemoryFree(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "tOrRi-v3AOM", ExportName = "sceNetNtohll", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetNtohll(CpuContext ctx) => ReturnUInt64(ctx, BinaryPrimitives.ReverseEndianness(ctx[CpuRegister.Rdi]));
+
+    [SysAbiExport(Nid = "QGOqGPnk5a4", ExportName = "sceNetPppoeStart", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetPppoeStart(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "FIV95WE1EuE", ExportName = "sceNetPppoeStop", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetPppoeStop(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "wvuUDv0jrMI", ExportName = "sceNetRecvmsg", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetRecvmsg(CpuContext ctx) => MessageCore(ctx, false);
+
+    [SysAbiExport(Nid = "AzqoBha7js4", ExportName = "sceNetResolverAbort", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetResolverAbort(CpuContext ctx) => Resolvers.ContainsKey(unchecked((int)ctx[CpuRegister.Rdi]))
+        ? ctx.SetReturn(0)
+        : ctx.SetReturn(NetErrorBadFileDescriptor);
+
+    [SysAbiExport(Nid = "JQk8ck8vnPY", ExportName = "sceNetResolverConnect", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetResolverConnect(CpuContext ctx) => ValidateAuxiliaryHandle(ctx, ResolverConnectHandles);
+
+    [SysAbiExport(Nid = "bonnMiDoOZg", ExportName = "sceNetResolverConnectAbort", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetResolverConnectAbort(CpuContext ctx) => ValidateAuxiliaryHandle(ctx, ResolverConnectHandles);
+
+    [SysAbiExport(Nid = "V5q6gvEJpw4", ExportName = "sceNetResolverConnectCreate", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetResolverConnectCreate(CpuContext ctx) => CreateAuxiliaryHandle(ctx, ResolverConnectHandles);
+
+    [SysAbiExport(Nid = "QFPjG6rqeZg", ExportName = "sceNetResolverConnectDestroy", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetResolverConnectDestroy(CpuContext ctx) => DestroyAuxiliaryHandle(ctx, ResolverConnectHandles);
+
+    [SysAbiExport(Nid = "Apb4YDxKsRI", ExportName = "sceNetResolverStartAton", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetResolverStartAton(CpuContext ctx) => ResolverAddressToName(ctx, 4);
+
+    [SysAbiExport(Nid = "zvzWA5IZMsg", ExportName = "sceNetResolverStartAton6", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetResolverStartAton6(CpuContext ctx) => ResolverAddressToName(ctx, 16);
+
+    [SysAbiExport(Nid = "zl35YNs9jnI", ExportName = "sceNetResolverStartNtoa6", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetResolverStartNtoa6(CpuContext ctx) => ResolverNameToAddress(ctx, AddressFamily.InterNetworkV6);
+
+    [SysAbiExport(Nid = "RCCY01Xd+58", ExportName = "sceNetResolverStartNtoaMultipleRecords", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetResolverStartNtoaMultipleRecords(CpuContext ctx) => ResolverMultipleRecords(ctx);
+
+    [SysAbiExport(Nid = "sT4nBQKUPqM", ExportName = "sceNetResolverStartNtoaMultipleRecordsEx", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetResolverStartNtoaMultipleRecordsEx(CpuContext ctx) => ResolverMultipleRecords(ctx);
+
+    [SysAbiExport(Nid = "2eKbgcboJso", ExportName = "sceNetSendmsg", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetSendmsg(CpuContext ctx) => MessageCore(ctx, true);
+
+    [SysAbiExport(Nid = "15Ywg-ZsSl0", ExportName = "sceNetSetDns6Info", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetSetDns6Info(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "E3oH1qsdqCA", ExportName = "sceNetSetDns6InfoToKernel", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetSetDns6InfoToKernel(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "B-M6KjO8-+w", ExportName = "sceNetSetDnsInfo", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetSetDnsInfo(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "8s+T0bJeyLQ", ExportName = "sceNetSetDnsInfoToKernel", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetSetDnsInfoToKernel(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "k1V1djYpk7k", ExportName = "sceNetShowIfconfig", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetShowIfconfig(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "j6pkkO2zJtg", ExportName = "sceNetShowIfconfigForBuffer", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetShowIfconfigForBuffer(CpuContext ctx) => WriteEmptyText(ctx);
+
+    [SysAbiExport(Nid = "E8dTcvQw3hg", ExportName = "sceNetShowIfconfigWithMemory", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetShowIfconfigWithMemory(CpuContext ctx) => ClearOptionalPointer(ctx, ctx[CpuRegister.Rdi]);
+
+    [SysAbiExport(Nid = "WxislcDAW5I", ExportName = "sceNetShowNetstat", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetShowNetstat(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "rX30iWQqqzg", ExportName = "sceNetShowNetstatEx", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetShowNetstatEx(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "vjwKTGa21f0", ExportName = "sceNetShowNetstatExForBuffer", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetShowNetstatExForBuffer(CpuContext ctx) => WriteEmptyText(ctx);
+
+    [SysAbiExport(Nid = "mqoB+LN0pW8", ExportName = "sceNetShowNetstatForBuffer", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetShowNetstatForBuffer(CpuContext ctx) => WriteEmptyText(ctx);
+
+    [SysAbiExport(Nid = "H5WHYRfDkR0", ExportName = "sceNetShowNetstatWithMemory", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetShowNetstatWithMemory(CpuContext ctx) => ClearOptionalPointer(ctx, ctx[CpuRegister.Rdi]);
+
+    [SysAbiExport(Nid = "tk0p0JmiBkM", ExportName = "sceNetShowPolicy", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetShowPolicy(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "dbrSNEuZfXI", ExportName = "sceNetShowPolicyWithMemory", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetShowPolicyWithMemory(CpuContext ctx) => ClearOptionalPointer(ctx, ctx[CpuRegister.Rdi]);
+
+    [SysAbiExport(Nid = "cEMX1VcPpQ8", ExportName = "sceNetShowRoute", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetShowRoute(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "fCa7-ihdRdc", ExportName = "sceNetShowRoute6", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetShowRoute6(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "nTJqXsbSS1I", ExportName = "sceNetShowRoute6ForBuffer", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetShowRoute6ForBuffer(CpuContext ctx) => WriteEmptyText(ctx);
+
+    [SysAbiExport(Nid = "TCZyE2YI1uM", ExportName = "sceNetShowRoute6WithMemory", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetShowRoute6WithMemory(CpuContext ctx) => ClearOptionalPointer(ctx, ctx[CpuRegister.Rdi]);
+
+    [SysAbiExport(Nid = "n-IAZb7QB1Y", ExportName = "sceNetShowRouteForBuffer", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetShowRouteForBuffer(CpuContext ctx) => WriteEmptyText(ctx);
+
+    [SysAbiExport(Nid = "0-XSSp1kEFM", ExportName = "sceNetShowRouteWithMemory", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetShowRouteWithMemory(CpuContext ctx) => ClearOptionalPointer(ctx, ctx[CpuRegister.Rdi]);
+
+    [SysAbiExport(Nid = "zJGf8xjFnQE", ExportName = "sceNetSocketAbort", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetSocketAbort(CpuContext ctx) => WithSocket(ctx, socket =>
+    {
+        try
+        {
+            socket.Socket.Shutdown(SocketShutdown.Both);
+        }
+        catch (SocketException)
+        {
+        }
+
+        return 0;
+    });
+
+    [SysAbiExport(Nid = "6AJE2jKg-c0", ExportName = "sceNetSyncCreate", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetSyncCreate(CpuContext ctx) => CreateAuxiliaryHandle(ctx, SyncHandles);
+
+    [SysAbiExport(Nid = "atGfzCaXMak", ExportName = "sceNetSyncDestroy", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetSyncDestroy(CpuContext ctx) => DestroyAuxiliaryHandle(ctx, SyncHandles);
+
+    [SysAbiExport(Nid = "sAleh-BoxLA", ExportName = "sceNetSyncGet", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetSyncGet(CpuContext ctx) => ValidateAuxiliaryHandle(ctx, SyncHandles);
+
+    [SysAbiExport(Nid = "Z-8Jda650Vk", ExportName = "sceNetSyncSignal", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetSyncSignal(CpuContext ctx) => ValidateAuxiliaryHandle(ctx, SyncHandles);
+
+    [SysAbiExport(Nid = "NP5gxDeYhIM", ExportName = "sceNetSyncWait", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetSyncWait(CpuContext ctx) => ValidateAuxiliaryHandle(ctx, SyncHandles);
+
+    [SysAbiExport(Nid = "3zRdT3O2Kxo", ExportName = "sceNetSysctl", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetSysctl(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "j-Op3ibRJaQ", ExportName = "sceNetThreadCreate", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetThreadCreate(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "KirVfZbqniw", ExportName = "sceNetThreadExit", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetThreadExit(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "pRbEzaV30qI", ExportName = "sceNetThreadJoin", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetThreadJoin(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "bjrzRLFali0", ExportName = "sceNetUsleep", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetUsleep(CpuContext ctx)
+    {
+        var microseconds = Math.Min(ctx[CpuRegister.Rdi], unchecked((ulong)BoundedWaitMicroseconds));
+        if (microseconds != 0)
+        {
+            Thread.Sleep(TimeSpan.FromMicroseconds(microseconds));
+        }
+
+        return ctx.SetReturn(0);
+    }
+
+    [SysAbiExport(Nid = "VZgoeBxPXUQ", ExportName = "sce_net_dummy", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetDummy(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "GAtITrgxKDE", ExportName = "sce_net_in6addr_any", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetIn6AddrAny(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "84MgU4MMTLQ", ExportName = "sce_net_in6addr_linklocal_allnodes", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetIn6AddrLinkLocalAllNodes(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "2uSWyOKYc1M", ExportName = "sce_net_in6addr_linklocal_allrouters", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetIn6AddrLinkLocalAllRouters(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "P3AeWBvPrkg", ExportName = "sce_net_in6addr_loopback", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetIn6AddrLoopback(CpuContext ctx) => NetOk(ctx);
+
+    [SysAbiExport(Nid = "PgNI+j4zxzM", ExportName = "sce_net_in6addr_nodelocal_allnodes", Target = Generation.Gen5, LibraryName = "libSceNet")]
+    public static int NetIn6AddrNodeLocalAllNodes(CpuContext ctx) => NetOk(ctx);
+
+    private static int NetOk(CpuContext ctx) => ctx.SetReturn(0);
+
+    private static int CreateAuxiliaryHandle(CpuContext ctx, ConcurrentDictionary<int, byte> handles)
+    {
+        var handle = Interlocked.Increment(ref _nextAuxiliaryId);
+        handles[handle] = 0;
+        return ReturnInt32(ctx, handle);
+    }
+
+    private static int DestroyAuxiliaryHandle(CpuContext ctx, ConcurrentDictionary<int, byte> handles) =>
+        handles.TryRemove(unchecked((int)ctx[CpuRegister.Rdi]), out _)
+            ? ctx.SetReturn(0)
+            : ctx.SetReturn(NetErrorBadFileDescriptor);
+
+    private static int ValidateAuxiliaryHandle(CpuContext ctx, ConcurrentDictionary<int, byte> handles) =>
+        handles.ContainsKey(unchecked((int)ctx[CpuRegister.Rdi]))
+            ? ctx.SetReturn(0)
+            : ctx.SetReturn(NetErrorBadFileDescriptor);
+
+    private static int ClearOptionalBuffer(CpuContext ctx, ulong address, int size) =>
+        address == 0 ? ctx.SetReturn(0) : WriteOptionalBuffer(ctx, address, new byte[size]);
+
+    private static int ClearOptionalPointer(CpuContext ctx, ulong address) =>
+        address == 0 || ctx.TryWriteUInt64(address, 0)
+            ? ctx.SetReturn(0)
+            : ctx.SetReturn(NetErrorMemoryFault);
+
+    private static int WriteOptionalBuffer(CpuContext ctx, ulong address, ReadOnlySpan<byte> bytes) =>
+        address == 0 || ctx.Memory.TryWrite(address, bytes)
+            ? ctx.SetReturn(0)
+            : ctx.SetReturn(NetErrorMemoryFault);
+
+    private static int WriteRequiredBuffer(CpuContext ctx, ulong address, ReadOnlySpan<byte> bytes)
+    {
+        if (address == 0)
+        {
+            return ctx.SetReturn(NetErrorInvalidArgument);
+        }
+
+        return ctx.Memory.TryWrite(address, bytes)
+            ? ctx.SetReturn(0)
+            : ctx.SetReturn(NetErrorMemoryFault);
+    }
+
+    private static int WriteRequiredUInt32(CpuContext ctx, ulong address, uint value)
+    {
+        if (address == 0)
+        {
+            return ctx.SetReturn(NetErrorInvalidArgument);
+        }
+
+        return ctx.TryWriteUInt32(address, value)
+            ? ctx.SetReturn(0)
+            : ctx.SetReturn(NetErrorMemoryFault);
+    }
+
+    private static int WriteRequiredInt32(CpuContext ctx, ulong address, int value)
+    {
+        if (address == 0)
+        {
+            return ctx.SetReturn(NetErrorInvalidArgument);
+        }
+
+        return ctx.TryWriteInt32(address, value)
+            ? ctx.SetReturn(0)
+            : ctx.SetReturn(NetErrorMemoryFault);
+    }
+
+    private static int WriteIpv4Sockaddr(CpuContext ctx, ulong address, ReadOnlySpan<byte> ipv4)
+    {
+        if (address == 0)
+        {
+            return ctx.SetReturn(0);
+        }
+
+        Span<byte> socketAddress = stackalloc byte[16];
+        socketAddress[0] = 16;
+        socketAddress[1] = OrbisAddressFamilyInet;
+        ipv4.CopyTo(socketAddress[4..8]);
+        return ctx.Memory.TryWrite(address, socketAddress)
+            ? ctx.SetReturn(0)
+            : ctx.SetReturn(NetErrorMemoryFault);
+    }
+
+    private static int ClearCountedResult(CpuContext ctx)
+    {
+        if (ctx[CpuRegister.Rsi] != 0 && !ctx.TryWriteUInt32(ctx[CpuRegister.Rsi], 0))
+        {
+            return ctx.SetReturn(NetErrorMemoryFault);
+        }
+
+        return ClearOptionalBuffer(ctx, ctx[CpuRegister.Rdi], 32);
+    }
+
+    private static int GetSocketInfoCore(CpuContext ctx, int size)
+    {
+        if (!Sockets.ContainsKey(unchecked((int)ctx[CpuRegister.Rdi])))
+        {
+            return ctx.SetReturn(NetErrorBadFileDescriptor);
+        }
+
+        return ClearOptionalBuffer(ctx, ctx[CpuRegister.Rsi], size);
+    }
+
+    private static int WriteEmptyText(CpuContext ctx)
+    {
+        if (ctx[CpuRegister.Rdi] == 0)
+        {
+            return ctx.SetReturn(0);
+        }
+
+        return ctx.Memory.TryWrite(ctx[CpuRegister.Rdi], new byte[1])
+            ? ctx.SetReturn(0)
+            : ctx.SetReturn(NetErrorMemoryFault);
+    }
+
+    private static int ReturnUInt64(CpuContext ctx, ulong value)
+    {
+        ctx[CpuRegister.Rax] = value;
+        return unchecked((int)value);
+    }
+
+    private static int ResolverAddressToName(CpuContext ctx, int addressLength)
+    {
+        if (!Resolvers.TryGetValue(unchecked((int)ctx[CpuRegister.Rdi]), out var resolver))
+        {
+            return ctx.SetReturn(NetErrorBadFileDescriptor);
+        }
+
+        var bytes = new byte[addressLength];
+        var capacity = ctx[CpuRegister.Rcx];
+        if (ctx[CpuRegister.Rsi] == 0 || ctx[CpuRegister.Rdx] == 0 || capacity == 0 ||
+            !ctx.Memory.TryRead(ctx[CpuRegister.Rsi], bytes))
+        {
+            return ctx.SetReturn(NetErrorInvalidArgument);
+        }
+
+        var encoded = Encoding.ASCII.GetBytes(new IPAddress(bytes) + "\0");
+        if ((ulong)encoded.Length > capacity)
+        {
+            resolver.LastError = unchecked((int)0x8041011C);
+            return ctx.SetReturn(resolver.LastError);
+        }
+
+        if (!ctx.Memory.TryWrite(ctx[CpuRegister.Rdx], encoded))
+        {
+            return ctx.SetReturn(NetErrorMemoryFault);
+        }
+
+        resolver.LastError = 0;
+        return ctx.SetReturn(0);
+    }
+
+    private static int ResolverNameToAddress(CpuContext ctx, AddressFamily family)
+    {
+        if (!Resolvers.TryGetValue(unchecked((int)ctx[CpuRegister.Rdi]), out var resolver))
+        {
+            return ctx.SetReturn(NetErrorBadFileDescriptor);
+        }
+
+        if (!TryReadUtf8Z(ctx, ctx[CpuRegister.Rsi], MaxNameLength, out var hostname) || ctx[CpuRegister.Rdx] == 0)
+        {
+            return ctx.SetReturn(NetErrorInvalidArgument);
+        }
+
+        try
+        {
+            var task = Dns.GetHostAddressesAsync(hostname);
+            if (!task.Wait(TimeSpan.FromMilliseconds(250)))
+            {
+                resolver.LastError = unchecked((int)0x804101E2);
+                return ctx.SetReturn(resolver.LastError);
+            }
+
+            var address = task.Result.FirstOrDefault(item => item.AddressFamily == family);
+            if (address is null)
+            {
+                resolver.LastError = NetResolverErrorNoHost;
+                return ctx.SetReturn(resolver.LastError);
+            }
+
+            if (!ctx.Memory.TryWrite(ctx[CpuRegister.Rdx], address.GetAddressBytes()))
+            {
+                return ctx.SetReturn(NetErrorMemoryFault);
+            }
+
+            resolver.LastError = 0;
+            return ctx.SetReturn(0);
+        }
+        catch (AggregateException ex) when (ex.InnerException is SocketException socketException)
+        {
+            resolver.LastError = TranslateSocketError(socketException.SocketErrorCode);
+            return ctx.SetReturn(resolver.LastError);
+        }
+        catch (SocketException ex)
+        {
+            resolver.LastError = TranslateSocketError(ex.SocketErrorCode);
+            return ctx.SetReturn(resolver.LastError);
+        }
+    }
+
+    private static int ResolverMultipleRecords(CpuContext ctx)
+    {
+        var infoAddress = ctx[CpuRegister.Rdx];
+        if (infoAddress == 0)
+        {
+            return ctx.SetReturn(NetErrorInvalidArgument);
+        }
+
+        var originalOutput = ctx[CpuRegister.Rdx];
+        ctx[CpuRegister.Rdx] = originalOutput;
+        var result = ResolverNameToAddress(ctx, AddressFamily.InterNetwork);
+        if (result != 0)
+        {
+            return result;
+        }
+
+        if (!ctx.TryWriteUInt32(infoAddress + 16, OrbisAddressFamilyInet) ||
+            !ctx.TryWriteUInt32(infoAddress + 20, 1) ||
+            !ctx.TryWriteUInt32(infoAddress + 24, 1))
+        {
+            return ctx.SetReturn(NetErrorMemoryFault);
+        }
+
+        return ctx.SetReturn(0);
+    }
+
+    private static int MessageCore(CpuContext ctx, bool send)
+    {
+        return WithSocket(ctx, socket =>
+        {
+            var messageAddress = ctx[CpuRegister.Rsi];
+            if (messageAddress == 0 || !ctx.TryReadUInt64(messageAddress + 16, out var vectorsAddress) ||
+                !ctx.TryReadUInt32(messageAddress + 24, out var vectorCount) || vectorCount > 1024)
+            {
+                return NetErrorInvalidArgument;
+            }
+
+            var vectors = new (ulong Address, int Length)[vectorCount];
+            var totalLength = 0;
+            for (var index = 0; index < vectors.Length; index++)
+            {
+                var vectorAddress = vectorsAddress + unchecked((ulong)(index * 16));
+                if (!ctx.TryReadUInt64(vectorAddress, out var dataAddress) ||
+                    !ctx.TryReadUInt64(vectorAddress + 8, out var dataLength) ||
+                    !TryGetTransferLength(dataLength, out var length) || totalLength > MaxTransferSize - length)
+                {
+                    return NetErrorInvalidArgument;
+                }
+
+                vectors[index] = (dataAddress, length);
+                totalLength += length;
+            }
+
+            var buffer = new byte[totalLength];
+            if (send)
+            {
+                var offset = 0;
+                foreach (var vector in vectors)
+                {
+                    if (vector.Length != 0 && (vector.Address == 0 ||
+                        !ctx.Memory.TryRead(vector.Address, buffer.AsSpan(offset, vector.Length))))
+                    {
+                        return NetErrorMemoryFault;
+                    }
+
+                    offset += vector.Length;
+                }
+
+                return socket.Socket.Send(buffer, MapMessageFlags(unchecked((int)ctx[CpuRegister.Rdx])));
+            }
+
+            if (!socket.Socket.Poll(GetWaitMicroseconds(socket, unchecked((int)ctx[CpuRegister.Rdx])), SelectMode.SelectRead))
+            {
+                return NetErrorWouldBlock;
+            }
+
+            var received = socket.Socket.Receive(buffer, MapMessageFlags(unchecked((int)ctx[CpuRegister.Rdx])));
+            var sourceOffset = 0;
+            foreach (var vector in vectors)
+            {
+                var copyLength = Math.Min(vector.Length, received - sourceOffset);
+                if (copyLength <= 0)
+                {
+                    break;
+                }
+
+                if (vector.Address == 0 || !ctx.Memory.TryWrite(vector.Address, buffer.AsSpan(sourceOffset, copyLength)))
+                {
+                    return NetErrorMemoryFault;
+                }
+
+                sourceOffset += copyLength;
+            }
+
+            return received;
+        });
     }
 
     private static int SendCore(CpuContext ctx, bool withDestination) => WithSocket(ctx, socket =>

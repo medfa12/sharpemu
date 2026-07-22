@@ -15,7 +15,11 @@ public sealed class NetworkExportsTests : IDisposable
     private const ulong BinaryAddress = 0x2000;
     private const ulong OutputAddress = 0x3000;
 
-    public NetworkExportsTests() => NetExports.ResetForTests();
+    public NetworkExportsTests()
+    {
+        NetExports.ResetForTests();
+        NetCtlExports.ResetIpcStateForTests();
+    }
 
     public void Dispose() => NetExports.ResetForTests();
 
@@ -47,6 +51,14 @@ public sealed class NetworkExportsTests : IDisposable
         ctx[CpuRegister.Rdi] = 0x78563412;
         NetExports.NetNtohl(ctx);
         Assert.Equal(0x12345678UL, ctx[CpuRegister.Rax]);
+
+        ctx[CpuRegister.Rdi] = 0x0123456789ABCDEF;
+        NetExports.NetHtonll(ctx);
+        Assert.Equal(0xEFCDAB8967452301UL, ctx[CpuRegister.Rax]);
+
+        ctx[CpuRegister.Rdi] = 0xEFCDAB8967452301;
+        NetExports.NetNtohll(ctx);
+        Assert.Equal(0x0123456789ABCDEFUL, ctx[CpuRegister.Rax]);
     }
 
     [Fact]
@@ -191,5 +203,74 @@ public sealed class NetworkExportsTests : IDisposable
         Span<byte> address = stackalloc byte[11];
         Assert.True(memory.TryRead(OutputAddress, address));
         Assert.Equal("192.168.0.2", Encoding.ASCII.GetString(address));
+    }
+
+    [Fact]
+    public void EtherAddressExports_RoundTripPackedSixByteAddress()
+    {
+        var ctx = NewContext(out var memory);
+        var expected = new byte[] { 0x02, 0x53, 0x48, 0x41, 0x52, 0x50 };
+        memory.TryWrite(BinaryAddress, expected);
+
+        ctx[CpuRegister.Rdi] = BinaryAddress;
+        ctx[CpuRegister.Rsi] = TextAddress;
+        NetExports.NetEtherNtostr(ctx);
+        Assert.Equal(0, Result(ctx));
+
+        Span<byte> text = stackalloc byte[18];
+        Assert.True(memory.TryRead(TextAddress, text));
+        Assert.Equal("02:53:48:41:52:50\0", Encoding.ASCII.GetString(text));
+
+        ctx[CpuRegister.Rdi] = TextAddress;
+        ctx[CpuRegister.Rsi] = OutputAddress;
+        NetExports.NetEtherStrton(ctx);
+        Assert.Equal(0, Result(ctx));
+
+        Span<byte> packed = stackalloc byte[6];
+        Assert.True(memory.TryRead(OutputAddress, packed));
+        Assert.Equal(expected, packed.ToArray());
+    }
+
+    [Fact]
+    public void SyncHandleTable_RejectsUseAfterDestroy()
+    {
+        var ctx = NewContext(out _);
+
+        NetExports.NetSyncCreate(ctx);
+        var handle = Result(ctx);
+        Assert.True(handle > 0);
+
+        ctx[CpuRegister.Rdi] = unchecked((ulong)handle);
+        NetExports.NetSyncWait(ctx);
+        Assert.Equal(0, Result(ctx));
+
+        NetExports.NetSyncDestroy(ctx);
+        Assert.Equal(0, Result(ctx));
+
+        NetExports.NetSyncSignal(ctx);
+        Assert.Equal(unchecked((int)0x80410109), Result(ctx));
+    }
+
+    [Fact]
+    public void NetCtlIpcStateAndBandwidth_AreCoherent()
+    {
+        var ctx = NewContext(out _);
+
+        ctx[CpuRegister.Rdi] = OutputAddress;
+        NetCtlExports.NetCtlGetStateIpcInt(ctx);
+        Assert.True(ctx.TryReadUInt32(OutputAddress, out var state));
+        Assert.Equal(3U, state);
+
+        NetCtlExports.NetCtlDisconnectIpcInt(ctx);
+        ctx[CpuRegister.Rdi] = OutputAddress;
+        NetCtlExports.NetCtlGetStateV6IpcInt(ctx);
+        Assert.True(ctx.TryReadUInt32(OutputAddress, out state));
+        Assert.Equal(0U, state);
+
+        NetCtlExports.NetCtlEnableBandwidthManagementIpcInt(ctx);
+        ctx[CpuRegister.Rdi] = OutputAddress;
+        NetCtlExports.NetCtlIsBandwidthManagementEnabledIpcInt(ctx);
+        Assert.True(ctx.TryReadUInt32(OutputAddress, out var enabled));
+        Assert.Equal(1U, enabled);
     }
 }
