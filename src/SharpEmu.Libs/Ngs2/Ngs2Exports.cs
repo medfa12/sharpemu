@@ -12,14 +12,18 @@ public static class Ngs2Exports
 {
     private const int ErrorInvalidMaxGrainSamples = unchecked((int)0x804A0050);
     private const int ErrorInvalidNumGrainSamples = unchecked((int)0x804A0051);
+    private const int ErrorInvalidNumChannels = unchecked((int)0x804A0052);
     private const int ErrorInvalidOutAddress = unchecked((int)0x804A0053);
     private const int ErrorInvalidOutSize = unchecked((int)0x804A0054);
     private const int ErrorInvalidOptionAddress = unchecked((int)0x804A0080);
     private const int ErrorInvalidOptionSize = unchecked((int)0x804A0081);
+    private const int ErrorInvalidOptionFlag = unchecked((int)0x804A0082);
     private const int ErrorInvalidMaxVoices = unchecked((int)0x804A0103);
     private const int ErrorInvalidHandle = unchecked((int)0x804A0200);
     private const int ErrorInvalidSampleRate = unchecked((int)0x804A0201);
     private const int ErrorInvalidBufferInfo = unchecked((int)0x804A0206);
+    private const int ErrorInvalidBufferAddress = unchecked((int)0x804A0207);
+    private const int ErrorInvalidBufferSize = unchecked((int)0x804A0209);
     private const int ErrorInvalidBufferAllocator = unchecked((int)0x804A020A);
     private const int ErrorInvalidReportHandler = unchecked((int)0x804A0203);
     private const int ErrorInvalidReportHandle = unchecked((int)0x804A0204);
@@ -36,6 +40,12 @@ public static class Ngs2Exports
     private const int ErrorInvalidOperation = unchecked((int)0x804A030F);
     private const int ErrorInvalidWaveformAddress = unchecked((int)0x804A0406);
     private const int ErrorInvalidWaveformSize = unchecked((int)0x804A0407);
+    private const int ErrorInvalidWaveformType = unchecked((int)0x804A0402);
+    private const int ErrorInvalidGeomDistance = unchecked((int)0x804A0920);
+    private const int ErrorInvalidGeomListener = unchecked((int)0x804A0921);
+    private const int ErrorInvalidGeomSource = unchecked((int)0x804A0922);
+    private const int ErrorInvalidGeomFlag = unchecked((int)0x804A0923);
+    private const int ErrorInvalidGeomCone = unchecked((int)0x804A0924);
     private const int ErrorInvalidVoiceStateSize = unchecked((int)0x804A0A06);
 
     private const ulong HandleStorageSize = 0x1000;
@@ -46,7 +56,8 @@ public static class Ngs2Exports
     private const int WaveformFormatSize = 0x18;
     private const int WaveformBlockSize = 0x20;
     private const int WaveformInfoSize = 0xC8;
-    private const ulong MaximumRenderBufferSize = 16 * 1024 * 1024;
+    private const ulong MaximumWaveformBufferSize = 16 * 1024 * 1024;
+    private const uint MinimumGrainSamples = 64;
     private const uint DefaultMaximumGrainSamples = 512;
     private const uint DefaultGrainSamples = 256;
     private const uint DefaultSampleRate = 48000;
@@ -68,6 +79,9 @@ public static class Ngs2Exports
         public uint GrainSamples = DefaultGrainSamples;
         public uint SampleRate = DefaultSampleRate;
         public ulong RenderCount;
+        public ulong LastRenderTick;
+        public float LastRenderRatio;
+        public byte[] BufferInfo = new byte[ContextBufferInfoSize];
         public ulong UserData;
     }
 
@@ -82,6 +96,7 @@ public static class Ngs2Exports
         public uint MaximumMatrices;
         public uint MaximumPorts;
         public ulong RenderCount;
+        public byte[] BufferInfo = new byte[ContextBufferInfoSize];
         public ulong UserData;
     }
 
@@ -102,7 +117,6 @@ public static class Ngs2Exports
         StopImmediate,
         Kill,
         Pause,
-        Resume,
     }
 
     private sealed class VoiceState
@@ -111,8 +125,6 @@ public static class Ngs2Exports
         public uint VoiceIndex;
         public VoicePhase Phase;
         public VoiceEvent PendingEvent;
-        public ulong DecodedSamples;
-        public ulong DecodedBytes;
     }
 
     private sealed class StreamState
@@ -133,6 +145,13 @@ public static class Ngs2Exports
         uint MaximumMatrices,
         uint MaximumPorts);
 
+    private readonly record struct RenderOutput(
+        ulong Address,
+        ulong Size,
+        uint WaveformType,
+        uint Channels,
+        ulong RequiredSize);
+
     [SysAbiExport(
         Nid = "AQkj7C0f3PY",
         ExportName = "sceNgs2SystemResetOption",
@@ -146,13 +165,12 @@ public static class Ngs2Exports
             return ctx.SetReturn(ErrorInvalidOptionAddress);
         }
 
-        var size = ctx.TargetGeneration == Generation.Gen5 ? 0x90 : 0x40;
-        var option = new byte[size];
-        BinaryPrimitives.WriteUInt64LittleEndian(option, (ulong)size);
-        var commonOffset = ctx.TargetGeneration == Generation.Gen5 ? 0x68 : 0x18;
-        BinaryPrimitives.WriteUInt32LittleEndian(option.AsSpan(commonOffset + 4), DefaultMaximumGrainSamples);
-        BinaryPrimitives.WriteUInt32LittleEndian(option.AsSpan(commonOffset + 8), DefaultGrainSamples);
-        BinaryPrimitives.WriteUInt32LittleEndian(option.AsSpan(commonOffset + 12), DefaultSampleRate);
+        // The PS5 compatibility library's setup helper compares option.size with 0x40 at 0xd778.
+        var option = new byte[0x40];
+        BinaryPrimitives.WriteUInt64LittleEndian(option, 0x40);
+        BinaryPrimitives.WriteUInt32LittleEndian(option.AsSpan(0x1C), DefaultMaximumGrainSamples);
+        BinaryPrimitives.WriteUInt32LittleEndian(option.AsSpan(0x20), DefaultGrainSamples);
+        BinaryPrimitives.WriteUInt32LittleEndian(option.AsSpan(0x24), DefaultSampleRate);
         return ctx.Memory.TryWrite(optionAddress, option)
             ? ctx.SetReturn(0)
             : ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
@@ -182,20 +200,20 @@ public static class Ngs2Exports
         var optionAddress = ctx[CpuRegister.Rdi];
         var allocatorAddress = ctx[CpuRegister.Rsi];
         var outHandleAddress = ctx[CpuRegister.Rdx];
-        if (outHandleAddress == 0)
-        {
-            return ctx.SetReturn(ErrorInvalidOutAddress);
-        }
         if (!TryValidateAllocator(ctx, allocatorAddress))
         {
             return ctx.SetReturn(ErrorInvalidBufferAllocator);
+        }
+        if (outHandleAddress == 0)
+        {
+            return ctx.SetReturn(ErrorInvalidOutAddress);
         }
         if (!TryReadSystemOption(ctx, optionAddress, out var option, out var optionError))
         {
             return ctx.SetReturn(optionError);
         }
 
-        return CreateSystem(ctx, option, outHandleAddress);
+        return CreateSystem(ctx, option, outHandleAddress, null);
     }
 
     [SysAbiExport(
@@ -210,17 +228,30 @@ public static class Ngs2Exports
         {
             return ctx.SetReturn(ErrorInvalidBufferInfo);
         }
+        if (ctx[CpuRegister.Rdx] == 0)
+        {
+            return ctx.SetReturn(ErrorInvalidOutAddress);
+        }
         if (!TryReadSystemOption(ctx, ctx[CpuRegister.Rdi], out var option, out var optionError))
         {
             return ctx.SetReturn(optionError);
         }
-        if (!ctx.TryReadUInt64(bufferInfoAddress, out var hostBuffer) ||
-            !ctx.TryReadUInt64(bufferInfoAddress + 8, out var hostBufferSize) ||
-            hostBuffer == 0 || hostBufferSize < HandleStorageSize)
+        var bufferInfo = new byte[ContextBufferInfoSize];
+        if (!ctx.Memory.TryRead(bufferInfoAddress, bufferInfo))
         {
-            return ctx.SetReturn(ErrorInvalidBufferInfo);
+            return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
         }
-        return CreateSystem(ctx, option, ctx[CpuRegister.Rdx]);
+        var hostBuffer = BinaryPrimitives.ReadUInt64LittleEndian(bufferInfo);
+        var hostBufferSize = BinaryPrimitives.ReadUInt64LittleEndian(bufferInfo.AsSpan(8));
+        if (hostBuffer == 0)
+        {
+            return ctx.SetReturn(ErrorInvalidBufferAddress);
+        }
+        if (hostBufferSize < HandleStorageSize)
+        {
+            return ctx.SetReturn(ErrorInvalidBufferSize);
+        }
+        return CreateSystem(ctx, option, ctx[CpuRegister.Rdx], bufferInfo);
     }
 
     [SysAbiExport(
@@ -287,11 +318,14 @@ public static class Ngs2Exports
         var info = new byte[SystemInfoSize];
         WriteName(info.AsSpan(0, 16), system.Name);
         BinaryPrimitives.WriteUInt64LittleEndian(info.AsSpan(16), handle);
+        system.BufferInfo.CopyTo(info, 24);
         BinaryPrimitives.WriteUInt32LittleEndian(info.AsSpan(88), system.Uid);
-        BinaryPrimitives.WriteUInt32LittleEndian(info.AsSpan(92), 1);
+        BinaryPrimitives.WriteUInt32LittleEndian(info.AsSpan(92), MinimumGrainSamples);
         BinaryPrimitives.WriteUInt32LittleEndian(info.AsSpan(96), system.MaximumGrainSamples);
         BinaryPrimitives.WriteUInt32LittleEndian(info.AsSpan(100), 1);
         BinaryPrimitives.WriteUInt32LittleEndian(info.AsSpan(104), rackCount);
+        BinaryPrimitives.WriteSingleLittleEndian(info.AsSpan(108), system.LastRenderRatio);
+        BinaryPrimitives.WriteUInt64LittleEndian(info.AsSpan(112), system.LastRenderTick);
         BinaryPrimitives.WriteUInt64LittleEndian(info.AsSpan(120), system.RenderCount);
         BinaryPrimitives.WriteUInt32LittleEndian(info.AsSpan(128), system.SampleRate);
         BinaryPrimitives.WriteUInt32LittleEndian(info.AsSpan(132), system.GrainSamples);
@@ -325,6 +359,22 @@ public static class Ngs2Exports
     {
         var systemHandle = ctx[CpuRegister.Rdi];
         var rackId = (uint)ctx[CpuRegister.Rsi];
+        if (ExpectedRackOptionSize(rackId) == 0)
+        {
+            return ctx.SetReturn(ErrorInvalidRackId);
+        }
+        if (!TryValidateAllocator(ctx, ctx[CpuRegister.Rcx]))
+        {
+            return ctx.SetReturn(ErrorInvalidBufferAllocator);
+        }
+        if (ctx[CpuRegister.R8] == 0)
+        {
+            return ctx.SetReturn(ErrorInvalidOutAddress);
+        }
+        if (!TryReadRackOption(ctx, rackId, ctx[CpuRegister.Rdx], out var option, out var optionError))
+        {
+            return ctx.SetReturn(optionError);
+        }
         lock (StateGate)
         {
             if (!Systems.ContainsKey(systemHandle))
@@ -332,15 +382,7 @@ public static class Ngs2Exports
                 return ctx.SetReturn(ErrorInvalidSystemHandle);
             }
         }
-        if (!TryValidateAllocator(ctx, ctx[CpuRegister.Rcx]))
-        {
-            return ctx.SetReturn(ErrorInvalidBufferAllocator);
-        }
-        if (!TryReadRackOption(ctx, rackId, ctx[CpuRegister.Rdx], out var option, out var optionError))
-        {
-            return ctx.SetReturn(optionError);
-        }
-        return CreateRack(ctx, systemHandle, rackId, option, ctx[CpuRegister.R8]);
+        return CreateRack(ctx, systemHandle, rackId, option, ctx[CpuRegister.R8], null);
     }
 
     [SysAbiExport(
@@ -353,6 +395,38 @@ public static class Ngs2Exports
         var systemHandle = ctx[CpuRegister.Rdi];
         var rackId = (uint)ctx[CpuRegister.Rsi];
         var bufferInfoAddress = ctx[CpuRegister.Rcx];
+        if (ExpectedRackOptionSize(rackId) == 0)
+        {
+            return ctx.SetReturn(ErrorInvalidRackId);
+        }
+        if (bufferInfoAddress == 0)
+        {
+            return ctx.SetReturn(ErrorInvalidBufferInfo);
+        }
+        if (ctx[CpuRegister.R8] == 0)
+        {
+            return ctx.SetReturn(ErrorInvalidOutAddress);
+        }
+        if (!TryReadRackOption(ctx, rackId, ctx[CpuRegister.Rdx], out var option, out var optionError))
+        {
+            return ctx.SetReturn(optionError);
+        }
+        var bufferInfo = new byte[ContextBufferInfoSize];
+        if (!ctx.Memory.TryRead(bufferInfoAddress, bufferInfo))
+        {
+            return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+        var hostBuffer = BinaryPrimitives.ReadUInt64LittleEndian(bufferInfo);
+        var hostBufferSize = BinaryPrimitives.ReadUInt64LittleEndian(bufferInfo.AsSpan(8));
+        if (hostBuffer == 0)
+        {
+            return ctx.SetReturn(ErrorInvalidBufferAddress);
+        }
+        var requiredSize = HandleStorageSize + (ulong)option.MaximumVoices * 0x40;
+        if (hostBufferSize < requiredSize)
+        {
+            return ctx.SetReturn(ErrorInvalidBufferSize);
+        }
         lock (StateGate)
         {
             if (!Systems.ContainsKey(systemHandle))
@@ -360,18 +434,7 @@ public static class Ngs2Exports
                 return ctx.SetReturn(ErrorInvalidSystemHandle);
             }
         }
-        if (bufferInfoAddress == 0 ||
-            !ctx.TryReadUInt64(bufferInfoAddress, out var hostBuffer) ||
-            !ctx.TryReadUInt64(bufferInfoAddress + 8, out var hostBufferSize) ||
-            hostBuffer == 0 || hostBufferSize == 0)
-        {
-            return ctx.SetReturn(ErrorInvalidBufferInfo);
-        }
-        if (!TryReadRackOption(ctx, rackId, ctx[CpuRegister.Rdx], out var option, out var optionError))
-        {
-            return ctx.SetReturn(optionError);
-        }
-        return CreateRack(ctx, systemHandle, rackId, option, ctx[CpuRegister.R8]);
+        return CreateRack(ctx, systemHandle, rackId, option, ctx[CpuRegister.R8], bufferInfo);
     }
 
     [SysAbiExport(
@@ -432,6 +495,7 @@ public static class Ngs2Exports
         var info = new byte[RackInfoSize];
         WriteName(info.AsSpan(0, 16), rack.Name);
         BinaryPrimitives.WriteUInt64LittleEndian(info.AsSpan(16), rackHandle);
+        rack.BufferInfo.CopyTo(info, 24);
         BinaryPrimitives.WriteUInt64LittleEndian(info.AsSpan(88), rack.SystemHandle);
         BinaryPrimitives.WriteUInt32LittleEndian(info.AsSpan(96), RackType(rack.RackId));
         BinaryPrimitives.WriteUInt32LittleEndian(info.AsSpan(100), rack.RackId);
@@ -551,7 +615,11 @@ public static class Ngs2Exports
         {
             return ctx.SetReturn(ErrorInvalidOutAddress);
         }
-        if (stateSize < 4 || stateSize > 0x400)
+        if (stateSize < 4)
+        {
+            return ctx.SetReturn(ErrorInvalidOutSize);
+        }
+        if (stateSize > 8)
         {
             return ctx.SetReturn(ErrorInvalidVoiceStateSize);
         }
@@ -567,11 +635,9 @@ public static class Ngs2Exports
 
         var state = new byte[(int)stateSize];
         BinaryPrimitives.WriteUInt32LittleEndian(state, StateFlags(voice.Phase));
-        if (state.Length >= 48)
+        if (state.Length >= 8)
         {
-            BinaryPrimitives.WriteSingleLittleEndian(state.AsSpan(4), voice.Phase == VoicePhase.Playing ? 1.0f : 0.0f);
-            BinaryPrimitives.WriteUInt64LittleEndian(state.AsSpan(16), voice.DecodedSamples);
-            BinaryPrimitives.WriteUInt64LittleEndian(state.AsSpan(24), voice.DecodedBytes);
+            BinaryPrimitives.WriteUInt32LittleEndian(state.AsSpan(4), 0);
         }
         return ctx.Memory.TryWrite(stateAddress, state)
             ? ctx.SetReturn(0)
@@ -596,6 +662,10 @@ public static class Ngs2Exports
         {
             if (!Voices.TryGetValue(voiceHandle, out var voice))
             {
+                if (!ctx.TryWriteUInt32(flagsAddress, 0))
+                {
+                    return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+                }
                 return ctx.SetReturn(ErrorInvalidVoiceHandle);
             }
             flags = StateFlags(voice.Phase);
@@ -649,45 +719,74 @@ public static class Ngs2Exports
                 return ctx.SetReturn(ErrorInvalidSystemHandle);
             }
         }
-        if (bufferInfoCount != 0 && bufferInfoAddress == 0)
+        // libSceNgs2.sprx 0xe9a6/0xe9af rejects both a null array and counts outside 1..16.
+        if (bufferInfoAddress == 0 || bufferInfoCount is 0 or > 16)
         {
-            return ctx.SetReturn(ErrorInvalidBufferInfo);
+            return ctx.SetReturn(ErrorInvalidBufferAddress);
         }
 
-        ulong renderedBytes = 0;
+        var outputs = new RenderOutput[bufferInfoCount];
         for (uint index = 0; index < bufferInfoCount; index++)
         {
             var entryAddress = bufferInfoAddress + index * RenderBufferInfoSize;
             if (!ctx.TryReadUInt64(entryAddress, out var bufferAddress) ||
-                !ctx.TryReadUInt64(entryAddress + 8, out var bufferSize))
+                !ctx.TryReadUInt64(entryAddress + 8, out var bufferSize) ||
+                !ctx.TryReadUInt32(entryAddress + 16, out var waveformType) ||
+                !ctx.TryReadUInt32(entryAddress + 20, out var channels))
             {
                 return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
             }
-            if (bufferSize > MaximumRenderBufferSize)
+            outputs[index] = new RenderOutput(bufferAddress, bufferSize, waveformType, channels, 0);
+        }
+
+        for (var index = 0; index < outputs.Length; index++)
+        {
+            var output = outputs[index];
+            if (output.Channels is not (1 or 2 or 6 or 8))
             {
-                return ctx.SetReturn(ErrorInvalidOutSize);
+                return ClearRenderOutputsAndReturn(ctx, outputs, ErrorInvalidNumChannels);
             }
-            if (bufferAddress != 0 && bufferSize != 0 && !TryClearGuestBuffer(ctx, bufferAddress, bufferSize))
+            var bytesPerSample = output.WaveformType switch
+            {
+                0x12 or 0x13 => 2UL,
+                0x18 or 0x19 => 4UL,
+                _ => 0UL,
+            };
+            if (bytesPerSample == 0)
+            {
+                return ClearRenderOutputsAndReturn(ctx, outputs, ErrorInvalidWaveformType);
+            }
+            if (output.Address == 0)
+            {
+                return ClearRenderOutputsAndReturn(ctx, outputs, ErrorInvalidBufferAddress);
+            }
+            var requiredSize = (ulong)system.GrainSamples * output.Channels * bytesPerSample;
+            outputs[index] = output with { RequiredSize = requiredSize };
+            if (output.Size < requiredSize)
+            {
+                return ClearRenderOutputsAndReturn(ctx, outputs, ErrorInvalidBufferSize);
+            }
+        }
+
+        foreach (var output in outputs)
+        {
+            if (!TryClearGuestBuffer(ctx, output.Address, output.RequiredSize))
             {
                 return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
             }
-            renderedBytes += bufferSize;
         }
 
         lock (StateGate)
         {
             system.RenderCount++;
+            system.LastRenderTick = system.RenderCount;
+            system.LastRenderRatio = 0;
             foreach (var pair in Racks.Where(pair => pair.Value.SystemHandle == systemHandle))
             {
                 pair.Value.RenderCount++;
                 foreach (var voice in Voices.Values.Where(value => value.RackHandle == pair.Key))
                 {
                     ApplyPendingEvent(voice);
-                    if (voice.Phase == VoicePhase.Playing)
-                    {
-                        voice.DecodedSamples += system.GrainSamples;
-                        voice.DecodedBytes += renderedBytes;
-                    }
                 }
             }
         }
@@ -714,7 +813,7 @@ public static class Ngs2Exports
                 return ctx.SetReturn(ErrorInvalidSystemHandle);
             }
             var samples = (uint)ctx[CpuRegister.Rsi];
-            if (samples == 0 || samples > system.MaximumGrainSamples)
+            if (!IsValidGrainSamples(samples) || samples > system.MaximumGrainSamples)
             {
                 return ctx.SetReturn(ErrorInvalidNumGrainSamples);
             }
@@ -737,7 +836,7 @@ public static class Ngs2Exports
                 return ctx.SetReturn(ErrorInvalidSystemHandle);
             }
             var sampleRate = (uint)ctx[CpuRegister.Rsi];
-            if (sampleRate is < 8000 or > 192000)
+            if (!IsValidSampleRate(sampleRate))
             {
                 return ctx.SetReturn(ErrorInvalidSampleRate);
             }
@@ -896,7 +995,7 @@ public static class Ngs2Exports
         {
             return ctx.SetReturn(ErrorInvalidWaveformAddress);
         }
-        if (dataSize == 0 || dataSize > MaximumRenderBufferSize)
+        if (dataSize == 0 || dataSize > MaximumWaveformBufferSize)
         {
             return ctx.SetReturn(ErrorInvalidWaveformSize);
         }
@@ -1032,21 +1131,105 @@ public static class Ngs2Exports
         var listenerAddress = ctx[CpuRegister.Rdi];
         var sourceAddress = ctx[CpuRegister.Rsi];
         var outputAddress = ctx[CpuRegister.Rdx];
+        var flags = (uint)ctx[CpuRegister.Rcx];
         if (listenerAddress == 0)
         {
-            return ctx.SetReturn(unchecked((int)0x804A0921));
+            return ctx.SetReturn(ErrorInvalidGeomListener);
         }
         if (sourceAddress == 0)
         {
-            return ctx.SetReturn(unchecked((int)0x804A0922));
+            return ctx.SetReturn(ErrorInvalidGeomSource);
         }
         if (outputAddress == 0)
         {
             return ctx.SetReturn(ErrorInvalidOutAddress);
         }
-        Span<byte> attribute = stackalloc byte[0x134];
-        attribute.Clear();
-        BinaryPrimitives.WriteInt32LittleEndian(attribute, BitConverter.SingleToInt32Bits(1.0f));
+        // The oracle rejects zero, bits above 0x1f, and matrix+ambisonics at 0x2b24..0x2b42.
+        if (flags is 0 or > 0x1F || (flags & 0x14) == 0x14)
+        {
+            return ctx.SetReturn(ErrorInvalidGeomFlag);
+        }
+
+        var listener = new byte[0x60];
+        var source = new byte[0x68];
+        if (!ctx.Memory.TryRead(listenerAddress, listener) || !ctx.Memory.TryRead(sourceAddress, source))
+        {
+            return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        var rolloffModel = BinaryPrimitives.ReadUInt32LittleEndian(source.AsSpan(0x34));
+        var maxDistance = ReadSingle(source, 0x38);
+        var rolloffFactor = ReadSingle(source, 0x3C);
+        var referenceDistance = ReadSingle(source, 0x40);
+        if (rolloffModel > 5 || maxDistance < 0 || rolloffFactor < 0 || referenceDistance < 0)
+        {
+            return ctx.SetReturn(ErrorInvalidGeomDistance);
+        }
+        if ((flags & 1) != 0 && !IsValidCone(source))
+        {
+            return ctx.SetReturn(ErrorInvalidGeomCone);
+        }
+
+        var x = ReadSingle(source, 0);
+        var y = ReadSingle(source, 4);
+        var z = ReadSingle(source, 8);
+        var tx = x * ReadSingle(listener, 0x00) + y * ReadSingle(listener, 0x10) +
+                 z * ReadSingle(listener, 0x20) + ReadSingle(listener, 0x30);
+        var ty = x * ReadSingle(listener, 0x04) + y * ReadSingle(listener, 0x14) +
+                 z * ReadSingle(listener, 0x24) + ReadSingle(listener, 0x34);
+        var tz = x * ReadSingle(listener, 0x08) + y * ReadSingle(listener, 0x18) +
+                 z * ReadSingle(listener, 0x28) + ReadSingle(listener, 0x38);
+        if (BinaryPrimitives.ReadUInt32LittleEndian(listener.AsSpan(0x50)) != 0)
+        {
+            tz = -tz;
+        }
+
+        var distance = MathF.Sqrt(tx * tx + ty * ty + tz * tz);
+        var level = CalculateDistanceLevel(
+            rolloffModel, distance, maxDistance, rolloffFactor, referenceDistance);
+        var minLevel = MathF.Max(0, ReadSingle(source, 0x54));
+        var maxLevel = MathF.Max(0, ReadSingle(source, 0x50));
+        if (maxLevel < minLevel)
+        {
+            (minLevel, maxLevel) = (maxLevel, minLevel);
+        }
+        level = Math.Clamp(level, minLevel, maxLevel);
+        if ((flags & 1) != 0)
+        {
+            level *= CalculateConeLevel(source, tx, ty, tz);
+        }
+
+        var attribute = new byte[0x134];
+        _ = ctx.Memory.TryRead(outputAddress, attribute);
+        if ((flags & 2) != 0)
+        {
+            WriteSingle(attribute, 0, CalculateDopplerPitch(listener, source, tx, ty, tz, distance));
+        }
+        if ((flags & 4) != 0)
+        {
+            attribute.AsSpan(4, 64 * sizeof(float)).Clear();
+            var matrixChannels = BinaryPrimitives.ReadUInt32LittleEndian(source.AsSpan(0x60));
+            if (matrixChannels is not (1 or 2 or 6 or 8))
+            {
+                matrixChannels = 1;
+            }
+            for (var channel = 0; channel < matrixChannels; channel++)
+            {
+                WriteSingle(attribute, 4 + channel * (8 + 1) * sizeof(float), level);
+            }
+        }
+        if ((flags & 8) != 0)
+        {
+            WriteSingle(attribute, 0x104, tx);
+            WriteSingle(attribute, 0x108, ty);
+            WriteSingle(attribute, 0x10C, tz);
+            WriteSingle(attribute, 0x110, level);
+        }
+        if ((flags & 0x10) != 0)
+        {
+            attribute.AsSpan(4, 8 * sizeof(float)).Clear();
+            WriteSingle(attribute, 4, level);
+        }
         return ctx.Memory.TryWrite(outputAddress, attribute)
             ? ctx.SetReturn(0)
             : ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
@@ -1389,7 +1572,112 @@ public static class Ngs2Exports
         return true;
     }
 
-    private static int CreateSystem(CpuContext ctx, SystemOption option, ulong outHandleAddress)
+    private static float ReadSingle(ReadOnlySpan<byte> data, int offset) =>
+        BinaryPrimitives.ReadSingleLittleEndian(data[offset..]);
+
+    private static void WriteSingle(Span<byte> data, int offset, float value) =>
+        BinaryPrimitives.WriteSingleLittleEndian(data[offset..], value);
+
+    private static bool IsValidCone(ReadOnlySpan<byte> source)
+    {
+        var innerLevel = ReadSingle(source, 0x24);
+        var innerAngle = ReadSingle(source, 0x28);
+        var outerLevel = ReadSingle(source, 0x2C);
+        var outerAngle = ReadSingle(source, 0x30);
+        return innerLevel is >= 0 and <= 2 && outerLevel is >= 0 and <= 2 &&
+               innerAngle is >= 0 and <= 360 && outerAngle is >= 0 and <= 360 &&
+               innerAngle <= outerAngle;
+    }
+
+    private static float CalculateDistanceLevel(
+        uint model,
+        float distance,
+        float maxDistance,
+        float rolloffFactor,
+        float referenceDistance)
+    {
+        var clampedDistance = Math.Clamp(distance, referenceDistance, MathF.Max(referenceDistance, maxDistance));
+        var selectedDistance = model >= 3 ? clampedDistance : distance;
+        var baseModel = model % 3;
+        if (rolloffFactor == 0)
+        {
+            return 1;
+        }
+        return baseModel switch
+        {
+            0 => referenceDistance <= 0
+                ? 1
+                : MathF.Max(0, referenceDistance /
+                    (referenceDistance + rolloffFactor * (selectedDistance - referenceDistance))),
+            1 => maxDistance <= referenceDistance
+                ? (selectedDistance <= referenceDistance ? 1 : 0)
+                : MathF.Max(0, 1 - rolloffFactor *
+                    (selectedDistance - referenceDistance) / (maxDistance - referenceDistance)),
+            2 => referenceDistance <= 0 || selectedDistance <= 0
+                ? 1
+                : MathF.Pow(selectedDistance / referenceDistance, -rolloffFactor),
+            _ => 1,
+        };
+    }
+
+    private static float CalculateConeLevel(ReadOnlySpan<byte> source, float x, float y, float z)
+    {
+        var distance = MathF.Sqrt(x * x + y * y + z * z);
+        var dx = ReadSingle(source, 0x18);
+        var dy = ReadSingle(source, 0x1C);
+        var dz = ReadSingle(source, 0x20);
+        var directionLength = MathF.Sqrt(dx * dx + dy * dy + dz * dz);
+        if (distance == 0 || directionLength == 0)
+        {
+            return ReadSingle(source, 0x24);
+        }
+        var cosine = Math.Clamp((dx * -x + dy * -y + dz * -z) / (directionLength * distance), -1, 1);
+        var angle = MathF.Acos(cosine) * (180 / MathF.PI) * 2;
+        var innerAngle = ReadSingle(source, 0x28);
+        var outerAngle = ReadSingle(source, 0x30);
+        var innerLevel = ReadSingle(source, 0x24);
+        var outerLevel = ReadSingle(source, 0x2C);
+        if (angle <= innerAngle)
+        {
+            return innerLevel;
+        }
+        if (angle >= outerAngle || outerAngle <= innerAngle)
+        {
+            return outerLevel;
+        }
+        return innerLevel + (outerLevel - innerLevel) *
+            ((angle - innerAngle) / (outerAngle - innerAngle));
+    }
+
+    private static float CalculateDopplerPitch(
+        ReadOnlySpan<byte> listener,
+        ReadOnlySpan<byte> source,
+        float x,
+        float y,
+        float z,
+        float distance)
+    {
+        var soundSpeed = ReadSingle(listener, 0x4C);
+        var dopplerFactor = ReadSingle(source, 0x44);
+        if (soundSpeed <= 0 || dopplerFactor <= 0 || distance == 0)
+        {
+            return 1;
+        }
+        var nx = x / distance;
+        var ny = y / distance;
+        var nz = z / distance;
+        var listenerVelocity = ReadSingle(listener, 0x40) * nx +
+                               ReadSingle(listener, 0x44) * ny +
+                               ReadSingle(listener, 0x48) * nz;
+        var sourceVelocity = ReadSingle(source, 0x0C) * nx +
+                             ReadSingle(source, 0x10) * ny +
+                             ReadSingle(source, 0x14) * nz;
+        var numerator = soundSpeed - dopplerFactor * listenerVelocity;
+        var denominator = soundSpeed - dopplerFactor * sourceVelocity;
+        return denominator <= 0 ? 4 : Math.Clamp(numerator / denominator, 0, 4);
+    }
+
+    private static int CreateSystem(CpuContext ctx, SystemOption option, ulong outHandleAddress, byte[]? bufferInfo)
     {
         if (outHandleAddress == 0)
         {
@@ -1398,6 +1686,12 @@ public static class Ngs2Exports
         if (!TryCreateHandle(ctx, 1, 0, out var handle) || !ctx.TryWriteUInt64(outHandleAddress, handle))
         {
             return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+        var effectiveBufferInfo = bufferInfo ?? new byte[ContextBufferInfoSize];
+        if (bufferInfo is null)
+        {
+            BinaryPrimitives.WriteUInt64LittleEndian(effectiveBufferInfo, handle);
+            BinaryPrimitives.WriteUInt64LittleEndian(effectiveBufferInfo.AsSpan(8), HandleStorageSize);
         }
         lock (StateGate)
         {
@@ -1408,12 +1702,19 @@ public static class Ngs2Exports
                 MaximumGrainSamples = option.MaximumGrainSamples,
                 GrainSamples = option.GrainSamples,
                 SampleRate = option.SampleRate,
+                BufferInfo = effectiveBufferInfo,
             };
         }
         return ctx.SetReturn(0);
     }
 
-    private static int CreateRack(CpuContext ctx, ulong systemHandle, uint rackId, RackOption option, ulong outHandleAddress)
+    private static int CreateRack(
+        CpuContext ctx,
+        ulong systemHandle,
+        uint rackId,
+        RackOption option,
+        ulong outHandleAddress,
+        byte[]? bufferInfo)
     {
         if (outHandleAddress == 0)
         {
@@ -1422,6 +1723,14 @@ public static class Ngs2Exports
         if (!TryCreateHandle(ctx, 2, systemHandle, out var handle) || !ctx.TryWriteUInt64(outHandleAddress, handle))
         {
             return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+        var effectiveBufferInfo = bufferInfo ?? new byte[ContextBufferInfoSize];
+        if (bufferInfo is null)
+        {
+            BinaryPrimitives.WriteUInt64LittleEndian(effectiveBufferInfo, handle);
+            BinaryPrimitives.WriteUInt64LittleEndian(
+                effectiveBufferInfo.AsSpan(8),
+                HandleStorageSize + (ulong)option.MaximumVoices * 0x40);
         }
         lock (StateGate)
         {
@@ -1435,6 +1744,7 @@ public static class Ngs2Exports
                 MaximumVoices = option.MaximumVoices,
                 MaximumMatrices = option.MaximumMatrices,
                 MaximumPorts = option.MaximumPorts,
+                BufferInfo = effectiveBufferInfo,
             };
         }
         return ctx.SetReturn(0);
@@ -1453,37 +1763,34 @@ public static class Ngs2Exports
             error = ErrorInvalidOptionAddress;
             return false;
         }
-        var expectedSize = ctx.TargetGeneration == Generation.Gen5 ? 0x90UL : 0x40UL;
-        if (size != expectedSize)
+        if (size != 0x40)
         {
             error = ErrorInvalidOptionSize;
             return false;
         }
-        var commonOffset = ctx.TargetGeneration == Generation.Gen5 ? 0x68UL : 0x18UL;
-        if (!ctx.TryReadUInt32(address + commonOffset + 4, out var maximumGrainSamples) ||
-            !ctx.TryReadUInt32(address + commonOffset + 8, out var grainSamples) ||
-            !ctx.TryReadUInt32(address + commonOffset + 12, out var sampleRate))
+        if (!ctx.TryReadUInt32(address + 0x1C, out var maximumGrainSamples) ||
+            !ctx.TryReadUInt32(address + 0x20, out var grainSamples) ||
+            !ctx.TryReadUInt32(address + 0x24, out var sampleRate))
         {
             error = ErrorInvalidOptionAddress;
             return false;
         }
-        if (maximumGrainSamples == 0)
+        if (!IsValidGrainSamples(maximumGrainSamples))
         {
             error = ErrorInvalidMaxGrainSamples;
             return false;
         }
-        if (grainSamples == 0 || grainSamples > maximumGrainSamples)
+        if (!IsValidGrainSamples(grainSamples) || grainSamples > maximumGrainSamples)
         {
             error = ErrorInvalidNumGrainSamples;
             return false;
         }
-        if (sampleRate is < 8000 or > 192000)
+        if (!IsValidSampleRate(sampleRate))
         {
             error = ErrorInvalidSampleRate;
             return false;
         }
-        var nameLength = ctx.TargetGeneration == Generation.Gen5 ? 64 : 16;
-        if (!TryReadName(ctx, address + 8, nameLength, out var name))
+        if (!TryReadName(ctx, address + 8, 16, out var name))
         {
             error = ErrorInvalidOptionAddress;
             return false;
@@ -1515,22 +1822,27 @@ public static class Ngs2Exports
             error = ErrorInvalidOptionAddress;
             return false;
         }
-        var expected = ExpectedRackOptionSize(ctx.TargetGeneration, rackId);
+        var expected = ExpectedRackOptionSize(rackId);
         if (expected == 0 || size != expected)
         {
             error = expected == 0 ? ErrorInvalidRackId : ErrorInvalidOptionSize;
             return false;
         }
-        var fieldOffset = ctx.TargetGeneration == Generation.Gen5 ? 0x4CUL : 0x1CUL;
-        if (!ctx.TryReadUInt32(address + fieldOffset, out var maximumGrainSamples) ||
-            !ctx.TryReadUInt32(address + fieldOffset + 4, out var maximumVoices) ||
-            !ctx.TryReadUInt32(address + fieldOffset + 12, out var maximumMatrices) ||
-            !ctx.TryReadUInt32(address + fieldOffset + 16, out var maximumPorts))
+        if (!ctx.TryReadUInt32(address + 0x18, out var flags) ||
+            !ctx.TryReadUInt32(address + 0x1C, out var maximumGrainSamples) ||
+            !ctx.TryReadUInt32(address + 0x20, out var maximumVoices) ||
+            !ctx.TryReadUInt32(address + 0x28, out var maximumMatrices) ||
+            !ctx.TryReadUInt32(address + 0x2C, out var maximumPorts))
         {
             error = ErrorInvalidOptionAddress;
             return false;
         }
-        if (maximumGrainSamples == 0)
+        if ((flags & 0x07FF_FFFF) != 0)
+        {
+            error = ErrorInvalidOptionFlag;
+            return false;
+        }
+        if (!IsValidGrainSamples(maximumGrainSamples))
         {
             error = ErrorInvalidMaxGrainSamples;
             return false;
@@ -1540,8 +1852,7 @@ public static class Ngs2Exports
             error = ErrorInvalidMaxVoices;
             return false;
         }
-        var nameLength = ctx.TargetGeneration == Generation.Gen5 ? 64 : 16;
-        if (!TryReadName(ctx, address + 8, nameLength, out var name))
+        if (!TryReadName(ctx, address + 8, 16, out var name))
         {
             error = ErrorInvalidOptionAddress;
             return false;
@@ -1558,33 +1869,27 @@ public static class Ngs2Exports
         0x3000 => new RackOption(string.Empty, 512, 1, 0, 0),
         0x4001 => new RackOption(string.Empty, 512, 256, 1, 8),
         0x4002 => new RackOption(string.Empty, 512, 1, 1, 8),
+        0x4003 => new RackOption(string.Empty, 512, 1, 1, 8),
         _ => default,
     };
 
-    private static ulong ExpectedRackOptionSize(Generation generation, uint rackId)
+    private static ulong ExpectedRackOptionSize(uint rackId) => rackId switch
     {
-        if (generation == Generation.Gen5)
-        {
-            return rackId switch
-            {
-                0x1000 => 0xD4,
-                0x2000 => 0xC4,
-                0x2001 => 0xB8,
-                0x3000 => 0xB8,
-                0x4001 => 0x518,
-                0x4002 => 0x508,
-                _ => 0,
-            };
-        }
-        return rackId switch
-        {
-            0x1000 => 0xA4,
-            0x2000 => 0x94,
-            0x2001 => 0x88,
-            0x3000 => 0x88,
-            _ => 0,
-        };
-    }
+        0x1000 => 0xA4,
+        0x2000 => 0x94,
+        0x2001 => 0x88,
+        0x3000 => 0x88,
+        0x4001 => 0x4E8,
+        0x4002 => 0x4D8,
+        0x4003 => 0x4D8,
+        _ => 0,
+    };
+
+    private static bool IsValidGrainSamples(uint samples) =>
+        samples is >= MinimumGrainSamples and <= 1024 && (samples & 0x3F) == 0;
+
+    private static bool IsValidSampleRate(uint sampleRate) => sampleRate is
+        11025 or 12000 or 22050 or 24000 or 44100 or 48000 or 88200 or 96000 or 176400 or 192000;
 
     private static int ApplyVoiceParameters(CpuContext ctx, RackState rack, VoiceState voice, ulong startAddress)
     {
@@ -1624,7 +1929,7 @@ public static class Ngs2Exports
                 {
                     return ErrorInvalidVoiceControlId;
                 }
-                if (size < requiredSize)
+                if (size != requiredSize)
                 {
                     return ErrorInvalidVoiceControlSize;
                 }
@@ -1636,12 +1941,11 @@ public static class Ngs2Exports
                     }
                     voice.PendingEvent = eventId switch
                     {
-                        0x0001 => VoiceEvent.Play,
-                        0x0002 => VoiceEvent.Stop,
-                        0x0004 => VoiceEvent.StopImmediate,
-                        0x0008 => VoiceEvent.Kill,
-                        0x0010 => VoiceEvent.Pause,
-                        0x0020 => VoiceEvent.Resume,
+                        1 => VoiceEvent.Play,
+                        2 => VoiceEvent.Stop,
+                        3 => VoiceEvent.StopImmediate,
+                        4 => VoiceEvent.Kill,
+                        5 => VoiceEvent.Pause,
                         _ => VoiceEvent.None,
                     };
                     if (voice.PendingEvent == VoiceEvent.None)
@@ -1650,9 +1954,17 @@ public static class Ngs2Exports
                     }
                 }
             }
-            else if (rackId == rack.RackId || rackId is 0x4000 or 0x4001 or 0x4002)
+            else if (rackId == rack.RackId)
             {
-                if (voice.Phase == VoicePhase.Empty)
+                if (!IsSupportedRackControl(rack.RackId, controlId))
+                {
+                    return ErrorInvalidVoiceControlId;
+                }
+                if (controlId == 0 && size != ExpectedVoiceSetupSize(rack.RackId))
+                {
+                    return ErrorInvalidVoiceControlSize;
+                }
+                if (controlId == 0 && voice.Phase == VoicePhase.Empty)
                 {
                     voice.Phase = VoicePhase.Setup;
                 }
@@ -1672,6 +1984,26 @@ public static class Ngs2Exports
         return ErrorCircularVoiceControl;
     }
 
+    private static ushort ExpectedVoiceSetupSize(uint rackId) => rackId switch
+    {
+        0x1000 or 0x4001 => 0x28,
+        0x2000 or 0x3000 or 0x4003 => 0x10,
+        0x2001 or 0x4002 => 0x18,
+        _ => 0,
+    };
+
+    private static bool IsSupportedRackControl(uint rackId, uint controlId) => rackId switch
+    {
+        0x1000 => controlId <= 0x0A,
+        0x2000 => controlId <= 0x06,
+        0x2001 => controlId <= 0x01,
+        0x3000 => controlId <= 0x06,
+        0x4001 => controlId <= 0x05,
+        0x4002 => controlId == 0,
+        0x4003 => controlId <= 0x01,
+        _ => false,
+    };
+
     private static void ApplyPendingEvent(VoiceState voice)
     {
         switch (voice.PendingEvent)
@@ -1683,16 +2015,13 @@ public static class Ngs2Exports
                 voice.Phase = VoicePhase.Stopped;
                 break;
             case VoiceEvent.StopImmediate:
+                voice.Phase = VoicePhase.Stopped;
+                break;
             case VoiceEvent.Kill:
                 voice.Phase = VoicePhase.Empty;
-                voice.DecodedSamples = 0;
-                voice.DecodedBytes = 0;
                 break;
             case VoiceEvent.Pause when voice.Phase == VoicePhase.Playing:
                 voice.Phase = VoicePhase.Paused;
-                break;
-            case VoiceEvent.Resume when voice.Phase == VoicePhase.Paused:
-                voice.Phase = VoicePhase.Playing;
                 break;
         }
         voice.PendingEvent = VoiceEvent.None;
@@ -1704,9 +2033,24 @@ public static class Ngs2Exports
         VoicePhase.Setup => 1,
         VoicePhase.Playing => 3,
         VoicePhase.Paused => 5,
-        VoicePhase.Stopped => 0xB,
+        VoicePhase.Stopped => 0x9,
         _ => 0,
     };
+
+    private static int ClearRenderOutputsAndReturn(CpuContext ctx, RenderOutput[] outputs, int error)
+    {
+        foreach (var output in outputs)
+        {
+            if (output.Address != 0 && output.Size != 0 &&
+                !TryClearGuestBuffer(ctx, output.Address, output.RequiredSize == 0
+                    ? output.Size
+                    : Math.Min(output.Size, output.RequiredSize)))
+            {
+                return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+            }
+        }
+        return ctx.SetReturn(error);
+    }
 
     private static bool TryParseWave(CpuContext ctx, ulong baseAddress, ReadOnlySpan<byte> data, Span<byte> info)
     {
