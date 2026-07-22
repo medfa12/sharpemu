@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using System.Buffers.Binary;
+using System.Text;
+using SharpEmu.HLE;
 using SharpEmu.Libs.SaveData;
 using Xunit;
 
@@ -77,6 +79,75 @@ public sealed class SaveDataStorageTests
         Assert.Equal(
             new byte[] { 9, 8, 7, 6 },
             File.ReadAllBytes(System.IO.Path.Combine(destination, "data", "progress.bin")));
+    }
+
+    [Fact]
+    public void SaveBackup_RoundTripRestoresSnapshotAndPreservesBackup()
+    {
+        using var temp = new TempDirectory();
+        var savePath = System.IO.Path.Combine(temp.Path, "slot");
+        var dataPath = System.IO.Path.Combine(savePath, "data", "progress.bin");
+        Directory.CreateDirectory(System.IO.Path.GetDirectoryName(dataPath)!);
+        File.WriteAllBytes(dataPath, [1, 2, 3, 4]);
+
+        SaveDataExports.CreateSaveBackup(savePath);
+        File.WriteAllBytes(dataPath, [9, 9]);
+        File.WriteAllBytes(System.IO.Path.Combine(savePath, "new.bin"), [8]);
+
+        Assert.True(SaveDataExports.RestoreSaveBackup(savePath));
+        Assert.Equal(new byte[] { 1, 2, 3, 4 }, File.ReadAllBytes(dataPath));
+        Assert.False(File.Exists(System.IO.Path.Combine(savePath, "new.bin")));
+        Assert.True(Directory.Exists(SaveDataExports.GetSaveBackupPath(savePath)));
+    }
+
+    [Fact]
+    public void SaveDataEvent_PackingUsesSdkFieldOffsets()
+    {
+        var packed = SaveDataExports.PackSaveDataEvent(2, 37, "PPSA12345", "AUTOSAVE01");
+
+        Assert.Equal(0x68, packed.Length);
+        Assert.Equal(2U, BinaryPrimitives.ReadUInt32LittleEndian(packed));
+        Assert.Equal(37, BinaryPrimitives.ReadInt32LittleEndian(packed.AsSpan(0x08)));
+        Assert.Equal("PPSA12345", ReadAscii(packed.AsSpan(0x10, 10)));
+        Assert.Equal("AUTOSAVE01", ReadAscii(packed.AsSpan(0x1A, 32)));
+        Assert.True(packed.AsSpan(0x3A).SequenceEqual(new byte[0x2E]));
+    }
+
+    [Fact]
+    public void CompatibilitySettings_RoundTripThroughGuestOutputs()
+    {
+        const ulong OutputAddress = 0x4000;
+        var memory = new SparseGuestMemory();
+        var ctx = new CpuContext(memory, Generation.Gen5);
+
+        ctx[CpuRegister.Rdi] = 19;
+        SaveDataExports.SaveDataSetSaveDataLibraryUser(ctx);
+        Assert.Equal(0, Result(ctx));
+
+        ctx[CpuRegister.Rdi] = OutputAddress;
+        SaveDataExports.SaveDataGetAppLaunchedUser(ctx);
+        Assert.Equal(0, Result(ctx));
+        Span<byte> user = stackalloc byte[sizeof(uint)];
+        Assert.True(memory.TryRead(OutputAddress, user));
+        Assert.Equal(19U, BinaryPrimitives.ReadUInt32LittleEndian(user));
+
+        ctx[CpuRegister.Rsi] = 1;
+        SaveDataExports.SaveDataSetAutoUploadSetting(ctx);
+        Assert.Equal(0, Result(ctx));
+
+        ctx[CpuRegister.Rsi] = OutputAddress;
+        SaveDataExports.SaveDataGetAutoUploadSetting(ctx);
+        Assert.Equal(0, Result(ctx));
+        Assert.True(memory.TryRead(OutputAddress, user));
+        Assert.Equal(1U, BinaryPrimitives.ReadUInt32LittleEndian(user));
+    }
+
+    private static int Result(CpuContext ctx) => unchecked((int)(uint)ctx[CpuRegister.Rax]);
+
+    private static string ReadAscii(ReadOnlySpan<byte> value)
+    {
+        var terminator = value.IndexOf((byte)0);
+        return Encoding.ASCII.GetString(terminator < 0 ? value : value[..terminator]);
     }
 
     private sealed class TempDirectory : IDisposable
