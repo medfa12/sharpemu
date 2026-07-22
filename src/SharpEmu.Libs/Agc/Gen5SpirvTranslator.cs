@@ -280,6 +280,9 @@ internal static partial class Gen5SpirvTranslator
         private static readonly bool _debugTonemapTransferOutput =
             Environment.GetEnvironmentVariable(
                 "SHARPEMU_PS_DEBUG_TONEMAP_TRANSFER") == "1";
+        private static readonly bool _debugTonemapAbsoluteOutput =
+            Environment.GetEnvironmentVariable(
+                "SHARPEMU_PS_DEBUG_TONEMAP_ABS") == "1";
         // SHARPEMU_PS_FORCE_EXPOSURE_SCALAR=1 (high-probability toggle): for
         // the tonemap/composite pixel shader at PixelShaderAddress
         // 0x0000000500640200 only, force the exposure-scale S_BUFFER_LOAD_DWORD
@@ -3745,9 +3748,17 @@ internal static partial class Gen5SpirvTranslator
                  _debugTonemapTransferOutput) &&
                 IsKnownTonemapShader())
             {
-                return component < 3
-                    ? Bitcast(_floatType, LoadV(240u + (uint)component))
-                    : Float(1f);
+                if (component >= 3)
+                {
+                    return Float(1f);
+                }
+
+                var value = Bitcast(
+                    _floatType,
+                    LoadV(240u + (uint)component));
+                return _debugTonemapAbsoluteOutput
+                    ? Ext(4, _floatType, value)
+                    : value;
             }
 
             var packed = LoadV(instruction.Sources[component >> 1].Value);
