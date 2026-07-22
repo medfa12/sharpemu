@@ -6790,6 +6790,7 @@ public static class AgcExports
         var descriptions = new List<string>(bindings.Count);
         var translatedBindings = new List<TranslatedImageBinding>(bindings.Count);
         var hasStorageBinding = false;
+        var computeWritebackEnabled = VulkanVideoPresenter.ComputeWritebackEnabled;
         foreach (var binding in bindings)
         {
             var isStorage = Gen5ShaderTranslator.IsStorageImageOperation(binding.Opcode);
@@ -6806,8 +6807,9 @@ public static class AgcExports
                     binding.MipLevel ?? 0,
                     binding.SamplerDescriptor,
                     IsArrayedImageBinding(binding),
-                    IsWritable: binding.Opcode.StartsWith("ImageStore", StringComparison.Ordinal) ||
-                        binding.Opcode.StartsWith("ImageAtomic", StringComparison.Ordinal)));
+                    IsWritable: computeWritebackEnabled &&
+                        (binding.Opcode.StartsWith("ImageStore", StringComparison.Ordinal) ||
+                         binding.Opcode.StartsWith("ImageAtomic", StringComparison.Ordinal))));
             hasStorageBinding |= isStorage;
 
             var descriptorState = descriptorValid ? string.Empty : "/invalid-desc";
@@ -6885,7 +6887,7 @@ public static class AgcExports
                     CreateVulkanGuestMemoryBuffers(
                         evaluation.GlobalMemoryBindings,
                         ctx,
-                        shaderState.Program);
+                        computeWritebackEnabled ? shaderState.Program : null);
                 VulkanVideoPresenter.SubmitComputeDispatch(
                     shaderAddress,
                     computeSpirv,
@@ -6896,7 +6898,7 @@ public static class AgcExports
                     dispatch.GroupCountZ,
                     VulkanVideoPresenter.SelectComputeWritebackMemory(
                         ctx.Memory,
-                        VulkanVideoPresenter.ComputeWritebackEnabled));
+                        computeWritebackEnabled));
                 gpuDispatch = true;
             }
         }

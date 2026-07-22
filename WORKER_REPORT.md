@@ -7,7 +7,7 @@ No exported firmware NID was changed in this assignment. The target is the AGC-t
 ## Observable contract
 
 - `SHARPEMU_COMPUTE_WRITEBACK` enables the feature only when its value is exactly `1` (`VulkanVideoPresenter.cs:240-245`). When unset or set to another value, the old compute submission gate and resource behavior remain in effect.
-- A storage image is an output only for decoded `ImageStore*` or `ImageAtomic*` instructions (`AgcExports.cs:6789-6810`). An `ImageLoad*` binding remains storage-capable for Vulkan descriptor purposes but is not copied to guest memory.
+- A storage image is an output only for decoded `ImageStore*` or `ImageAtomic*` instructions (`AgcExports.cs:6789-6812`). An `ImageLoad*` binding remains storage-capable for Vulkan descriptor purposes but is not copied to guest memory.
 - A global/storage buffer is an output only when one of that binding's recorded instruction PCs resolves to `BufferStore*` or `BufferAtomic*` in the decoded shader program (`AgcExports.cs:6217-6257`). Read-only buffer bindings are not copied back.
 - The submitting AGC thread captures the guest-memory interface while `CpuContext` is still in scope and passes it with the compute work item (`AgcExports.cs:6880-6899`; `VulkanVideoPresenter.cs:1298-1358`). The render thread therefore does not need a `CpuContext`.
 - The requested auto-exposure image contract is the layout-invariant mip-0, non-arrayed 1x1 output. `R16Sfloat` has a two-byte readback. Larger images are deliberately excluded because copying an optimal-tiled Vulkan image into linear bytes is not sufficient to reproduce an arbitrary PS5 guest tiled layout (`VulkanVideoPresenter.cs:261-313`, `5335-5381`).
