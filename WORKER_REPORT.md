@@ -52,7 +52,8 @@ The guest buffer itself is correct. For example, the draw bound a 160-byte
 cbuffer at `0x502DF5520`; byte 48 contains the three values above, and byte 116
 contains `0x3F000000` (`0.5`), not zero.
 
-The zero originates in `Gen5SpirvTranslator.TryEmitScalarMemory`. Scalar
+The cascade root is `Gen5SpirvTranslator.cs:2473`,
+`TryEmitScalarMemory`. Scalar
 evaluation follows one scalar branch and records only PC `0x38` for the s28
 cbuffer. The other reachable SMEM PCs (`0x204`, `0x274`, `0x29C`, `0x2C4`,
 `0x2F0`, `0x300`, `0x324`, `0x344`, `0x354`, `0x530`, `0x60C`, `0x614`, and
@@ -111,9 +112,12 @@ the dispatch synchronization point before the sampled alias is resolved.
 
 ## Verification
 
-- `SharpEmu.Libs.csproj` build: passed.
-- Targeted decoder and new regression tests: passed.
-- Full solution test result is recorded in the final handoff after the cleanup
-  commit.
+- `SharpEmu.Libs.csproj` build: passed, 0 warnings and 0 errors.
+- Targeted decoder and new regression tests: 76 passed.
+- Full `SharpEmu.slnx` suite: 1,136 passed (144 library tests and 992 main
+  tests), 0 failed, 0 skipped.
+- The cleaned single-switch build was VM-verified again: tonemap sequences 31,
+  65, 134, 168, and 238 each reported `8294400/8294400` output pixels.
 - VM authoritative before/after logs were saved locally as
-  `/tmp/tonemap-r1-capture.log` and `/tmp/tonemap-r1-combined-fix.log`.
+  `/tmp/tonemap-r1-capture.log`, `/tmp/tonemap-r1-combined-fix.log`, and
+  `/tmp/tonemap-r1-single-flag-fresh.log`.
