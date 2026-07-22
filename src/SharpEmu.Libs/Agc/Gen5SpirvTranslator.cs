@@ -274,6 +274,9 @@ internal static partial class Gen5SpirvTranslator
         private static readonly bool _debugTonemapCurveOutput =
             Environment.GetEnvironmentVariable(
                 "SHARPEMU_PS_DEBUG_TONEMAP_CURVE") == "1";
+        private static readonly bool _debugTonemapGamutOutput =
+            Environment.GetEnvironmentVariable(
+                "SHARPEMU_PS_DEBUG_TONEMAP_GAMUT") == "1";
         private static readonly bool _debugTonemapTransferOutput =
             Environment.GetEnvironmentVariable(
                 "SHARPEMU_PS_DEBUG_TONEMAP_TRANSFER") == "1";
@@ -1813,7 +1816,16 @@ internal static partial class Gen5SpirvTranslator
             var emitted = TryEmitVectorAlu(instruction, out error);
             if (emitted && IsKnownTonemapShader())
             {
-                if (_debugTonemapCurveOutput)
+                if (_debugTonemapGamutOutput)
+                {
+                    if (instruction.Pc == 0x604u)
+                    {
+                        StoreV(240, LoadV(10));
+                        StoreV(241, LoadV(12));
+                        StoreV(242, LoadV(9));
+                    }
+                }
+                else if (_debugTonemapCurveOutput)
                 {
                     // 0x538 is the first vector instruction after all three
                     // conditional curve branches restore EXEC at 0x52C. Take
@@ -3726,6 +3738,7 @@ internal static partial class Gen5SpirvTranslator
             }
 
             if ((_debugTonemapSampleOutput ||
+                 _debugTonemapGamutOutput ||
                  _debugTonemapCurveOutput ||
                  _debugTonemapCoreOutput ||
                  _debugTonemapGradeOutput ||
