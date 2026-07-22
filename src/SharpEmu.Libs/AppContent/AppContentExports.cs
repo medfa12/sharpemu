@@ -15,7 +15,11 @@ public static class AppContentExports
     private const int BootParamSize = 40;
     private const int MountPointSize = 16;
     private const int AddcontInfoSize = 24;
+    private const int EntitlementKeySize = 16;
+    private const int DownloadProgressSize = 16;
+    private const ulong DefaultAvailableSpaceKb = 1024UL * 1024UL;
     private const string Temp0MountPoint = "/temp0";
+    private const string SmallSharedMountPoint = "/smallshared";
     private const uint AppParamSkuFlag = 0;
     private const int AppParamSkuFlagFull = 3;
 
@@ -198,6 +202,177 @@ public static class AppContentExports
         }
 
         return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
+    }
+
+    [SysAbiExport(Nid = "ZiATpP9gEkA", ExportName = "sceAppContentAddcontDelete", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceAppContent")]
+    public static int AppContentAddcontDelete(CpuContext ctx) => ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
+
+    [SysAbiExport(Nid = "7gxh+5QubhY", ExportName = "sceAppContentAddcontEnqueueDownload", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceAppContent")]
+    public static int AppContentAddcontEnqueueDownload(CpuContext ctx) => ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
+
+    [SysAbiExport(Nid = "TVM-aYIsG9k", ExportName = "sceAppContentAddcontEnqueueDownloadSp", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceAppContent")]
+    public static int AppContentAddcontEnqueueDownloadSp(CpuContext ctx) => ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
+
+    [SysAbiExport(Nid = "VANhIWcqYak", ExportName = "sceAppContentAddcontMount", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceAppContent")]
+    public static int AppContentAddcontMount(CpuContext ctx)
+    {
+        var entitlementLabelAddress = ctx[CpuRegister.Rsi];
+        var mountPointAddress = ctx[CpuRegister.Rdx];
+        if (entitlementLabelAddress == 0 || mountPointAddress == 0)
+        {
+            return ctx.SetReturn(AppContentErrorParameter);
+        }
+
+        if (!TryWriteZeroes(ctx, mountPointAddress, MountPointSize))
+        {
+            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        return ctx.SetReturn(AppContentErrorDrmNoEntitlement);
+    }
+
+    [SysAbiExport(Nid = "D3H+cjfzzFY", ExportName = "sceAppContentAddcontShrink", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceAppContent")]
+    public static int AppContentAddcontShrink(CpuContext ctx) => ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
+
+    [SysAbiExport(Nid = "3rHWaV-1KC4", ExportName = "sceAppContentAddcontUnmount", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceAppContent")]
+    public static int AppContentAddcontUnmount(CpuContext ctx) =>
+        ctx[CpuRegister.Rdi] == 0
+            ? ctx.SetReturn(AppContentErrorParameter)
+            : ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
+
+    [SysAbiExport(Nid = "+OlXCu8qxUk", ExportName = "sceAppContentAppParamGetString", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceAppContent")]
+    public static int AppContentAppParamGetString(CpuContext ctx)
+    {
+        var bufferAddress = ctx[CpuRegister.Rsi];
+        var bufferSize = ctx[CpuRegister.Rdx];
+        if (bufferAddress == 0 || bufferSize == 0)
+        {
+            return ctx.SetReturn(AppContentErrorParameter);
+        }
+
+        ReadOnlySpan<byte> terminator = stackalloc byte[] { 0 };
+        return ctx.Memory.TryWrite(bufferAddress, terminator)
+            ? ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK)
+            : ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+    }
+
+    [SysAbiExport(Nid = "gpGZDB4ZlrI", ExportName = "sceAppContentDownload0Expand", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceAppContent")]
+    public static int AppContentDownload0Expand(CpuContext ctx) => ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
+
+    [SysAbiExport(Nid = "S5eMvWnbbXg", ExportName = "sceAppContentDownload0Shrink", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceAppContent")]
+    public static int AppContentDownload0Shrink(CpuContext ctx) => ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
+
+    [SysAbiExport(Nid = "B5gVeVurdUA", ExportName = "sceAppContentDownload1Expand", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceAppContent")]
+    public static int AppContentDownload1Expand(CpuContext ctx) => ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
+
+    [SysAbiExport(Nid = "kUeYucqnb7o", ExportName = "sceAppContentDownload1Shrink", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceAppContent")]
+    public static int AppContentDownload1Shrink(CpuContext ctx) => ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
+
+    [SysAbiExport(Nid = "Gl6w5i0JokY", ExportName = "sceAppContentDownloadDataGetAvailableSpaceKb", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceAppContent")]
+    public static int AppContentDownloadDataGetAvailableSpaceKb(CpuContext ctx) => WriteAvailableSpace(ctx, CpuRegister.Rsi);
+
+    [SysAbiExport(Nid = "5bvvbUSiFs4", ExportName = "sceAppContentGetAddcontDownloadProgress", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceAppContent")]
+    public static int AppContentGetAddcontDownloadProgress(CpuContext ctx)
+    {
+        var entitlementLabelAddress = ctx[CpuRegister.Rsi];
+        var progressAddress = ctx[CpuRegister.Rdx];
+        if (entitlementLabelAddress == 0 || progressAddress == 0)
+        {
+            return ctx.SetReturn(AppContentErrorParameter);
+        }
+
+        return TryWriteZeroes(ctx, progressAddress, DownloadProgressSize)
+            ? ctx.SetReturn(AppContentErrorDrmNoEntitlement)
+            : ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+    }
+
+    [SysAbiExport(Nid = "XTWR0UXvcgs", ExportName = "sceAppContentGetEntitlementKey", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceAppContent")]
+    public static int AppContentGetEntitlementKey(CpuContext ctx)
+    {
+        var entitlementLabelAddress = ctx[CpuRegister.Rsi];
+        var keyAddress = ctx[CpuRegister.Rdx];
+        if (entitlementLabelAddress == 0 || keyAddress == 0)
+        {
+            return ctx.SetReturn(AppContentErrorParameter);
+        }
+
+        return TryWriteZeroes(ctx, keyAddress, EntitlementKeySize)
+            ? ctx.SetReturn(AppContentErrorDrmNoEntitlement)
+            : ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+    }
+
+    [SysAbiExport(Nid = "74-1x3lyZK8", ExportName = "sceAppContentGetRegion", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceAppContent")]
+    public static int AppContentGetRegion(CpuContext ctx) => ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
+
+    [SysAbiExport(Nid = "bVtF7v2uqT0", ExportName = "sceAppContentRequestPatchInstall", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceAppContent")]
+    public static int AppContentRequestPatchInstall(CpuContext ctx) => ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
+
+    [SysAbiExport(Nid = "9Gq5rOkWzNU", ExportName = "sceAppContentSmallSharedDataFormat", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceAppContent")]
+    public static int AppContentSmallSharedDataFormat(CpuContext ctx) => ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
+
+    [SysAbiExport(Nid = "xhb-r8etmAA", ExportName = "sceAppContentSmallSharedDataGetAvailableSpaceKb", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceAppContent")]
+    public static int AppContentSmallSharedDataGetAvailableSpaceKb(CpuContext ctx) => WriteAvailableSpace(ctx, CpuRegister.Rsi);
+
+    [SysAbiExport(Nid = "QuApZnMo9MM", ExportName = "sceAppContentSmallSharedDataMount", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceAppContent")]
+    public static int AppContentSmallSharedDataMount(CpuContext ctx) => WriteMountPoint(ctx, ctx[CpuRegister.Rdi], SmallSharedMountPoint);
+
+    [SysAbiExport(Nid = "EqMtBHWu-5M", ExportName = "sceAppContentSmallSharedDataUnmount", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceAppContent")]
+    public static int AppContentSmallSharedDataUnmount(CpuContext ctx) =>
+        ctx[CpuRegister.Rdi] == 0
+            ? ctx.SetReturn(AppContentErrorParameter)
+            : ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
+
+    [SysAbiExport(Nid = "a5N7lAG0y2Q", ExportName = "sceAppContentTemporaryDataFormat", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceAppContent")]
+    public static int AppContentTemporaryDataFormat(CpuContext ctx) =>
+        ctx[CpuRegister.Rdi] == 0
+            ? ctx.SetReturn(AppContentErrorParameter)
+            : ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
+
+    [SysAbiExport(Nid = "SaKib2Ug0yI", ExportName = "sceAppContentTemporaryDataGetAvailableSpaceKb", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceAppContent")]
+    public static int AppContentTemporaryDataGetAvailableSpaceKb(CpuContext ctx) => WriteAvailableSpace(ctx, CpuRegister.Rsi);
+
+    [SysAbiExport(Nid = "7bOLX66Iz-U", ExportName = "sceAppContentTemporaryDataMount", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceAppContent")]
+    public static int AppContentTemporaryDataMount(CpuContext ctx) => WriteMountPoint(ctx, ctx[CpuRegister.Rdi], Temp0MountPoint);
+
+    [SysAbiExport(Nid = "bcolXMmp6qQ", ExportName = "sceAppContentTemporaryDataUnmount", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceAppContent")]
+    public static int AppContentTemporaryDataUnmount(CpuContext ctx) =>
+        ctx[CpuRegister.Rdi] == 0
+            ? ctx.SetReturn(AppContentErrorParameter)
+            : ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
+
+    private static int WriteAvailableSpace(CpuContext ctx, CpuRegister outputRegister)
+    {
+        var availableSpaceAddress = ctx[outputRegister];
+        if (availableSpaceAddress == 0)
+        {
+            return ctx.SetReturn(AppContentErrorParameter);
+        }
+
+        return ctx.TryWriteUInt64(availableSpaceAddress, DefaultAvailableSpaceKb)
+            ? ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK)
+            : ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+    }
+
+    private static int WriteMountPoint(CpuContext ctx, ulong mountPointAddress, string value)
+    {
+        if (mountPointAddress == 0)
+        {
+            return ctx.SetReturn(AppContentErrorParameter);
+        }
+
+        Span<byte> mountPoint = stackalloc byte[MountPointSize];
+        mountPoint.Clear();
+        Encoding.ASCII.GetBytes(value, mountPoint);
+        return ctx.Memory.TryWrite(mountPointAddress, mountPoint)
+            ? ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK)
+            : ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+    }
+
+    private static bool TryWriteZeroes(CpuContext ctx, ulong address, int size)
+    {
+        Span<byte> zeroes = stackalloc byte[size];
+        zeroes.Clear();
+        return ctx.Memory.TryWrite(address, zeroes);
     }
 
     internal static bool TryReadUserDefinedParam(uint paramId, out int value)
