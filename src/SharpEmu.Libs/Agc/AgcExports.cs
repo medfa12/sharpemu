@@ -3149,7 +3149,11 @@ public static class AgcExports
     LibraryName = "libSceAgc")]
     public static int DriverRegisterResource(CpuContext ctx)
     {
-        return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
+        // Retail firmware body is `mov eax, 0x8A6C9018; ret`
+        // (SCE_AGC_ERROR_RESOURCE_REGISTRATION_NO_PA_DEBUG): resource
+        // registration is a no-op unless PA Debug is enabled, which retail
+        // consoles never are. The title tolerates this every call.
+        return ctx.SetReturn(unchecked((int)0x8A6C9018));
     }
 
     private static int RemoveResourcesForOwner(SubmittedGpuState state, uint owner)

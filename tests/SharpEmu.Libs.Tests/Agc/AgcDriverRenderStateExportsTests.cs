@@ -175,14 +175,15 @@ public sealed class AgcDriverRenderStateExportsTests
     }
 
     [Fact]
-    public void RegisterResource_ReturnsSuccessWithoutTouchingOutput()
+    public void RegisterResource_ReturnsFirmwareNoPaDebugWithoutTouchingOutput()
     {
         var (ctx, _) = NewContext();
         const uint sentinel = 0xA5A55A5A;
         Assert.True(ctx.TryWriteUInt32(OutputAddress, sentinel));
         ctx[CpuRegister.Rdi] = OutputAddress;
 
-        Assert.Equal(0, AgcExports.DriverRegisterResource(ctx));
+        // Retail firmware body is `mov eax, 0x8A6C9018; ret`.
+        Assert.Equal(unchecked((int)0x8A6C9018), AgcExports.DriverRegisterResource(ctx));
         Assert.Equal(sentinel, ReadDword(ctx, OutputAddress));
     }
 
