@@ -9,6 +9,7 @@ using Silk.NET.Vulkan;
 using Silk.NET.Vulkan.Extensions.KHR;
 using Silk.NET.Vulkan.Extensions.EXT;
 using Silk.NET.Windowing;
+using SharpEmu.HLE;
 using System.Diagnostics;
 using System.Globalization;
 using System.Numerics;
@@ -50,7 +51,8 @@ internal sealed record VulkanGuestDrawTexture(
     uint DstSelect = 0xFAC,
     VulkanGuestSampler Sampler = default,
     bool ArrayedView = false,
-    uint ArrayLayers = 1);
+    uint ArrayLayers = 1,
+    bool IsWritable = false);
 
 internal readonly record struct VulkanGuestSampler(
     uint Word0,
@@ -60,7 +62,8 @@ internal readonly record struct VulkanGuestSampler(
 
 internal sealed record VulkanGuestMemoryBuffer(
     ulong BaseAddress,
-    byte[] Data);
+    byte[] Data,
+    bool IsWritable = false);
 
 internal sealed record VulkanGuestVertexBuffer(
     uint Location,
@@ -208,7 +211,8 @@ internal sealed record VulkanComputeGuestDispatch(
     IReadOnlyList<VulkanGuestMemoryBuffer> GlobalMemoryBuffers,
     uint GroupCountX,
     uint GroupCountY,
-    uint GroupCountZ);
+    uint GroupCountZ,
+    ICpuMemory? GuestMemory);
 
 // Ordered-flip capture work item (SHARPEMU_ORDERED_FLIP). Enqueued into the
 // guest-work FIFO on a display-buffer flip so that the resolved source render
@@ -233,6 +237,90 @@ internal static unsafe partial class VulkanVideoPresenter
             Environment.GetEnvironmentVariable("SHARPEMU_DEEP_PIPELINE"),
             "1",
             StringComparison.Ordinal);
+    private static readonly bool _computeWriteback = IsComputeWritebackEnabled(
+        Environment.GetEnvironmentVariable("SHARPEMU_COMPUTE_WRITEBACK"));
+
+    internal const ulong MaxComputeWritebackBytes = 4 * 1024;
+
+    internal static bool ComputeWritebackEnabled => _computeWriteback;
+
+    internal static bool IsComputeWritebackEnabled(string? value) =>
+        string.Equals(value, "1", StringComparison.Ordinal);
+
+    internal static ICpuMemory? SelectComputeWritebackMemory(
+        ICpuMemory memory,
+        bool enabled) => enabled ? memory : null;
+
+    internal static bool IsSmallWritableComputeBuffer(
+        VulkanGuestMemoryBuffer buffer) =>
+        buffer.IsWritable &&
+        buffer.BaseAddress != 0 &&
+        buffer.Data.Length > 0 &&
+        (ulong)buffer.Data.Length <= MaxComputeWritebackBytes;
+
+    internal static uint GetComputeWritebackBytesPerPixel(Format format) =>
+        format switch
+        {
+            Format.R8Unorm or
+            Format.R8Uint or
+            Format.R8Sint => 1,
+            Format.R16Sfloat or
+            Format.R16Unorm or
+            Format.R16Uint or
+            Format.R16Sint or
+            Format.R8G8Unorm or
+            Format.R8G8Uint or
+            Format.R8G8Sint => 2,
+            Format.R32Uint or
+            Format.R32Sint or
+            Format.R32Sfloat or
+            Format.R16G16Uint or
+            Format.R16G16Sint or
+            Format.R16G16Sfloat or
+            Format.R8G8B8A8Uint or
+            Format.R8G8B8A8Sint or
+            Format.R8G8B8A8Unorm or
+            Format.A2R10G10B10UnormPack32 or
+            Format.A2B10G10R10UnormPack32 => 4,
+            Format.R16G16B16A16Uint or
+            Format.R16G16B16A16Sint or
+            Format.R16G16B16A16Sfloat or
+            Format.R32G32Uint or
+            Format.R32G32Sint or
+            Format.R32G32Sfloat => 8,
+            Format.R32G32B32A32Uint or
+            Format.R32G32B32A32Sint or
+            Format.R32G32B32A32Sfloat => 16,
+            _ => 0,
+        };
+
+    internal static bool TryGetComputeImageWritebackSize(
+        Format format,
+        uint width,
+        uint height,
+        out ulong byteCount)
+    {
+        var bytesPerPixel = GetComputeWritebackBytesPerPixel(format);
+        // The initial contract is deliberately the layout-invariant 1x1 path.
+        // Larger tiled images require a guest-format retile before writeback.
+        if (width != 1 || height != 1 || bytesPerPixel == 0)
+        {
+            byteCount = 0;
+            return false;
+        }
+
+        byteCount = bytesPerPixel;
+        return byteCount <= MaxComputeWritebackBytes;
+    }
+
+    internal static bool TryWriteComputeOutput(
+        ICpuMemory? memory,
+        ulong address,
+        ReadOnlySpan<byte> bytes) =>
+        memory is not null &&
+        address != 0 &&
+        bytes.Length > 0 &&
+        memory.TryWrite(address, bytes);
 
     private const uint DefaultWindowWidth = 1280;
     private const uint DefaultWindowHeight = 720;
@@ -1214,13 +1302,16 @@ internal static unsafe partial class VulkanVideoPresenter
         IReadOnlyList<VulkanGuestMemoryBuffer> globalMemoryBuffers,
         uint groupCountX,
         uint groupCountY,
-        uint groupCountZ)
+        uint groupCountZ,
+        ICpuMemory? guestMemory = null)
     {
         if (computeSpirv.Length == 0 ||
             groupCountX == 0 ||
             groupCountY == 0 ||
             groupCountZ == 0 ||
-            textures.All(texture => !texture.IsStorage))
+            (textures.All(texture => !texture.IsStorage) &&
+             (!_computeWriteback || guestMemory is null ||
+              globalMemoryBuffers.All(buffer => !IsSmallWritableComputeBuffer(buffer)))))
         {
             return;
         }
@@ -1263,7 +1354,8 @@ internal static unsafe partial class VulkanVideoPresenter
                     globalMemoryBuffers.ToArray(),
                     groupCountX,
                     groupCountY,
-                    groupCountZ));
+                    groupCountZ,
+                    _computeWriteback ? guestMemory : null));
         }
     }
 
@@ -3068,6 +3160,8 @@ internal static unsafe partial class VulkanVideoPresenter
             public DescriptorSet DescriptorSet;
             public TextureResource[] Textures = [];
             public GlobalBufferResource[] GlobalMemoryBuffers = [];
+            public ICpuMemory? ComputeWritebackMemory;
+            public ComputeImageWriteback[] ComputeImageWritebacks = [];
             public VertexBufferResource[] VertexBuffers = [];
             public VkBuffer IndexBuffer;
             public DeviceMemory IndexMemory;
@@ -3159,6 +3253,18 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             public VkBuffer Buffer;
             public DeviceMemory Memory;
+            public ulong Size;
+            public ulong GuestBaseAddress;
+            public ulong GuestSize;
+            public bool IsWritable;
+        }
+
+        private sealed class ComputeImageWriteback
+        {
+            public required GuestImageResource Image;
+            public VkBuffer Buffer;
+            public DeviceMemory Memory;
+            public ulong GuestAddress;
             public ulong Size;
         }
 
@@ -4423,6 +4529,16 @@ internal static unsafe partial class VulkanVideoPresenter
                         $"[LOADER][ERROR] guest readback trace failed: {exception.Message}");
                 }
 
+                try
+                {
+                    WriteBackComputeOutputs(submission.Resources);
+                }
+                catch (Exception exception)
+                {
+                    Console.Error.WriteLine(
+                        $"[LOADER][ERROR] compute writeback failed: {exception.Message}");
+                }
+
                 DestroyTranslatedDrawResources(submission.Resources);
                 ParkGuestCommandBuffer(submission.CommandBuffer);
                 // The fence status was just confirmed Success above, so it is
@@ -4433,6 +4549,69 @@ internal static unsafe partial class VulkanVideoPresenter
             if (splitCapacity)
             {
                 _dtCapReapTicks += Stopwatch.GetTimestamp() - tReap0;
+            }
+        }
+
+        private void WriteBackComputeOutputs(TranslatedDrawResources resources)
+        {
+            if (!_computeWriteback || resources.ComputeWritebackMemory is not { } memory)
+            {
+                return;
+            }
+
+            foreach (var writeback in resources.ComputeImageWritebacks)
+            {
+                MapAndWriteComputeOutput(
+                    memory,
+                    writeback.Memory,
+                    writeback.GuestAddress,
+                    writeback.Size,
+                    "image");
+            }
+
+            foreach (var globalBuffer in resources.GlobalMemoryBuffers)
+            {
+                if (globalBuffer is null ||
+                    !globalBuffer.IsWritable ||
+                    globalBuffer.GuestBaseAddress == 0 ||
+                    globalBuffer.GuestSize == 0 ||
+                    globalBuffer.GuestSize > MaxComputeWritebackBytes)
+                {
+                    continue;
+                }
+
+                MapAndWriteComputeOutput(
+                    memory,
+                    globalBuffer.Memory,
+                    globalBuffer.GuestBaseAddress,
+                    globalBuffer.GuestSize,
+                    "buffer");
+            }
+        }
+
+        private void MapAndWriteComputeOutput(
+            ICpuMemory memory,
+            DeviceMemory sourceMemory,
+            ulong guestAddress,
+            ulong size,
+            string kind)
+        {
+            void* mapped;
+            Check(
+                _vk.MapMemory(_device, sourceMemory, 0, size, 0, &mapped),
+                "vkMapMemory(compute writeback)");
+            try
+            {
+                var bytes = new ReadOnlySpan<byte>(mapped, checked((int)size));
+                var nonblack = bytes.IndexOfAnyExcept((byte)0) >= 0;
+                var written = TryWriteComputeOutput(memory, guestAddress, bytes);
+                Console.Error.WriteLine(
+                    $"[LOADER][WRITEBACK] kind={kind} addr=0x{guestAddress:X16} " +
+                    $"size={size} nonblack={(nonblack ? 1 : 0)} written={(written ? 1 : 0)}");
+            }
+            finally
+            {
+                _vk.UnmapMemory(_device, sourceMemory);
             }
         }
 
@@ -5158,6 +5337,48 @@ internal static unsafe partial class VulkanVideoPresenter
                 {
                     resources.Textures[index] =
                         ResolveTextureResource(dispatch.Textures[index]);
+                }
+
+                if (_computeWriteback && dispatch.GuestMemory is not null)
+                {
+                    resources.ComputeWritebackMemory = dispatch.GuestMemory;
+                    var imageWritebacks = new List<ComputeImageWriteback>();
+                    var capturedImages = new HashSet<GuestImageResource>();
+                    for (var index = 0; index < dispatch.Textures.Count; index++)
+                    {
+                        var texture = dispatch.Textures[index];
+                        var resource = resources.Textures[index];
+                        if (!texture.IsStorage ||
+                            !texture.IsWritable ||
+                            texture.Address == 0 ||
+                            texture.MipLevel != 0 ||
+                            texture.ArrayedView ||
+                            resource.GuestImage is not { } guestImage ||
+                            !capturedImages.Add(guestImage) ||
+                            !TryGetComputeImageWritebackSize(
+                                guestImage.Format,
+                                guestImage.Width,
+                                guestImage.Height,
+                                out var byteCount))
+                        {
+                            continue;
+                        }
+
+                        var readbackBuffer = CreateHostBuffer(
+                            new byte[checked((int)byteCount)],
+                            BufferUsageFlags.TransferDstBit,
+                            out var readbackMemory);
+                        imageWritebacks.Add(new ComputeImageWriteback
+                        {
+                            Image = guestImage,
+                            Buffer = readbackBuffer,
+                            Memory = readbackMemory,
+                            GuestAddress = texture.Address,
+                            Size = byteCount,
+                        });
+                    }
+
+                    resources.ComputeImageWritebacks = imageWritebacks.ToArray();
                 }
 
                 if (traceResources)
@@ -6919,6 +7140,9 @@ internal static unsafe partial class VulkanVideoPresenter
                 Buffer = buffer,
                 Memory = memory,
                 Size = size,
+                GuestBaseAddress = guestBuffer.BaseAddress,
+                GuestSize = (ulong)guestBuffer.Data.Length,
+                IsWritable = guestBuffer.IsWritable,
             };
         }
 
@@ -8020,6 +8244,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
                     if (isLastBatch)
                     {
+                        RecordComputeWritebacks(resources);
                         RecordStorageImagesForRead(resources, PipelineStageFlags.ComputeShaderBit);
                     }
 
@@ -8076,6 +8301,97 @@ internal static unsafe partial class VulkanVideoPresenter
                     InvalidateGuestImageLayouts(resources);
                     DestroyTranslatedDrawResources(resources);
                 }
+            }
+        }
+
+        private void RecordComputeWritebacks(TranslatedDrawResources resources)
+        {
+            if (!_computeWriteback || resources.ComputeWritebackMemory is null)
+            {
+                return;
+            }
+
+            foreach (var writeback in resources.ComputeImageWritebacks)
+            {
+                TransitionGuestImage(
+                    writeback.Image,
+                    ImageLayout.TransferSrcOptimal,
+                    PipelineStageFlags.TransferBit,
+                    AccessFlags.TransferReadBit);
+                var region = new BufferImageCopy
+                {
+                    ImageSubresource = new ImageSubresourceLayers
+                    {
+                        AspectMask = ImageAspectFlags.ColorBit,
+                        LayerCount = 1,
+                    },
+                    ImageExtent = new Extent3D(1, 1, 1),
+                };
+                _vk.CmdCopyImageToBuffer(
+                    _commandBuffer,
+                    writeback.Image.Image,
+                    ImageLayout.TransferSrcOptimal,
+                    writeback.Buffer,
+                    1,
+                    &region);
+
+                var hostBarrier = new BufferMemoryBarrier
+                {
+                    SType = StructureType.BufferMemoryBarrier,
+                    SrcAccessMask = AccessFlags.TransferWriteBit,
+                    DstAccessMask = AccessFlags.HostReadBit,
+                    SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                    DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                    Buffer = writeback.Buffer,
+                    Offset = 0,
+                    Size = writeback.Size,
+                };
+                _vk.CmdPipelineBarrier(
+                    _commandBuffer,
+                    PipelineStageFlags.TransferBit,
+                    PipelineStageFlags.HostBit,
+                    0,
+                    0,
+                    null,
+                    1,
+                    &hostBarrier,
+                    0,
+                    null);
+            }
+
+            foreach (var globalBuffer in resources.GlobalMemoryBuffers)
+            {
+                if (globalBuffer is null ||
+                    !globalBuffer.IsWritable ||
+                    globalBuffer.GuestBaseAddress == 0 ||
+                    globalBuffer.GuestSize == 0 ||
+                    globalBuffer.GuestSize > MaxComputeWritebackBytes)
+                {
+                    continue;
+                }
+
+                var hostBarrier = new BufferMemoryBarrier
+                {
+                    SType = StructureType.BufferMemoryBarrier,
+                    SrcAccessMask = AccessFlags.ShaderWriteBit,
+                    DstAccessMask = AccessFlags.HostReadBit,
+                    SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                    DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                    Buffer = globalBuffer.Buffer,
+                    Offset = 0,
+                    Size = globalBuffer.GuestSize,
+                };
+                _vk.CmdPipelineBarrier(
+                    _commandBuffer,
+                    PipelineStageFlags.ComputeShaderBit,
+                    PipelineStageFlags.HostBit,
+                    0,
+                    0,
+                    null,
+                    1,
+                    &hostBarrier,
+                    0,
+                    null);
             }
         }
 
@@ -11579,6 +11895,11 @@ internal static unsafe partial class VulkanVideoPresenter
 
         private void DestroyTranslatedDrawResources(TranslatedDrawResources resources)
         {
+            foreach (var writeback in resources.ComputeImageWritebacks)
+            {
+                RecycleHostBuffer(writeback.Buffer, writeback.Memory);
+            }
+
             if (resources.CaptureReadbackBuffer.Handle != 0)
             {
                 // The fence has signalled by the time resources are destroyed, so
