@@ -192,4 +192,133 @@ public sealed class NetworkExportsTests : IDisposable
         Assert.True(memory.TryRead(OutputAddress, address));
         Assert.Equal("192.168.0.2", Encoding.ASCII.GetString(address));
     }
+
+    [Fact]
+    public void HttpOptionsAndEpoll_RoundTripPerTemplateState()
+    {
+        var ctx = NewContext(out var memory);
+        ctx[CpuRegister.Rdx] = 0x4000;
+        var contextId = HttpExports.HttpInit(ctx);
+
+        memory.TryWrite(TextAddress, Encoding.UTF8.GetBytes("SharpEmu-Test\0"));
+        ctx[CpuRegister.Rdi] = unchecked((ulong)contextId);
+        ctx[CpuRegister.Rsi] = TextAddress;
+        ctx[CpuRegister.Rdx] = 2;
+        ctx[CpuRegister.Rcx] = 0;
+        var templateId = HttpExports.HttpCreateTemplate(ctx);
+
+        ctx[CpuRegister.Rdi] = unchecked((ulong)templateId);
+        ctx[CpuRegister.Rsi] = 0;
+        Assert.Equal(0, HttpExports.HttpSetAutoRedirect(ctx));
+
+        ctx[CpuRegister.Rsi] = OutputAddress;
+        Assert.Equal(0, HttpExports.HttpGetAutoRedirect(ctx));
+        Assert.True(ctx.TryReadUInt32(OutputAddress, out var enabled));
+        Assert.Equal(0U, enabled);
+
+        ctx[CpuRegister.Rdi] = unchecked((ulong)contextId);
+        ctx[CpuRegister.Rsi] = BinaryAddress;
+        Assert.Equal(0, HttpExports.HttpCreateEpoll(ctx));
+        Assert.True(ctx.TryReadUInt64(BinaryAddress, out var epoll));
+        Assert.True(epoll > 0);
+
+        ctx[CpuRegister.Rdi] = unchecked((ulong)templateId);
+        ctx[CpuRegister.Rsi] = epoll;
+        ctx[CpuRegister.Rdx] = 0x1122334455667788;
+        Assert.Equal(0, HttpExports.HttpSetEpoll(ctx));
+
+        ctx[CpuRegister.Rsi] = BinaryAddress + 8;
+        ctx[CpuRegister.Rdx] = BinaryAddress + 16;
+        Assert.Equal(0, HttpExports.HttpGetEpoll(ctx));
+        Assert.True(ctx.TryReadUInt64(BinaryAddress + 8, out var returnedEpoll));
+        Assert.True(ctx.TryReadUInt64(BinaryAddress + 16, out var userArgument));
+        Assert.Equal(epoll, returnedEpoll);
+        Assert.Equal(0x1122334455667788UL, userArgument);
+    }
+
+    [Fact]
+    public void HttpHeaders_OverwriteAndRemoveCaseInsensitively()
+    {
+        var ctx = NewContext(out var memory);
+        ctx[CpuRegister.Rdx] = 0x4000;
+        var contextId = HttpExports.HttpInit(ctx);
+
+        memory.TryWrite(TextAddress, Encoding.UTF8.GetBytes("SharpEmu-Test\0"));
+        ctx[CpuRegister.Rdi] = unchecked((ulong)contextId);
+        ctx[CpuRegister.Rsi] = TextAddress;
+        ctx[CpuRegister.Rdx] = 2;
+        var templateId = HttpExports.HttpCreateTemplate(ctx);
+
+        memory.TryWrite(TextAddress, Encoding.UTF8.GetBytes("X-Test\0"));
+        memory.TryWrite(BinaryAddress, Encoding.UTF8.GetBytes("first\0"));
+        ctx[CpuRegister.Rdi] = unchecked((ulong)templateId);
+        ctx[CpuRegister.Rsi] = TextAddress;
+        ctx[CpuRegister.Rdx] = BinaryAddress;
+        ctx[CpuRegister.Rcx] = 0;
+        Assert.Equal(0, HttpExports.HttpAddRequestHeader(ctx));
+
+        memory.TryWrite(TextAddress, Encoding.UTF8.GetBytes("x-test\0"));
+        memory.TryWrite(BinaryAddress, Encoding.UTF8.GetBytes("second\0"));
+        Assert.Equal(0, HttpExports.HttpAddRequestHeader(ctx));
+
+        ctx[CpuRegister.Rsi] = TextAddress;
+        Assert.Equal(0, HttpExports.HttpRemoveRequestHeader(ctx));
+        Assert.Equal(unchecked((int)0x80431025), HttpExports.HttpRemoveRequestHeader(ctx));
+    }
+
+    [Fact]
+    public void HttpCookieStats_UseSdkFieldPacking()
+    {
+        var ctx = NewContext(out var memory);
+        ctx[CpuRegister.Rdx] = 0x4000;
+        var contextId = HttpExports.HttpInit(ctx);
+
+        const string cookie = "session=abc";
+        memory.TryWrite(TextAddress, Encoding.UTF8.GetBytes("https://example.test/path\0"));
+        memory.TryWrite(BinaryAddress, Encoding.UTF8.GetBytes(cookie));
+        ctx[CpuRegister.Rdi] = unchecked((ulong)contextId);
+        ctx[CpuRegister.Rsi] = TextAddress;
+        ctx[CpuRegister.Rdx] = BinaryAddress;
+        ctx[CpuRegister.Rcx] = unchecked((ulong)cookie.Length);
+        Assert.Equal(0, HttpExports.HttpAddCookie(ctx));
+
+        ctx[CpuRegister.Rsi] = OutputAddress;
+        Assert.Equal(0, HttpExports.HttpGetCookieStats(ctx));
+        Assert.True(ctx.TryReadUInt64(OutputAddress, out var currentSize));
+        Assert.True(ctx.TryReadUInt32(OutputAddress + 8, out var currentCount));
+        Assert.True(ctx.TryReadUInt64(OutputAddress + 16, out var maximumSize));
+        Assert.True(ctx.TryReadUInt32(OutputAddress + 24, out var maximumCount));
+        Assert.True(currentSize > 0);
+        Assert.Equal(1U, currentCount);
+        Assert.Equal(currentSize, maximumSize);
+        Assert.Equal(currentCount, maximumCount);
+    }
+
+    [Fact]
+    public void HttpStatusParser_WritesVersionCodeAndReasonSlice()
+    {
+        var ctx = NewContext(out var memory);
+        const string line = "HTTP/2.0 204 No Content\r\n";
+        memory.TryWrite(TextAddress, Encoding.ASCII.GetBytes(line));
+        memory.WriteUInt64(0x5008, OutputAddress + 32);
+        ctx[CpuRegister.Rsp] = 0x5000;
+        ctx[CpuRegister.Rdi] = TextAddress;
+        ctx[CpuRegister.Rsi] = unchecked((ulong)line.Length);
+        ctx[CpuRegister.Rdx] = OutputAddress;
+        ctx[CpuRegister.Rcx] = OutputAddress + 4;
+        ctx[CpuRegister.R8] = OutputAddress + 8;
+        ctx[CpuRegister.R9] = OutputAddress + 16;
+
+        Assert.Equal(line.Length, HttpExports.HttpParseStatusLine(ctx));
+        Assert.True(ctx.TryReadUInt32(OutputAddress, out var major));
+        Assert.True(ctx.TryReadUInt32(OutputAddress + 4, out var minor));
+        Assert.True(ctx.TryReadUInt32(OutputAddress + 8, out var code));
+        Assert.True(ctx.TryReadUInt64(OutputAddress + 16, out var phraseAddress));
+        Assert.True(ctx.TryReadUInt64(OutputAddress + 32, out var phraseLength));
+        Assert.Equal(2U, major);
+        Assert.Equal(0U, minor);
+        Assert.Equal(204U, code);
+        Assert.Equal(TextAddress + 13, phraseAddress);
+        Assert.Equal(10UL, phraseLength);
+    }
 }
