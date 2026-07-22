@@ -3177,25 +3177,33 @@ internal static unsafe partial class VulkanVideoPresenter
                 _window.SetWindowIcon(ref icon);
             }
 
-            WaitForRenderDocAttachIfRequested();
-            _vk = Vk.GetApi();
-            CreateInstance();
-            TraceInitStep("instance");
-            CreateSurface();
-            TraceInitStep("surface");
-            SelectPhysicalDevice();
-            CreateDevice();
-            TraceInitStep("device");
-            CreatePipelineCache();
-            CreateSwapchain();
-            TraceInitStep("swapchain");
-            CreateCommandResources();
-            TraceInitStep("command-resources");
-            CreateGuestDrawResources();
-            TraceInitStep("guest-draw-resources");
-            _vulkanReady = true;
-            Console.Error.WriteLine(
-                $"[LOADER][INFO] Vulkan VideoOut ready: {_extent.Width}x{_extent.Height}, format={_swapchainFormat}");
+            try
+            {
+                WaitForRenderDocAttachIfRequested();
+                _vk = Vk.GetApi();
+                CreateInstance();
+                TraceInitStep("instance");
+                CreateSurface();
+                TraceInitStep("surface");
+                SelectPhysicalDevice();
+                CreateDevice();
+                TraceInitStep("device");
+                CreatePipelineCache();
+                CreateSwapchain();
+                TraceInitStep("swapchain");
+                CreateCommandResources();
+                TraceInitStep("command-resources");
+                CreateGuestDrawResources();
+                TraceInitStep("guest-draw-resources");
+                _vulkanReady = true;
+                Console.Error.WriteLine(
+                    $"[LOADER][INFO] Vulkan VideoOut ready: {_extent.Width}x{_extent.Height}, format={_swapchainFormat}");
+            }
+            catch (Exception exception)
+            {
+                _vulkanReady = false;
+                Console.Error.WriteLine($"[LOADER][WARN] Vulkan VideoOut disabled: {exception.Message}");
+            }
         }
 
         private static void TraceInitStep(string step) =>
