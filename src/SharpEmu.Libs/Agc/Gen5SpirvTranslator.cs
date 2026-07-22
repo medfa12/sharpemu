@@ -259,6 +259,12 @@ internal static partial class Gen5SpirvTranslator
         private static readonly bool _forcePackedStoreExecValues =
             Environment.GetEnvironmentVariable(
                 "SHARPEMU_FORCE_PACKED_STORE_EXEC_VALUES") == "1";
+        // Emits the raw HDR sample from the Astro Bot tonemap shader directly
+        // to MRT0. This separates image-coordinate/binding failures from the
+        // shader's downstream colour-grade and transfer-function ALU.
+        private static readonly bool _debugTonemapSampleOutput =
+            Environment.GetEnvironmentVariable(
+                "SHARPEMU_PS_DEBUG_TONEMAP_SAMPLE") == "1";
         // SHARPEMU_PS_FORCE_EXPOSURE_SCALAR=1 (high-probability toggle): for
         // the tonemap/composite pixel shader at PixelShaderAddress
         // 0x0000000500640200 only, force the exposure-scale S_BUFFER_LOAD_DWORD
@@ -3078,6 +3084,13 @@ internal static partial class Gen5SpirvTranslator
                     _ => Bitcast(_uintType, value),
                 };
                 StoreV(image.VectorData + output++, raw);
+                if (_debugTonemapSampleOutput &&
+                    IsKnownTonemapShader() &&
+                    instruction.Pc == 0x2Cu &&
+                    output <= 3)
+                {
+                    StoreV(240u + output - 1u, raw);
+                }
             }
 
             return true;
@@ -3635,6 +3648,13 @@ internal static partial class Gen5SpirvTranslator
                 return Float(1f);
             }
 
+            if (_debugTonemapSampleOutput && IsKnownTonemapShader())
+            {
+                return component < 3
+                    ? Bitcast(_floatType, LoadV(240u + (uint)component))
+                    : Float(1f);
+            }
+
             var packed = LoadV(instruction.Sources[component >> 1].Value);
             var unpacked = Ext(62, _vec2Type, packed);
             return _module.AddInstruction(
@@ -3643,6 +3663,10 @@ internal static partial class Gen5SpirvTranslator
                 unpacked,
                 (uint)(component & 1));
         }
+
+        private bool IsKnownTonemapShader() =>
+            _pixelShaderAddress == ExposureScalarShaderAddress ||
+            _pixelShaderAddress == RelocatedExposureScalarShaderAddress;
 
         private uint GetPixelOutputType(Gen5PixelOutputKind kind) =>
             kind switch
