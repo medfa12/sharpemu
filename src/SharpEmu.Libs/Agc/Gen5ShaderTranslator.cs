@@ -2038,13 +2038,18 @@ internal static class Gen5ShaderTranslator
                 sources =
                 [
                     Gen5Operand.Scalar(scalarBase),
-                    Gen5Operand.Scalar(scalarOffset),
+                    Gen5Operand.Source(scalarOffset),
                 ];
                 destinations = Enumerable
                     .Range((int)scalarDestination, checked((int)count))
                     .Select(index => Gen5Operand.Scalar((uint)index))
                     .ToArray();
-                control = new Gen5ScalarMemoryControl(count, offset, scalarOffset);
+                // GFX10 scalar operand 125 is architectural NULL, not s125.
+                // SMEM uses it as a zero SOFFSET for immediate-only loads.
+                control = new Gen5ScalarMemoryControl(
+                    count,
+                    offset,
+                    scalarOffset == 125 ? null : scalarOffset);
                 break;
             }
             case Gen5ShaderEncoding.Vop1:
