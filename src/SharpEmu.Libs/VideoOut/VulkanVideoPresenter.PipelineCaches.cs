@@ -77,7 +77,6 @@ internal static unsafe partial class VulkanVideoPresenter
     private static long _vsFallbackFullscreen;
     private static long _vsCapture;
     private static long _vsReal;
-    private static long _feedbackDropDetail;
     private sealed partial class Presenter : IDisposable
     {
         // SHARPEMU_CACHE_RENDERPASS caches (all render-thread state, no locking).

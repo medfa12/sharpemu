@@ -4867,7 +4867,8 @@ internal static unsafe partial class VulkanVideoPresenter
             RenderPass renderPass,
             IReadOnlyList<Format> renderTargetFormats,
             Extent2D extent,
-            VulkanGuestDepthTarget? depth = null)
+            VulkanGuestDepthTarget? depth = null,
+            IReadOnlyDictionary<ulong, GuestImageResource>? feedbackProducers = null)
         {
             var vertexSpirv = draw.VertexSpirv;
             if (draw.RenderState.Blends.Count != renderTargetFormats.Count)
@@ -4979,7 +4980,8 @@ internal static unsafe partial class VulkanVideoPresenter
 
                 for (var index = 0; index < draw.Textures.Count; index++)
                 {
-                    resources.Textures[index] = ResolveTextureResource(draw.Textures[index]);
+                    resources.Textures[index] =
+                        ResolveTextureResource(draw.Textures[index], feedbackProducers);
                 }
 
                 for (var index = 0; index < draw.GlobalMemoryBuffers.Count; index++)
@@ -6063,7 +6065,9 @@ internal static unsafe partial class VulkanVideoPresenter
         }
 
         [MethodImpl(MethodImplOptions.NoInlining)]
-        private TextureResource ResolveTextureResource(VulkanGuestDrawTexture texture)
+        private TextureResource ResolveTextureResource(
+            VulkanGuestDrawTexture texture,
+            IReadOnlyDictionary<ulong, GuestImageResource>? feedbackProducers = null)
         {
             if (texture.IsStorage)
             {
@@ -6071,6 +6075,27 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             var vkFormat = GetTextureFormat(texture.Format, texture.NumberType);
+
+            // Render-target feedback loop: this sampled texture's guest address is
+            // also one of the current draw's bound color targets (Astro's ps=0x..D00
+            // composite reads and writes the 3840x2160 scanout in the same draw).
+            // Reading and writing the same image is undefined in Vulkan, so bind a
+            // snapshot copy of the target's PRE-draw contents instead. RecordCopyOnSample
+            // (run before the color-attachment transition) captures the correct
+            // pre-draw pixels. This must run before the same-image alias branches
+            // below (TryFindSampleAlias / TryFindNativeAlias / TryFindPresentable),
+            // which would otherwise return the target's own live image and re-create
+            // the loop.
+            if (feedbackProducers is not null &&
+                texture.Address != 0 &&
+                !texture.IsFallback &&
+                !texture.ArrayedView &&
+                !IsBlockCompressedFormat(vkFormat) &&
+                feedbackProducers.TryGetValue(texture.Address, out var feedbackProducer) &&
+                feedbackProducer.Image.Handle != 0)
+            {
+                return CreateCopyOnSampleTextureResource(texture, feedbackProducer);
+            }
 
             // SHARPEMU_FORCE_EXPOSURE: a tiny (<=2x2) sampled surface is the
             // game's auto-exposure average-luminance value, which nothing writes
@@ -8532,50 +8557,29 @@ internal static unsafe partial class VulkanVideoPresenter
                 .Where(target => target.Address != 0)
                 .Select(target => target.Address)
                 .ToHashSet();
-            if (work.Draw.Textures.Any(texture =>
-                    targetAddresses.Contains(texture.Address)))
+            // Render-target feedback loop: one or more sampled textures alias a
+            // bound color target (Astro's ps=0x..D00 reads+writes the scanout in a
+            // single draw). Rather than drop the draw (loses the composite -> grey
+            // frame) or bind the same live image (undefined -> garbage), collect the
+            // aliasing target addresses; after the target images are resolved below
+            // we build a producer map so ResolveTextureResource snapshot-copies the
+            // pre-draw contents. SHARPEMU_ALLOW_FEEDBACK_LOOP forces the old
+            // same-image double-bind for A/B comparison.
+            var feedbackAddresses = work.Draw.Textures
+                .Where(texture => targetAddresses.Contains(texture.Address))
+                .Select(texture => texture.Address)
+                .ToHashSet();
+            var resolveFeedback = feedbackAddresses.Count > 0 && !_allowFeedbackLoop;
+            if (feedbackAddresses.Count > 0)
             {
-                if (!_allowFeedbackLoop)
+                foreach (var address in feedbackAddresses)
                 {
-                    if (_logVsFallback &&
-                        System.Threading.Interlocked.Increment(ref _feedbackDropDetail) <= 40)
-                    {
-                        var collisions = work.Draw.Textures
-                            .Where(t => targetAddresses.Contains(t.Address))
-                            .Select(t =>
-                            {
-                                var tgt = work.Targets.First(rt => rt.Address == t.Address);
-                                return $"tex[0x{t.Address:X16} {t.Width}x{t.Height} " +
-                                       $"f{t.Format}/n{t.NumberType} storage={t.IsStorage}]" +
-                                       $"==rt[{tgt.Width}x{tgt.Height} f{tgt.Format}/n{tgt.NumberType}]";
-                            });
-                        Console.Error.WriteLine(
-                            $"[LOADER][FBDROP] ps=0x{work.Draw.PixelShaderAddress:X16} " +
-                            $"vcount={work.Draw.VertexCount} prim={work.Draw.PrimitiveType} " +
-                            $"attrs={work.Draw.AttributeCount} vbufs={work.Draw.VertexBuffers.Count} " +
-                            $"textures={work.Draw.Textures.Count} targets={work.Targets.Count} " +
-                            $"collide=[{string.Join(';', collisions)}]");
-                    }
-                    else
+                    if (_tracedFeedbackLoopTargets.Add(address))
                     {
                         Console.Error.WriteLine(
-                            $"[LOADER][WARN] Vulkan skipped render-target feedback loop " +
-                            $"targets={string.Join(',', targetAddresses.Select(address => $"0x{address:X16}"))}");
-                    }
-                    AbandonPendingRenderTargets(work);
-                    return;
-                }
-
-                // SHARPEMU_ALLOW_FEEDBACK_LOOP: execute the draw despite the
-                // aliasing so the frame can complete. Log once per target.
-                foreach (var address in targetAddresses)
-                {
-                    if (work.Draw.Textures.Any(texture => texture.Address == address) &&
-                        _tracedFeedbackLoopTargets.Add(address))
-                    {
-                        Console.Error.WriteLine(
-                            $"[LOADER][WARN] Vulkan executing render-target feedback loop " +
-                            $"target=0x{address:X16} (SHARPEMU_ALLOW_FEEDBACK_LOOP)");
+                            $"[LOADER][WARN] Vulkan render-target feedback loop " +
+                            $"target=0x{address:X16} " +
+                            $"({(resolveFeedback ? "copy-on-sample resolve" : "SHARPEMU_ALLOW_FEEDBACK_LOOP double-bind")})");
                     }
                 }
             }
@@ -8651,6 +8655,26 @@ internal static unsafe partial class VulkanVideoPresenter
                 }
 
                 targets[index] = GetOrCreateGuestImage(slotTarget, formats[index]);
+            }
+
+            // Producer map for render-target feedback loops: map each aliased
+            // target's guest address to its resolved image so ResolveTextureResource
+            // snapshot-copies the pre-draw contents instead of sampling the live
+            // target. Only real (non-redirected) color slots contribute.
+            Dictionary<ulong, GuestImageResource>? feedbackProducers = null;
+            if (resolveFeedback)
+            {
+                feedbackProducers = new Dictionary<ulong, GuestImageResource>();
+                for (var index = 0; index < targets.Length; index++)
+                {
+                    var address = work.Targets[index].Address;
+                    if (address != 0 &&
+                        feedbackAddresses.Contains(address) &&
+                        targets[index].Image.Handle != 0)
+                    {
+                        feedbackProducers.TryAdd(address, targets[index]);
+                    }
+                }
             }
 
             var firstTarget = targets[0];
@@ -8817,7 +8841,8 @@ internal static unsafe partial class VulkanVideoPresenter
                     renderPass,
                     formats,
                     extent,
-                    effectiveDepth);
+                    effectiveDepth,
+                    feedbackProducers);
                 resources.TransientRenderPass = transientRenderPass;
                 resources.TransientFramebuffer = transientFramebuffer;
                 transientRenderPass = default;
