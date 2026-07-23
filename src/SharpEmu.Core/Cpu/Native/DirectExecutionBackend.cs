@@ -1119,22 +1119,41 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		}
 	}
 
-	private void StartRipSampler()
+	[System.Runtime.InteropServices.DllImport("kernel32.dll")]
+	private static extern nint GetCurrentProcess();
+
+	[System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+	private static extern unsafe bool ReadProcessMemory(
+		nint hProcess, ulong lpBaseAddress, void* lpBuffer, nuint nSize, out nuint numberOfBytesRead);
+
+	private unsafe void StartRipSampler()
 	{
 		var sampler = new Thread(() =>
 		{
 			// Give the loader time to reach guest execution before sampling.
 			Thread.Sleep(3000);
-			var hist = new Dictionary<ulong, long>();
+			var ripHist = new Dictionary<ulong, long>();
+			// Return-address (call-site) histogram: scanning each sampled thread's
+			// stack for guest-code-range qwords reveals the CALL CHAIN of the busy
+			// loop, not just its leaf RIP -- i.e. which game subsystem is stuck.
+			var callHist = new Dictionary<ulong, long>();
 			var sw = Stopwatch.StartNew();
 			long nextDumpMs = 5000;
 			var self = _hostThreading?.CurrentThreadId ?? 0u;
+			var proc = GetCurrentProcess();
+			const int stackWords = 96;
+			var stackBuf = stackalloc ulong[stackWords];
+			// Guest code region: image is loaded at 0x800000000; code sits in the
+			// low ~256 MB. Return addresses fall in this band; stack data pointers
+			// (heap/stack) sit far above, so this filter isolates call sites.
+			const ulong codeLo = 0x800000000UL;
+			const ulong codeHi = 0x810000000UL;
 			while (!_hostShutdownRequested)
 			{
 				try
 				{
-					using var proc = System.Diagnostics.Process.GetCurrentProcess();
-					foreach (System.Diagnostics.ProcessThread pt in proc.Threads)
+					using var procInfo = System.Diagnostics.Process.GetCurrentProcess();
+					foreach (System.Diagnostics.ProcessThread pt in procInfo.Threads)
 					{
 						var tid = unchecked((uint)pt.Id);
 						if (tid == self || _hostThreading is null)
@@ -1142,11 +1161,31 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 							continue;
 						}
 
-						if (_hostThreading.TryCaptureThreadRegisters(tid, out var regs) &&
-							regs.Rip >= 0x800000000UL && regs.Rip < 0x900000000UL)
+						if (!_hostThreading.TryCaptureThreadRegisters(tid, out var regs) ||
+							regs.Rip < codeLo || regs.Rip >= 0x900000000UL)
 						{
-							hist.TryGetValue(regs.Rip, out var c);
-							hist[regs.Rip] = c + 1;
+							continue;
+						}
+
+						ripHist.TryGetValue(regs.Rip, out var c);
+						ripHist[regs.Rip] = c + 1;
+
+						// Walk the stack for return addresses (call sites).
+						if (regs.Rsp != 0 &&
+							ReadProcessMemory(proc, regs.Rsp, stackBuf, (nuint)(stackWords * sizeof(ulong)), out var read))
+						{
+							var words = (int)(read / sizeof(ulong));
+							var seen = 0;
+							for (var i = 0; i < words && seen < 12; i++)
+							{
+								var v = stackBuf[i];
+								if (v >= codeLo && v < codeHi)
+								{
+									callHist.TryGetValue(v, out var cc);
+									callHist[v] = cc + 1;
+									seen++;
+								}
+							}
 						}
 					}
 				}
@@ -1159,11 +1198,12 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				if (sw.ElapsedMilliseconds >= nextDumpMs)
 				{
 					nextDumpMs += 5000;
-					var top = hist.OrderByDescending(kv => kv.Value).Take(25).ToArray();
-					var line = string.Join(
-						" | ",
-						top.Select(kv => "0x" + kv.Key.ToString("X10") + "=" + kv.Value));
-					Console.Error.WriteLine("[LOADER][RIPSAMPLE] guest-rip top25: " + line);
+					var topRip = ripHist.OrderByDescending(kv => kv.Value).Take(15).ToArray();
+					Console.Error.WriteLine("[LOADER][RIPSAMPLE] guest-rip top15: " +
+						string.Join(" | ", topRip.Select(kv => "0x" + kv.Key.ToString("X10") + "=" + kv.Value)));
+					var topCall = callHist.OrderByDescending(kv => kv.Value).Take(25).ToArray();
+					Console.Error.WriteLine("[LOADER][CALLSITE] guest call-sites top25: " +
+						string.Join(" | ", topCall.Select(kv => "0x" + kv.Key.ToString("X10") + "=" + kv.Value)));
 				}
 			}
 		})
