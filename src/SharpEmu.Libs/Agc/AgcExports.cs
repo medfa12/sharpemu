@@ -4444,13 +4444,28 @@ public static class AgcExports
 
             if (classified && classification.IsAmplifying)
             {
+                // NGG amplify backend milestone 0: read the geometry-output
+                // sizing registers so the eventual compute-capture stage can
+                // bound its vertex/index/counter buffers. VGT_GS_MAX_VERT_OUT
+                // [10:0] = max output verts per subgroup; VGT_GS_OUT_PRIM_TYPE
+                // [1:0] = emitted topology (0 point / 1 line-strip / 2 tri-strip);
+                // GE_MAX_OUTPUT_PER_SUBGROUP [8:0] = hard per-subgroup cap.
+                state.CxRegisters.TryGetValue(0x2CEu, out var vgtGsMaxVertOutRaw);
+                state.CxRegisters.TryGetValue(0x29Bu, out var vgtGsOutPrimTypeRaw);
+                state.CxRegisters.TryGetValue(0x1FFu, out var geMaxOutputRaw);
+                var gsMaxVertOut = vgtGsMaxVertOutRaw & 0x7FFu;
+                var gsOutPrimType = vgtGsOutPrimTypeRaw & 0x3u;
+                var geMaxOutputPerSubgroup = geMaxOutputRaw & 0x1FFu;
+
                 // Loud, deduplicated warning: running this as a plain VS drops
                 // the amplification. Real geometry needs the amplify backend.
                 TraceAgc(
                     $"agc.ngg_warn es=0x{exportShaderAddress:X16} AMPLIFYING " +
                     $"(emit={classification.EmitCount} cut={classification.CutCount}) " +
-                    "— plain-VS path will not reproduce this geometry; " +
-                    "pass-through count-forcing suppressed.");
+                    $"maxVertOut={gsMaxVertOut} outPrimType={gsOutPrimType} " +
+                    $"geMaxOutput={geMaxOutputPerSubgroup} " +
+                    $"inst={state.InstanceCount} indexCount={vertexCount} " +
+                    "— plain-VS path will not reproduce this geometry; amplify backend future work.");
             }
         }
 
