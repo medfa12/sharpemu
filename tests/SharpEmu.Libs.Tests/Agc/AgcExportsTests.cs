@@ -16,6 +16,8 @@ public sealed class AgcExportsTests
     private const ulong StackAddress = MemoryBase + 0x300;
     private const ulong RegistrationMemoryAddress = MemoryBase + 0x400;
     private const ulong ResourceAddress = MemoryBase + 0x800;
+    private const ulong CommandBufferAddress = MemoryBase + 0x1000;
+    private const ulong CommandAddress = MemoryBase + 0x1200;
 
     private readonly FakeCpuMemory _memory = new(MemoryBase, 0x2000);
     private readonly CpuContext _ctx;
@@ -111,5 +113,201 @@ public sealed class AgcExportsTests
             AgcExports.DriverUnregisterResource(_ctx));
 
         RegisterResource(firstOwner, "replacement resource");
+    }
+
+    [Fact]
+    public void DcbAcquireMem_AlignsAndReturnsFirstPacketOfCompatibilityPair()
+    {
+        Assert.True(_ctx.TryWriteUInt64(CommandBufferAddress + 0x10, CommandAddress + 1));
+        Assert.True(_ctx.TryWriteUInt64(CommandBufferAddress + 0x18, MemoryBase + 0x1700));
+        Assert.True(_ctx.TryWriteUInt32(CommandBufferAddress + 0x30, 0));
+        Assert.True(_ctx.TryWriteUInt32(StackAddress + sizeof(ulong), 400));
+
+        _ctx[CpuRegister.Rdi] = CommandBufferAddress;
+        _ctx[CpuRegister.Rsi] = 3;
+        _ctx[CpuRegister.Rdx] = 0xFFFF_FFFF;
+        _ctx[CpuRegister.Rcx] = 0xFFFF_FFFF;
+        _ctx[CpuRegister.R8] = 0x0000_0012_3456_7800;
+        _ctx[CpuRegister.R9] = 0x1234;
+        _ctx[CpuRegister.Rsp] = StackAddress;
+
+        Assert.Equal(0, AgcExports.DcbAcquireMem(_ctx));
+        Assert.Equal(CommandAddress + 4, _ctx[CpuRegister.Rax]);
+        Assert.Equal(CommandAddress + 68, ReadUInt64(CommandBufferAddress + 0x10));
+        Assert.Equal(0xC006_5800u, ReadUInt32(CommandAddress + 4));
+        Assert.Equal(0x8600_7FC0u, ReadUInt32(CommandAddress + 8));
+        Assert.Equal(0x13u, ReadUInt32(CommandAddress + 12));
+        Assert.Equal(0x1234_5678u, ReadUInt32(CommandAddress + 20));
+        Assert.Equal(25u, ReadUInt32(CommandAddress + 28));
+        Assert.Equal(0x100u, ReadUInt32(CommandAddress + 32));
+        Assert.Equal(0xC006_5800u, ReadUInt32(CommandAddress + 36));
+        Assert.Equal(0x8000_0000u, ReadUInt32(CommandAddress + 40));
+        Assert.Equal(0x7_FEFFu, ReadUInt32(CommandAddress + 64));
+    }
+
+    [Fact]
+    public void AcbAcquireMem_UsesAlignedCompatibilityPairAndClampedPolling()
+    {
+        Assert.True(_ctx.TryWriteUInt64(CommandBufferAddress + 0x10, CommandAddress + 2));
+        Assert.True(_ctx.TryWriteUInt64(CommandBufferAddress + 0x18, MemoryBase + 0x1700));
+        Assert.True(_ctx.TryWriteUInt32(CommandBufferAddress + 0x30, 0));
+
+        _ctx[CpuRegister.Rdi] = CommandBufferAddress;
+        _ctx[CpuRegister.Rsi] = 0xFFFF_FFFF;
+        _ctx[CpuRegister.Rdx] = 0x0000_0012_3456_7800;
+        _ctx[CpuRegister.Rcx] = 0x100;
+        _ctx[CpuRegister.R8] = uint.MaxValue;
+
+        Assert.Equal(0, AgcExports.AcbAcquireMem(_ctx));
+        Assert.Equal(CommandAddress + 4, _ctx[CpuRegister.Rax]);
+        Assert.Equal(CommandAddress + 68, ReadUInt64(CommandBufferAddress + 0x10));
+        Assert.Equal(0u, ReadUInt32(CommandAddress + 8));
+        Assert.Equal(0u, ReadUInt32(CommandAddress + 12));
+        Assert.Equal(0xFFFFu, ReadUInt32(CommandAddress + 28));
+        Assert.Equal(0x100u, ReadUInt32(CommandAddress + 32));
+        Assert.Equal(0xC006_5800u, ReadUInt32(CommandAddress + 36));
+        Assert.Equal(0x7_FEFFu, ReadUInt32(CommandAddress + 64));
+    }
+
+    [Fact]
+    public void AcquireMemGetSize_ReturnsNormalInitializationMaximum()
+    {
+        Assert.Equal(0, AgcExports.DcbAcquireMemGetSize(_ctx));
+        Assert.Equal(64UL, _ctx[CpuRegister.Rax]);
+
+        Assert.Equal(0, AgcExports.AcbAcquireMemGetSize(_ctx));
+        Assert.Equal(64UL, _ctx[CpuRegister.Rax]);
+    }
+
+    [Fact]
+    public void DcbAcquireMem_AdvancesOnePacketWhenCompatibilityPacketIsNotNeeded()
+    {
+        Assert.True(_ctx.TryWriteUInt64(CommandBufferAddress + 0x10, CommandAddress));
+        Assert.True(_ctx.TryWriteUInt64(CommandBufferAddress + 0x18, MemoryBase + 0x1700));
+        Assert.True(_ctx.TryWriteUInt32(CommandBufferAddress + 0x30, 0));
+        Assert.True(_ctx.TryWriteUInt32(StackAddress + sizeof(ulong), 400));
+        _ctx[CpuRegister.Rdi] = CommandBufferAddress;
+        _ctx[CpuRegister.Rsi] = 0;
+        _ctx[CpuRegister.Rdx] = 0;
+        _ctx[CpuRegister.Rcx] = 0;
+        _ctx[CpuRegister.R8] = 0;
+        _ctx[CpuRegister.R9] = 0;
+        _ctx[CpuRegister.Rsp] = StackAddress;
+
+        Assert.Equal(0, AgcExports.DcbAcquireMem(_ctx));
+        Assert.Equal(CommandAddress, _ctx[CpuRegister.Rax]);
+        Assert.Equal(CommandAddress + 32, ReadUInt64(CommandBufferAddress + 0x10));
+        Assert.Equal(25u, ReadUInt32(CommandAddress + 24));
+    }
+
+    [Fact]
+    public void IndirectRegisterAddressPatches_UseSharpEmuLayoutWithoutOpcodeValidation()
+    {
+        var patches = new Func<CpuContext, int>[]
+        {
+            AgcExports.SetCxRegIndirectPatchSetAddress,
+            AgcExports.SetShRegIndirectPatchSetAddress,
+            AgcExports.SetUcRegIndirectPatchSetAddress,
+        };
+
+        foreach (var patch in patches)
+        {
+            Assert.True(_ctx.TryWriteUInt32(CommandAddress, 0xDEAD_BEEF));
+            Assert.True(_ctx.TryWriteUInt32(CommandAddress + 4, 17));
+            _ctx[CpuRegister.Rdi] = CommandAddress;
+            _ctx[CpuRegister.Rsi] = 0x0000_1234_5678_9ABC;
+
+            Assert.Equal(0, patch(_ctx));
+            Assert.Equal(17u, ReadUInt32(CommandAddress + 4));
+            Assert.Equal(0x0000_1234_5678_9ABCUL, ReadUInt64(CommandAddress + 8));
+        }
+    }
+
+    [Fact]
+    public void CondExecAddressPatch_IsLenientAndPreservesLowModeBits()
+    {
+        Assert.True(_ctx.TryWriteUInt32(CommandAddress, 0xDEAD_BEEF));
+        Assert.True(_ctx.TryWriteUInt32(CommandAddress + 4, 3));
+        _ctx[CpuRegister.Rdi] = CommandAddress;
+        _ctx[CpuRegister.Rsi] = 0x0000_1234_5678_9AB8;
+
+        Assert.Equal(0, AgcExports.CondExecPatchSetCommandAddress(_ctx));
+        Assert.Equal(0x5678_9ABBu, ReadUInt32(CommandAddress + 4));
+        Assert.Equal(0x0000_1234u, ReadUInt32(CommandAddress + 8));
+    }
+
+    [Fact]
+    public void DmaDataSourceAddressPatch_UsesSharpEmuSourceFieldWithoutOpcodeValidation()
+    {
+        Assert.True(_ctx.TryWriteUInt32(CommandAddress, 0xDEAD_BEEF));
+        Assert.True(_ctx.TryWriteUInt64(CommandAddress + 8, 0x1111_2222_3333_4444));
+        _ctx[CpuRegister.Rdi] = CommandAddress;
+        _ctx[CpuRegister.Rsi] = 0x1234_5678_9ABC_DEF0;
+
+        Assert.Equal(0, AgcExports.DmaDataPatchSetSrcAddressOrOffsetOrImmediate(_ctx));
+        Assert.Equal(0x1111_2222_3333_4444UL, ReadUInt64(CommandAddress + 8));
+        Assert.Equal(0x1234_5678_9ABC_DEF0UL, ReadUInt64(CommandAddress + 24));
+    }
+
+    [Theory]
+    [InlineData(0x3C, 8)]
+    [InlineData(0x10, 4)]
+    [InlineData(0xEE, 4)]
+    public void WaitRegMemAddressPatch_UsesEmitterLayoutAndFallsBackLeniently(uint opcode, ulong fieldOffset)
+    {
+        Assert.True(_ctx.TryWriteUInt32(CommandAddress, 0xC000_0000u | (opcode << 8)));
+        _ctx[CpuRegister.Rdi] = CommandAddress;
+        _ctx[CpuRegister.Rsi] = 0x1234_5678_9ABC_DEF0;
+
+        Assert.Equal(0, AgcExports.WaitRegMemPatchAddress(_ctx));
+        Assert.Equal(0x1234_5678_9ABC_DEF0UL, ReadUInt64(CommandAddress + fieldOffset));
+    }
+
+    [Fact]
+    public void EndOfPipeAddressPatch_IsLenientAndPreservesLowModeBits()
+    {
+        Assert.True(_ctx.TryWriteUInt32(CommandAddress, 0xDEAD_BEEF));
+        Assert.True(_ctx.TryWriteUInt32(CommandAddress + 12, 2));
+        _ctx[CpuRegister.Rdi] = CommandAddress;
+        _ctx[CpuRegister.Rsi] = 0x1234_5678_9ABC_DEF0;
+
+        Assert.Equal(0, AgcExports.QueueEndOfPipeActionPatchAddress(_ctx));
+        Assert.Equal(0x9ABC_DEF2u, ReadUInt32(CommandAddress + 12));
+        Assert.Equal(0x1234_5678u, ReadUInt32(CommandAddress + 16));
+    }
+
+    [Fact]
+    public void AddressPatches_RejectOnlyNullCommandPointers()
+    {
+        _ctx[CpuRegister.Rdi] = 0;
+        _ctx[CpuRegister.Rsi] = 0x1234;
+
+        Assert.Equal(
+            (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT,
+            AgcExports.WaitRegMemPatchAddress(_ctx));
+        Assert.Equal(
+            (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT,
+            AgcExports.QueueEndOfPipeActionPatchAddress(_ctx));
+        Assert.Equal(
+            (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT,
+            AgcExports.SetShRegIndirectPatchSetAddress(_ctx));
+        Assert.Equal(
+            (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT,
+            AgcExports.CondExecPatchSetCommandAddress(_ctx));
+        Assert.Equal(
+            (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT,
+            AgcExports.DmaDataPatchSetSrcAddressOrOffsetOrImmediate(_ctx));
+    }
+
+    private uint ReadUInt32(ulong address)
+    {
+        Assert.True(_ctx.TryReadUInt32(address, out var value));
+        return value;
+    }
+
+    private ulong ReadUInt64(ulong address)
+    {
+        Assert.True(_ctx.TryReadUInt64(address, out var value));
+        return value;
     }
 }
