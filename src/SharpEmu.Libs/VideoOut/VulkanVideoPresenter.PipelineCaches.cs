@@ -59,6 +59,24 @@ internal static unsafe partial class VulkanVideoPresenter
             "1",
             StringComparison.Ordinal);
     private static readonly HashSet<ulong> _tracedFeedbackLoopTargets = [];
+
+    // SHARPEMU_LOG_VS_FALLBACK: a real scene draw that reaches
+    // CreateTranslatedDrawResources with empty VertexSpirv is silently replaced
+    // by a hardcoded fullscreen-triangle VS (SpirvFixedShaders), and an NGG
+    // pass-through draw takes the compute-capture path. Both reduce a many-vertex
+    // mesh to a tiny fixed-function primitive set, which paints the observed flat
+    // diagonal gradient. This logs, per unique pixel-shader, which substitution
+    // fired plus vertex-count/primitive so the gradient surfaces can be
+    // attributed to fullscreen-fallback vs NGG-capture vs a real VS.
+    private static readonly bool _logVsFallback =
+        string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_LOG_VS_FALLBACK"),
+            "1",
+            StringComparison.Ordinal);
+    private static readonly HashSet<(ulong Ps, int Kind)> _tracedVsFallback = [];
+    private static long _vsFallbackFullscreen;
+    private static long _vsCapture;
+    private static long _vsReal;
     private sealed partial class Presenter : IDisposable
     {
         // SHARPEMU_CACHE_RENDERPASS caches (all render-thread state, no locking).

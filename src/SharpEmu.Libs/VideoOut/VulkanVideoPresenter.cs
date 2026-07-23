@@ -4899,6 +4899,23 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             var useCapture = captureSpirv is not null;
+            if (_logVsFallback)
+            {
+                var kind = useCapture ? 1 : (vertexSpirv.Length == 0 ? 2 : 0);
+                if (kind == 1) { System.Threading.Interlocked.Increment(ref _vsCapture); }
+                else if (kind == 2) { System.Threading.Interlocked.Increment(ref _vsFallbackFullscreen); }
+                else { System.Threading.Interlocked.Increment(ref _vsReal); }
+                if (_tracedVsFallback.Add((draw.PixelShaderAddress, kind)))
+                {
+                    var name = kind == 1 ? "ngg-capture" : kind == 2 ? "fullscreen-fallback" : "real-vs";
+                    Console.Error.WriteLine(
+                        $"[LOADER][VSFALLBACK] {name} ps=0x{draw.PixelShaderAddress:X16} " +
+                        $"vsLen={draw.VertexSpirv.Length} vcount={draw.VertexCount} " +
+                        $"prim={draw.PrimitiveType} attrs={draw.AttributeCount} " +
+                        $"vbufs={draw.VertexBuffers.Count} " +
+                        $"totals[real={_vsReal} fs={_vsFallbackFullscreen} ngg={_vsCapture}]");
+                }
+            }
             if (useCapture)
             {
                 // The pass-through export already applies the full transform in
