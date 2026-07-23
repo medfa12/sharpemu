@@ -43,6 +43,22 @@ internal static unsafe partial class VulkanVideoPresenter
             Environment.GetEnvironmentVariable("SHARPEMU_CACHE_RENDERPASS"),
             "1",
             StringComparison.Ordinal);
+
+    // SHARPEMU_ALLOW_FEEDBACK_LOOP: when a draw samples a texture whose guest
+    // address is also one of its bound color render targets (a read+write
+    // feedback loop -- legal on GNM/PS5, undefined in core Vulkan), the default
+    // path drops the whole draw. Astro Bot spins forever rendering into one such
+    // target (0x...507410000) and never reaches its first flip. With this flag
+    // the draw executes anyway, binding the target image directly as the sampled
+    // source; desktop NVIDIA tolerates the aliasing well enough to let the frame
+    // complete. This is the cheap unblock experiment ahead of a proper
+    // snapshot-copy resolve.
+    private static readonly bool _allowFeedbackLoop =
+        string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_ALLOW_FEEDBACK_LOOP"),
+            "1",
+            StringComparison.Ordinal);
+    private static readonly HashSet<ulong> _tracedFeedbackLoopTargets = [];
     private sealed partial class Presenter : IDisposable
     {
         // SHARPEMU_CACHE_RENDERPASS caches (all render-thread state, no locking).

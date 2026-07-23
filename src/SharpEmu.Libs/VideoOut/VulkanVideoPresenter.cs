@@ -8518,11 +8518,27 @@ internal static unsafe partial class VulkanVideoPresenter
             if (work.Draw.Textures.Any(texture =>
                     targetAddresses.Contains(texture.Address)))
             {
-                Console.Error.WriteLine(
-                    $"[LOADER][WARN] Vulkan skipped render-target feedback loop " +
-                    $"targets={string.Join(',', targetAddresses.Select(address => $"0x{address:X16}"))}");
-                AbandonPendingRenderTargets(work);
-                return;
+                if (!_allowFeedbackLoop)
+                {
+                    Console.Error.WriteLine(
+                        $"[LOADER][WARN] Vulkan skipped render-target feedback loop " +
+                        $"targets={string.Join(',', targetAddresses.Select(address => $"0x{address:X16}"))}");
+                    AbandonPendingRenderTargets(work);
+                    return;
+                }
+
+                // SHARPEMU_ALLOW_FEEDBACK_LOOP: execute the draw despite the
+                // aliasing so the frame can complete. Log once per target.
+                foreach (var address in targetAddresses)
+                {
+                    if (work.Draw.Textures.Any(texture => texture.Address == address) &&
+                        _tracedFeedbackLoopTargets.Add(address))
+                    {
+                        Console.Error.WriteLine(
+                            $"[LOADER][WARN] Vulkan executing render-target feedback loop " +
+                            $"target=0x{address:X16} (SHARPEMU_ALLOW_FEEDBACK_LOOP)");
+                    }
+                }
             }
 
             var (renderWidth, renderHeight) = ComputeMrtRenderExtent(work.Targets);
