@@ -3771,6 +3771,32 @@ public static class AgcExports
                             $"cpuCount={argIndexCount} seedCount={seedIndexCount} " +
                             $"indexBufCount={state.IndexBufferCount} inst={Math.Max(argInstanceCount, 1u)}");
                     }
+
+                    // NGG-bridge verification (SHARPEMU_LOG_INDIRECT): capture the
+                    // full parse-time picture of an indirect draw so the geometry
+                    // capture bridge is designed against measured reality -- the
+                    // live 5-dword record, the bound index buffer, and the input
+                    // primitive topology. Re-read the record so a later change
+                    // (a GPU producer overwriting the stale template) is visible.
+                    if (string.Equals(
+                            Environment.GetEnvironmentVariable("SHARPEMU_LOG_INDIRECT"),
+                            "1",
+                            StringComparison.Ordinal))
+                    {
+                        ctx.TryReadUInt32(argsBase + 8, out var argFirstIndex);
+                        ctx.TryReadUInt32(argsBase + 12, out var argVertexOffset);
+                        ctx.TryReadUInt32(argsBase + 16, out var argFirstInstance);
+                        ctx.TryReadUInt32(argsBase, out var reread0);
+                        state.UcRegisters.TryGetValue(VgtPrimitiveType, out var primType);
+                        Console.Error.WriteLine(
+                            $"[LOADER][INDIRECT] args=0x{argsBase:X16} " +
+                            $"rec=[idx={argIndexCount} inst={argInstanceCount} " +
+                            $"firstIdx={argFirstIndex} vtxOff={unchecked((int)argVertexOffset)} " +
+                            $"firstInst={argFirstInstance}] reread_idx={reread0} " +
+                            $"idxBuf=0x{state.IndexBufferAddress:X16} idxBufCount={state.IndexBufferCount} " +
+                            $"idxSize={state.IndexSize} primType=0x{primType:X} " +
+                            $"stateInst={state.InstanceCount}");
+                    }
                 }
 
                 TryTranslateGuestDraw(ctx, gpuState, state, effectiveCount, indexed);
