@@ -2,7 +2,7 @@
 # vm-astro.sh <r1|r2> <secs> "<ENV k=v;k=v>" -- deploy current git HEAD to the VM, build incrementally, boot Astro Bot, print render signals.
 set -euo pipefail
 REPO="${1:-r1}"; SECS="${2:-120}"; ENVP="${3:-none}"
-KEY="$HOME/astro-vm-ssh-key"; VM="astro@34.45.90.170"
+KEY="$HOME/astro-vm-ssh-key"; VM="astro@"
 export GIT_SSH_COMMAND="ssh -i $KEY -o StrictHostKeyChecking=accept-new"
 echo "[vm-astro] pushing HEAD -> vm-$REPO"
 git push -f "$VM:C:/$REPO" HEAD:master 2>&1 | tail -1
