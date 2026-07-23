@@ -108,16 +108,30 @@ public sealed class AudioOut2ExportsTests
     }
 
     [Fact]
-    public void PortGetState_MainPort_ReportsChannelsFromDataFormat()
+    public void PortGetState_MainPort_ReportsOneAvailableStereoEndpoint()
     {
         var ctx = CreateContext();
         var handle = CreatePort(ctx, portType: 0, dataFormat: 0x800);
         var state = GetState(ctx, handle);
 
         Assert.Equal(0x01, BinaryPrimitives.ReadUInt16LittleEndian(state)); // output: main
-        Assert.Equal(8, state[0x02]);
+        Assert.Equal(2, state[0x02]);
         Assert.Equal(127, BinaryPrimitives.ReadInt16LittleEndian(state.AsSpan(0x04)));
-        Assert.Equal(0u, BinaryPrimitives.ReadUInt32LittleEndian(state.AsSpan(0x08))); // flags
+        Assert.Equal(0, BinaryPrimitives.ReadUInt16LittleEndian(state.AsSpan(0x06)));
+        Assert.Equal(1u, BinaryPrimitives.ReadUInt32LittleEndian(state.AsSpan(0x08))); // 3D_AVAILABLE
+        Assert.All(state[0x0C..], value => Assert.Equal(0, value));
+    }
+
+    [Fact]
+    public void PortGetState_BgmPort_SharesThePrimaryStereoEndpoint()
+    {
+        var ctx = CreateContext();
+        var handle = CreatePort(ctx, portType: 1, dataFormat: 0x800);
+        var state = GetState(ctx, handle);
+
+        Assert.Equal(0x01, BinaryPrimitives.ReadUInt16LittleEndian(state));
+        Assert.Equal(2, state[0x02]);
+        Assert.Equal(1u, BinaryPrimitives.ReadUInt32LittleEndian(state.AsSpan(0x08)));
     }
 
     [Fact]
@@ -130,6 +144,7 @@ public sealed class AudioOut2ExportsTests
         // The Sndz main loop tests output bit 6 to detect the pad speaker.
         Assert.Equal(0x40, BinaryPrimitives.ReadUInt16LittleEndian(state));
         Assert.Equal(1, state[0x02]);
+        Assert.Equal(0u, BinaryPrimitives.ReadUInt32LittleEndian(state.AsSpan(0x08)));
     }
 
     [Fact]
@@ -142,6 +157,7 @@ public sealed class AudioOut2ExportsTests
 
         Assert.Equal(0x01, BinaryPrimitives.ReadUInt16LittleEndian(state));
         Assert.Equal(1, state[0x02]);
+        Assert.Equal(0u, BinaryPrimitives.ReadUInt32LittleEndian(state.AsSpan(0x08)));
     }
 
     [Fact]
@@ -164,11 +180,16 @@ public sealed class AudioOut2ExportsTests
         var info = new byte[0x50];
         Assert.True(ctx.Memory.TryRead(InfoAddress, info));
 
-        Assert.Equal(0, info[0x00]); // type: stereo
+        Assert.Equal(0, info[0x00]); // type: TV
         Assert.Equal(0x3u, BinaryPrimitives.ReadUInt32LittleEndian(info.AsSpan(0x04))); // FL|FR
+        Assert.Equal(1u, BinaryPrimitives.ReadUInt32LittleEndian(info.AsSpan(0x08))); // 3D_AVAILABLE
+        Assert.Equal(0u, BinaryPrimitives.ReadUInt32LittleEndian(info.AsSpan(0x0C)));
         // The reconfig path (eboot 0x800DED210) reads i16 azimuths at
         // info+0x10 with a 4-byte stride: {i16 azimuth, i16 elevation}[16].
         Assert.Equal(-30, BinaryPrimitives.ReadInt16LittleEndian(info.AsSpan(0x10)));
+        Assert.Equal(0, BinaryPrimitives.ReadInt16LittleEndian(info.AsSpan(0x12)));
         Assert.Equal(30, BinaryPrimitives.ReadInt16LittleEndian(info.AsSpan(0x14)));
+        Assert.Equal(0, BinaryPrimitives.ReadInt16LittleEndian(info.AsSpan(0x16)));
+        Assert.All(info[0x18..], value => Assert.Equal(0, value));
     }
 }
