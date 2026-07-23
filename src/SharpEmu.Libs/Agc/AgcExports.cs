@@ -4573,6 +4573,29 @@ public static class AgcExports
         state.GuestDrawKind = GuestDrawKind.None;
         state.NggEsAmplifying = false;
         state.NggEsPassthroughGeometry = false;
+
+        // CB_COLOR_CONTROL modes EliminateFastClear (2), FmaskDecompress (5) and
+        // DccDecompress (6) are colour-buffer metadata operations: the bound
+        // shader is only a vehicle for the fixed-function pass, so applying it as
+        // a normal colour draw writes garbage over the target and corrupts the
+        // composites that sample it afterwards. Decode MODE from bits [6:4] and
+        // skip the draw before it is translated.
+        if (state.CxRegisters.TryGetValue(CbColorControl, out var cbColorControl) &&
+            (((cbColorControl >> 4) & 0x7u) is 2u or 5u or 6u))
+        {
+            if (string.Equals(
+                    Environment.GetEnvironmentVariable("SHARPEMU_LOG_INDIRECT"),
+                    "1",
+                    StringComparison.Ordinal))
+            {
+                Console.Error.WriteLine(
+                    $"[LOADER][CBMETA] skip mode={(cbColorControl >> 4) & 0x7u} " +
+                    $"es=0x{(hasExportShader ? exportShaderAddress : 0):X16} vcount={vertexCount}");
+            }
+
+            return;
+        }
+
         DetectNggPrimitiveDraw(
             ctx,
             state,
