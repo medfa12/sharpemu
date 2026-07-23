@@ -8537,9 +8537,31 @@ internal static unsafe partial class VulkanVideoPresenter
             {
                 if (!_allowFeedbackLoop)
                 {
-                    Console.Error.WriteLine(
-                        $"[LOADER][WARN] Vulkan skipped render-target feedback loop " +
-                        $"targets={string.Join(',', targetAddresses.Select(address => $"0x{address:X16}"))}");
+                    if (_logVsFallback &&
+                        System.Threading.Interlocked.Increment(ref _feedbackDropDetail) <= 40)
+                    {
+                        var collisions = work.Draw.Textures
+                            .Where(t => targetAddresses.Contains(t.Address))
+                            .Select(t =>
+                            {
+                                var tgt = work.Targets.First(rt => rt.Address == t.Address);
+                                return $"tex[0x{t.Address:X16} {t.Width}x{t.Height} " +
+                                       $"f{t.Format}/n{t.NumberType} storage={t.IsStorage}]" +
+                                       $"==rt[{tgt.Width}x{tgt.Height} f{tgt.Format}/n{tgt.NumberType}]";
+                            });
+                        Console.Error.WriteLine(
+                            $"[LOADER][FBDROP] ps=0x{work.Draw.PixelShaderAddress:X16} " +
+                            $"vcount={work.Draw.VertexCount} prim={work.Draw.PrimitiveType} " +
+                            $"attrs={work.Draw.AttributeCount} vbufs={work.Draw.VertexBuffers.Count} " +
+                            $"textures={work.Draw.Textures.Count} targets={work.Targets.Count} " +
+                            $"collide=[{string.Join(';', collisions)}]");
+                    }
+                    else
+                    {
+                        Console.Error.WriteLine(
+                            $"[LOADER][WARN] Vulkan skipped render-target feedback loop " +
+                            $"targets={string.Join(',', targetAddresses.Select(address => $"0x{address:X16}"))}");
+                    }
                     AbandonPendingRenderTargets(work);
                     return;
                 }
