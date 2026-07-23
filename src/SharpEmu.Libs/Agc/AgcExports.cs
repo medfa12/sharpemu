@@ -4593,12 +4593,17 @@ public static class AgcExports
                 "1",
                 StringComparison.Ordinal))
         {
+            var rtDesc = renderTargets.Count > 0
+                ? string.Join(",", renderTargets.Select(t => $"0x{t.Address:X10}:{t.Width}x{t.Height}:f{t.Format}"))
+                : "none";
+            var depthDesc = depthTarget is { } d ? $"0x{d.Address:X10}:{d.Width}x{d.Height}" : "none";
             Console.Error.WriteLine(
                 $"[LOADER][NGGGATE] es=0x{(hasExportShader ? exportShaderAddress : 0):X16} " +
                 $"passthrough={state.NggEsPassthroughGeometry} amplify={state.NggEsAmplifying} " +
                 $"vcount={vertexCount} indInst={state.IndirectInstanceCount} " +
                 $"idxBufCount={state.IndexBufferCount} " +
-                $"expandGate={(state.NggEsPassthroughGeometry && vertexCount <= 1 && state.IndirectInstanceCount > 1 && state.IndexBufferCount == 0)}");
+                $"expandGate={(state.NggEsPassthroughGeometry && vertexCount <= 1 && state.IndirectInstanceCount > 1 && state.IndexBufferCount == 0)} " +
+                $"targets=[{rtDesc}] depth={depthDesc}");
         }
         if (state.NggEsPassthroughGeometry &&
             vertexCount <= 1 &&
