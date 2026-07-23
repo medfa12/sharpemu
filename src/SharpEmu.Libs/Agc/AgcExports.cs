@@ -5209,6 +5209,13 @@ public static class AgcExports
                 exportShaderAddress,
                 vertexInputs,
                 vertexCount,
+                // A flattened instanced NGG draw generates one vertex per
+                // subgroup/instance procedurally; its vertex count is the
+                // authoritative IndirectInstanceCount, NOT a vertex-buffer
+                // descriptor's record count. Capping to NumRecords here would
+                // collapse the whole mesh to the size of an unrelated fetch
+                // buffer (e.g. a 3-element constant buffer), rendering nothing.
+                countIsExact: flattenInstanceToVertex,
                 ref draw);
         }
 
@@ -5380,6 +5387,7 @@ public static class AgcExports
         ulong exportShaderAddress,
         IReadOnlyList<Gen5VertexInputBinding> vertexInputs,
         uint invocationCount,
+        bool countIsExact,
         ref TranslatedGuestDraw draw)
     {
         if (!Gen5ShaderScalarEvaluator.TryEvaluate(
@@ -5400,8 +5408,13 @@ public static class AgcExports
         // is the fetch descriptor's record count. Drawing more than that emits
         // degenerate w=0 triangles that kill the whole draw, so cap the dispatch
         // and draw to the actual vertex count when it is known.
+        // NumRecords is the first fetch descriptor's capacity, not the draw's
+        // vertex count. It is a valid clamp only when the vertex count was
+        // inferred (could overshoot the fetched buffer and emit w=0 triangles);
+        // for a flattened instanced draw the count is exact (IndirectInstanceCount)
+        // and must NOT be capped to an unrelated buffer's length.
         var recordCount = vertexInputs.Count > 0 ? vertexInputs[0].NumRecords : 0;
-        var effectiveCount = recordCount is > 0 and <= 1_048_576
+        var effectiveCount = !countIsExact && recordCount is > 0 and <= 1_048_576
             ? Math.Min(recordCount, invocationCount)
             : invocationCount;
         if (string.Equals(
