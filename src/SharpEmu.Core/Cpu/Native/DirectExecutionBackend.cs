@@ -363,6 +363,11 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	private bool _logHleHist;
 	private readonly System.Collections.Concurrent.ConcurrentDictionary<string, long> _hleHist = new();
 	private long _hleHistNextDump;
+	// SHARPEMU_LOG_RIP_SAMPLE: a background sampler that periodically suspends
+	// every guest-executing OS thread and records its instruction pointer.
+	// The hot guest RIP on a stuck screen is the address of the poll loop the
+	// game spins on, which can then be disassembled to find the gate condition.
+	private bool _logRipSample;
 
 	private bool _logImportFrames;
 
@@ -1035,6 +1040,11 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		_logBootstrap = string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_BOOTSTRAP"), "1", StringComparison.Ordinal);
 		_logAllImports = string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_ALL_IMPORTS"), "1", StringComparison.Ordinal);
 		_logHleHist = string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_HLE_HIST"), "1", StringComparison.Ordinal);
+		_logRipSample = string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_RIP_SAMPLE"), "1", StringComparison.Ordinal);
+		if (_logRipSample)
+		{
+			StartRipSampler();
+		}
 		_logImportFrames = string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_IMPORT_FRAMES"), "1", StringComparison.Ordinal);
 		_logImportRecent = string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_IMPORT_RECENT"), "1", StringComparison.Ordinal);
 		_logStackCheck = string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_STACK_CHK"), "1", StringComparison.Ordinal);
@@ -1107,6 +1117,61 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			GuestThreadExecution.Scheduler = previousGuestThreadScheduler;
 			Console.Error.WriteLine("[LOADER][INFO] === Execute END (LastError: " + (LastError ?? "null") + ") ===");
 		}
+	}
+
+	private void StartRipSampler()
+	{
+		var sampler = new Thread(() =>
+		{
+			// Give the loader time to reach guest execution before sampling.
+			Thread.Sleep(3000);
+			var hist = new Dictionary<ulong, long>();
+			var sw = Stopwatch.StartNew();
+			long nextDumpMs = 5000;
+			var self = _hostThreading?.CurrentThreadId ?? 0u;
+			while (!_hostShutdownRequested)
+			{
+				try
+				{
+					using var proc = System.Diagnostics.Process.GetCurrentProcess();
+					foreach (System.Diagnostics.ProcessThread pt in proc.Threads)
+					{
+						var tid = unchecked((uint)pt.Id);
+						if (tid == self || _hostThreading is null)
+						{
+							continue;
+						}
+
+						if (_hostThreading.TryCaptureThreadRegisters(tid, out var regs) &&
+							regs.Rip >= 0x800000000UL && regs.Rip < 0x900000000UL)
+						{
+							hist.TryGetValue(regs.Rip, out var c);
+							hist[regs.Rip] = c + 1;
+						}
+					}
+				}
+				catch
+				{
+					// Threads come and go; ignore transient capture failures.
+				}
+
+				Thread.Sleep(15);
+				if (sw.ElapsedMilliseconds >= nextDumpMs)
+				{
+					nextDumpMs += 5000;
+					var top = hist.OrderByDescending(kv => kv.Value).Take(25).ToArray();
+					var line = string.Join(
+						" | ",
+						top.Select(kv => "0x" + kv.Key.ToString("X10") + "=" + kv.Value));
+					Console.Error.WriteLine("[LOADER][RIPSAMPLE] guest-rip top25: " + line);
+				}
+			}
+		})
+		{
+			IsBackground = true,
+			Name = "RipSampler",
+		};
+		sampler.Start();
 	}
 
 	internal void RequestHostShutdown(string reason)
