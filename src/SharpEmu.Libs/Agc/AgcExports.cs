@@ -1653,6 +1653,54 @@ public static class AgcExports
         return ReturnPointer(ctx, commandAddress);
     }
 
+    // sceAgcDcbSet{Uc,Cx,Sh}RegisterDirect: emit a single SET_*_REG PM4 packet
+    // for a register passed by value as {u32 offset, u32 value} in RSI. Titles
+    // use these to program config/context/shader registers directly into the DCB
+    // (e.g. NGG geometry state); returning NOT_IMPLEMENTED drops the register
+    // write entirely, leaving the geometry pipeline stale.
+    private static int DcbSetRegisterDirect(CpuContext ctx, uint op, string space)
+    {
+        var commandBufferAddress = ctx[CpuRegister.Rdi];
+        var packedRegister = ctx[CpuRegister.Rsi];
+        var registerOffset = (uint)(packedRegister & 0xFFFF_FFFFUL);
+        var registerValue = (uint)(packedRegister >> 32);
+        if (commandBufferAddress == 0)
+        {
+            return ReturnPointer(ctx, 0);
+        }
+
+        if (!TryAllocateCommandDwords(ctx, commandBufferAddress, 3, out var commandAddress) ||
+            !ctx.TryWriteUInt32(commandAddress, Pm4(3, op, 0)) ||
+            !ctx.TryWriteUInt32(commandAddress + 4, registerOffset & 0xFFFFu) ||
+            !ctx.TryWriteUInt32(commandAddress + 8, registerValue))
+        {
+            return ReturnPointer(ctx, 0);
+        }
+
+        TraceAgc(
+            $"agc.dcb_set_{space}_direct buf=0x{commandBufferAddress:X16} " +
+            $"cmd=0x{commandAddress:X16} offset=0x{registerOffset:X4} value=0x{registerValue:X8}");
+        return ReturnPointer(ctx, commandAddress);
+    }
+
+    [SysAbiExport(Nid = "w4-d0n60hdo", ExportName = "sceAgcDcbSetUcRegisterDirect", Target = Generation.Gen5, LibraryName = "libSceAgc")]
+    public static int DcbSetUcRegisterDirect(CpuContext ctx) => DcbSetRegisterDirect(ctx, ItSetUconfigReg, "uc");
+
+    [SysAbiExport(Nid = "aP1Ki9G3++4", ExportName = "sceAgcDcbSetUcRegisterDirectGetSize", Target = Generation.Gen5, LibraryName = "libSceAgc")]
+    public static int DcbSetUcRegisterDirectGetSize(CpuContext ctx) => ctx.SetReturn(3 * sizeof(uint));
+
+    [SysAbiExport(Nid = "LHFXRrlTPD8", ExportName = "sceAgcDcbSetCxRegisterDirect", Target = Generation.Gen5, LibraryName = "libSceAgc")]
+    public static int DcbSetCxRegisterDirect(CpuContext ctx) => DcbSetRegisterDirect(ctx, ItSetContextReg, "cx");
+
+    [SysAbiExport(Nid = "1DeUNpRIDDA", ExportName = "sceAgcDcbSetCxRegisterDirectGetSize", Target = Generation.Gen5, LibraryName = "libSceAgc")]
+    public static int DcbSetCxRegisterDirectGetSize(CpuContext ctx) => ctx.SetReturn(3 * sizeof(uint));
+
+    [SysAbiExport(Nid = "pFLArOT53+w", ExportName = "sceAgcDcbSetShRegisterDirect", Target = Generation.Gen5, LibraryName = "libSceAgc")]
+    public static int DcbSetShRegisterDirect(CpuContext ctx) => DcbSetRegisterDirect(ctx, ItSetShReg, "sh");
+
+    [SysAbiExport(Nid = "QhPDD513V0w", ExportName = "sceAgcDcbSetShRegisterDirectGetSize", Target = Generation.Gen5, LibraryName = "libSceAgc")]
+    public static int DcbSetShRegisterDirectGetSize(CpuContext ctx) => ctx.SetReturn(3 * sizeof(uint));
+
     [SysAbiExport(
         Nid = "tSBxhAPyytQ",
         ExportName = "sceAgcDcbSetNumInstances",
