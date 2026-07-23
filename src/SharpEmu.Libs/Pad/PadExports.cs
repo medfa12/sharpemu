@@ -30,6 +30,18 @@ public static class PadExports
     private static bool _initialized;
     private static int _controlsAnnouncementLogged;
 
+    // SHARPEMU_PAD_AUTO_PRESS: on a headless VM there is no keyboard or controller,
+    // so every pad read returns "connected, no buttons" forever -- a title/notice
+    // screen that waits for a button press to advance is then stranded. When set,
+    // synthesize a repeating press/release edge (alternating Cross and Options so
+    // either "press to start" or a system dialog dismisses) that the guest samples
+    // as a real button event.
+    private static readonly bool _autoPress =
+        string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_PAD_AUTO_PRESS"),
+            "1",
+            StringComparison.Ordinal);
+
     [SysAbiExport(
         Nid = "hv1luiJrqQM",
         ExportName = "scePadInit",
@@ -847,6 +859,18 @@ public static class PadExports
             rightY = MergeAxis(xpad.RightY, rightY);
             l2 = Math.Max(l2, xpad.L2);
             r2 = Math.Max(r2, xpad.R2);
+        }
+
+        if (_autoPress)
+        {
+            // ~1s cycle: hold for 200ms then release for 800ms so the guest sees a
+            // clean down->up edge. Alternate Cross (confirm/start) and Options each
+            // cycle to cover both a "press any button" title and a menu prompt.
+            var ms = now / (Stopwatch.Frequency / 1000);
+            if (ms % 1000 < 200)
+            {
+                buttons |= (ms / 1000) % 2 == 0 ? 0x4000u : 0x0008u;
+            }
         }
 
         _cachedInputState = new PadState(
