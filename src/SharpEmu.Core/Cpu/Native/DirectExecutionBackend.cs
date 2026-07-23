@@ -1204,6 +1204,25 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 					var topCall = callHist.OrderByDescending(kv => kv.Value).Take(25).ToArray();
 					Console.Error.WriteLine("[LOADER][CALLSITE] guest call-sites top25: " +
 						string.Join(" | ", topCall.Select(kv => "0x" + kv.Key.ToString("X10") + "=" + kv.Value)));
+					// Dump RUNTIME bytes ending at each top call-site so the real
+					// (relocated) CALL instruction + callee can be disassembled
+					// off-box; the static eboot does not match runtime.
+					var codeBuf = stackalloc byte[64];
+					foreach (var kv in topCall.Take(8))
+					{
+						var siteAddr = kv.Key;
+						var start = siteAddr >= 48UL ? siteAddr - 48UL : siteAddr;
+						if (ReadProcessMemory(proc, start, codeBuf, 64, out var got) && got >= 48)
+						{
+							var sb = new System.Text.StringBuilder();
+							for (var i = 0; i < (int)got; i++)
+							{
+								sb.Append(codeBuf[i].ToString("x2"));
+							}
+							Console.Error.WriteLine(
+								$"[LOADER][CALLBYTES] site=0x{siteAddr:X10} start=0x{start:X10} bytes={sb}");
+						}
+					}
 				}
 			}
 		})
