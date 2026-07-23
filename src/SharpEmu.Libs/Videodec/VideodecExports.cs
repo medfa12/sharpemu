@@ -30,11 +30,6 @@ public static class VideodecExports
         public uint Height { get; init; }
     }
 
-    [SysAbiExport(
-        Nid = "qkgRiwHyheU",
-        ExportName = "sceVideodecCreateDecoder",
-        Target = Generation.Gen5,
-        LibraryName = "libSceVideodec")]
     public static int VideodecCreateDecoder(CpuContext ctx)
     {
         var configAddress = ctx[CpuRegister.Rdi];
@@ -92,11 +87,6 @@ public static class VideodecExports
         return ctx.SetReturn(0);
     }
 
-    [SysAbiExport(
-        Nid = "q0W5GJMovMs",
-        ExportName = "sceVideodecDecode",
-        Target = Generation.Gen5,
-        LibraryName = "libSceVideodec")]
     public static int VideodecDecode(CpuContext ctx)
     {
         var controlAddress = ctx[CpuRegister.Rdi];
@@ -134,11 +124,6 @@ public static class VideodecExports
         return WriteEmptyPictureInfo(ctx, pictureInfoAddress, decoder, pts, attachedData);
     }
 
-    [SysAbiExport(
-        Nid = "U0kpGF1cl90",
-        ExportName = "sceVideodecDeleteDecoder",
-        Target = Generation.Gen5,
-        LibraryName = "libSceVideodec")]
     public static int VideodecDeleteDecoder(CpuContext ctx)
     {
         var controlAddress = ctx[CpuRegister.Rdi];
@@ -165,11 +150,6 @@ public static class VideodecExports
             : ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
     }
 
-    [SysAbiExport(
-        Nid = "jeigLlKdp5I",
-        ExportName = "sceVideodecFlush",
-        Target = Generation.Gen5,
-        LibraryName = "libSceVideodec")]
     public static int VideodecFlush(CpuContext ctx)
     {
         var controlAddress = ctx[CpuRegister.Rdi];

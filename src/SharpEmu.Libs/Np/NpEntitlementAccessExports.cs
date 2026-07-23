@@ -7,11 +7,8 @@ namespace SharpEmu.Libs.Np;
 
 public static class NpEntitlementAccessExports
 {
-    private const int NpEntitlementAccessErrorParameter = unchecked((int)0x817D0002);
-    private const int NpEntitlementAccessErrorNoEntitlement = unchecked((int)0x817D0007);
-    private const int BootParamSize = 32;
-    private const int AddcontEntitlementInfoSize = 28;
-    private const int EntitlementKeySize = 16;
+    private const int BootParamClearSize = 0x20;
+    private const int EmptyAddcontInfoListSize = 0x10;
 
     [SysAbiExport(
         Nid = "jO8DM8oyego",
@@ -23,16 +20,14 @@ public static class NpEntitlementAccessExports
         var initParam = ctx[CpuRegister.Rdi];
         var bootParam = ctx[CpuRegister.Rsi];
 
-        if (initParam == 0 || bootParam == 0)
+        if (bootParam != 0)
         {
-            return ctx.SetReturn(NpEntitlementAccessErrorParameter);
-        }
-
-        Span<byte> clear = stackalloc byte[BootParamSize];
-        clear.Clear();
-        if (!ctx.Memory.TryWrite(bootParam, clear))
-        {
-            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+            Span<byte> clear = stackalloc byte[BootParamClearSize];
+            clear.Clear();
+            if (!ctx.Memory.TryWrite(bootParam, clear))
+            {
+                return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+            }
         }
 
         TraceNpEntitlementAccess($"initialize init=0x{initParam:X16} boot=0x{bootParam:X16}");
@@ -47,53 +42,28 @@ public static class NpEntitlementAccessExports
     public static int NpEntitlementAccessGetAddcontEntitlementInfoList(CpuContext ctx)
     {
         var listAddress = ctx[CpuRegister.Rsi];
-        var listCount = unchecked((uint)ctx[CpuRegister.Rdx]);
-        var hitCountAddress = ctx[CpuRegister.Rcx];
-        if (hitCountAddress == 0 || (listAddress == 0 && listCount != 0))
+        if (listAddress != 0)
         {
-            return ctx.SetReturn(NpEntitlementAccessErrorParameter);
-        }
-
-        if (listCount > 4096)
-        {
-            return ctx.SetReturn(NpEntitlementAccessErrorParameter);
-        }
-
-        if (listAddress != 0 && listCount != 0 &&
-            !ctx.Memory.TryWrite(listAddress, new byte[checked((int)listCount * AddcontEntitlementInfoSize)]))
-        {
-            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
-        }
-
-        if (!ctx.TryWriteUInt32(hitCountAddress, 0))
-        {
-            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+            Span<byte> emptyList = stackalloc byte[EmptyAddcontInfoListSize];
+            emptyList.Clear();
+            if (!ctx.Memory.TryWrite(listAddress, emptyList))
+            {
+                return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+            }
         }
 
         TraceNpEntitlementAccess(
             $"get_addcont_info_list service=0x{ctx[CpuRegister.Rdi]:X16} list=0x{listAddress:X16} " +
-            $"max={listCount} hit_num=0x{hitCountAddress:X16} -> empty");
+            $"max={ctx[CpuRegister.Rdx]} flags=0x{ctx[CpuRegister.Rcx]:X16} -> empty");
         return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
     }
 
-    [SysAbiExport(
-        Nid = "lPDO62PpJIA",
-        ExportName = "sceNpEntitlementAccessGetSkuFlag",
-        Target = Generation.Gen4 | Generation.Gen5,
-        LibraryName = "libSceNpEntitlementAccess")]
-    public static int NpEntitlementAccessGetSkuFlag(CpuContext ctx)
-    {
-        var flagAddress = ctx[CpuRegister.Rdi];
-        if (flagAddress == 0)
-        {
-            return ctx.SetReturn(NpEntitlementAccessErrorParameter);
-        }
+    private const int EmptyAddcontInfoSize = 0x30;
 
-        return ctx.TryWriteUInt32(flagAddress, 3)
-            ? ctx.SetReturn(0)
-            : ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
-    }
-
+    // Singular lookup of one add-on-content entitlement (rdx = info out). We own
+    // no DLC, so report an empty/zeroed info and success — matching the list
+    // variant's "no entitlements" answer. Dead Cells calls this while loading a
+    // level; leaving it unresolved left the info struct uninitialized.
     [SysAbiExport(
         Nid = "xddD23+8TfQ",
         ExportName = "sceNpEntitlementAccessGetAddcontEntitlementInfo",
@@ -101,47 +71,21 @@ public static class NpEntitlementAccessExports
         LibraryName = "libSceNpEntitlementAccess")]
     public static int NpEntitlementAccessGetAddcontEntitlementInfo(CpuContext ctx)
     {
-        var labelAddress = ctx[CpuRegister.Rsi];
         var infoAddress = ctx[CpuRegister.Rdx];
-        if (labelAddress == 0 || infoAddress == 0)
+        if (infoAddress != 0)
         {
-            return ctx.SetReturn(NpEntitlementAccessErrorParameter);
+            Span<byte> info = stackalloc byte[EmptyAddcontInfoSize];
+            info.Clear();
+            if (!ctx.Memory.TryWrite(infoAddress, info))
+            {
+                return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+            }
         }
 
-        Span<byte> label = stackalloc byte[20];
-        Span<byte> info = stackalloc byte[AddcontEntitlementInfoSize];
-        info.Clear();
-        if (!ctx.Memory.TryRead(labelAddress, label) || !ctx.Memory.TryWrite(infoAddress, info))
-        {
-            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
-        }
-
-        return ctx.SetReturn(NpEntitlementAccessErrorNoEntitlement);
-    }
-
-    [SysAbiExport(
-        Nid = "5LiMEPuW0DQ",
-        ExportName = "sceNpEntitlementAccessGetEntitlementKey",
-        Target = Generation.Gen4 | Generation.Gen5,
-        LibraryName = "libSceNpEntitlementAccess")]
-    public static int NpEntitlementAccessGetEntitlementKey(CpuContext ctx)
-    {
-        var labelAddress = ctx[CpuRegister.Rsi];
-        var keyAddress = ctx[CpuRegister.Rdx];
-        if (labelAddress == 0 || keyAddress == 0)
-        {
-            return ctx.SetReturn(NpEntitlementAccessErrorParameter);
-        }
-
-        Span<byte> label = stackalloc byte[20];
-        Span<byte> key = stackalloc byte[EntitlementKeySize];
-        key.Clear();
-        if (!ctx.Memory.TryRead(labelAddress, label) || !ctx.Memory.TryWrite(keyAddress, key))
-        {
-            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
-        }
-
-        return ctx.SetReturn(NpEntitlementAccessErrorNoEntitlement);
+        TraceNpEntitlementAccess(
+            $"get_addcont_info service=0x{ctx[CpuRegister.Rdi]:X16} label=0x{ctx[CpuRegister.Rsi]:X16} " +
+            $"info=0x{infoAddress:X16} -> empty");
+        return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
     }
 
     private static void TraceNpEntitlementAccess(string message)

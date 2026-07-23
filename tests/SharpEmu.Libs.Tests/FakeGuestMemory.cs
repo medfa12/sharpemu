@@ -12,12 +12,14 @@ namespace SharpEmu.Libs.Tests;
 internal sealed class FakeGuestMemory : ICpuMemory, IGuestAddressSpace
 {
     private readonly FakeCpuMemory _inner;
+    private readonly ulong _baseAddress;
     private readonly ulong _limit;
     private ulong _next;
 
     public FakeGuestMemory(ulong baseAddress, int size, ulong allocationBase)
     {
         _inner = new FakeCpuMemory(baseAddress, size);
+        _baseAddress = baseAddress;
         _limit = baseAddress + (ulong)size;
         _next = allocationBase;
     }
@@ -53,6 +55,14 @@ internal sealed class FakeGuestMemory : ICpuMemory, IGuestAddressSpace
 
     public bool TryProtect(ulong address, ulong size, GuestPageProtection protection) => true;
 
+    public bool TryBackFixedRange(ulong address, ulong size, bool executable) =>
+        size != 0 &&
+        address >= _baseAddress &&
+        address <= _limit &&
+        size <= _limit - address;
+
     public bool TryAllocateGuestMemory(ulong size, ulong alignment, out ulong address) =>
         TryAllocateAtOrAbove(0, size, executable: false, alignment, out address);
+
+    public bool TryFreeGuestMemory(ulong address) => true;
 }

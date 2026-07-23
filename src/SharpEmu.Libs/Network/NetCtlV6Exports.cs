@@ -11,7 +11,7 @@ public static class NetCtlV6Exports
     public static int NetCtlGetInfoV6(CpuContext ctx) => NetCtlExports.NetCtlGetInfo(ctx);
 
     [SysAbiExport(Nid = "H5yARg37U5g", ExportName = "sceNetCtlGetResultV6", LibraryName = "libSceNetCtlV6", Target = Generation.Gen5)]
-    public static int NetCtlGetResultV6(CpuContext ctx) => NetCtlExports.NetCtlGetResult(ctx);
+    public static int NetCtlGetResultV6(CpuContext ctx) => ctx.SetReturn(0, typeof(long));
 
     [SysAbiExport(Nid = "+lxqIKeU9UY", ExportName = "sceNetCtlGetStateV6", LibraryName = "libSceNetCtlV6", Target = Generation.Gen5)]
     public static int NetCtlGetStateV6(CpuContext ctx) => NetCtlExports.NetCtlGetState(ctx);

@@ -5,6 +5,7 @@ using SharpEmu.Core.Runtime;
 using SharpEmu.Core.Cpu;
 using SharpEmu.GUI;
 using SharpEmu.HLE;
+using SharpEmu.HLE.Host;
 using SharpEmu.Libs.VideoOut;
 using SharpEmu.Logging;
 using System.Globalization;
@@ -53,7 +54,7 @@ internal static partial class Program
         // threads spin up long before VideoOut is opened). VideoOut also requests
         // this lazily, but doing it here covers the whole run and the call is
         // idempotent (Windows-guarded, no-op on non-Windows).
-        SharpEmu.Libs.HostTimerResolution.Request();
+        HostPlatform.Current.Threading.RequestTimerResolution();
         InstallProcessDeathDiagnostics();
         try
         {
@@ -106,11 +107,16 @@ internal static partial class Program
 
     private static int Run(string[] args)
     {
-        args = NormalizeInternalArguments(args, out var isMitigatedChild);
-        if (args.Length == 0 && !isMitigatedChild)
+        if (Updater.TryApply(args, out var updateExitCode))
         {
-            // No arguments: open the desktop frontend. Any argument selects
-            // the classic CLI behavior below.
+            return updateExitCode;
+        }
+
+        args = NormalizeInternalArguments(args, out var isMitigatedChild);
+        PreloadGlfw();
+
+        if (args.Length == 0)
+        {
             return GuiLauncher.Run();
         }
 
@@ -123,6 +129,163 @@ internal static partial class Program
             TryEnableConsoleFileMirror(earlyLogFilePath);
         }
 
+        if (!CheckHostArchitecture())
+        {
+            return 5;
+        }
+
+        if (OperatingSystem.IsMacOS() || OperatingSystem.IsLinux())
+        {
+            if (OperatingSystem.IsMacOS())
+            {
+                ConfigureMoltenVkDefaults();
+                PreloadMacVulkanLoader();
+            }
+
+            // GLFW requires window creation and event processing on the
+            // process main thread: AppKit demands it on macOS, and X11 has a
+            // single event queue that must be serviced from the main thread
+            // (a window created and polled off it may never map, which showed
+            // as a running game with no visible window on Linux). Emulation
+            // moves to a worker thread and the main thread services the window
+            // work the video presenter posts. Windows keeps a per-thread event
+            // queue, so its window stays on the presenter's own thread.
+            var exitCode = 0;
+            HostMainThread.Enable();
+            var emulation = new Thread(() =>
+            {
+                try
+                {
+                    exitCode = RunEmulator(args, isMitigatedChild);
+                }
+                finally
+                {
+                    HostMainThread.Shutdown();
+                }
+            }, 32 * 1024 * 1024)
+            {
+                Name = "SharpEmu Emulation",
+            };
+            emulation.Start();
+            HostMainThread.Pump();
+            emulation.Join();
+            return exitCode;
+        }
+
+        return RunEmulator(args, isMitigatedChild);
+    }
+
+    /// <summary>
+    /// The supported host execution model, checked before any emulation
+    /// starts: the CPU backend executes guest x86-64 code natively, so the
+    /// host process must be x86-64 — win-x64/linux-x64 on x64 hardware, or
+    /// osx-x64 under Rosetta 2 on Apple Silicon (Rosetta translates the
+    /// whole process, so it still reports as X64 here). An arm64 process
+    /// (e.g. the osx-arm64 build) can browse the GUI but cannot run games;
+    /// failing up front distinguishes that from MoltenVK, signal-handler,
+    /// or guest-memory startup problems.
+    /// </summary>
+    private static bool CheckHostArchitecture()
+    {
+        if (RuntimeInformation.ProcessArchitecture == Architecture.X64)
+        {
+            return true;
+        }
+
+        Console.Error.WriteLine(
+            $"[LOADER][ERROR] Unsupported process architecture " +
+            $"{RuntimeInformation.ProcessArchitecture}: guest code executes " +
+            "natively, so SharpEmu must run as an x86-64 process.");
+        if (OperatingSystem.IsMacOS())
+        {
+            Console.Error.WriteLine(
+                "[LOADER][ERROR] On Apple Silicon, use the osx-x64 build under " +
+                "Rosetta 2 (install with: softwareupdate --install-rosetta).");
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Applies MoltenVK performance defaults before the Vulkan loader is
+    /// loaded. Existing user-provided values always take precedence.
+    /// </summary>
+    private static void ConfigureMoltenVkDefaults()
+    {
+        try
+        {
+            _ = MacSetEnv("MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS", "0", 0);
+            _ = MacSetEnv("MVK_CONFIG_SHOULD_MAXIMIZE_CONCURRENT_COMPILATION", "1", 0);
+            _ = MacSetEnv("MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS", "1", 0);
+            _ = MacSetEnv("MVK_CONFIG_RESUME_LOST_DEVICE", "1", 0);
+        }
+        catch (Exception exception)
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][WARN] Failed to set MoltenVK defaults: {exception.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Makes a Vulkan loader visible to GLFW's dlopen("libvulkan.1.dylib").
+    /// Homebrew's Vulkan libraries are arm64-only and cannot load into this
+    /// x86-64 (Rosetta 2) process, so a universal libMoltenVK.dylib placed
+    /// next to the executable (named libvulkan.1.dylib) is preloaded here;
+    /// dyld then resolves GLFW's bare-name dlopen to the loaded image.
+    /// </summary>
+    private static void PreloadMacVulkanLoader()
+    {
+        var candidates = new[]
+        {
+            Path.Combine(AppContext.BaseDirectory, "libvulkan.1.dylib"),
+            Path.Combine(AppContext.BaseDirectory, "libMoltenVK.dylib"),
+            Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                ".sharpemu", "x64lib", "libvulkan.1.dylib"),
+        };
+        foreach (var candidate in candidates)
+        {
+            if (File.Exists(candidate) && NativeLibrary.TryLoad(candidate, out _))
+            {
+                Console.Error.WriteLine($"[LOADER][INFO] Vulkan loader preloaded: {candidate}");
+                return;
+            }
+        }
+
+        if (NativeLibrary.TryLoad("libvulkan.1.dylib", out _))
+        {
+            return;
+        }
+
+        Console.Error.WriteLine(
+            "[LOADER][WARN] No x86-64 Vulkan loader found; video output will be unavailable. " +
+            "Place a universal libMoltenVK.dylib (from the MoltenVK releases) next to SharpEmu " +
+            "as libvulkan.1.dylib.");
+    }
+
+    /// <summary>
+    /// SharpEmu.CLI.csproj publishes glfw into a "plugins" subfolder rather
+    /// than flat next to the executable, which falls outside the default OS
+    /// DLL/dlopen search path. Preloading it here by full path first means
+    /// any later bare-name lookup (however Silk.NET/GLFW itself resolves the
+    /// library) finds it already loaded in the process and reuses it -- the
+    /// same technique <see cref="PreloadMacVulkanLoader"/> already relies on
+    /// for the Vulkan loader.
+    /// </summary>
+    private static void PreloadGlfw()
+    {
+        var fileName = OperatingSystem.IsWindows() ? "glfw3.dll"
+            : OperatingSystem.IsMacOS() ? "libglfw.3.dylib"
+            : "libglfw.so.3";
+        var candidate = Path.Combine(AppContext.BaseDirectory, "plugins", fileName);
+        if (File.Exists(candidate))
+        {
+            NativeLibrary.TryLoad(candidate, out _);
+        }
+    }
+
+    private static int RunEmulator(string[] args, bool isMitigatedChild)
+    {
         Console.Error.WriteLine($"[DEBUG] SharpEmu starting with {args.Length} args");
         LogBinaryStamp();
 
@@ -154,7 +317,17 @@ internal static partial class Program
                 Environment.GetEnvironmentVariable("SHARPEMU_RENDERDOC_CAPTURE") ?? "sharpemu_capture");
         }
 
-        if (!TryParseArguments(args, out var ebootPath, out var runtimeOptions, out var logLevel, out var logFilePath))
+        if (!TryExtractHostSurfaceArgument(args, out var emulatorArgs, out var hostSurface, out var hostSurfaceError))
+        {
+            Console.Error.WriteLine($"[LOADER][ERROR] {hostSurfaceError}");
+            return 1;
+        }
+
+        HostSessionControl.SetEmbeddedHostSurface(
+            hostSurface?.WindowHandle ?? 0,
+            hostSurface?.DisplayHandle ?? 0);
+
+        if (!TryParseArguments(emulatorArgs, out var ebootPath, out var runtimeOptions, out var logLevel, out var logFilePath))
         {
             PrintUsage();
             return 1;
@@ -179,68 +352,156 @@ internal static partial class Program
             return 2;
         }
 
-        Console.Error.WriteLine("[DEBUG] Creating runtime...");
-
-        using var runtime = SharpEmuRuntime.CreateDefault(runtimeOptions);
-
-        OrbisGen2Result result;
-        ConsoleCancelEventHandler? cancelHandler = null;
-        try
+        if (!TryGetDebugServerOptions(args, out var debugServerEnabled, out var debugServerOptions, out var debugServerError))
         {
-            cancelHandler = (_, eventArgs) =>
-            {
-                eventArgs.Cancel = true;
-                VideoOutExports.NotifyHostInterrupt();
-            };
-            Console.CancelKeyPress += cancelHandler;
-
-            Console.Error.WriteLine($"[DEBUG] Running: {ebootPath}");
-            result = runtime.Run(ebootPath);
-            Console.Error.WriteLine($"[DEBUG] Result: {result}");
+            Log.Error($"Invalid --debug-server endpoint: {debugServerError}");
+            return 1;
         }
-        catch (Exception ex)
+
+        SharpEmu.Debugger.DebuggerServerHost? debugHost = null;
+        if (debugServerEnabled)
         {
-            Console.Error.WriteLine($"[DEBUG] Exception: {ex}");
-            Log.Error("SharpEmu failed to run.", ex);
-            return 3;
-        }
-        finally
-        {
-            if (cancelHandler is not null)
+            debugHost = new SharpEmu.Debugger.DebuggerServerHost(debugServerOptions);
+            try
             {
-                Console.CancelKeyPress -= cancelHandler;
+                debugHost.Start();
+                Log.Info($"Live debug server listening on {debugHost.Endpoint}. Attach with SharpEmu.DebugClient.");
+                // With StopAtEntry, the guest parks at its first frame until a
+                // client connects and continues.
+                runtimeOptions = runtimeOptions with { DebugHook = debugHost.Hook };
+            }
+            catch (Exception ex)
+            {
+                Log.Error("Failed to start the debug server.", ex);
+                debugHost.DisposeAsync().AsTask().GetAwaiter().GetResult();
+                return 6;
             }
         }
 
-        Log.Info($"SharpEmu execution completed. Result={result} (0x{(int)result:X8})");
-        if (!string.IsNullOrWhiteSpace(runtime.LastSessionSummary))
+        Console.Error.WriteLine("[DEBUG] Creating runtime...");
+
+        try
         {
-            Log.Info(runtime.LastSessionSummary);
+            if (hostSurface is not null && !VulkanVideoHost.TryAttachSurface(hostSurface))
+            {
+                Console.Error.WriteLine("[LOADER][ERROR] The requested GUI host surface is already active.");
+                return 3;
+            }
+
+            using var runtime = SharpEmuRuntime.CreateDefault(runtimeOptions);
+
+            OrbisGen2Result result;
+            ConsoleCancelEventHandler? cancelHandler = null;
+            try
+            {
+                cancelHandler = (_, eventArgs) =>
+                {
+                    eventArgs.Cancel = true;
+                    VideoOutExports.NotifyHostInterrupt();
+                };
+                Console.CancelKeyPress += cancelHandler;
+
+                Console.Error.WriteLine($"[DEBUG] Running: {ebootPath}");
+                result = runtime.Run(ebootPath);
+                Console.Error.WriteLine($"[DEBUG] Result: {result}");
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"[DEBUG] Exception: {ex}");
+                Log.Error("SharpEmu failed to run.", ex);
+                return 3;
+            }
+            finally
+            {
+                if (cancelHandler is not null)
+                {
+                    Console.CancelKeyPress -= cancelHandler;
+                }
+            }
+
+            Log.Info($"SharpEmu execution completed. Result={result} (0x{(int)result:X8})");
+            if (!string.IsNullOrWhiteSpace(runtime.LastSessionSummary))
+            {
+                Log.Info(runtime.LastSessionSummary);
+            }
+
+            if (!string.IsNullOrWhiteSpace(runtime.LastBasicBlockTrace))
+            {
+                Log.Info("BB trace:");
+                Log.Info(runtime.LastBasicBlockTrace);
+            }
+
+            if (!string.IsNullOrWhiteSpace(runtime.LastMilestoneLog))
+            {
+                Log.Info(runtime.LastMilestoneLog);
+            }
+
+            if (result != OrbisGen2Result.ORBIS_GEN2_OK && !string.IsNullOrWhiteSpace(runtime.LastExecutionDiagnostics))
+            {
+                Log.Warn(runtime.LastExecutionDiagnostics);
+            }
+
+            if (runtimeOptions.ImportTraceLimit > 0 && !string.IsNullOrWhiteSpace(runtime.LastExecutionTrace))
+            {
+                Log.Info("Import trace:");
+                Log.Info(runtime.LastExecutionTrace);
+            }
+
+            return result == OrbisGen2Result.ORBIS_GEN2_OK ? 0 : 4;
+        }
+        finally
+        {
+            if (debugHost is not null)
+            {
+                debugHost.NotifyRunCompleted();
+                debugHost.DisposeAsync().AsTask().GetAwaiter().GetResult();
+            }
+
+            HostSessionControl.SetEmbeddedHostSurface(0);
+            if (hostSurface is not null)
+            {
+                VulkanVideoHost.RequestClose();
+                VulkanVideoHost.DetachSurface(hostSurface);
+                hostSurface.Dispose();
+            }
+        }
+    }
+
+    private static bool TryExtractHostSurfaceArgument(
+        IReadOnlyList<string> args,
+        out string[] emulatorArgs,
+        out VulkanHostSurface? hostSurface,
+        out string? error)
+    {
+        const string hostSurfacePrefix = "--host-surface=";
+        var remaining = new List<string>(args.Count);
+        hostSurface = null;
+        error = null;
+        foreach (var argument in args)
+        {
+            if (!argument.StartsWith(hostSurfacePrefix, StringComparison.OrdinalIgnoreCase))
+            {
+                remaining.Add(argument);
+                continue;
+            }
+
+            if (hostSurface is not null)
+            {
+                emulatorArgs = [];
+                error = "more than one GUI host surface was specified";
+                return false;
+            }
+
+            var descriptor = argument[hostSurfacePrefix.Length..];
+            if (!VulkanHostSurface.TryCreateChildProcessSurface(descriptor, out hostSurface, out error))
+            {
+                emulatorArgs = [];
+                return false;
+            }
         }
 
-        if (!string.IsNullOrWhiteSpace(runtime.LastBasicBlockTrace))
-        {
-            Log.Info("BB trace:");
-            Log.Info(runtime.LastBasicBlockTrace);
-        }
-
-        if (!string.IsNullOrWhiteSpace(runtime.LastMilestoneLog))
-        {
-            Log.Info(runtime.LastMilestoneLog);
-        }
-
-        if (result != OrbisGen2Result.ORBIS_GEN2_OK && !string.IsNullOrWhiteSpace(runtime.LastExecutionDiagnostics))
-        {
-            Log.Warn(runtime.LastExecutionDiagnostics);
-        }
-
-        if (runtimeOptions.ImportTraceLimit > 0 && !string.IsNullOrWhiteSpace(runtime.LastExecutionTrace))
-        {
-            Log.Info("Import trace:");
-            Log.Info(runtime.LastExecutionTrace);
-        }
-
-        return result == OrbisGen2Result.ORBIS_GEN2_OK ? 0 : 4;
+        emulatorArgs = remaining.ToArray();
+        return true;
     }
 
     private static void EnsureCliConsole()
@@ -337,7 +598,9 @@ internal static partial class Program
         return handle != 0 && handle != -1;
     }
 
-    private static string[] NormalizeInternalArguments(string[] args, out bool isMitigatedChild)
+    private static string[] NormalizeInternalArguments(
+        string[] args,
+        out bool isMitigatedChild)
     {
         isMitigatedChild = false;
         var trustedMitigatedChild = string.Equals(
@@ -383,12 +646,7 @@ internal static partial class Program
             return false;
         }
 
-        var childArgs = new string[args.Length + 1];
-        childArgs[0] = MitigatedChildFlag;
-        for (var i = 0; i < args.Length; i++)
-        {
-            childArgs[i + 1] = args[i];
-        }
+        string[] childArgs = [MitigatedChildFlag, .. args];
 
         var commandLine = BuildCommandLine(processPath, childArgs);
         var startupInfoEx = new STARTUPINFOEX();
@@ -439,7 +697,7 @@ internal static partial class Program
             nint jobHandle = 0;
             Environment.SetEnvironmentVariable(MitigatedChildEnvironment, "1");
             var created = CreateProcessW(
-                processPath,
+                null,
                 cmdLineBuilder,
                 0,
                 0,
@@ -857,9 +1115,10 @@ internal static partial class Program
 
     private static void PrintUsage()
     {
-        Log.Info("Usage: SharpEmu.CLI [--strict] [--trace-imports[=N]] [--cpu-engine=<native>] [--log-level=<level>] [--log-file[=<path>]] <path-to-eboot.bin>");
+        Log.Info("Usage: SharpEmu.CLI [--strict] [--trace-imports[=N]] [--cpu-engine=<native>] [--log-level=<level>] [--log-file[=<path>]] [--debug-server[=host:port]] <path-to-eboot.bin>");
         Log.Info(@"Example: SharpEmu.CLI --cpu-engine=native --trace-imports=64 --log-level=debug --log-file ""E:\Games\...\eboot.bin""");
         Log.Info("       SharpEmu.CLI --present-test[=<seconds>]  (verify the Vulkan presenter without a game image)");
+        Log.Info("Debug server: --debug-server starts a live debug listener (default 127.0.0.1:5714); connect with SharpEmu.DebugClient.");
     }
 
     private static bool TryParsePresentTest(string[] args, out int? durationSeconds)
@@ -887,6 +1146,42 @@ internal static partial class Program
         }
 
         return false;
+    }
+
+    /// <summary>
+    /// Detects the <c>--debug-server</c> flag and parses its optional
+    /// <c>host:port</c> endpoint. Returns false only when the flag is present but
+    /// its endpoint is malformed, so the caller can abort with a clear error.
+    /// </summary>
+    private static bool TryGetDebugServerOptions(
+        string[] args,
+        out bool enabled,
+        out SharpEmu.Debugger.Server.DebuggerServerOptions options,
+        out string error)
+    {
+        enabled = false;
+        options = new SharpEmu.Debugger.Server.DebuggerServerOptions();
+        error = string.Empty;
+        foreach (var argument in args)
+        {
+            if (string.Equals(argument, "--debug-server", StringComparison.OrdinalIgnoreCase))
+            {
+                enabled = true;
+                continue;
+            }
+
+            const string prefix = "--debug-server=";
+            if (argument.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+            {
+                enabled = true;
+                if (!SharpEmu.Debugger.Server.DebuggerServerOptions.TryParseEndpoint(argument[prefix.Length..], out options, out error))
+                {
+                    return false;
+                }
+            }
+        }
+
+        return true;
     }
 
     private static bool TryParseArguments(
@@ -917,6 +1212,15 @@ internal static partial class Program
             if (string.Equals(argument, "--strict", StringComparison.OrdinalIgnoreCase))
             {
                 strictDynlibResolution = true;
+                continue;
+            }
+
+            // The debug-server endpoint is parsed separately (see
+            // TryGetDebugServerOptions); accept the flag here so it is not
+            // rejected as an unknown option or mistaken for the eboot path.
+            if (string.Equals(argument, "--debug-server", StringComparison.OrdinalIgnoreCase) ||
+                argument.StartsWith("--debug-server=", StringComparison.OrdinalIgnoreCase))
+            {
                 continue;
             }
 
@@ -1247,7 +1551,7 @@ internal static partial class Program
     [DllImport("kernel32.dll", EntryPoint = "CreateProcessW", SetLastError = true, CharSet = CharSet.Unicode)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool CreateProcessW(
-        string applicationName,
+        string? applicationName,
         StringBuilder commandLine,
         nint processAttributes,
         nint threadAttributes,
@@ -1304,4 +1608,7 @@ internal static partial class Program
         uint creationDisposition,
         uint flagsAndAttributes,
         nint templateFile);
+
+    [DllImport("libSystem", EntryPoint = "setenv")]
+    private static extern int MacSetEnv(string name, string value, int overwrite);
 }

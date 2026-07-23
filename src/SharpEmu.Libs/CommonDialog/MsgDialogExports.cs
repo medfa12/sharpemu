@@ -1,9 +1,9 @@
 // Copyright (C) 2026 SharpEmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+using SharpEmu.HLE;
 using System.Buffers.Binary;
 using System.Threading;
-using SharpEmu.HLE;
 
 namespace SharpEmu.Libs.CommonDialog;
 
@@ -17,28 +17,16 @@ public static class MsgDialogExports
     private const int ErrorOk = 0;
     private const int ErrorNotInitialized = unchecked((int)0x80B80003);
     private const int ErrorNotFinished = unchecked((int)0x80B80005);
-    private const int ErrorInvalidState = unchecked((int)0x80B80006);
-    private const int ErrorBusy = unchecked((int)0x80B80008);
-    private const int ErrorParamInvalid = unchecked((int)0x80B8000A);
+    private const int ErrorBusy = unchecked((int)0x80B80007);
     private const int ErrorNotRunning = unchecked((int)0x80B8000B);
     private const int ErrorArgNull = unchecked((int)0x80B8000D);
 
-    private const int ModeUserMessage = 1;
-    private const int ModeProgressBar = 2;
-    private const int ModeSystemMessage = 3;
-    private const int ResultSize = 44;
-    private const int ResultOk = 0;
-    private const int ResultUserCanceled = 1;
-    private const int ButtonIdInvalid = 0;
-    private const int ButtonIdFirst = 1;
-    private const int ButtonIdSecond = 2;
+    // Result buffer layout follows the common dialog convention: mode at +0x00,
+    // result at +0x04, buttonId at +0x08. The affirmative button (OK/YES) is 1.
+    private const int ResultSize = 0x20;
+    private const int ButtonIdAffirmative = 1;
 
     private static int _status;
-    private static int _mode;
-    private static int _result;
-    private static int _buttonId;
-
-    internal static bool IsUsed => Volatile.Read(ref _status) != StatusNone;
 
     [SysAbiExport(
         Nid = "lDqxaY1UbEo",
@@ -47,6 +35,9 @@ public static class MsgDialogExports
         LibraryName = "libSceMsgDialog")]
     public static int MsgDialogInitialize(CpuContext ctx)
     {
+        // Treat repeated initialization as success. The dialog service is process-global in
+        // this HLE implementation and has no per-call resources to recreate. Only promote
+        // from NONE so re-initializing mid-flow cannot clobber a running/finished dialog.
         Interlocked.CompareExchange(ref _status, StatusInitialized, StatusNone);
         return ctx.SetReturn(ErrorOk);
     }
@@ -63,9 +54,6 @@ public static class MsgDialogExports
             return ctx.SetReturn(ErrorNotInitialized);
         }
 
-        Volatile.Write(ref _mode, 0);
-        Volatile.Write(ref _result, 0);
-        Volatile.Write(ref _buttonId, 0);
         return ctx.SetReturn(ErrorOk);
     }
 
@@ -93,59 +81,76 @@ public static class MsgDialogExports
             return ctx.SetReturn(ErrorBusy);
         }
 
-        if (status is not (StatusInitialized or StatusFinished))
-        {
-            return ctx.SetReturn(ErrorInvalidState);
-        }
+        LogDialogMessage(ctx, paramAddress);
 
-        if (!ctx.TryReadInt32(paramAddress + 0x38, out var mode))
-        {
-            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
-        }
-
-        int result;
-        int buttonId;
-        switch (mode)
-        {
-            case ModeUserMessage:
-                if (!ctx.TryReadUInt64(paramAddress + 0x40, out var userParamAddress))
-                {
-                    return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
-                }
-
-                if (userParamAddress == 0)
-                {
-                    return ctx.SetReturn(ErrorParamInvalid);
-                }
-
-                if (!ctx.TryReadInt32(userParamAddress, out var buttonType))
-                {
-                    return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
-                }
-
-                if (!TrySelectImmediateResult(buttonType, out result, out buttonId))
-                {
-                    return ctx.SetReturn(ErrorParamInvalid);
-                }
-
-                break;
-            case ModeProgressBar:
-                result = ResultOk;
-                buttonId = ButtonIdInvalid;
-                break;
-            case ModeSystemMessage:
-                result = ResultOk;
-                buttonId = ButtonIdFirst;
-                break;
-            default:
-                return ctx.SetReturn(ErrorParamInvalid);
-        }
-
-        Volatile.Write(ref _mode, mode);
-        Volatile.Write(ref _result, result);
-        Volatile.Write(ref _buttonId, buttonId);
-        Interlocked.Exchange(ref _status, StatusFinished);
+        // There is no host popup to actually show. Enter RUNNING so close/cancel paths see
+        // a live dialog; the guest's next status poll auto-dismisses it (see PollStatus).
+        Interlocked.Exchange(ref _status, StatusRunning);
         return ctx.SetReturn(ErrorOk);
+    }
+
+    // Best-effort extraction of the dialog text so fatal-error popups are visible in the
+    // log even though no host dialog is shown. The PS5 SceMsgDialogParam layout is not
+    // fully known, so chase every qword in the struct that points at readable text - one
+    // level deep, then a second level for nested sub-param structs.
+    private static void LogDialogMessage(CpuContext ctx, ulong paramAddress)
+    {
+        Console.Error.WriteLine($"[LOADER][INFO] sceMsgDialogOpen: param=0x{paramAddress:X12}");
+
+        Span<byte> head = stackalloc byte[0xA0];
+        if (ctx.Memory.TryRead(paramAddress, head))
+        {
+            DumpPointerStrings(ctx, paramAddress, head, "param", chaseNested: true);
+        }
+    }
+
+    private static void DumpPointerStrings(CpuContext ctx, ulong baseAddress, ReadOnlySpan<byte> bytes, string label, bool chaseNested)
+    {
+        Span<byte> nested = stackalloc byte[0x40];
+        for (var offset = 0; offset + 8 <= bytes.Length; offset += 8)
+        {
+            var value = System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(bytes[offset..]);
+            if (value < 0x10000 || value == baseAddress)
+            {
+                continue;
+            }
+
+            var text = TryReadPrintableText(ctx, value);
+            if (text is not null)
+            {
+                Console.Error.WriteLine($"[LOADER][INFO]   {label}+0x{offset:X2} -> 0x{value:X12} text=\"{text}\"");
+            }
+            else if (chaseNested && ctx.Memory.TryRead(value, nested))
+            {
+                DumpPointerStrings(ctx, value, nested, $"{label}+0x{offset:X2}", chaseNested: false);
+            }
+        }
+    }
+
+    private static string? TryReadPrintableText(CpuContext ctx, ulong address)
+    {
+        Span<byte> bytes = stackalloc byte[256];
+        if (!ctx.Memory.TryRead(address, bytes))
+        {
+            return null;
+        }
+
+        var nullIndex = bytes.IndexOf((byte)0);
+        if (nullIndex < 2)
+        {
+            return null;
+        }
+
+        var candidate = bytes[..nullIndex];
+        foreach (var b in candidate)
+        {
+            if (b is < 0x20 or > 0x7E && b != (byte)'\n' && b != (byte)'\r' && b != (byte)'\t')
+            {
+                return null;
+            }
+        }
+
+        return System.Text.Encoding.ASCII.GetString(candidate).Replace("\n", "\\n").Replace("\r", "\\r");
     }
 
     [SysAbiExport(
@@ -153,14 +158,24 @@ public static class MsgDialogExports
         ExportName = "sceMsgDialogGetStatus",
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libSceMsgDialog")]
-    public static int MsgDialogGetStatus(CpuContext ctx) => ctx.SetReturn(Volatile.Read(ref _status));
+    public static int MsgDialogGetStatus(CpuContext ctx) => ctx.SetReturn(PollStatus());
 
     [SysAbiExport(
         Nid = "6fIC3XKt2k0",
         ExportName = "sceMsgDialogUpdateStatus",
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libSceMsgDialog")]
-    public static int MsgDialogUpdateStatus(CpuContext ctx) => ctx.SetReturn(Volatile.Read(ref _status));
+    public static int MsgDialogUpdateStatus(CpuContext ctx) => ctx.SetReturn(PollStatus());
+
+    // With no host UI the dialog cannot wait for user input: the first status poll after
+    // Open observes the dialog as already dismissed. Advancing on both UpdateStatus and
+    // GetStatus keeps every guest polling pattern free of infinite RUNNING loops, while
+    // an Open -> Close sequence with no poll in between still exercises the close path.
+    private static int PollStatus()
+    {
+        Interlocked.CompareExchange(ref _status, StatusFinished, StatusRunning);
+        return Volatile.Read(ref _status);
+    }
 
     [SysAbiExport(
         Nid = "Lr8ovHH9l6A",
@@ -180,14 +195,16 @@ public static class MsgDialogExports
             return ctx.SetReturn(ErrorNotFinished);
         }
 
+        // Report the affirmative button so yes/no prompts take the confirming branch;
+        // buttonId 0 is the "invalid" sentinel and games may treat it as an error.
         Span<byte> result = stackalloc byte[ResultSize];
         result.Clear();
-        BinaryPrimitives.WriteInt32LittleEndian(result, Volatile.Read(ref _mode));
-        BinaryPrimitives.WriteInt32LittleEndian(result[0x04..], Volatile.Read(ref _result));
-        BinaryPrimitives.WriteInt32LittleEndian(result[0x08..], Volatile.Read(ref _buttonId));
+        BinaryPrimitives.WriteInt32LittleEndian(result[0x04..], 0);
+        BinaryPrimitives.WriteInt32LittleEndian(result[0x08..], ButtonIdAffirmative);
+
         if (!ctx.Memory.TryWrite(resultAddress, result))
         {
-            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+            return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
         }
 
         return ctx.SetReturn(ErrorOk);
@@ -229,44 +246,15 @@ public static class MsgDialogExports
         LibraryName = "libSceMsgDialog")]
     public static int MsgDialogProgressBarSetMsg(CpuContext ctx) => ProgressBarNoOp(ctx);
 
-    internal static bool TrySelectImmediateResult(int buttonType, out int result, out int buttonId)
+    // There is no visible bar to update. Accept the call whenever the service is alive so
+    // save/install loops that report progress do not abort on an unexpected error.
+    private static int ProgressBarNoOp(CpuContext ctx)
     {
-        result = ResultOk;
-        buttonId = ButtonIdFirst;
-        switch (buttonType)
+        if (Volatile.Read(ref _status) == StatusNone)
         {
-            case 0:
-            case 1:
-            case 3:
-            case 5:
-            case 6:
-            case 9:
-                return true;
-            case 2:
-                buttonId = ButtonIdInvalid;
-                return true;
-            case 7:
-                buttonId = ButtonIdSecond;
-                return true;
-            case 8:
-                result = ResultUserCanceled;
-                buttonId = ButtonIdInvalid;
-                return true;
-            default:
-                result = 0;
-                buttonId = 0;
-                return false;
+            return ctx.SetReturn(ErrorNotInitialized);
         }
-    }
 
-    internal static void ResetForTests()
-    {
-        Interlocked.Exchange(ref _status, StatusNone);
-        Volatile.Write(ref _mode, 0);
-        Volatile.Write(ref _result, 0);
-        Volatile.Write(ref _buttonId, 0);
+        return ctx.SetReturn(ErrorOk);
     }
-
-    private static int ProgressBarNoOp(CpuContext ctx) =>
-        ctx.SetReturn(Volatile.Read(ref _status) == StatusNone ? ErrorNotInitialized : ErrorOk);
 }

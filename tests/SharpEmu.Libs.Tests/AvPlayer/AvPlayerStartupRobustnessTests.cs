@@ -91,7 +91,8 @@ public sealed class AvPlayerStartupRobustnessTests : IDisposable
     public void StreamInfoExExportUsesRuntimeReflectionRegistration()
     {
         var manager = new ModuleManager();
-        manager.RegisterFromAssembly(typeof(AvPlayerExports).Assembly, Generation.Gen5);
+        manager.RegisterExports(
+            SharpEmu.Generated.SysAbiExportRegistry.CreateExports(Generation.Gen5));
 
         Assert.True(manager.TryGetExport("ctTAcF5DiKQ", out var export));
         Assert.Equal("sceAvPlayerGetStreamInfoEx", export.Name);

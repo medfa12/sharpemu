@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using SharpEmu.HLE;
+using SharpEmu.HLE.Host;
 using System.Buffers;
-using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Diagnostics;
 
@@ -12,10 +12,13 @@ namespace SharpEmu.Libs.Audio;
 public static class AudioOutExports
 {
     private static readonly ConcurrentDictionary<int, PortState> Ports = new();
-    private static readonly ConcurrentDictionary<int, byte> PassThroughPorts = new();
     private static int _nextPortHandle;
-    private static int _nextPassThroughHandle = 0x1000;
-    private static int _masteringInitialized;
+
+    // Diagnostic: confirm sceAudioOutOutput is actually called and whether the
+    // guest submits real samples or silence. Gated so it costs nothing when off.
+    private static readonly bool _traceOutput = string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_LOG_AUDIO_OUT"), "1", StringComparison.Ordinal);
+    private static long _outputCount;
 
     private sealed class PortState : IDisposable
     {
@@ -31,7 +34,7 @@ public static class AudioOutExports
             int channels,
             int bytesPerSample,
             bool isFloat,
-            WinMmAudioPort? backend)
+            IHostAudioStream? backend)
         {
             UserId = userId;
             Type = type;
@@ -52,7 +55,8 @@ public static class AudioOutExports
         public int Channels { get; }
         public int BytesPerSample { get; }
         public bool IsFloat { get; }
-        public WinMmAudioPort? Backend { get; }
+        public IHostAudioStream? Backend { get; }
+        public volatile float Volume = 1.0f;
         public int BufferByteLength =>
             checked((int)BufferLength * Channels * BytesPerSample);
 
@@ -107,12 +111,13 @@ public static class AudioOutExports
             return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
         }
 
-        WinMmAudioPort? backend = null;
+        IHostAudioStream? backend = null;
         string backendName;
         try
         {
-            backend = new WinMmAudioPort(frequency);
-            backendName = "winmm";
+            var audio = HostPlatform.Current.Audio;
+            backend = audio.OpenStereoPcm16Stream(frequency);
+            backendName = audio.BackendName;
         }
         catch (Exception exception)
         {
@@ -157,6 +162,37 @@ public static class AudioOutExports
     }
 
     [SysAbiExport(
+        Nid = "GrQ9s4IrNaQ",
+        ExportName = "sceAudioOutGetPortState",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceAudioOut")]
+    public static int AudioOutGetPortState(CpuContext ctx)
+    {
+        var handle = unchecked((int)ctx[CpuRegister.Rdi]);
+        var stateAddress = ctx[CpuRegister.Rsi];
+        if (stateAddress == 0 || !Ports.TryGetValue(handle, out var port))
+        {
+            return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        // SceAudioOutPortState: report a connected primary output at full volume
+        // so pacing/mixing code sees a live port. We do no host rerouting, so
+        // rerouteCounter and flag stay zero.
+        Span<byte> state = stackalloc byte[16];
+        state.Clear();
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt16LittleEndian(state, 1);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt16LittleEndian(
+            state[2..], (ushort)port.Channels);
+        state[7] = 127;
+        if (!ctx.Memory.TryWrite(stateAddress, state))
+        {
+            return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        return ctx.SetReturn(0);
+    }
+
+    [SysAbiExport(
         Nid = "QOQtbeDqsT4",
         ExportName = "sceAudioOutOutput",
         Target = Generation.Gen5,
@@ -167,7 +203,12 @@ public static class AudioOutExports
         var sourceAddress = ctx[CpuRegister.Rsi];
         if (!Ports.TryGetValue(handle, out var port))
         {
-            return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+            // Host shutdown disposes the ports while guest audio threads are
+            // still draining their last buffers; report success so the guest
+            // winds down without a per-buffer error (and its WARN log flood).
+            return ctx.SetReturn(_shutdown
+                ? 0
+                : (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
         }
 
         if (sourceAddress == 0)
@@ -184,15 +225,43 @@ public static class AudioOutExports
                 return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
             }
 
-            if (port.Backend is null ||
-                !port.Backend.Submit(
-                    source,
-                    port.BufferLength,
-                    port.Channels,
-                    port.BytesPerSample,
-                    port.IsFloat))
+            if (_traceOutput)
+            {
+                var n = Interlocked.Increment(ref _outputCount);
+                if (n <= 8 || n % 200 == 0)
+                {
+                    var peak = PeakAmplitude(source, port.IsFloat, port.BytesPerSample);
+                    Console.Error.WriteLine(
+                        $"[LOADER][TRACE] audioout.output#{n} handle={handle} bytes={source.Length} ch={port.Channels} float={port.IsFloat} vol={port.Volume:F2} peak={peak:F4} backend={(port.Backend is null ? "none" : "coreaudio")}");
+                }
+            }
+
+            if (port.Backend is null)
             {
                 port.PaceSilence();
+                return ctx.SetReturn(0);
+            }
+
+            var outputLength = checked((int)port.BufferLength * AudioPcmConversion.OutputFrameSize);
+            var output = ArrayPool<byte>.Shared.Rent(outputLength);
+            try
+            {
+                AudioPcmConversion.ConvertToStereoPcm16(
+                    source,
+                    output.AsSpan(0, outputLength),
+                    checked((int)port.BufferLength),
+                    port.Channels,
+                    port.BytesPerSample,
+                    port.IsFloat,
+                    port.Volume);
+                if (!port.Backend.Submit(output.AsSpan(0, outputLength)))
+                {
+                    port.PaceSilence();
+                }
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(output);
             }
 
             return ctx.SetReturn(0);
@@ -211,234 +280,79 @@ public static class AudioOutExports
     public static int AudioOutSetVolume(CpuContext ctx)
     {
         var handle = unchecked((int)ctx[CpuRegister.Rdi]);
-        return ctx.SetReturn(
-            Ports.ContainsKey(handle)
-                ? 0
-                : (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
-    }
-
-    private static int Ok(CpuContext ctx) => ctx.SetReturn(0);
-
-    private static int OpenPassThrough(CpuContext ctx)
-    {
-        var handle = Interlocked.Increment(ref _nextPassThroughHandle);
-        PassThroughPorts[handle] = 0;
-        return ctx.SetReturn(handle);
-    }
-
-    private static int ClosePassThrough(CpuContext ctx)
-    {
-        var handle = unchecked((int)ctx[CpuRegister.Rdi]);
-        return ctx.SetReturn(PassThroughPorts.TryRemove(handle, out _)
-            ? 0
-            : (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
-    }
-
-    private static int GetPassThroughTime(CpuContext ctx)
-    {
-        var handle = unchecked((int)ctx[CpuRegister.Rdi]);
-        var output = ctx[CpuRegister.Rsi];
-        if (!PassThroughPorts.ContainsKey(handle) || output == 0)
+        var channelFlags = unchecked((uint)ctx[CpuRegister.Rsi]);
+        var volumeArrayAddress = ctx[CpuRegister.Rdx];
+        if (!Ports.TryGetValue(handle, out var port))
         {
             return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
         }
 
-        var micros = (ulong)(Stopwatch.GetTimestamp() * 1_000_000L / Stopwatch.Frequency);
-        return ctx.TryWriteUInt64(output, micros)
-            ? ctx.SetReturn(0)
-            : ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
-    }
-
-    [SysAbiExport(Nid = "Iz9X7ISldhs", ExportName = "sceAudioOutA3dControl", Target = Generation.Gen5, LibraryName = "libSceAudioOut")]
-    public static int sceAudioOutA3dControl(CpuContext ctx) => Ok(ctx);
-    [SysAbiExport(Nid = "9RVIoocOVAo", ExportName = "sceAudioOutA3dExit", Target = Generation.Gen5, LibraryName = "libSceAudioOut")]
-    public static int sceAudioOutA3dExit(CpuContext ctx) => Ok(ctx);
-    [SysAbiExport(Nid = "n7KgxE8rOuE", ExportName = "sceAudioOutA3dInit", Target = Generation.Gen5, LibraryName = "libSceAudioOut")]
-    public static int sceAudioOutA3dInit(CpuContext ctx) => Ok(ctx);
-    [SysAbiExport(Nid = "WBAO6-n0-4M", ExportName = "sceAudioOutAttachToApplicationByPid", Target = Generation.Gen5, LibraryName = "libSceAudioOut")]
-    public static int sceAudioOutAttachToApplicationByPid(CpuContext ctx) => Ok(ctx);
-    [SysAbiExport(Nid = "O3FM2WXIJaI", ExportName = "sceAudioOutChangeAppModuleState", Target = Generation.Gen5, LibraryName = "libSceAudioOut")]
-    public static int sceAudioOutChangeAppModuleState(CpuContext ctx) => Ok(ctx);
-    [SysAbiExport(Nid = "ol4LbeTG8mc", ExportName = "sceAudioOutDetachFromApplicationByPid", Target = Generation.Gen5, LibraryName = "libSceAudioOut")]
-    public static int sceAudioOutDetachFromApplicationByPid(CpuContext ctx) => Ok(ctx);
-    [SysAbiExport(Nid = "r1V9IFEE+Ts", ExportName = "sceAudioOutExConfigureOutputMode", Target = Generation.Gen5, LibraryName = "libSceAudioOut")]
-    public static int sceAudioOutExConfigureOutputMode(CpuContext ctx) => Ok(ctx);
-    [SysAbiExport(Nid = "wZakRQsWGos", ExportName = "sceAudioOutExGetSystemInfo", Target = Generation.Gen5, LibraryName = "libSceAudioOut")]
-    public static int sceAudioOutExGetSystemInfo(CpuContext ctx) => ClearOptional(ctx, ctx[CpuRegister.Rdi], 0x20);
-    [SysAbiExport(Nid = "xjjhT5uw08o", ExportName = "sceAudioOutExPtClose", Target = Generation.Gen5, LibraryName = "libSceAudioOut")]
-    public static int sceAudioOutExPtClose(CpuContext ctx) => ClosePassThrough(ctx);
-    [SysAbiExport(Nid = "DsST7TNsyfo", ExportName = "sceAudioOutExPtGetLastOutputTime", Target = Generation.Gen5, LibraryName = "libSceAudioOut")]
-    public static int sceAudioOutExPtGetLastOutputTime(CpuContext ctx) => GetPassThroughTime(ctx);
-    [SysAbiExport(Nid = "4UlW3CSuCa4", ExportName = "sceAudioOutExPtOpen", Target = Generation.Gen5, LibraryName = "libSceAudioOut")]
-    public static int sceAudioOutExPtOpen(CpuContext ctx) => OpenPassThrough(ctx);
-    [SysAbiExport(Nid = "Xcj8VTtnZw0", ExportName = "sceAudioOutExSystemInfoIsSupportedAudioOutExMode", Target = Generation.Gen5, LibraryName = "libSceAudioOut")]
-    public static int sceAudioOutExSystemInfoIsSupportedAudioOutExMode(CpuContext ctx) => Ok(ctx);
-    [SysAbiExport(Nid = "I3Fwcmkg5Po", ExportName = "sceAudioOutGetFocusEnablePid", Target = Generation.Gen5, LibraryName = "libSceAudioOut")]
-    public static int sceAudioOutGetFocusEnablePid(CpuContext ctx) => WriteOptionalUInt32(ctx, ctx[CpuRegister.Rdi], 0);
-    [SysAbiExport(Nid = "Y3lXfCFEWFY", ExportName = "sceAudioOutGetHandleStatusInfo", Target = Generation.Gen5, LibraryName = "libSceAudioOut")]
-    public static int sceAudioOutGetHandleStatusInfo(CpuContext ctx) => ClearOptional(ctx, ctx[CpuRegister.Rsi], 0x20);
-    [SysAbiExport(Nid = "-00OAutAw+c", ExportName = "sceAudioOutGetInfo", Target = Generation.Gen5, LibraryName = "libSceAudioOut")]
-    public static int sceAudioOutGetInfo(CpuContext ctx) => ClearOptional(ctx, ctx[CpuRegister.Rsi], 0x20);
-    [SysAbiExport(Nid = "RqmKxBqB8B4", ExportName = "sceAudioOutGetInfoOpenNum", Target = Generation.Gen5, LibraryName = "libSceAudioOut")]
-    public static int sceAudioOutGetInfoOpenNum(CpuContext ctx) => WriteOptionalUInt32(ctx, ctx[CpuRegister.Rdi], (uint)Ports.Count);
-    [SysAbiExport(Nid = "Ptlts326pds", ExportName = "sceAudioOutGetLastOutputTime", Target = Generation.Gen5, LibraryName = "libSceAudioOut")]
-    public static int sceAudioOutGetLastOutputTime(CpuContext ctx)
-    {
-        var handle = unchecked((int)ctx[CpuRegister.Rdi]);
-        var output = ctx[CpuRegister.Rsi];
-        if (!Ports.ContainsKey(handle) || output == 0)
+        const int unityVolume = 32768;
+        var maxVolume = 0;
+        var found = false;
+        if (volumeArrayAddress != 0)
         {
-            return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+            Span<byte> raw = stackalloc byte[sizeof(int)];
+            for (var channel = 0; channel < 8; channel++)
+            {
+                if ((channelFlags & (1u << channel)) == 0)
+                {
+                    continue;
+                }
+
+                if (!ctx.Memory.TryRead(volumeArrayAddress + (ulong)(channel * sizeof(int)), raw))
+                {
+                    return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+                }
+
+                var value = System.Buffers.Binary.BinaryPrimitives.ReadInt32LittleEndian(raw);
+                maxVolume = Math.Max(maxVolume, value);
+                found = true;
+            }
         }
-        var micros = (ulong)(Stopwatch.GetTimestamp() * 1_000_000L / Stopwatch.Frequency);
-        return ctx.TryWriteUInt64(output, micros) ? ctx.SetReturn(0) : ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
-    }
-    [SysAbiExport(Nid = "GrQ9s4IrNaQ", ExportName = "sceAudioOutGetPortState", Target = Generation.Gen5, LibraryName = "libSceAudioOut")]
-    public static int sceAudioOutGetPortState(CpuContext ctx)
-    {
-        var handle = unchecked((int)ctx[CpuRegister.Rdi]);
-        var output = ctx[CpuRegister.Rsi];
-        if (!Ports.TryGetValue(handle, out var port) || output == 0)
+
+        if (found)
         {
-            return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+            port.Volume = Math.Clamp(maxVolume / (float)unityVolume, 0f, 1f);
         }
-        Span<byte> state = stackalloc byte[0x20];
-        state.Clear();
-        BinaryPrimitives.WriteUInt16LittleEndian(state, port.Type is 2 or 3 ? (ushort)2 : port.Type == 4 ? (ushort)4 : (ushort)1);
-        state[2] = (byte)Math.Min(port.Channels, 2);
-        BinaryPrimitives.WriteInt16LittleEndian(state[4..], port.Type == 4 ? (short)127 : (short)-1);
-        return ctx.Memory.TryWrite(output, state) ? ctx.SetReturn(0) : ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+
+        return ctx.SetReturn(0);
     }
-    [SysAbiExport(Nid = "c7mVozxJkPU", ExportName = "sceAudioOutGetSimulatedBusUsableStatusByBusType", Target = Generation.Gen5, LibraryName = "libSceAudioOut")]
-    public static int sceAudioOutGetSimulatedBusUsableStatusByBusType(CpuContext ctx) => WriteOptionalUInt32(ctx, ctx[CpuRegister.Rsi], 1);
-    [SysAbiExport(Nid = "pWmS7LajYlo", ExportName = "sceAudioOutGetSimulatedHandleStatusInfo", Target = Generation.Gen5, LibraryName = "libSceAudioOut")]
-    public static int sceAudioOutGetSimulatedHandleStatusInfo(CpuContext ctx) => ClearOptional(ctx, ctx[CpuRegister.Rsi], 0x20);
-    [SysAbiExport(Nid = "oPLghhAWgMM", ExportName = "sceAudioOutGetSimulatedHandleStatusInfo2", Target = Generation.Gen5, LibraryName = "libSceAudioOut")]
-    public static int sceAudioOutGetSimulatedHandleStatusInfo2(CpuContext ctx) => ClearOptional(ctx, ctx[CpuRegister.Rsi], 0x20);
-    [SysAbiExport(Nid = "5+r7JYHpkXg", ExportName = "sceAudioOutGetSparkVss", Target = Generation.Gen5, LibraryName = "libSceAudioOut")]
-    public static int sceAudioOutGetSparkVss(CpuContext ctx) => WriteOptionalUInt32(ctx, ctx[CpuRegister.Rdi], 0);
-    [SysAbiExport(Nid = "R5hemoKKID8", ExportName = "sceAudioOutGetSystemState", Target = Generation.Gen5, LibraryName = "libSceAudioOut")]
-    public static int sceAudioOutGetSystemState(CpuContext ctx) => ClearRequired(ctx, ctx[CpuRegister.Rdi], 0x20);
-    [SysAbiExport(Nid = "n16Kdoxnvl0", ExportName = "sceAudioOutInitIpmiGetSession", Target = Generation.Gen5, LibraryName = "libSceAudioOut")]
-    public static int sceAudioOutInitIpmiGetSession(CpuContext ctx) => WriteOptionalUInt32(ctx, ctx[CpuRegister.Rdi], 1);
-    [SysAbiExport(Nid = "r+qKw+ueD+Q", ExportName = "sceAudioOutMasteringGetState", Target = Generation.Gen5, LibraryName = "libSceAudioOut")]
-    public static int sceAudioOutMasteringGetState(CpuContext ctx) => WriteOptionalUInt32(ctx, ctx[CpuRegister.Rdi], (uint)Volatile.Read(ref _masteringInitialized));
-    [SysAbiExport(Nid = "xX4RLegarbg", ExportName = "sceAudioOutMasteringInit", Target = Generation.Gen5, LibraryName = "libSceAudioOut")]
-    public static int sceAudioOutMasteringInit(CpuContext ctx)
+
+    // Peak normalized amplitude [0,1] of an interleaved PCM buffer, used only by
+    // the SHARPEMU_LOG_AUDIO_OUT diagnostic to distinguish real audio from silence.
+    private static float PeakAmplitude(ReadOnlySpan<byte> source, bool isFloat, int bytesPerSample)
     {
-        if (ctx[CpuRegister.Rdi] != 0) return ctx.SetReturn(unchecked((int)0x80260201));
-        Volatile.Write(ref _masteringInitialized, 1);
-        return Ok(ctx);
-    }
-    [SysAbiExport(Nid = "4055yaUg3EY", ExportName = "sceAudioOutMasteringSetParam", Target = Generation.Gen5, LibraryName = "libSceAudioOut")]
-    public static int sceAudioOutMasteringSetParam(CpuContext ctx) => Ok(ctx);
-    [SysAbiExport(Nid = "RVWtUgoif5o", ExportName = "sceAudioOutMasteringTerm", Target = Generation.Gen5, LibraryName = "libSceAudioOut")]
-    public static int sceAudioOutMasteringTerm(CpuContext ctx) { Volatile.Write(ref _masteringInitialized, 0); return Ok(ctx); }
-    [SysAbiExport(Nid = "-LXhcGARw3k", ExportName = "sceAudioOutMbusInit", Target = Generation.Gen5, LibraryName = "libSceAudioOut")]
-    public static int sceAudioOutMbusInit(CpuContext ctx) => Ok(ctx);
-    [SysAbiExport(Nid = "qLpSK75lXI4", ExportName = "sceAudioOutOpenEx", Target = Generation.Gen5, LibraryName = "libSceAudioOut")]
-    public static int sceAudioOutOpenEx(CpuContext ctx) => AudioOutOpen(ctx);
-    [SysAbiExport(Nid = "w3PdaSTSwGE", ExportName = "sceAudioOutOutputs", Target = Generation.Gen5, LibraryName = "libSceAudioOut")]
-    public static int sceAudioOutOutputs(CpuContext ctx)
-    {
-        var entries = ctx[CpuRegister.Rdi];
-        var count = unchecked((uint)ctx[CpuRegister.Rsi]);
-        if (entries == 0 || count == 0 || count > 25) return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
-        for (uint i = 0; i < count; i++)
+        var peak = 0f;
+        if (isFloat && bytesPerSample == 4)
         {
-            if (!ctx.TryReadUInt32(entries + i * 16, out var handle) || !ctx.TryReadUInt64(entries + i * 16 + 8, out var pointer))
-                return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
-            ctx[CpuRegister.Rdi] = handle;
-            ctx[CpuRegister.Rsi] = pointer;
-            var result = AudioOutOutput(ctx);
-            if (result < 0) return result;
+            for (var i = 0; i + 4 <= source.Length; i += 4)
+            {
+                var v = Math.Abs(System.Buffers.Binary.BinaryPrimitives.ReadSingleLittleEndian(source.Slice(i, 4)));
+                if (v > peak)
+                {
+                    peak = v;
+                }
+            }
         }
-        return Ok(ctx);
-    }
-    [SysAbiExport(Nid = "MapHTgeogbk", ExportName = "sceAudioOutPtClose", Target = Generation.Gen5, LibraryName = "libSceAudioOut")]
-    public static int sceAudioOutPtClose(CpuContext ctx) => ClosePassThrough(ctx);
-    [SysAbiExport(Nid = "YZaq+UKbriQ", ExportName = "sceAudioOutPtGetLastOutputTime", Target = Generation.Gen5, LibraryName = "libSceAudioOut")]
-    public static int sceAudioOutPtGetLastOutputTime(CpuContext ctx) => GetPassThroughTime(ctx);
-    [SysAbiExport(Nid = "xyT8IUCL3CI", ExportName = "sceAudioOutPtOpen", Target = Generation.Gen5, LibraryName = "libSceAudioOut")]
-    public static int sceAudioOutPtOpen(CpuContext ctx) => OpenPassThrough(ctx);
-    [SysAbiExport(Nid = "o4OLQQqqA90", ExportName = "sceAudioOutSetConnections", Target = Generation.Gen5, LibraryName = "libSceAudioOut")]
-    public static int sceAudioOutSetConnections(CpuContext ctx) => Ok(ctx);
-    [SysAbiExport(Nid = "QHq2ylFOZ0k", ExportName = "sceAudioOutSetConnectionsForUser", Target = Generation.Gen5, LibraryName = "libSceAudioOut")]
-    public static int sceAudioOutSetConnectionsForUser(CpuContext ctx) => Ok(ctx);
-    [SysAbiExport(Nid = "r9KGqGpwTpg", ExportName = "sceAudioOutSetDevConnection", Target = Generation.Gen5, LibraryName = "libSceAudioOut")]
-    public static int sceAudioOutSetDevConnection(CpuContext ctx) => Ok(ctx);
-    [SysAbiExport(Nid = "08MKi2E-RcE", ExportName = "sceAudioOutSetHeadphoneOutMode", Target = Generation.Gen5, LibraryName = "libSceAudioOut")]
-    public static int sceAudioOutSetHeadphoneOutMode(CpuContext ctx) => Ok(ctx);
-    [SysAbiExport(Nid = "18IVGrIQDU4", ExportName = "sceAudioOutSetJediJackVolume", Target = Generation.Gen5, LibraryName = "libSceAudioOut")]
-    public static int sceAudioOutSetJediJackVolume(CpuContext ctx) => Ok(ctx);
-    [SysAbiExport(Nid = "h0o+D4YYr1k", ExportName = "sceAudioOutSetJediSpkVolume", Target = Generation.Gen5, LibraryName = "libSceAudioOut")]
-    public static int sceAudioOutSetJediSpkVolume(CpuContext ctx) => Ok(ctx);
-    [SysAbiExport(Nid = "KI9cl22to7E", ExportName = "sceAudioOutSetMainOutput", Target = Generation.Gen5, LibraryName = "libSceAudioOut")]
-    public static int sceAudioOutSetMainOutput(CpuContext ctx) => Ok(ctx);
-    [SysAbiExport(Nid = "wVwPU50pS1c", ExportName = "sceAudioOutSetMixLevelPadSpk", Target = Generation.Gen5, LibraryName = "libSceAudioOut")]
-    public static int sceAudioOutSetMixLevelPadSpk(CpuContext ctx) => ctx.SetReturn(Ports.ContainsKey(unchecked((int)ctx[CpuRegister.Rdi])) ? 0 : (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
-    [SysAbiExport(Nid = "eeRsbeGYe20", ExportName = "sceAudioOutSetMorpheusParam", Target = Generation.Gen5, LibraryName = "libSceAudioOut")]
-    public static int sceAudioOutSetMorpheusParam(CpuContext ctx) => Ok(ctx);
-    [SysAbiExport(Nid = "IZrItPnflBM", ExportName = "sceAudioOutSetMorpheusWorkingMode", Target = Generation.Gen5, LibraryName = "libSceAudioOut")]
-    public static int sceAudioOutSetMorpheusWorkingMode(CpuContext ctx) => Ok(ctx);
-    [SysAbiExport(Nid = "Gy0ReOgXW00", ExportName = "sceAudioOutSetPortConnections", Target = Generation.Gen5, LibraryName = "libSceAudioOut")]
-    public static int sceAudioOutSetPortConnections(CpuContext ctx) => Ok(ctx);
-    [SysAbiExport(Nid = "oRBFflIrCg0", ExportName = "sceAudioOutSetPortStatuses", Target = Generation.Gen5, LibraryName = "libSceAudioOut")]
-    public static int sceAudioOutSetPortStatuses(CpuContext ctx) => Ok(ctx);
-    [SysAbiExport(Nid = "ae-IVPMSWjU", ExportName = "sceAudioOutSetRecMode", Target = Generation.Gen5, LibraryName = "libSceAudioOut")]
-    public static int sceAudioOutSetRecMode(CpuContext ctx) => Ok(ctx);
-    [SysAbiExport(Nid = "d3WL2uPE1eE", ExportName = "sceAudioOutSetSparkParam", Target = Generation.Gen5, LibraryName = "libSceAudioOut")]
-    public static int sceAudioOutSetSparkParam(CpuContext ctx) => Ok(ctx);
-    [SysAbiExport(Nid = "X7Cfsiujm8Y", ExportName = "sceAudioOutSetUsbVolume", Target = Generation.Gen5, LibraryName = "libSceAudioOut")]
-    public static int sceAudioOutSetUsbVolume(CpuContext ctx) => Ok(ctx);
-    [SysAbiExport(Nid = "rho9DH-0ehs", ExportName = "sceAudioOutSetVolumeDown", Target = Generation.Gen5, LibraryName = "libSceAudioOut")]
-    public static int sceAudioOutSetVolumeDown(CpuContext ctx) => Ok(ctx);
-    [SysAbiExport(Nid = "I91P0HAPpjw", ExportName = "sceAudioOutStartAuxBroadcast", Target = Generation.Gen5, LibraryName = "libSceAudioOut")]
-    public static int sceAudioOutStartAuxBroadcast(CpuContext ctx) => Ok(ctx);
-    [SysAbiExport(Nid = "uo+eoPzdQ-s", ExportName = "sceAudioOutStartSharePlay", Target = Generation.Gen5, LibraryName = "libSceAudioOut")]
-    public static int sceAudioOutStartSharePlay(CpuContext ctx) => Ok(ctx);
-    [SysAbiExport(Nid = "AImiaYFrKdc", ExportName = "sceAudioOutStopAuxBroadcast", Target = Generation.Gen5, LibraryName = "libSceAudioOut")]
-    public static int sceAudioOutStopAuxBroadcast(CpuContext ctx) => Ok(ctx);
-    [SysAbiExport(Nid = "teCyKKZPjME", ExportName = "sceAudioOutStopSharePlay", Target = Generation.Gen5, LibraryName = "libSceAudioOut")]
-    public static int sceAudioOutStopSharePlay(CpuContext ctx) => Ok(ctx);
-    [SysAbiExport(Nid = "95bdtHdNUic", ExportName = "sceAudioOutSuspendResume", Target = Generation.Gen5, LibraryName = "libSceAudioOut")]
-    public static int sceAudioOutSuspendResume(CpuContext ctx) => Ok(ctx);
-    [SysAbiExport(Nid = "oRJZnXxok-M", ExportName = "sceAudioOutSysConfigureOutputMode", Target = Generation.Gen5, LibraryName = "libSceAudioOut")]
-    public static int sceAudioOutSysConfigureOutputMode(CpuContext ctx) => Ok(ctx);
-    [SysAbiExport(Nid = "Tf9-yOJwF-A", ExportName = "sceAudioOutSysGetHdmiMonitorInfo", Target = Generation.Gen5, LibraryName = "libSceAudioOut")]
-    public static int sceAudioOutSysGetHdmiMonitorInfo(CpuContext ctx) => ClearOptional(ctx, ctx[CpuRegister.Rdi], 0x40);
-    [SysAbiExport(Nid = "y2-hP-KoTMI", ExportName = "sceAudioOutSysGetSystemInfo", Target = Generation.Gen5, LibraryName = "libSceAudioOut")]
-    public static int sceAudioOutSysGetSystemInfo(CpuContext ctx) => ClearOptional(ctx, ctx[CpuRegister.Rdi], 0x20);
-    [SysAbiExport(Nid = "YV+bnMvMfYg", ExportName = "sceAudioOutSysHdmiMonitorInfoIsSupportedAudioOutMode", Target = Generation.Gen5, LibraryName = "libSceAudioOut")]
-    public static int sceAudioOutSysHdmiMonitorInfoIsSupportedAudioOutMode(CpuContext ctx) => Ok(ctx);
-    [SysAbiExport(Nid = "JEHhANREcLs", ExportName = "sceAudioOutSystemControlGet", Target = Generation.Gen5, LibraryName = "libSceAudioOut")]
-    public static int sceAudioOutSystemControlGet(CpuContext ctx) => ClearOptional(ctx, ctx[CpuRegister.Rdx], 0x20);
-    [SysAbiExport(Nid = "9CHWVv6r3Dg", ExportName = "sceAudioOutSystemControlSet", Target = Generation.Gen5, LibraryName = "libSceAudioOut")]
-    public static int sceAudioOutSystemControlSet(CpuContext ctx) => Ok(ctx);
+        else if (bytesPerSample == 2)
+        {
+            for (var i = 0; i + 2 <= source.Length; i += 2)
+            {
+                var v = Math.Abs(System.Buffers.Binary.BinaryPrimitives.ReadInt16LittleEndian(source.Slice(i, 2)) / 32768f);
+                if (v > peak)
+                {
+                    peak = v;
+                }
+            }
+        }
 
-    private static int WriteOptionalUInt32(CpuContext ctx, ulong address, uint value)
-    {
-        return address == 0 || ctx.TryWriteUInt32(address, value)
-            ? ctx.SetReturn(0)
-            : ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
-    }
-
-    private static int ClearOptional(CpuContext ctx, ulong address, int size)
-    {
-        if (address == 0) return ctx.SetReturn(0);
-        return ctx.Memory.TryWrite(address, new byte[size])
-            ? ctx.SetReturn(0)
-            : ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
-    }
-
-    private static int ClearRequired(CpuContext ctx, ulong address, int size)
-    {
-        if (address == 0) return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
-        return ClearOptional(ctx, address, size);
+        return peak;
     }
 
     public static void ShutdownAllPorts()
     {
+        Volatile.Write(ref _shutdown, true);
         foreach (var handle in Ports.Keys)
         {
             if (Ports.TryRemove(handle, out var port))
@@ -447,6 +361,8 @@ public static class AudioOutExports
             }
         }
     }
+
+    private static bool _shutdown;
 
     private static bool TryGetFormat(
         int rawFormat,

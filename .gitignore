@@ -32,6 +32,8 @@ packages/
 .nuget/
 .dotnet-home/
 .cache/
+__pycache__/
+*.py[cod]
 
 .DS_Store
 Thumbs.db
@@ -40,7 +42,6 @@ ehthumbs.db
 
 .vs/
 .idea/
-
 # Local inspiration/reference material
 inspiration
 
@@ -50,3 +51,4 @@ inspiration
 games
 *.pkg
 __pycache__/
+.vscode/

@@ -6,6 +6,18 @@ SPDX-License-Identifier: GPL-2.0-or-later
 <Project Sdk="Microsoft.NET.Sdk">
   <ItemGroup>
     <ProjectReference Include="..\SharpEmu.HLE\SharpEmu.HLE.csproj" />
+    <ProjectReference Include="..\SharpEmu.ShaderCompiler\SharpEmu.ShaderCompiler.csproj" />
+    <ProjectReference Include="..\SharpEmu.ShaderCompiler.Metal\SharpEmu.ShaderCompiler.Metal.csproj" />
+    <ProjectReference Include="..\SharpEmu.ShaderCompiler.Vulkan\SharpEmu.ShaderCompiler.Vulkan.csproj" />
+    <!-- SysAbi export generator + analyzers (compile-time registry, NID validation). -->
+    <ProjectReference Include="..\SharpEmu.SourceGenerators\SharpEmu.SourceGenerators.csproj"
+                      OutputItemType="Analyzer"
+                      ReferenceOutputAssembly="false" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The PS5 symbol catalog: lets the analyzer flag export names it doesn't know. -->
+    <AdditionalFiles Include="..\..\scripts\ps5_names.txt" />
   </ItemGroup>
 
   <ItemGroup>
@@ -14,6 +26,8 @@ SPDX-License-Identifier: GPL-2.0-or-later
   </ItemGroup>
 
   <ItemGroup>
+    <PackageReference Include="FFmpeg.AutoGen" />
+    <PackageReference Include="Silk.NET.Input" />
     <PackageReference Include="Silk.NET.Vulkan" />
     <PackageReference Include="Silk.NET.Vulkan.Extensions.EXT" />
     <PackageReference Include="Silk.NET.Vulkan.Extensions.KHR" />
@@ -21,7 +35,9 @@ SPDX-License-Identifier: GPL-2.0-or-later
   </ItemGroup>
 
   <PropertyGroup>
-    <NoWarn>$(NoWarn);1591</NoWarn>
+    <!-- Fork-only compatibility exports intentionally extend upstream's
+         symbol catalog; their explicit NIDs remain validated for collisions. -->
+    <NoWarn>$(NoWarn);1591;SHEM006</NoWarn>
   </PropertyGroup>
 
   <PropertyGroup>

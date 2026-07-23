@@ -27,13 +27,11 @@ internal static class KernelPthreadState
     internal static ulong GetCurrentThreadHandle()
     {
         var guestThreadHandle = GuestThreadExecution.CurrentGuestThreadHandle;
+        // Prefer the bound guest handle even when it is not yet in Threads.
+        // Falling through to a synthetic ThreadStatic handle while a guest
+        // thread is bound causes mutex owner mismatches (unlock PERM → hang).
         if (guestThreadHandle != 0)
         {
-            // A running guest thread's handle is a stable per-thread identity.
-            // Lazily register it if some non-pthread creation path never did, so
-            // callers never fall back to the host-worker-static handle -- which
-            // changes as the thread migrates across the worker pool and breaks
-            // identity-keyed guest code (e.g. Havok's thread->context map).
             EnsureGuestThreadIdentity(guestThreadHandle);
             return guestThreadHandle;
         }
@@ -54,12 +52,25 @@ internal static class KernelPthreadState
         return _currentThreadUniqueId;
     }
 
-    private static ThreadIdentity EnsureGuestThreadIdentity(ulong guestThreadHandle) =>
-        Threads.GetOrAdd(guestThreadHandle, static _ =>
+    internal static string DescribeThreadHandle(ulong threadHandle)
+    {
+        if (threadHandle == 0)
         {
-            var uniqueId = unchecked((ulong)Interlocked.Increment(ref _nextUniqueThreadId));
-            return new ThreadIdentity(uniqueId, $"Thread-{uniqueId:X}");
-        });
+            return "none";
+        }
+
+        return TryGetThreadIdentity(threadHandle, out var identity)
+            ? $"0x{threadHandle:X16}('{identity.Name}')"
+            : $"0x{threadHandle:X16}";
+    }
+
+    internal static string CurrentSyncThreadTag()
+    {
+        var handle = GetCurrentThreadHandle();
+        return TryGetThreadIdentity(handle, out var identity)
+            ? $"thread='{identity.Name}'/id=0x{identity.UniqueId:X}"
+            : $"thread='?'/id=0x{handle:X16}";
+    }
 
     internal static ulong CreateThreadHandle(string name)
     {
@@ -72,18 +83,16 @@ internal static class KernelPthreadState
         return Threads.TryGetValue(threadHandle, out identity);
     }
 
-    /// <summary>
-    /// Builds the <c>thread='&lt;name&gt;'/id=0x&lt;id&gt;</c> tag used by the
-    /// SHARPEMU_LOG_SYNC runtime traces. Only call when tracing is enabled: it
-    /// resolves (and, for a not-yet-seen thread, lazily registers) the current
-    /// thread identity, so it allocates and must never run on the default path.
-    /// </summary>
-    internal static string CurrentSyncThreadTag()
+    private static ThreadIdentity EnsureGuestThreadIdentity(ulong guestThreadHandle)
     {
-        var handle = GetCurrentThreadHandle();
-        return TryGetThreadIdentity(handle, out var identity)
-            ? $"thread='{identity.Name}'/id=0x{identity.UniqueId:X}"
-            : $"thread='?'/id=0x{handle:X16}";
+        if (Threads.TryGetValue(guestThreadHandle, out var existing))
+        {
+            return existing;
+        }
+
+        var uniqueId = unchecked((ulong)Interlocked.Increment(ref _nextUniqueThreadId));
+        var identity = new ThreadIdentity(uniqueId, $"Guest-0x{guestThreadHandle:X}");
+        return Threads.GetOrAdd(guestThreadHandle, identity);
     }
 
     private static void EnsureCurrentThreadRegistered()

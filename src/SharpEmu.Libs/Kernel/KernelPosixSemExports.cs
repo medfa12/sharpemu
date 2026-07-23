@@ -54,11 +54,6 @@ public static class KernelPosixSemExports
         }
     }
 
-    [SysAbiExport(
-        Nid = "pDuPEf3m4fI",
-        ExportName = "sem_init",
-        Target = Generation.Gen4 | Generation.Gen5,
-        LibraryName = "libc")]
     public static int SemInit(CpuContext ctx)
     {
         // (sem_t* sem, int pshared, unsigned value)
@@ -75,11 +70,6 @@ public static class KernelPosixSemExports
         return ctx.SetReturn(0);
     }
 
-    [SysAbiExport(
-        Nid = "YCV5dGGBcCo",
-        ExportName = "sem_wait",
-        Target = Generation.Gen4 | Generation.Gen5,
-        LibraryName = "libc")]
     public static int SemWait(CpuContext ctx)
     {
         var sem = ctx[CpuRegister.Rdi];
@@ -91,11 +81,6 @@ public static class KernelPosixSemExports
         return Wait(ctx, sem);
     }
 
-    [SysAbiExport(
-        Nid = "WBWzsRifCEA",
-        ExportName = "sem_trywait",
-        Target = Generation.Gen4 | Generation.Gen5,
-        LibraryName = "libc")]
     public static int SemTrywait(CpuContext ctx)
     {
         var sem = ctx[CpuRegister.Rdi];
@@ -118,11 +103,6 @@ public static class KernelPosixSemExports
         return ctx.SetReturn(-1);
     }
 
-    [SysAbiExport(
-        Nid = "w5IHyvahg-o",
-        ExportName = "sem_timedwait",
-        Target = Generation.Gen4 | Generation.Gen5,
-        LibraryName = "libc")]
     public static int SemTimedwait(CpuContext ctx)
     {
         // (sem_t* sem, const timespec* abstime). We don't honor the absolute
@@ -137,11 +117,6 @@ public static class KernelPosixSemExports
         return Wait(ctx, sem);
     }
 
-    [SysAbiExport(
-        Nid = "IKP8typ0QUk",
-        ExportName = "sem_post",
-        Target = Generation.Gen4 | Generation.Gen5,
-        LibraryName = "libc")]
     public static int SemPost(CpuContext ctx)
     {
         var sem = ctx[CpuRegister.Rdi];
@@ -173,11 +148,6 @@ public static class KernelPosixSemExports
         return ctx.SetReturn(0);
     }
 
-    [SysAbiExport(
-        Nid = "Bq+LRV-N6Hk",
-        ExportName = "sem_getvalue",
-        Target = Generation.Gen4 | Generation.Gen5,
-        LibraryName = "libc")]
     public static int SemGetvalue(CpuContext ctx)
     {
         // (sem_t* sem, int* sval)
@@ -194,11 +164,6 @@ public static class KernelPosixSemExports
             : ctx.SetReturn(-1);
     }
 
-    [SysAbiExport(
-        Nid = "cDW233RAwWo",
-        ExportName = "sem_destroy",
-        Target = Generation.Gen4 | Generation.Gen5,
-        LibraryName = "libc")]
     public static int SemDestroy(CpuContext ctx)
     {
         var sem = ctx[CpuRegister.Rdi];

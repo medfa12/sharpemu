@@ -6,7 +6,6 @@ using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Threading;
 using SharpEmu.HLE;
-using SharpEmu.HLE.Host;
 
 namespace SharpEmu.Core.Cpu.Native;
 
@@ -30,11 +29,48 @@ public sealed partial class DirectExecutionBackend
 	private static readonly bool NativeGuestWorkersDisabled =
 		string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_DISABLE_NATIVE_GUEST_WORKERS"), "1", StringComparison.Ordinal);
 
+	// Cap concurrent native-worker Runs. Astro's tbb_thead burst overlaps many
+	// UnmanagedCallersOnly prologues; a large prewarm + unbounded concurrency
+	// FailFasts (0xC0000409) mid-storm with no VEH breadcrumb. Pool size and
+	// in-flight Runs are separate knobs.
+	private static readonly int NativeWorkerMaxConcurrent = ReadNativeWorkerMaxConcurrent();
+
+	private static int ReadNativeWorkerMaxConcurrent()
+	{
+		if (int.TryParse(
+			    Environment.GetEnvironmentVariable("SHARPEMU_NATIVE_WORKER_MAX_CONCURRENT"),
+			    out var parsed) &&
+		    parsed > 0)
+		{
+			return Math.Clamp(parsed, 1, 64);
+		}
+
+		return 2;
+	}
+
 	private readonly object _nativeWorkerGate = new();
 	private readonly List<NativeGuestExecutor> _allNativeWorkers = new();
 	private readonly Stack<NativeGuestExecutor> _idleNativeWorkers = new();
+	private readonly SemaphoreSlim _nativeWorkerRunLimiter = new(NativeWorkerMaxConcurrent);
 	private bool _nativeWorkersDisposed;
 	private int _nativeWorkerCreationFailedLogged;
+
+	private const uint StackSizeParamIsAReservation = 0x00010000u;
+
+	[DllImport("kernel32.dll", SetLastError = true)]
+	private static extern nint CreateThread(
+		nint lpThreadAttributes,
+		nuint dwStackSize,
+		nint lpStartAddress,
+		nint lpParameter,
+		uint dwCreationFlags,
+		out uint lpThreadId);
+
+	[DllImport("kernel32.dll", SetLastError = true)]
+	private static extern uint WaitForSingleObject(nint hHandle, uint dwMilliseconds);
+
+	[DllImport("kernel32.dll", SetLastError = true)]
+	private static extern bool TerminateThread(nint hThread, uint dwExitCode);
 
 	// Runs an emitted guest entry stub. Preferred path is a pooled native worker
 	// thread; falls back to the historical inline calli (guest frames above this
@@ -43,43 +79,154 @@ public sealed partial class DirectExecutionBackend
 	// Callers set the Active* thread-statics before emitting the stub and read the
 	// yield/forced-exit flags right after this returns, so the worker outcome is
 	// copied back into this thread's statics before returning.
-	private unsafe int RunGuestEntryStub(void* entryStub, ulong hostRspSlot)
+	private unsafe int RunGuestEntryStub(void* entryStub, ulong hostRspSlot, bool requireNativeWorker = false)
 	{
-		var worker = RentNativeGuestExecutor();
-		if (worker is null)
-		{
-			_hostThreading.SetTlsValue(_hostRspSlotTlsIndex, (nint)hostRspSlot);
-			return CallNativeEntry(entryStub);
-		}
+		// Limit in-flight native Runs before renting so the idle pool is not
+		// drained by threads blocked on the concurrency gate.
+		_nativeWorkerRunLimiter.Wait();
+		NativeGuestExecutor? worker = null;
 		try
 		{
-			var state = _activeGuestThreadState;
-			var nativeReturn = worker.Run(
-				_activeCpuContext!,
-				state,
-				GuestThreadExecution.CurrentGuestThreadHandle,
-				_activeEntryReturnSentinelRip,
-				_activeGuestReturnSlotAddress,
-				(nint)hostRspSlot,
-				(nint)entryStub,
-				state?.AffinityMask ?? 0,
-				out var yieldRequested,
-				out var yieldReason,
-				out var forcedExit);
-			_activeGuestThreadYieldRequested = yieldRequested;
-			_activeGuestThreadYieldReason = yieldReason;
-			_activeForcedGuestExit = forcedExit;
-			return nativeReturn;
+			// Astro can spawn a burst of tbb_thead while workers are still in
+			// TerminateThread+respawn. Wait for a native worker — never fall back
+			// to managed inline (FailFast) and never throw (uncaught throw mid-
+			// storm was a silent process die).
+			var maxAttempts = requireNativeWorker ? 500 : 48;
+			for (var attempt = 0; attempt < maxAttempts; attempt++)
+			{
+				worker = RentNativeGuestExecutor();
+				if (worker is not null)
+				{
+					break;
+				}
+
+				if (!requireNativeWorker)
+				{
+					break;
+				}
+
+				Thread.Sleep(attempt < 32 ? 1 : 4);
+			}
+
+			if (worker is null)
+			{
+				if (requireNativeWorker)
+				{
+					var n = Interlocked.Increment(ref _tbbNativeWorkerRefuseCount);
+					if (n <= 8 || n % 32 == 0)
+					{
+						Console.Error.WriteLine(
+							$"[LOADER][ERROR] tbb_native_worker unavailable #{n} after {maxAttempts} attempts; " +
+							"skipping run (no managed inline, no throw)");
+						Console.Error.Flush();
+					}
+
+					_activeGuestThreadYieldRequested = true;
+					_activeGuestThreadYieldReason = "tbb_native_worker_unavailable";
+					_activeForcedGuestExit = true;
+					return unchecked((int)0x80020012);
+				}
+
+				TlsSetValue(_hostRspSlotTlsIndex, (nint)hostRspSlot);
+				return CallNativeEntry(entryStub);
+			}
+
+			try
+			{
+				var state = _activeGuestThreadState;
+				if (state is { Name: "tbb_thead" })
+				{
+					var n = Interlocked.Increment(ref _tbbNativeRunEnterCount);
+					if (n <= 12 || n % 64 == 0)
+					{
+						Console.Error.WriteLine(
+							$"[LOADER][INFO] tbb_run_enter #{n} native_tid_pending handle=0x{state.ThreadHandle:X16} " +
+							$"max_concurrent={NativeWorkerMaxConcurrent}");
+						Console.Error.Flush();
+					}
+				}
+
+				var nativeReturn = worker.Run(
+					_activeCpuContext!,
+					state,
+					GuestThreadExecution.CurrentGuestThreadHandle,
+					_activeEntryReturnSentinelRip,
+					_activeGuestReturnSlotAddress,
+					(nint)hostRspSlot,
+					(nint)entryStub,
+					state?.AffinityMask ?? 0,
+					out var yieldRequested,
+					out var yieldReason,
+					out var forcedExit);
+				_activeGuestThreadYieldRequested = yieldRequested;
+				_activeGuestThreadYieldReason = yieldReason;
+				_activeForcedGuestExit = forcedExit;
+				return nativeReturn;
+			}
+			finally
+			{
+				ReturnNativeGuestExecutor(worker);
+			}
 		}
 		finally
 		{
-			ReturnNativeGuestExecutor(worker);
+			_nativeWorkerRunLimiter.Release();
 		}
+	}
+
+	private static int _tbbNativeRunEnterCount;
+	private static int _tbbNativeWorkerRefuseCount;
+	internal static int _tbbWorkerPrologueFaultCount;
+
+	private void PrewarmNativeGuestWorkers(int count)
+	{
+		if (!OperatingSystem.IsWindows() || NativeGuestWorkersDisabled || count <= 0)
+		{
+			return;
+		}
+
+		var warmed = new List<NativeGuestExecutor>(count);
+		for (var i = 0; i < count; i++)
+		{
+			var worker = NativeGuestExecutor.TryCreate(this);
+			if (worker is null)
+			{
+				break;
+			}
+
+			warmed.Add(worker);
+		}
+
+		lock (_nativeWorkerGate)
+		{
+			if (_nativeWorkersDisposed)
+			{
+				foreach (var worker in warmed)
+				{
+					worker.Dispose();
+				}
+				return;
+			}
+
+			foreach (var worker in warmed)
+			{
+				_allNativeWorkers.Add(worker);
+				_idleNativeWorkers.Push(worker);
+			}
+		}
+
+		Console.Error.WriteLine(
+			$"[LOADER][INFO] Native guest workers prewarmed: {warmed.Count}/{count} " +
+			$"max_concurrent={NativeWorkerMaxConcurrent}");
+		Console.Error.Flush();
 	}
 
 	private NativeGuestExecutor? RentNativeGuestExecutor()
 	{
-		if (NativeGuestWorkersDisabled)
+		// NativeGuestExecutor emits a Win32 wait loop and creates it with
+		// kernel32!CreateThread. POSIX hosts use the established inline entry
+		// path until the worker loop has a pthread/eventfd implementation.
+		if (!OperatingSystem.IsWindows() || NativeGuestWorkersDisabled)
 		{
 			return null;
 		}
@@ -172,8 +319,20 @@ public sealed partial class DirectExecutionBackend
 		private static nint _exitThreadAddress;
 
 		private readonly DirectExecutionBackend _backend;
-		private readonly AutoResetEvent _workAvailable = new(false);
-		private readonly AutoResetEvent _workCompleted = new(false);
+		// Windows uses AutoResetEvent (its SafeWaitHandle is a real kernel
+		// event the emitted loop can wait on); POSIX uses worker-event
+		// semaphores shared the same way via PosixHostStubs.
+		private readonly AutoResetEvent? _workAvailable;
+		private readonly AutoResetEvent? _workCompleted;
+		private nint _workSemaphore;
+		private nint _doneSemaphore;
+
+		// RunPrologue/RunEpilogue compile to the host ABI (SysV on POSIX); the
+		// emitted loop calls them with Win64 registers, so POSIX routes the
+		// calls through register-shuffling thunks (shared by all workers).
+		private static nint _posixPrologueThunk;
+		private static nint _posixEpilogueThunk;
+		private static readonly object PosixThunkGate = new();
 		private GCHandle _selfHandle;
 		private void* _controlBlock;
 		private void* _loopStub;
@@ -212,11 +371,16 @@ public sealed partial class DirectExecutionBackend
 		private NativeGuestExecutor(DirectExecutionBackend backend)
 		{
 			_backend = backend;
+			if (OperatingSystem.IsWindows())
+			{
+				_workAvailable = new AutoResetEvent(false);
+				_workCompleted = new AutoResetEvent(false);
+			}
 		}
 
 		public static NativeGuestExecutor? TryCreate(DirectExecutionBackend backend)
 		{
-			if (!EnsureHostRuntimeExports(backend._hostSymbols))
+			if (!EnsureKernel32Exports())
 			{
 				return null;
 			}
@@ -229,27 +393,32 @@ public sealed partial class DirectExecutionBackend
 			return executor;
 		}
 
-		private static bool EnsureHostRuntimeExports(IHostSymbolResolver symbols)
+		private static bool EnsureKernel32Exports()
 		{
 			if (_exitThreadAddress != 0)
 			{
 				return _waitForSingleObjectAddress != 0 && _setEventAddress != 0;
 			}
-			_waitForSingleObjectAddress = symbols.GetAddress(HostRuntimeFunction.WaitForSingleObject);
-			_setEventAddress = symbols.GetAddress(HostRuntimeFunction.SetEvent);
-			_exitThreadAddress = symbols.GetAddress(HostRuntimeFunction.ExitThread);
+			nint kernel32 = GetModuleHandle("kernel32.dll");
+			if (kernel32 == 0)
+			{
+				return false;
+			}
+			_waitForSingleObjectAddress = GetProcAddress(kernel32, "WaitForSingleObject");
+			_setEventAddress = GetProcAddress(kernel32, "SetEvent");
+			_exitThreadAddress = GetProcAddress(kernel32, "ExitThread");
 			return _waitForSingleObjectAddress != 0 && _setEventAddress != 0 && _exitThreadAddress != 0;
 		}
 
 		private bool Initialize()
 		{
 			_selfHandle = GCHandle.Alloc(this);
-			_controlBlock = (void*)_backend._hostMemory.Allocate(0, 4096u, HostPageProtection.ReadWrite);
+			_controlBlock = VirtualAlloc(null, 4096u, 12288u, 4u);
 			if (_controlBlock == null)
 			{
 				return false;
 			}
-			_loopStub = (void*)_backend._hostMemory.Allocate(0, LoopStubSize, HostPageProtection.ReadWriteExecute);
+			_loopStub = VirtualAlloc(null, LoopStubSize, 12288u, 64u);
 			if (_loopStub == null)
 			{
 				return false;
@@ -258,8 +427,34 @@ public sealed partial class DirectExecutionBackend
 			var prologuePtr = (nint)(delegate* unmanaged<nint, nint>)&RunPrologue;
 			var epiloguePtr = (nint)(delegate* unmanaged<nint, int, void>)&RunEpilogue;
 			var executorHandle = GCHandle.ToIntPtr(_selfHandle);
-			var workHandle = _workAvailable.SafeWaitHandle.DangerousGetHandle();
-			var doneHandle = _workCompleted.SafeWaitHandle.DangerousGetHandle();
+			nint workHandle;
+			nint doneHandle;
+			if (OperatingSystem.IsWindows())
+			{
+				workHandle = _workAvailable!.SafeWaitHandle.DangerousGetHandle();
+				doneHandle = _workCompleted!.SafeWaitHandle.DangerousGetHandle();
+			}
+			else
+			{
+				lock (PosixThunkGate)
+				{
+					if (_posixPrologueThunk == 0)
+					{
+						_posixPrologueThunk = PosixHostStubs.CreateWin64ToSysVThunk(prologuePtr);
+						_posixEpilogueThunk = PosixHostStubs.CreateWin64ToSysVThunk(epiloguePtr);
+					}
+				}
+				prologuePtr = _posixPrologueThunk;
+				epiloguePtr = _posixEpilogueThunk;
+				_workSemaphore = PosixHostStubs.CreateWorkerEvent();
+				_doneSemaphore = PosixHostStubs.CreateWorkerEvent();
+				if (_workSemaphore == 0 || _doneSemaphore == 0)
+				{
+					return false;
+				}
+				workHandle = _workSemaphore;
+				doneHandle = _doneSemaphore;
+			}
 
 			byte* code = (byte*)_loopStub;
 			int offset = 0;
@@ -331,15 +526,33 @@ public sealed partial class DirectExecutionBackend
 			*(int*)(code + skipJump) = skipEntryOffset - (skipJump + sizeof(int));
 
 			uint oldProtect = 0;
-			if (!_backend._hostMemory.Protect((ulong)_loopStub, LoopStubSize, HostPageProtection.ReadExecute, out oldProtect))
+			if (!VirtualProtect(_loopStub, LoopStubSize, 32u, &oldProtect))
 			{
 				return false;
 			}
-			_backend._hostMemory.FlushInstructionCache((ulong)_loopStub, LoopStubSize);
-			_threadHandle = _backend._hostThreading.CreateNativeThread(
-				(nint)_loopStub,
+			FlushInstructionCache(GetCurrentProcess(), _loopStub, LoopStubSize);
+			return StartWorkerThread();
+		}
+
+		private bool RestartWorkerThread()
+		{
+			if (_loopStub == null || _controlBlock == null)
+			{
+				return false;
+			}
+
+			*(int*)_controlBlock = 0;
+			return StartWorkerThread();
+		}
+
+		private bool StartWorkerThread()
+		{
+			_threadHandle = CreateThread(
 				0,
 				WorkerStackReservation,
+				(nint)_loopStub,
+				0,
+				StackSizeParamIsAReservation,
 				out _nativeThreadId);
 			if (_threadHandle == 0)
 			{
@@ -377,8 +590,51 @@ public sealed partial class DirectExecutionBackend
 			_runYieldRequested = false;
 			_runYieldReason = null;
 			_runForcedExit = false;
-			_workAvailable.Set();
-			_workCompleted.WaitOne();
+			SignalWorkAvailable();
+			WaitWorkCompleted();
+
+			// Normal path: RunEpilogue/ExitRun clears _entered before SetEvent(done).
+			// TBB abort stub SetEvent's without ExitRun — _entered stays true.
+			if (_entered)
+			{
+				var waitRc = WaitForSingleObject(_threadHandle, 500u);
+				Console.Error.WriteLine(
+					$"[LOADER][WARN] Native guest worker tid={_nativeThreadId} aborted during run; " +
+					$"wait_rc=0x{waitRc:X8} respawning");
+				Console.Error.Flush();
+				if (_runState is { } abortedState)
+				{
+					_ = GuestThreadExecution.NotifyGuestThreadAbandoned(
+						abortedState.ThreadHandle,
+						"tbb_worker_abort");
+					Volatile.Write(ref abortedState.HostThreadId, _prevHostThreadId);
+				}
+				_entered = false;
+				if (_threadHandle != 0)
+				{
+					// Abort stub parks (no ExitThread). Force-kill the parked OS
+					// thread so we can recreate the loop without process teardown.
+					if (waitRc != 0u)
+					{
+						_ = TerminateThread(_threadHandle, unchecked((uint)(-1)));
+						_ = WaitForSingleObject(_threadHandle, 1000u);
+					}
+					CloseHandle(_threadHandle);
+					_threadHandle = 0;
+					_nativeThreadId = 0;
+				}
+				if (!RestartWorkerThread())
+				{
+					_runPrologueFailed = true;
+				}
+				else
+				{
+					_runPrologueFailed = false;
+					_runForcedExit = true;
+					_runNativeResult = 0;
+				}
+			}
+
 			_runContext = null;
 			_runState = null;
 			yieldRequested = _runYieldRequested;
@@ -386,9 +642,46 @@ public sealed partial class DirectExecutionBackend
 			forcedExit = _runForcedExit;
 			if (_runPrologueFailed)
 			{
-				throw new InvalidOperationException("Native guest worker failed to bind the run ambient (prologue fault)");
+				// Never throw out of the native-worker rent path: an uncaught
+				// exception mid-TBB storm kills the process with no FailFast
+				// breadcrumb.
+				var n = Interlocked.Increment(ref _tbbWorkerPrologueFaultCount);
+				if (n <= 8 || n % 32 == 0)
+				{
+					Console.Error.WriteLine(
+						$"[LOADER][ERROR] tbb_worker prologue fault #{n}; soft-fail run " +
+						$"(tid={_nativeThreadId})");
+					Console.Error.Flush();
+				}
+
+				yieldRequested = true;
+				yieldReason = "tbb_worker_prologue_fault";
+				forcedExit = true;
+				return unchecked((int)0x80020012);
 			}
 			return _runNativeResult;
+		}
+
+		private void SignalWorkAvailable()
+		{
+			if (_workAvailable is not null)
+			{
+				_workAvailable.Set();
+				return;
+			}
+
+			_ = PosixHostStubs.SignalWorkerEvent(_workSemaphore);
+		}
+
+		private void WaitWorkCompleted()
+		{
+			if (_workCompleted is not null)
+			{
+				_workCompleted.WaitOne();
+				return;
+			}
+
+			_ = PosixHostStubs.WaitWorkerEvent(_doneSemaphore, -1);
 		}
 
 		[UnmanagedCallersOnly]
@@ -445,7 +738,7 @@ public sealed partial class DirectExecutionBackend
 			_prevYieldRequested = _activeGuestThreadYieldRequested;
 			_prevYieldReason = _activeGuestThreadYieldReason;
 			_prevState = _activeGuestThreadState;
-			_prevHostRspSlot = backend._hostThreading.GetTlsValue(backend._hostRspSlotTlsIndex);
+			_prevHostRspSlot = TlsGetValue(backend._hostRspSlotTlsIndex);
 			_prevGuestThreadHandle = GuestThreadExecution.EnterGuestThread(_runGuestThreadHandle);
 			_entered = true;
 			_activeExecutionBackend = backend;
@@ -457,11 +750,23 @@ public sealed partial class DirectExecutionBackend
 			_activeGuestThreadYieldReason = null;
 			_activeGuestThreadState = _runState;
 			backend.BindTlsBase(_runContext!);
-			backend._hostThreading.SetTlsValue(backend._hostRspSlotTlsIndex, _runHostRspSlot);
+			TlsSetValue(backend._hostRspSlotTlsIndex, _runHostRspSlot);
+			if (backend._workerDoneEventTlsIndex != uint.MaxValue)
+			{
+				nint doneHandle = OperatingSystem.IsWindows()
+					? _workCompleted!.SafeWaitHandle.DangerousGetHandle()
+					: _doneSemaphore;
+				TlsSetValue(backend._workerDoneEventTlsIndex, doneHandle);
+			}
+			if (backend._tbbAbortEligibleTlsIndex != uint.MaxValue)
+			{
+				nint eligible = _runState is { Name: "tbb_thead" } ? 1 : 0;
+				TlsSetValue(backend._tbbAbortEligibleTlsIndex, eligible);
+			}
 			if (_runState is { } state)
 			{
 				_prevHostThreadId = Volatile.Read(ref state.HostThreadId);
-				Volatile.Write(ref state.HostThreadId, unchecked((int)backend._hostThreading.CurrentThreadId));
+				Volatile.Write(ref state.HostThreadId, unchecked((int)GetCurrentThreadId()));
 			}
 			if (_runAffinityMask != 0)
 			{
@@ -491,7 +796,15 @@ public sealed partial class DirectExecutionBackend
 			{
 				Volatile.Write(ref state.HostThreadId, _prevHostThreadId);
 			}
-			_backend._hostThreading.SetTlsValue(_backend._hostRspSlotTlsIndex, _prevHostRspSlot);
+			TlsSetValue(_backend._hostRspSlotTlsIndex, _prevHostRspSlot);
+			if (_backend._workerDoneEventTlsIndex != uint.MaxValue)
+			{
+				TlsSetValue(_backend._workerDoneEventTlsIndex, 0);
+			}
+			if (_backend._tbbAbortEligibleTlsIndex != uint.MaxValue)
+			{
+				TlsSetValue(_backend._tbbAbortEligibleTlsIndex, 0);
+			}
 			GuestThreadExecution.RestoreGuestThread(_prevGuestThreadHandle);
 			_activeExecutionBackend = _prevBackend;
 			_activeCpuContext = _prevContext;
@@ -520,7 +833,7 @@ public sealed partial class DirectExecutionBackend
 			}
 			try
 			{
-				_workAvailable.Set();
+				SignalWorkAvailable();
 			}
 			catch (ObjectDisposedException)
 			{
@@ -528,8 +841,8 @@ public sealed partial class DirectExecutionBackend
 			var exited = _threadHandle == 0;
 			if (_threadHandle != 0)
 			{
-				exited = _backend._hostThreading.WaitForThreadExit(_threadHandle, 1000u);
-				_backend._hostThreading.CloseThreadHandle(_threadHandle);
+				exited = WaitForSingleObject(_threadHandle, 1000u) == 0u;
+				CloseHandle(_threadHandle);
 				_threadHandle = 0;
 			}
 			if (!exited)
@@ -543,20 +856,30 @@ public sealed partial class DirectExecutionBackend
 			}
 			if (_loopStub != null)
 			{
-				_backend._hostMemory.Free((ulong)_loopStub);
+				VirtualFree(_loopStub, 0u, 32768u);
 				_loopStub = null;
 			}
 			if (_controlBlock != null)
 			{
-				_backend._hostMemory.Free((ulong)_controlBlock);
+				VirtualFree(_controlBlock, 0u, 32768u);
 				_controlBlock = null;
 			}
 			if (_selfHandle.IsAllocated)
 			{
 				_selfHandle.Free();
 			}
-			_workAvailable.Dispose();
-			_workCompleted.Dispose();
+			_workAvailable?.Dispose();
+			_workCompleted?.Dispose();
+			if (_workSemaphore != 0)
+			{
+				PosixHostStubs.DestroyWorkerEvent(_workSemaphore);
+				_workSemaphore = 0;
+			}
+			if (_doneSemaphore != 0)
+			{
+				PosixHostStubs.DestroyWorkerEvent(_doneSemaphore);
+				_doneSemaphore = 0;
+			}
 		}
 	}
 }

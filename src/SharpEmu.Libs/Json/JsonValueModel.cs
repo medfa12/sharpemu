@@ -102,7 +102,6 @@ internal static class JsonObjectHeap
 
     internal static void ResetForTests()
     {
-        JsonExports.ResetForTests();
         Values.Clear();
         Strings.Clear();
         GlobalNullAccessCallback = 0;

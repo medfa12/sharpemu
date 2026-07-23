@@ -12,6 +12,13 @@
 //   [2] v_mul_lo_i32 -> low  32 bits of the same product
 //   [3] store attempted with EXEC=0 -> must NOT land (sentinel remains)
 //   [4] store after EXEC restored   -> 1.5f (0x3FC00000)
+//   [5] v_pk_fma_f16 fma(2.5h, 21024h,  7.496e-5h) -> 0x7A6B packed; the exact
+//       sum sits just above an f16 midpoint, so a double-rounded f32
+//       multiply-add would give 0x7A6A instead
+//   [6] the same fma with the addend negated -> 0x7A6A packed (just below the
+//       same midpoint), pinning the opposite rounding direction
+//   [7] the pinned fma with the clamp modifier -> 0x3C00 packed (both lanes
+//       exceed 1.0, so each saturates to 1.0)
 // Every other word of the buffer must still hold the sentinel afterwards.
 //
 // Creating the compute pipeline doubles as a driver-acceptance check for the
@@ -34,6 +41,15 @@ var product = (long)0x7FFFFFFF * 0x00010003;
 var expectedHi = (uint)(product >> 32);
 var expectedLo = (uint)product;
 var expectedRestored = BitConverter.SingleToUInt32Bits(1.5f);
+
+// v_pk_fma_f16 of (0x4100, 0x7522, 0x04EA) per lane: the exact product
+// 2.5 * 21024 = 52560 is an f16 tie (between 0x7A6A and 0x7A6B), so the tiny
+// addend decides the rounding direction under a single fused rounding.
+const uint ExpectedPkFma = 0x7A6B_7A6B;
+const uint ExpectedPkFmaNeg = 0x7A6A_7A6A;
+// Both lanes of the pinned fma are ~52560, far above 1.0, so the clamp modifier
+// saturates each to 1.0 (0x3C00 in f16).
+const uint ExpectedPkFmaClamp = 0x3C00_3C00;
 
 unsafe
 {
@@ -352,6 +368,9 @@ unsafe
         ("v_mul_lo_i32 lo(0x7FFFFFFF*0x10003)", words[2], expectedLo),
         ("exec=0 store suppressed (offset 12 sentinel)", words[3], Sentinel),
         ("store after exec restore (offset 16)", words[4], expectedRestored),
+        ("v_pk_fma_f16 fused rounds up at midpoint", words[5], ExpectedPkFma),
+        ("v_pk_fma_f16 neg addend rounds down", words[6], ExpectedPkFmaNeg),
+        ("v_pk_fma_f16 clamp saturates to 1.0", words[7], ExpectedPkFmaClamp),
     };
     var failures = 0;
     foreach (var (name, actual, expected) in results)

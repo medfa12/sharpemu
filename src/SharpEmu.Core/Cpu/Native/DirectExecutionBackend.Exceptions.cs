@@ -8,11 +8,8 @@ using System.Globalization;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Threading;
-using SharpEmu.Core.Cpu;
 using SharpEmu.Core.Cpu.Disasm;
-using SharpEmu.Core.Cpu.Native.Windows;
 using SharpEmu.HLE;
-using SharpEmu.HLE.Host;
 
 namespace SharpEmu.Core.Cpu.Native;
 
@@ -20,17 +17,28 @@ public sealed partial class DirectExecutionBackend
 {
 	private const ulong LazyCommitWindowBytes = 0x0200_0000UL;
 	private static int _lazyCommitTraceCount;
+	private static int _guestAllocatorHoleRecoveries;
+	private static int _auxiliaryThreadExecuteFaultRecoveries;
+	private static int _auxiliaryThreadExecuteFaultSkips;
+	private nint _workerAbortStack;
+	private const uint WorkerAbortStackSize = 0x10000u;
 
 	private unsafe void SetupExceptionHandler()
 	{
+		if (!OperatingSystem.IsWindows())
+		{
+			SetupPosixExceptionHandler();
+			return;
+		}
+
 		if (!string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_DISABLE_RAW_HANDLER"), "1", StringComparison.Ordinal))
 		{
-			_rawExceptionHandlerStub = _faultHandling.CreateHandlerThunk(RawVectoredHandlerPtrManaged, _hostRspSlotTlsIndex, _tlsGetValueAddress);
+			_rawExceptionHandlerStub = CreateExceptionHandlerTrampoline(RawVectoredHandlerPtrManaged);
 			if (_rawExceptionHandlerStub == 0)
 			{
 				throw new InvalidOperationException("Failed to create raw exception handler trampoline");
 			}
-			_rawExceptionHandler = _faultHandling.AddFirstChanceHandler(_rawExceptionHandlerStub);
+			_rawExceptionHandler = (nint)AddVectoredExceptionHandler(1u, _rawExceptionHandlerStub);
 			Console.Error.WriteLine($"[LOADER][INFO] Raw exception handler installed: 0x{_rawExceptionHandler:X16}");
 		}
 		else
@@ -40,22 +48,22 @@ public sealed partial class DirectExecutionBackend
 
 		_handlerDelegate = VectoredHandler;
 		_handlerHandle = GCHandle.Alloc(_handlerDelegate);
-		_exceptionHandlerStub = _faultHandling.CreateHandlerThunk(Marshal.GetFunctionPointerForDelegate(_handlerDelegate), _hostRspSlotTlsIndex, _tlsGetValueAddress);
+		_exceptionHandlerStub = CreateExceptionHandlerTrampoline(Marshal.GetFunctionPointerForDelegate(_handlerDelegate));
 		if (_exceptionHandlerStub == 0)
 		{
 			throw new InvalidOperationException("Failed to create exception handler trampoline");
 		}
-		_exceptionHandler = _faultHandling.AddFirstChanceHandler(_exceptionHandlerStub);
+		_exceptionHandler = (nint)AddVectoredExceptionHandler(1u, _exceptionHandlerStub);
 		Console.Error.WriteLine($"[LOADER][INFO] Exception handler installed: 0x{_exceptionHandler:X16}");
 
 		_unhandledFilterDelegate = UnhandledExceptionFilter;
 		_unhandledFilterHandle = GCHandle.Alloc(_unhandledFilterDelegate);
-		_unhandledFilterStub = _faultHandling.CreateHandlerThunk(Marshal.GetFunctionPointerForDelegate(_unhandledFilterDelegate), _hostRspSlotTlsIndex, _tlsGetValueAddress);
+		_unhandledFilterStub = CreateExceptionHandlerTrampoline(Marshal.GetFunctionPointerForDelegate(_unhandledFilterDelegate));
 		if (_unhandledFilterStub == 0)
 		{
 			throw new InvalidOperationException("Failed to create unhandled exception filter trampoline");
 		}
-		_faultHandling.SetUnhandledFilter(_unhandledFilterStub);
+		SetUnhandledExceptionFilter(_unhandledFilterStub);
 	}
 
 	private unsafe int UnhandledExceptionFilter(void* exceptionInfo)
@@ -63,8 +71,8 @@ public sealed partial class DirectExecutionBackend
 		try
 		{
 			EXCEPTION_RECORD* exceptionRecord = ((EXCEPTION_POINTERS*)exceptionInfo)->ExceptionRecord;
-			ulong rip = ReadCtxU64(((EXCEPTION_POINTERS*)exceptionInfo)->ContextRecord, CTX_RIP);
-			ulong rsp = ReadCtxU64(((EXCEPTION_POINTERS*)exceptionInfo)->ContextRecord, CTX_RSP);
+			ulong rip = ReadCtxU64(((EXCEPTION_POINTERS*)exceptionInfo)->ContextRecord, 248);
+			ulong rsp = ReadCtxU64(((EXCEPTION_POINTERS*)exceptionInfo)->ContextRecord, 152);
 			Console.Error.WriteLine("[LOADER][FATAL] Unhandled exception filter fired.");
 			Console.Error.WriteLine($"[LOADER][FATAL]   Code: 0x{exceptionRecord->ExceptionCode:X8}");
 			Console.Error.WriteLine($"[LOADER][FATAL]   Exception Address: 0x{(ulong)(nint)exceptionRecord->ExceptionAddress:X16}");
@@ -103,35 +111,33 @@ public sealed partial class DirectExecutionBackend
 				return 0;
 			}
 
-			ulong rip = ReadCtxU64(contextRecord, CTX_RIP);
-			ulong rsp = ReadCtxU64(contextRecord, CTX_RSP);
+			ulong rip = ReadCtxU64(contextRecord, 248);
+			ulong rsp = ReadCtxU64(contextRecord, 152);
+			if (TryRecoverGuestInt41(exceptionCode, contextRecord, rip))
+			{
+				return -1;
+			}
+			if (TryRecoverAuxiliaryThreadExecuteFault(exceptionRecord, contextRecord, rip))
+			{
+				return -1;
+			}
 
-			// Thread-mode probe: a hardware exception raised while this thread is inside
-			// the managed import gateway means the VEH->managed reentry happened from
-			// cooperative GC mode — a ReversePInvokeBadTransition candidate.
-			if (LogThreadMode && _threadModeGatewayDepth > 0)
-			{
-				TraceThreadMode(
-					$"veh_in_gateway code=0x{exceptionCode:X8} rip=0x{rip:X16} gateway_depth={_threadModeGatewayDepth}");
-			}
-
-			if (exceptionCode == WindowsFaultCodes.AccessViolation && TryHandleLazyCommittedPage(exceptionRecord, rip, rsp))
+			if (exceptionCode == 3221225477u && TryHandleLazyCommittedPage(exceptionRecord, rip, rsp))
 			{
 				return -1;
 			}
-			if (exceptionCode == 3221225477u && TryHandleGuestAssertTrap(contextRecord, rip))
+			if (exceptionCode == 3221225477u &&
+				TryRecoverGuestAllocatorHole(exceptionRecord, contextRecord, rip))
 			{
 				return -1;
 			}
-			if (exceptionCode == 3221225477u && TryHandleNullFieldLoad(exceptionRecord, contextRecord, rip))
+			if (exceptionCode == StatusIllegalInstruction &&
+				TryRecoverIllegalInstruction(contextRecord, rip))
 			{
 				return -1;
 			}
-			if (exceptionCode == 3221225477u && TryHandleNullFieldCompare(exceptionRecord, contextRecord, rip))
-			{
-				return -1;
-			}
-			if (exceptionCode == 3221225501u && TryHandleSse4aInstruction(contextRecord, rip))
+			if (exceptionCode == StatusIllegalInstruction &&
+				TryRecoverAmdCompatInstruction(contextRecord, rip))
 			{
 				return -1;
 			}
@@ -146,10 +152,10 @@ public sealed partial class DirectExecutionBackend
 
 			switch (exceptionCode)
 			{
-				case WindowsFaultCodes.AccessViolation:
+				case 3221225477u:
 					LogAccessViolationTrace(exceptionAddress, exceptionRecord);
 					break;
-				case WindowsFaultCodes.FastFail:
+				case 3221226505u:
 					{
 						ulong p0 = exceptionRecord->NumberParameters >= 1 ? (*exceptionRecord->ExceptionInformation) : 0;
 						ulong p1 = exceptionRecord->NumberParameters >= 2 ? exceptionRecord->ExceptionInformation[1] : 0;
@@ -159,36 +165,60 @@ public sealed partial class DirectExecutionBackend
 					}
 			}
 
-			ulong rax = ReadCtxU64(contextRecord, CTX_RAX);
-			ulong rbx = ReadCtxU64(contextRecord, CTX_RBX);
-			ulong rcx = ReadCtxU64(contextRecord, CTX_RCX);
-			ulong rdx = ReadCtxU64(contextRecord, CTX_RDX);
-			ulong rsi = ReadCtxU64(contextRecord, CTX_RSI);
-			ulong rdi = ReadCtxU64(contextRecord, CTX_RDI);
-			ulong rbp = ReadCtxU64(contextRecord, CTX_RBP);
-			ulong r8 = ReadCtxU64(contextRecord, CTX_R8);
-			ulong r9 = ReadCtxU64(contextRecord, CTX_R9);
-			ulong r10 = ReadCtxU64(contextRecord, CTX_R10);
-			ulong r11 = ReadCtxU64(contextRecord, CTX_R11);
-			ulong r12 = ReadCtxU64(contextRecord, CTX_R12);
-			ulong r13 = ReadCtxU64(contextRecord, CTX_R13);
-			ulong r14 = ReadCtxU64(contextRecord, CTX_R14);
-			ulong r15 = ReadCtxU64(contextRecord, CTX_R15);
+			ulong rax = ReadCtxU64(contextRecord, 120);
+			ulong rbx = ReadCtxU64(contextRecord, 144);
+			ulong rcx = ReadCtxU64(contextRecord, 128);
+			ulong rdx = ReadCtxU64(contextRecord, 136);
+			ulong rsi = ReadCtxU64(contextRecord, 168);
+			ulong rdi = ReadCtxU64(contextRecord, 176);
+			ulong rbp = ReadCtxU64(contextRecord, 160);
+			ulong r8 = ReadCtxU64(contextRecord, 184);
+			ulong r9 = ReadCtxU64(contextRecord, 192);
+			ulong r10 = ReadCtxU64(contextRecord, 200);
+			ulong r11 = ReadCtxU64(contextRecord, 208);
+			ulong r12 = ReadCtxU64(contextRecord, 216);
+			ulong r13 = ReadCtxU64(contextRecord, 224);
+			ulong r14 = ReadCtxU64(contextRecord, 232);
+			ulong r15 = ReadCtxU64(contextRecord, 240);
 
 			Console.Error.WriteLine("[LOADER][INFO] =========================================");
 			Console.Error.WriteLine("[LOADER][INFO] NATIVE EXCEPTION CAUGHT!");
 			Console.Error.WriteLine($"[LOADER][INFO]   Code: 0x{exceptionCode:X8}");
 			Console.Error.WriteLine($"[LOADER][INFO]   Exception Address: 0x{exceptionAddress:X16}");
 			Console.Error.WriteLine($"[LOADER][INFO]   RIP: 0x{rip:X16}");
+			Console.Error.WriteLine(
+				$"[LOADER][INFO]   Host thread: managed={Environment.CurrentManagedThreadId} " +
+				$"name='{Thread.CurrentThread.Name ?? "<unnamed>"}'");
+			if (_activeGuestThreadState is { } activeGuestThread)
+			{
+				Console.Error.WriteLine(
+					$"[LOADER][INFO]   Guest thread: handle=0x{activeGuestThread.ThreadHandle:X16} " +
+					$"name='{activeGuestThread.Name}' state={activeGuestThread.State} " +
+					$"last_import={activeGuestThread.LastImportNid ?? "<none>"} " +
+					$"last_ret=0x{activeGuestThread.LastReturnRip:X16}");
+				Console.Error.WriteLine(
+					$"[LOADER][INFO]   Last import registers: " +
+					$"rax=0x{Volatile.Read(ref activeGuestThread.LastImportRax):X16} " +
+					$"result_valid={Volatile.Read(ref activeGuestThread.LastImportResultValid) != 0} " +
+					$"rdi=0x{activeGuestThread.LastImportRdi:X16} " +
+					$"rsi=0x{activeGuestThread.LastImportRsi:X16} " +
+					$"rdx=0x{activeGuestThread.LastImportRdx:X16} " +
+					$"rcx=0x{activeGuestThread.LastImportRcx:X16} " +
+					$"r8=0x{activeGuestThread.LastImportR8:X16} " +
+					$"r9=0x{activeGuestThread.LastImportR9:X16}");
+				Console.Error.WriteLine(
+					$"[LOADER][INFO]   Last import stack args: " +
+					$"0=0x{activeGuestThread.LastImportStack0:X16} " +
+					$"1=0x{activeGuestThread.LastImportStack1:X16} " +
+					$"2=0x{activeGuestThread.LastImportStack2:X16} " +
+					$"3=0x{activeGuestThread.LastImportStack3:X16} " +
+					$"4=0x{activeGuestThread.LastImportStack4:X16} " +
+					$"5=0x{activeGuestThread.LastImportStack5:X16}");
+			}
 			if (TryFormatNearestRuntimeSymbol(rip, out string symbol))
 			{
 				Console.Error.WriteLine("[LOADER][INFO]   RIP symbol: " + symbol);
 			}
-			// The guest thread the fault happened on; cross-reference with
-			// tls.identity_fallback traces to tell whether a thread-identity
-			// (fs-based TLS) collision drove a Havok-style map-miss crash.
-			Console.Error.WriteLine(
-				$"[LOADER][INFO]   Guest thread handle: 0x{SharpEmu.HLE.GuestThreadExecution.CurrentGuestThreadHandle:X16}");
 			Console.Error.WriteLine($"[LOADER][INFO]   RAX: 0x{rax:X16}");
 			Console.Error.WriteLine($"[LOADER][INFO]   RBX: 0x{rbx:X16}");
 			Console.Error.WriteLine($"[LOADER][INFO]   RCX: 0x{rcx:X16}");
@@ -209,7 +239,7 @@ public sealed partial class DirectExecutionBackend
 
 			ulong accessType = 0;
 			ulong target = 0;
-			if (exceptionCode == WindowsFaultCodes.AccessViolation && exceptionRecord->NumberParameters >= 2)
+			if (exceptionCode == 3221225477u && exceptionRecord->NumberParameters >= 2)
 			{
 				accessType = *exceptionRecord->ExceptionInformation;
 				target = exceptionRecord->ExceptionInformation[1];
@@ -222,76 +252,57 @@ public sealed partial class DirectExecutionBackend
 				};
 				Console.Error.WriteLine("[LOADER][INFO]   AV access: " + accessText);
 				Console.Error.WriteLine($"[LOADER][INFO]   AV target: 0x{target:X16}");
-				if (_hostMemory.Query(target, out var mbi))
+				if (VirtualQuery((void*)target, out var mbi, (nuint)sizeof(MEMORY_BASIC_INFORMATION64)) != 0)
 				{
-					Console.Error.WriteLine($"[LOADER][INFO]   AV target region: base=0x{mbi.BaseAddress:X16} size=0x{mbi.RegionSize:X16} state=0x{mbi.RawState:X08} protect=0x{mbi.RawProtection:X08}");
+					Console.Error.WriteLine($"[LOADER][INFO]   AV target region: base=0x{mbi.BaseAddress:X16} size=0x{mbi.RegionSize:X16} state=0x{mbi.State:X08} protect=0x{mbi.Protect:X08}");
 				}
 
 			}
 
-			// A write AV inside guest code is almost always the tail end of the
-			// guest's OWN allocator/object-graph logic (a vtable call, a field
-			// read) rather than an unresolved import. Dumping what each
-			// register-as-pointer points to turns the crash log itself into a
-			// mini object dump, so the pool/allocator state that produced the
-			// bad address is visible without a second disassembly round trip.
-			DumpGuestPointerRegisters(rdi, rsi, rdx, rcx, r8, r9, r12, r13, r14, r15, rax, rbx);
-
-			try
+			Console.Error.WriteLine("[LOADER][INFO]   Stack qwords (RSP..):");
+			for (int i = 0; i < 16; i++)
 			{
-				Console.Error.WriteLine("[LOADER][INFO]   Stack qwords (RSP..):");
-				for (int i = 0; i < 16; i++)
+				ulong stackAddr = rsp + (ulong)(i * 8);
+				if (!TryReadHostQword(stackAddr, out ulong value))
 				{
-					ulong stackAddr = rsp + (ulong)(i * 8);
-					ulong value = (ulong)Marshal.ReadInt64((nint)stackAddr);
-					Console.Error.WriteLine($"[LOADER][INFO]     [rsp+0x{i * 8:X2}] @0x{stackAddr:X16} = 0x{value:X16}");
+					Console.Error.WriteLine("[LOADER][WARNING]   Could not read stack qwords.");
+					break;
 				}
-			}
-			catch
-			{
-				Console.Error.WriteLine("[LOADER][WARNING]   Could not read stack qwords.");
+				Console.Error.WriteLine($"[LOADER][INFO]     [rsp+0x{i * 8:X2}] @0x{stackAddr:X16} = 0x{value:X16}");
 			}
 
-			// The faulting REP MOVSB helper is a leaf (no frame), so the RBP walk
-			// skips its caller. The real memcpy call site is the return address at
-			// [rsp]. Dump code windows around every plausible code pointer in the
-			// first 48 stack slots so the argument set-up (how the bad source
-			// pointer was computed) can be disassembled offline.
-			try
+			if (string.Equals(
+					Environment.GetEnvironmentVariable("SHARPEMU_DUMP_FAULT_STACK_WINDOW"),
+					"1",
+					StringComparison.Ordinal))
 			{
-				Console.Error.WriteLine("[LOADER][INFO]   Stack return-address call-site windows:");
-				var seenRet = new HashSet<ulong>();
-				int dumped = 0;
-				for (int i = 0; i < 48 && dumped < 10; i++)
+				Console.Error.WriteLine("[LOADER][INFO]   Full fault stack window (RSP-0x300..RSP+0x100):");
+				var windowStart = rsp >= 0x300 ? rsp - 0x300 : 0;
+				for (var stackAddr = windowStart; stackAddr < rsp + 0x100; stackAddr += 8)
 				{
-					ulong slotAddr = rsp + (ulong)(i * 8);
-					ulong candidate;
-					try { candidate = (ulong)Marshal.ReadInt64((nint)slotAddr); }
-					catch { continue; }
-					if (candidate <= 0x1000 || !seenRet.Add(candidate))
+					if (!TryReadHostQword(stackAddr, out var value))
 					{
 						continue;
 					}
-					if (!_hostMemory.Query(candidate, out var q) || (q.RawProtection & 0xF0) == 0)
-					{
-						continue;
-					}
-					try
-					{
-						byte[] w = new byte[64];
-						Marshal.Copy((nint)(candidate - 56), w, 0, w.Length);
-						Console.Error.WriteLine($"[LOADER][INFO]     ret@[rsp+0x{i * 8:X2}]=0x{candidate:X16} [ret-0x38..ret+0x08]: " + BitConverter.ToString(w).Replace("-", " "));
-						dumped++;
-					}
-					catch
-					{
-					}
+
+					var relative = unchecked((long)(stackAddr - rsp));
+					var relativeText = relative >= 0
+						? $"+0x{relative:X}"
+						: $"-0x{-relative:X}";
+					var symbolText = TryFormatNearestRuntimeSymbol(value, out var stackSymbol)
+						? $" [{stackSymbol}]"
+						: string.Empty;
+					Console.Error.WriteLine(
+						$"[LOADER][INFO]     [rsp{relativeText}] " +
+						$"@0x{stackAddr:X16} = 0x{value:X16}{symbolText}");
 				}
 			}
-			catch
-			{
-				Console.Error.WriteLine("[LOADER][WARNING]   Could not dump stack call-site windows.");
-			}
+
+			DumpPointerWindow("fault-register-rbx", rbx, 0x60);
+			DumpPointerWindow("fault-register-rsi", rsi, 0x60);
+			DumpPointerWindow("fault-register-rdi", rdi, 0x60);
+			DumpPointerWindow("fault-register-r13", r13, 0x60);
+			DumpPointerWindow("fault-register-r14", r14, 0x60);
 
 			try
 			{
@@ -299,27 +310,17 @@ public sealed partial class DirectExecutionBackend
 				ulong frame = rbp;
 				for (int i = 0; i < 12; i++)
 				{
-					if (frame < 140733193388032L || frame > 140737488355327L)
+					if (frame < 0x10000)
 					{
 						break;
 					}
-					ulong next = (ulong)Marshal.ReadInt64((nint)frame);
-					ulong ret = (ulong)Marshal.ReadInt64((nint)(frame + 8));
+					if (!TryReadHostQword(frame, out ulong next) || !TryReadHostQword(frame + 8, out ulong ret))
+					{
+						Console.Error.WriteLine("[LOADER][WARNING]   Could not walk RBP frame chain.");
+						break;
+					}
 					string extra = TryFormatNearestRuntimeSymbol(ret, out string retSym) ? $" [{retSym}]" : string.Empty;
 					Console.Error.WriteLine($"[LOADER][INFO]     frame#{i}: rbp=0x{frame:X16} ret=0x{ret:X16}{extra} next=0x{next:X16}");
-					if (i < 3 && ret > 48)
-					{
-						try
-						{
-							byte[] callSite = new byte[48];
-							Marshal.Copy((nint)(ret - 40), callSite, 0, callSite.Length);
-							Console.Error.WriteLine($"[LOADER][INFO]       call-site frame#{i} [ret-0x28..ret+0x08]: " + BitConverter.ToString(callSite).Replace("-", " "));
-						}
-						catch
-						{
-							Console.Error.WriteLine($"[LOADER][INFO]       call-site frame#{i}: unreadable");
-						}
-					}
 					if (next <= frame)
 					{
 						break;
@@ -334,16 +335,15 @@ public sealed partial class DirectExecutionBackend
 
 			switch (exceptionCode)
 			{
-				case WindowsFaultCodes.AccessViolation:
+				case 3221225477u:
 					Console.Error.WriteLine("[LOADER][ERROR]   Type: Access Violation");
 					Console.Error.WriteLine("[LOADER][ERROR]   This usually means:");
 					Console.Error.WriteLine("[LOADER][ERROR]     - Guest code called an unmapped import");
 					Console.Error.WriteLine("[LOADER][ERROR]     - Guest code accessed unmapped memory");
 					Console.Error.WriteLine("[LOADER][ERROR]     - Need to implement HLE for this NID");
-					try
+					byte[] code = new byte[16];
+					if (TryReadHostBytes(rip, code))
 					{
-						byte[] code = new byte[16];
-						Marshal.Copy((nint)rip, code, 0, code.Length);
 						Console.Error.WriteLine("[LOADER][INFO]   Code at RIP: " + BitConverter.ToString(code).Replace("-", " "));
 						if (code[0] == 100)
 						{
@@ -359,61 +359,72 @@ public sealed partial class DirectExecutionBackend
 							Console.Error.WriteLine($"[LOADER][INFO]   RBP: 0x{rbp:X16} (mod 16 = {rbp % 16})");
 							Console.Error.WriteLine($"[LOADER][INFO]   RSP: 0x{rsp:X16} (mod 16 = {rsp % 16})");
 						}
-						if (rip > 16)
+						byte[] before = new byte[16];
+						if (rip > 16 && TryReadHostBytes(rip - 16, before))
 						{
-							byte[] before = new byte[16];
-							Marshal.Copy((nint)(rip - 16), before, 0, before.Length);
 							Console.Error.WriteLine("[LOADER][INFO]   Code before RIP: " + BitConverter.ToString(before).Replace("-", " "));
 						}
-						if (rip > 32)
+						byte[] window = new byte[64];
+						if (rip > 32 && TryReadHostBytes(rip - 32, window))
 						{
-							byte[] window = new byte[64];
-							Marshal.Copy((nint)(rip - 32), window, 0, window.Length);
 							Console.Error.WriteLine("[LOADER][INFO]   Code window [RIP-0x20..]: " + BitConverter.ToString(window).Replace("-", " "));
 						}
+						for (var stackIndex = 0; stackIndex < 16; stackIndex++)
+						{
+							byte[] stackSlot = new byte[8];
+							if (!TryReadHostBytes(rsp + (ulong)(stackIndex * 8), stackSlot))
+							{
+								continue;
+							}
+							var candidate = BitConverter.ToUInt64(stackSlot);
+							if (candidate < _entryPoint || candidate >= _entryPoint + 0x10000000 || candidate < 24)
+							{
+								continue;
+							}
+							byte[] callSiteWindow = new byte[48];
+							if (TryReadHostBytes(candidate - 24, callSiteWindow))
+							{
+								Console.Error.WriteLine(
+									$"[LOADER][INFO]   Stack guest-code candidate [rsp+0x{stackIndex * 8:X2}]=0x{candidate:X16}, bytes [-0x18..]: " +
+									BitConverter.ToString(callSiteWindow).Replace("-", " "));
+							}
+						}
 					}
-					catch
+					else
 					{
 						Console.Error.WriteLine("[LOADER][ERROR]   Could not read code at RIP");
 					}
 					DumpRecentImportTrace();
-					DumpGuestDisasmDiagnostics(rip, rbp);
+					DumpGuestDisasmDiagnostics(rip, rbp, rsp);
+					DumpGuestRegisterWindowDiagnostics(
+						rax, rbx, rcx, rdx, rsi, rdi, rbp, rsp,
+						r8, r9, r10, r11, r12, r13, r14, r15);
 					DumpGuestReferenceDiagnostics();
 					DumpGuestPointerWindowDiagnostics();
-					// Flush any not-yet-drained guarded-intrinsic swallows: the most
-					// recent ones are often the first touch of whatever corrupted
-					// state this fault is now tripping over.
-					DrainImportGuardRing("crash");
 					break;
-				case WindowsFaultCodes.Breakpoint:
+				case 2147483651u:
 					Console.Error.WriteLine("[LOADER][WARNING]   Type: Breakpoint (int3)");
 					Console.Error.WriteLine("[LOADER][WARNING]   Unexpected breakpoint in direct-bridge mode");
 					break;
-				case WindowsFaultCodes.IllegalInstruction:
+				case 1073741845u:
+					Console.Error.WriteLine("[LOADER][ERROR]   Type: Abort (SIGABRT)");
+					DumpRecentImportTrace();
+					DumpGuestDisasmDiagnostics(rip, rbp, rsp);
+					break;
+				case 3221225501u:
 					Console.Error.WriteLine("[LOADER][INFO]   Type: Illegal Instruction");
+					byte[] illegalCode = new byte[16];
+					if (TryReadHostBytes(rip, illegalCode))
+					{
+						Console.Error.WriteLine("[LOADER][INFO]   Code at RIP: " + BitConverter.ToString(illegalCode).Replace("-", " "));
+					}
+					DumpRecentImportTrace();
+					DumpGuestDisasmDiagnostics(rip, rbp, rsp);
 					break;
 			}
 
 			Console.Error.WriteLine("[LOADER][INFO] =========================================");
 			Console.Error.Flush();
-			return 0;
-		}
-		catch (Exception ex)
-		{
-			// This method is invoked by Windows as a native callback with no
-			// managed frame above it. A .NET exception escaping here crosses
-			// that boundary and is fatal-and-unrecoverable by CoreCLR design
-			// -- worse, silently so, since the crash happens mid-exception-
-			// dispatch before any of our own logging has a chance to run.
-			try
-			{
-				Console.Error.WriteLine($"[LOADER][FATAL] VectoredHandler itself threw: {ex}");
-				Console.Error.Flush();
-			}
-			catch
-			{
-			}
-
 			return 0;
 		}
 		finally
@@ -422,74 +433,228 @@ public sealed partial class DirectExecutionBackend
 		}
 	}
 
-	private static bool IsBenignHostDebugException(uint exceptionCode)
+	private unsafe bool TryRecoverAuxiliaryThreadExecuteFault(
+		EXCEPTION_RECORD* exceptionRecord,
+		void* contextRecord,
+		ulong rip)
 	{
-		return exceptionCode is DBG_PRINTEXCEPTION_C or DBG_PRINTEXCEPTION_WIDE_C or MS_VC_THREADNAME_EXCEPTION;
-	}
-
-	private static unsafe void DumpGuestPointerRegisters(params ulong[] candidates)
-	{
-		var names = new[] { "rdi", "rsi", "rdx", "rcx", "r8", "r9", "r12", "r13", "r14", "r15", "rax", "rbx" };
-		Console.Error.WriteLine("[LOADER][INFO]   Register-as-pointer dumps:");
-		for (var i = 0; i < candidates.Length && i < names.Length; i++)
+		if (exceptionRecord->ExceptionCode != 3221225477u)
 		{
-			var address = candidates[i];
-			// Guest heap/object pointers land well below the kernel/stack
-			// range; skip small integers and host-range values so the dump
-			// stays limited to plausible guest object pointers.
-			if (address < 0x1_0000 || address > 0x0000_7FFF_FFFF_FFFF)
-			{
-				continue;
-			}
-
-			// A faulted read here re-enters the vectored handler and aborts the
-			// process, so probe commit/protection state instead of trusting a
-			// try/catch around the dereference.
-			if (!IsHostRangeReadable(address, 24 * sizeof(ulong)))
-			{
-				Console.Error.WriteLine($"[LOADER][INFO]     *{names[i]} (0x{address:X16}): unreadable");
-				continue;
-			}
-
-			var qwords = new ulong[24];
-			for (var q = 0; q < qwords.Length; q++)
-			{
-				qwords[q] = *(ulong*)(address + (ulong)(q * 8));
-			}
-
-			Console.Error.WriteLine(
-				$"[LOADER][INFO]     *{names[i]} (0x{address:X16}): " +
-				string.Join(' ', Array.ConvertAll(qwords, v => $"0x{v:X16}")));
+			return false;
 		}
+
+		// Prefer ThreadStatic active state; fall back to host-thread name when
+		// concurrent TBB AVs race logging (tLT61: recover skipped, then Fatal).
+		GuestThreadState? activeThread = _activeGuestThreadState;
+		if (activeThread is null || activeThread.Name != "tbb_thead")
+		{
+			var hostName = Thread.CurrentThread.Name;
+			if (hostName is null ||
+				!hostName.StartsWith("SharpEmu-tbb_thead", StringComparison.Ordinal))
+			{
+				return false;
+			}
+
+			activeThread = FindGuestThreadStateByHostThreadId(unchecked((int)GetCurrentThreadId()));
+			if (activeThread is null || activeThread.Name != "tbb_thead")
+			{
+				var skip = Interlocked.Increment(ref _auxiliaryThreadExecuteFaultSkips);
+				if (skip <= 8 || skip % 64 == 0)
+				{
+					Console.Error.WriteLine(
+						$"[LOADER][WARN] tbb_recover skip #{skip}: rip=0x{rip:X16} " +
+						$"host='{hostName}' active={(activeThread?.Name ?? "null")}");
+					Console.Error.Flush();
+				}
+				return false;
+			}
+		}
+
+		var hostExit = ActiveEntryReturnSentinelRip;
+		if (hostExit < 0x10000)
+		{
+			hostExit = unchecked((ulong)_guestReturnStub);
+		}
+
+			// Prefer worker-abort (SetEvent + ExitThread) over host_exit→RunEpilogue:
+		// the latter FailFasts the process after TBB recover (tLT28/30 silent die).
+		// Do NOT abandon mutexes here — managed HLE from inside VEH can re-enter
+		// and Fatal (tLT73). NativeGuestExecutor.Run abandons after detecting abort.
+		var abortRip = unchecked((ulong)_workerAbortStub);
+		if (abortRip >= 0x10000)
+		{
+			// Do NOT SetEvent from managed VEH: that wakes the renter which may
+			// TerminateThread while this thread is still inside VEH return
+			// (tLTA2: recover logged, no respawning, process die). Abort stub
+			// SetEvent's only after CONTINUE_EXECUTION resumes at park.
+
+			// Prefer the entry-stub-saved host RSP (real CreateThread stack).
+			// Do not treat mid-range host stacks as guest — Astro worker stacks
+			// often sit in 0x02xxxxxx_xxxx and were wrongly replaced with a
+			// shared VirtualAlloc abort stack (concurrent TBB AV → die).
+			var hostRspSlot = TlsGetValue(_hostRspSlotTlsIndex);
+			ulong hostRsp = 0;
+			if (hostRspSlot != 0)
+			{
+				hostRsp = *(ulong*)hostRspSlot;
+			}
+
+			if (hostRsp < 0x10000)
+			{
+				hostRsp = EnsureWorkerAbortStackRsp();
+			}
+
+			if (hostRsp >= 0x10000)
+			{
+				WriteCtxU64(contextRecord, 152, hostRsp & ~0xFUL);
+			}
+
+			WriteCtxU64(contextRecord, 120, 0);
+			WriteCtxU64(contextRecord, 248, abortRip);
+			var recovery = Interlocked.Increment(ref _auxiliaryThreadExecuteFaultRecoveries);
+			Console.Error.WriteLine(
+				$"[LOADER][WARN] Recovered auxiliary TBB execute fault #{recovery}: " +
+				$"thread=0x{activeThread.ThreadHandle:X16} target=0x{rip:X16} " +
+				$"host_rsp=0x{hostRsp:X16} -> worker_abort=0x{abortRip:X16}");
+			Console.Error.WriteLine(
+				"[LOADER][INFO] tbb_recover: parking native worker (SetEvent+park); " +
+				"renter will TerminateThread+respawn — avoids ExitThread after VEH");
+			Console.Error.Flush();
+			return true;
+		}
+
+		if (hostExit < 0x10000)
+		{
+			Console.Error.WriteLine(
+				$"[LOADER][WARN] Could not recover auxiliary TBB execute fault: target=0x{rip:X16} " +
+				$"active_exit=0x{ActiveEntryReturnSentinelRip:X16} guest_return_stub=0x{unchecked((ulong)_guestReturnStub):X16}");
+			return false;
+		}
+
+		_ = TryPatchActiveGuestReturnSlot(hostExit);
+		WriteCtxU64(contextRecord, 120, 0);
+		WriteCtxU64(contextRecord, 248, hostExit);
+		var recoveryFallback = Interlocked.Increment(ref _auxiliaryThreadExecuteFaultRecoveries);
+		Console.Error.WriteLine(
+			$"[LOADER][WARN] Recovered auxiliary TBB execute fault #{recoveryFallback}: " +
+			$"thread=0x{activeThread.ThreadHandle:X16} target=0x{rip:X16} -> host_exit=0x{hostExit:X16}");
+		Console.Error.WriteLine(
+			"[LOADER][INFO] tbb_recover: resumed at host_exit (abort stub unavailable); " +
+			"subsequent FastFail/CLR must not re-enter managed VEH " +
+			"(live trampoline pre-filters 0xC0000409 / 0xE0434352)");
+		Console.Error.Flush();
+		return true;
 	}
 
-	private static unsafe bool IsHostRangeReadable(ulong address, ulong length)
+	private GuestThreadState? FindGuestThreadStateByHostThreadId(int hostThreadId)
 	{
-		var hostMemory = ResolveDiagnosticsHostMemory();
-		var cursor = address;
-		var end = address + length;
-		while (cursor < end)
+		if (hostThreadId == 0)
 		{
-			if (!hostMemory.Query(cursor, out var mbi))
-			{
-				return false;
-			}
+			return null;
+		}
 
-			if (mbi.State != HostRegionState.Committed || !IsReadableProtection(mbi.RawProtection) || (mbi.RawProtection & PAGE_GUARD) != 0)
+		try
+		{
+			foreach (var thread in SnapshotGuestThreads())
 			{
-				return false;
+				if (Volatile.Read(ref thread.HostThreadId) == hostThreadId)
+				{
+					return thread;
+				}
 			}
+		}
+		catch
+		{
+		}
 
-			var regionEnd = mbi.BaseAddress + mbi.RegionSize;
-			if (regionEnd <= cursor)
+		return null;
+	}
+
+	private unsafe ulong EnsureWorkerAbortStackRsp()
+	{
+		if (_workerAbortStack == 0)
+		{
+			_workerAbortStack = (nint)VirtualAlloc(null, WorkerAbortStackSize, 12288u, 4u);
+			if (_workerAbortStack == 0)
 			{
-				return false;
+				return 0;
 			}
+		}
 
-			cursor = regionEnd;
+		// Grow-down stack: hand out near the top with alignment headroom.
+		return (ulong)(_workerAbortStack + (nint)WorkerAbortStackSize - 0x100) & ~0xFUL;
+	}
+
+	private unsafe bool TryRecoverGuestInt41(uint exceptionCode, void* contextRecord, ulong rip)
+	{
+		if (!_ignoreGuestInt41 || exceptionCode != 3221225477u || rip < 0x10000)
+		{
+			return false;
+		}
+
+		byte[] opcode = new byte[2];
+		if (!TryReadHostBytes(rip, opcode) || opcode[0] != 0xCD || opcode[1] != 0x41)
+		{
+			return false;
+		}
+
+		var count = Interlocked.Increment(ref _ignoredGuestInt41Count);
+		WriteCtxU64(contextRecord, 248, rip + 2);
+		if (count <= 16 || count % 65536 == 0)
+		{
+			Console.Error.WriteLine(
+				$"[LOADER][WARN] Ignored guest int 0x41 trap #{count} at 0x{rip:X16} (default-on; set SHARPEMU_IGNORE_INT41=0 to disable)");
+			Console.Error.Flush();
+		}
+		return true;
+	}
+
+	private unsafe static bool TryRecoverGuestAllocatorHole(
+		EXCEPTION_RECORD* exceptionRecord,
+		void* contextRecord,
+		ulong rip)
+	{
+		if (string.Equals(
+				Environment.GetEnvironmentVariable("SHARPEMU_DISABLE_GUEST_ALLOCATOR_HOLE_RECOVERY"),
+				"1",
+				StringComparison.Ordinal) ||
+			exceptionRecord->NumberParameters < 2 ||
+			exceptionRecord->ExceptionInformation[0] != 0 ||
+			exceptionRecord->ExceptionInformation[1] != 8 ||
+			ReadCtxU64(contextRecord, CTX_RDI) != 0 ||
+			rip < 0x10000)
+		{
+			return false;
+		}
+
+		// Demon's Souls occasionally leaves an empty payload in a locked pool
+		// tree node. The allocator dereferences payload+8 before reaching its
+		// existing empty-pool fallback. Match the instruction stream instead of
+		// a title-specific absolute address, then resume at that fallback so the
+		// lock is released and the allocator can try its next backing pool.
+		const ulong allocatorHoleSignature = 0x634CFF568D08778BUL;
+		if (*(ulong*)rip != allocatorHoleSignature || *((byte*)rip + 8) != 0xF2)
+		{
+			return false;
+		}
+
+		const ulong emptyPoolFallbackDelta = 0x8E;
+		WriteCtxU64(contextRecord, CTX_RIP, rip + emptyPoolFallbackDelta);
+		var recovery = Interlocked.Increment(ref _guestAllocatorHoleRecoveries);
+		if (recovery <= 16 || (recovery & (recovery - 1)) == 0)
+		{
+			Console.Error.WriteLine(
+				$"[LOADER][WARN] Guest allocator empty-node adapter recovery #{recovery}: " +
+				$"rip=0x{rip:X16} -> 0x{rip + emptyPoolFallbackDelta:X16}");
+			Console.Error.Flush();
 		}
 
 		return true;
+	}
+
+	private static bool IsBenignHostDebugException(uint exceptionCode)
+	{
+		return exceptionCode is DBG_PRINTEXCEPTION_C or DBG_PRINTEXCEPTION_WIDE_C or MS_VC_THREADNAME_EXCEPTION;
 	}
 
 	private unsafe static void LogNestedVectoredException(void* exceptionInfo)
@@ -505,8 +670,8 @@ public sealed partial class DirectExecutionBackend
 			EXCEPTION_POINTERS* pointers = (EXCEPTION_POINTERS*)exceptionInfo;
 			EXCEPTION_RECORD* record = pointers->ExceptionRecord;
 			void* contextRecord = pointers->ContextRecord;
-			ulong rip = contextRecord != null ? ReadCtxU64(contextRecord, CTX_RIP) : 0;
-			ulong rsp = contextRecord != null ? ReadCtxU64(contextRecord, CTX_RSP) : 0;
+			ulong rip = contextRecord != null ? ReadCtxU64(contextRecord, 248) : 0;
+			ulong rsp = contextRecord != null ? ReadCtxU64(contextRecord, 152) : 0;
 			ulong accessType = record->NumberParameters >= 1 ? *record->ExceptionInformation : 0;
 			ulong target = record->NumberParameters >= 2 ? record->ExceptionInformation[1] : 0;
 			Console.Error.WriteLine(
@@ -566,7 +731,7 @@ public sealed partial class DirectExecutionBackend
 		}
 	}
 
-	private void DumpGuestDisasmDiagnostics(ulong rip, ulong rbp)
+	private void DumpGuestDisasmDiagnostics(ulong rip, ulong rbp, ulong rsp)
 	{
 		if (!string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_DISASM"), "1", StringComparison.Ordinal))
 		{
@@ -578,12 +743,20 @@ public sealed partial class DirectExecutionBackend
 			DumpGuestInstructionStream("fault-prelude", rip - 0x20, 24);
 		}
 
+		// Optimized guest code frequently omits frame pointers. The return
+		// address at RSP is then more useful than an RBP walk and identifies the
+		// exact call site that supplied the faulting arguments.
+		if (TryReadHostQword(rsp, out var stackReturn) && stackReturn >= 0x60)
+		{
+			DumpGuestInstructionStream("stack-return-prelude", stackReturn - 0x60, 40);
+		}
+
 		try
 		{
 			ulong frame = rbp;
 			for (int i = 0; i < 3; i++)
 			{
-				if (frame < 140733193388032L || frame > 140737488355327L)
+				if (frame < 0x10000)
 				{
 					break;
 				}
@@ -652,7 +825,7 @@ public sealed partial class DirectExecutionBackend
 		ulong address = scanBase;
 		while (address < scanEnd)
 		{
-			if (!_hostMemory.Query(address, out var mbi))
+			if (VirtualQuery((void*)address, out var mbi, (nuint)sizeof(MEMORY_BASIC_INFORMATION64)) == 0)
 			{
 				break;
 			}
@@ -664,9 +837,9 @@ public sealed partial class DirectExecutionBackend
 				break;
 			}
 
-			if (mbi.State == HostRegionState.Committed &&
-				IsReadableProtection(mbi.RawProtection) &&
-				IsExecutableProtection(mbi.RawProtection))
+			if (mbi.State == MEM_COMMIT &&
+				IsReadableProtection(mbi.Protect) &&
+				IsExecutableProtection(mbi.Protect))
 			{
 				ScanExecutableRegionForTargetReferences(regionBase, regionEnd, targetList, hitCounts, maxHitsPerTarget);
 			}
@@ -724,6 +897,55 @@ public sealed partial class DirectExecutionBackend
 		foreach (var target in targetList)
 		{
 			DumpPointerWindow($"ptrwin-0x{target:X16}", target, windowSize);
+		}
+	}
+
+	private void DumpGuestRegisterWindowDiagnostics(
+		ulong rax,
+		ulong rbx,
+		ulong rcx,
+		ulong rdx,
+		ulong rsi,
+		ulong rdi,
+		ulong rbp,
+		ulong rsp,
+		ulong r8,
+		ulong r9,
+		ulong r10,
+		ulong r11,
+		ulong r12,
+		ulong r13,
+		ulong r14,
+		ulong r15)
+	{
+		if (!string.Equals(
+				Environment.GetEnvironmentVariable("SHARPEMU_LOG_REGISTER_WINDOWS"),
+				"1",
+				StringComparison.Ordinal))
+		{
+			return;
+		}
+
+		// A register can be the only surviving reference to the object or
+		// argument array that caused a native guest fault. Capture a compact
+		// window while the process is alive so the post-mortem log can
+		// distinguish an absent object from a partially initialized one.
+		var registers = new (string Name, ulong Value)[]
+		{
+			("rax", rax), ("rbx", rbx), ("rcx", rcx), ("rdx", rdx),
+			("rsi", rsi), ("rdi", rdi), ("rbp", rbp), ("rsp", rsp),
+			("r8", r8), ("r9", r9), ("r10", r10), ("r11", r11),
+			("r12", r12), ("r13", r13), ("r14", r14), ("r15", r15),
+		};
+		var seen = new HashSet<ulong>();
+		foreach (var (name, value) in registers)
+		{
+			if (value < 0x10000 || !seen.Add(value))
+			{
+				continue;
+			}
+
+			DumpPointerWindow($"register-{name}", value, 0x80);
 		}
 	}
 
@@ -971,13 +1193,13 @@ public sealed partial class DirectExecutionBackend
 			return false;
 		}
 
-		if (!_hostMemory.Query(address, out var mbi))
+		if (VirtualQuery((void*)address, out var mbi, (nuint)sizeof(MEMORY_BASIC_INFORMATION64)) == 0)
 		{
 			return false;
 		}
 
 		ulong regionEnd = mbi.BaseAddress + mbi.RegionSize;
-		if (mbi.State != HostRegionState.Committed || !IsReadableProtection(mbi.RawProtection) || regionEnd <= address || address > regionEnd - 8)
+		if (mbi.State != MEM_COMMIT || !IsReadableProtection(mbi.Protect) || regionEnd <= address || address > regionEnd - 8)
 		{
 			return false;
 		}
@@ -990,6 +1212,61 @@ public sealed partial class DirectExecutionBackend
 		catch
 		{
 			value = 0;
+			return false;
+		}
+	}
+
+	private static bool TryReadHostQword(ulong address, out ulong value)
+	{
+		if (!OperatingSystem.IsWindows())
+		{
+			// A stray read inside the signal handler would raise a nested
+			// SIGSEGV and kill the process before diagnostics finish, so
+			// probe the region table instead of relying on try/catch.
+			return TryReadStackU64(address, out value);
+		}
+
+		value = 0;
+		try
+		{
+			value = (ulong)Marshal.ReadInt64((nint)address);
+			return true;
+		}
+		catch
+		{
+			return false;
+		}
+	}
+
+	private unsafe static bool TryReadHostBytes(ulong address, byte[] buffer)
+	{
+		if (address < 65536)
+		{
+			return false;
+		}
+
+		if (!OperatingSystem.IsWindows())
+		{
+			// See TryReadHostQword: probe every touched page before reading.
+			ulong end = address + (ulong)buffer.Length;
+			for (ulong page = address & 0xFFFFFFFFFFFFF000uL; page < end; page += 4096)
+			{
+				if (VirtualQuery((void*)page, out var mbi, (nuint)sizeof(MEMORY_BASIC_INFORMATION64)) == 0 ||
+					mbi.State != MEM_COMMIT ||
+					!IsReadableProtection(mbi.Protect))
+				{
+					return false;
+				}
+			}
+		}
+
+		try
+		{
+			Marshal.Copy((nint)address, buffer, 0, buffer.Length);
+			return true;
+		}
+		catch
+		{
 			return false;
 		}
 	}
@@ -1068,566 +1345,6 @@ public sealed partial class DirectExecutionBackend
 		return true;
 	}
 
-	// This engine compiles its assert macro as: log the message via a
-	// helper call, then execute a software interrupt (observed: `int 0x41`)
-	// unconditionally, followed immediately by a jmp to the normal
-	// post-assert continuation point. On real PS5 hardware that software
-	// interrupt is a defined trap gate the kernel handles (log-and-return
-	// for a non-fatal assert in a retail/CERT build); Windows has no
-	// handler for these custom, engine-defined vectors, so the CPU's
-	// attempt to service the interrupt surfaces to us as a read AV at
-	// target=0xFFFFFFFFFFFFFFFF with RIP pointing at the `int N` opcode
-	// itself. Any `int N` hit this way is almost certainly the same
-	// pattern regardless of N -- the game defines its own small set of
-	// debug-trap vectors -- so this is not limited to 0x41. Two vectors are
-	// excluded defensively: 0x2E (legacy Windows/NT syscall gate) and 0x80
-	// (Linux syscall-compat convention), in case Windows ever has real
-	// machinery wired to either, however unlikely on a 64-bit host.
-	// Recognizing the shape and skipping the two-byte instruction
-	// reproduces "log and continue" instead of a hard crash.
-	private unsafe bool TryHandleGuestAssertTrap(void* contextRecord, ulong rip)
-	{
-		if (rip < 65536 || rip >= 140737488355328L || !IsHostRangeReadable(rip, 2))
-		{
-			return false;
-		}
-
-		if (*(byte*)rip != 0xCD)
-		{
-			return false;
-		}
-
-		byte vector = *(byte*)(rip + 1);
-		if (vector == 0x2E || vector == 0x80)
-		{
-			return false;
-		}
-
-		// The log helper's formatted buffer often starts one byte before RSI
-		// (a leading newline sits at RSI-1, observed empirically), but RSI-1
-		// can cross into an unmapped preceding page depending on allocator
-		// layout -- try the one-byte-earlier read first for a cleaner
-		// message, falling back to RSI itself (missing only its first
-		// character) rather than losing the message entirely.
-		ulong rsi = ReadCtxU64(contextRecord, 168);
-		if (TryReadGuestAssertMessage(rsi - 1, out var message) ||
-			TryReadGuestAssertMessage(rsi, out message))
-		{
-			Console.Error.WriteLine($"[LOADER][WARN] Guest engine assert (int 0x{vector:X2}, non-fatal, continuing): {message}");
-			if (message.Contains("defaultBusses", StringComparison.Ordinal))
-			{
-				TryPatchEmptyDefaultBusses(contextRecord);
-			}
-		}
-		else
-		{
-			Console.Error.WriteLine($"[LOADER][WARN] Guest engine assert (int 0x{vector:X2}, non-fatal, continuing) at 0x{rip:X16}");
-		}
-
-		Console.Error.Flush();
-		WriteCtxU64(contextRecord, 248, rip + 2);
-		return true;
-	}
-
-	// The soft-continue above lets boot get past this specific assert (the
-	// SoundManager invariant "exactly one default audio bus exists"), but
-	// the code right after it unconditionally dereferences
-	// defaultBusses.begin() regardless of whether the check actually
-	// passed -- on real hardware that path is only reached once something
-	// else has already registered a bus, which this emulator doesn't yet
-	// model. Tolerating the resulting null-pointer reads one instruction
-	// encoding at a time (as TryHandleNullFieldLoad/Compare above do) is a
-	// fundamentally reactive whack-a-mole: each new field access the game
-	// walks off that null needs its own narrow recognizer, and some of them
-	// are writes -- a materially riskier class to paper over than a read,
-	// since there's no safe "pretend this succeeded" for a write to an
-	// address that was never real memory to begin with.
-	//
-	// Instead, this patches the vector's begin/end pointers directly, once,
-	// to reference a small zeroed guest object -- fixing the actual empty
-	// container rather than every symptom of it being empty. r14 holds
-	// SoundManager's global singleton pointer at this exact trap site
-	// (loaded well before the size check and never overwritten before here
-	// -- confirmed via disassembly of the surrounding code), and
-	// defaultBusses lives at [r14+0x2730] (begin) / [r14+0x2738] (end); the
-	// checked invariant is `end - begin == 0x18`, i.e. exactly one 24-byte
-	// element. A zeroed placeholder object reads back as "no
-	// capabilities/no entries" for whatever fields the game's own code goes
-	// on to check, matching the safe-default convention this codebase
-	// already uses elsewhere for not-yet-modeled state (e.g. the AudioOut2
-	// queue-level stubs always reporting an empty, ready queue).
-	private unsafe void TryPatchEmptyDefaultBusses(void* contextRecord)
-	{
-		ulong soundManager = ReadCtxU64(contextRecord, 232); // r14
-		if (soundManager < 65536 || !IsHostRangeReadable(soundManager, 0x2740))
-		{
-			return;
-		}
-
-		ulong begin = *(ulong*)(soundManager + 0x2730);
-		if (begin != 0)
-		{
-			// Already patched (or genuinely populated by something else) --
-			// idempotent no-op, since this trap fires repeatedly.
-			return;
-		}
-
-		var context = ActiveCpuContext;
-		if (context is null || !TryGetGuestMemoryAllocator(context, out var allocator))
-		{
-			return;
-		}
-
-		const ulong busObjectSize = 0x1000;
-		const ulong elementSize = 0x18;
-		if (!allocator.TryAllocateGuestMemory(busObjectSize, 0x1000, out var busObject) ||
-			!IsHostRangeReadable(busObject, busObjectSize))
-		{
-			return;
-		}
-
-		// The element's only field this codebase constructs is its first
-		// qword, a pointer to the actual bus object; the allocator already
-		// returns zeroed memory, so everything past that first field (and
-		// the whole bus object) reads back as zero without needing to
-		// touch it explicitly.
-		*(ulong*)busObject = busObject + elementSize;
-
-		*(ulong*)(soundManager + 0x2730) = busObject;
-		*(ulong*)(soundManager + 0x2738) = busObject + elementSize;
-
-		Console.Error.WriteLine(
-			$"[LOADER][WARN] Patched empty defaultBusses at 0x{soundManager:X16} with a zeroed placeholder bus at 0x{busObject:X16}");
-		Console.Error.Flush();
-	}
-
-	private static bool TryGetGuestMemoryAllocator(CpuContext context, out IGuestMemoryAllocator allocator)
-	{
-		if (context.Memory is IGuestMemoryAllocator direct)
-		{
-			allocator = direct;
-			return true;
-		}
-
-		if (context.Memory is TrackedCpuMemory tracked && tracked.Inner is IGuestMemoryAllocator inner)
-		{
-			allocator = inner;
-			return true;
-		}
-
-		allocator = null!;
-		return false;
-	}
-
-	// Context-record byte offsets for GP registers 0-15 in x86-64 ModRM
-	// encoding order (rax,rcx,rdx,rbx,rsp,rbp,rsi,rdi,r8-r15), matching the
-	// offsets already used throughout this file (rax=120 ... r15=240).
-	private static readonly int[] GpRegisterContextOffsets =
-	[
-		120, 128, 136, 144, 152, 160, 168, 176,
-		184, 192, 200, 208, 216, 224, 232, 240,
-	];
-
-	// Some getter-shaped code loads a field straight out of a not-yet-
-	// populated object (e.g. `mov rdi, [rax]` where rax is a container's
-	// begin-pointer and the container is still empty) without a null check,
-	// immediately after a soft-continued assert whose message already
-	// signals the underlying condition is known and tolerated by the
-	// engine's own retail-build design. Real hardware would fault here too
-	// if this path were genuinely reached with no valid object -- but on
-	// real hardware it normally isn't, because some earlier step we don't
-	// yet emulate would have populated the field. Rather than hard-crash,
-	// this narrowly recognizes the `REX.W mov r64, [r64]` / `REX.W mov r64,
-	// [r64+disp8]` pattern (opcode 0x8B, mod=00 or mod=01, no SIB/
-	// RIP-relative operand -- i.e. plain register-indirect with zero or an
-	// 8-bit displacement) reading through a near-null pointer, synthesizes
-	// "the read returned 0" by zeroing the destination register, and steps
-	// over the instruction. This mirrors a documented compatibility
-	// technique used by several console emulators (a backed "zero page" for
-	// near-null reads) without actually mapping guest memory at address 0,
-	// which Windows will not allow. Deliberately narrow: only READ access,
-	// only this one exact encoding family, only when the faulting address
-	// itself is near-null -- a write or execute fault at the same address is
-	// a materially different, more serious bug class and is left to crash
-	// normally.
-	private const ulong NearNullGuardLimit = 0x10000UL;
-
-	private static unsafe bool TryHandleNullFieldLoad(EXCEPTION_RECORD* exceptionRecord, void* contextRecord, ulong rip)
-	{
-		if (exceptionRecord->NumberParameters < 2)
-		{
-			return false;
-		}
-
-		ulong accessType = *exceptionRecord->ExceptionInformation;
-		ulong target = exceptionRecord->ExceptionInformation[1];
-		if (accessType != 0 || target >= NearNullGuardLimit)
-		{
-			return false;
-		}
-
-		if (rip < 65536 || rip >= 140737488355328L || !IsHostRangeReadable(rip, 3))
-		{
-			return false;
-		}
-
-		byte rexByte = *(byte*)rip;
-		if (rexByte < 0x48 || rexByte > 0x4F)
-		{
-			// Require REX.W (64-bit operand size); this pattern is only
-			// meaningful for pointer-sized loads.
-			return false;
-		}
-
-		if (*(byte*)(rip + 1) != 0x8B)
-		{
-			return false;
-		}
-
-		byte modRm = *(byte*)(rip + 2);
-		int mod = (modRm >> 6) & 0x3;
-		int reg = (modRm >> 3) & 0x7;
-		int rm = modRm & 0x7;
-		if (mod > 1 || rm == 0x4 || (mod == 0 && rm == 0x5))
-		{
-			// Only [reg] / [reg+disp8] addressing (no SIB byte, no
-			// RIP-relative, no disp32) is handled -- anything else needs a
-			// fuller decoder this narrow check deliberately does not
-			// attempt.
-			return false;
-		}
-
-		int instructionLength = 3;
-		long disp = 0;
-		if (mod == 1)
-		{
-			if (!IsHostRangeReadable(rip, 4))
-			{
-				return false;
-			}
-
-			disp = *(sbyte*)(rip + 3);
-			instructionLength = 4;
-		}
-
-		bool rexR = (rexByte & 0x4) != 0;
-		bool rexB = (rexByte & 0x1) != 0;
-		int destRegister = reg | (rexR ? 0x8 : 0);
-		int sourceRegister = rm | (rexB ? 0x8 : 0);
-
-		ulong sourceValue = ReadCtxU64(contextRecord, GpRegisterContextOffsets[sourceRegister]);
-		if (unchecked((ulong)((long)sourceValue + disp)) != target)
-		{
-			// Sanity check: the register we decoded as the memory operand's
-			// base (plus any displacement) must actually hold the address
-			// that faulted.
-			return false;
-		}
-
-		Console.Error.WriteLine(
-			$"[LOADER][WARN] Guest null-field load tolerated: rip=0x{rip:X16} reads [0x{target:X}] -> synthesizing 0");
-		Console.Error.Flush();
-
-		WriteCtxU64(contextRecord, GpRegisterContextOffsets[destRegister], 0);
-		WriteCtxU64(contextRecord, 248, rip + (ulong)instructionLength);
-		return true;
-	}
-
-	// Sibling to TryHandleNullFieldLoad above, for a different shape of the
-	// same "getter-shaped code touches an empty/never-populated field"
-	// scenario: a `cmp dword ptr [reg], imm8` / `cmp dword ptr [reg+disp8],
-	// imm8` guard (opcode 0x83 /7, i.e. group-1 CMP with an 8-bit immediate)
-	// reading a count/flags dword through a near-null base pointer, e.g. a
-	// container's element count checked before iterating it. Synthesizing
-	// "the read returned 0" here means computing the CMP's flags as if the
-	// dword were 0 -- which is what lets the game's own zero-elements guard
-	// clause take its empty/bail-out branch instead of treating a null
-	// container as if it held real data. Same narrow scoping as the sibling
-	// handler: only READ access, only this one opcode-group encoding, only
-	// register-indirect with zero or 8-bit displacement (no SIB, no
-	// RIP-relative, no disp32), only when the faulting address itself is
-	// near-null.
-	private static unsafe bool TryHandleNullFieldCompare(EXCEPTION_RECORD* exceptionRecord, void* contextRecord, ulong rip)
-	{
-		if (exceptionRecord->NumberParameters < 2)
-		{
-			return false;
-		}
-
-		ulong accessType = *exceptionRecord->ExceptionInformation;
-		ulong target = exceptionRecord->ExceptionInformation[1];
-		if (accessType != 0 || target >= NearNullGuardLimit)
-		{
-			return false;
-		}
-
-		if (rip < 65536 || rip >= 140737488355328L || !IsHostRangeReadable(rip, 1))
-		{
-			return false;
-		}
-
-		int index = 0;
-		byte first = *(byte*)(rip + (ulong)index);
-		bool hasRex = first >= 0x40 && first <= 0x4F;
-		byte rexByte = hasRex ? first : (byte)0;
-		if (hasRex)
-		{
-			index++;
-		}
-
-		if (!IsHostRangeReadable(rip, (ulong)index + 1) || *(byte*)(rip + (ulong)index) != 0x83)
-		{
-			return false;
-		}
-		index++;
-
-		if (!IsHostRangeReadable(rip, (ulong)index + 1))
-		{
-			return false;
-		}
-
-		byte modRm = *(byte*)(rip + (ulong)index);
-		int mod = (modRm >> 6) & 0x3;
-		int reg = (modRm >> 3) & 0x7;
-		int rm = modRm & 0x7;
-		if (reg != 7 || rm == 0x4 || mod > 1 || (mod == 0 && rm == 0x5))
-		{
-			// Only the CMP (/7) form of opcode-group 1, and only [reg] /
-			// [reg+disp8] addressing -- no SIB byte, no RIP-relative, no
-			// disp32.
-			return false;
-		}
-		index++;
-
-		long disp = 0;
-		if (mod == 1)
-		{
-			if (!IsHostRangeReadable(rip, (ulong)index + 1))
-			{
-				return false;
-			}
-
-			disp = *(sbyte*)(rip + (ulong)index);
-			index++;
-		}
-
-		if (!IsHostRangeReadable(rip, (ulong)index + 1))
-		{
-			return false;
-		}
-
-		sbyte imm8 = *(sbyte*)(rip + (ulong)index);
-		index++;
-
-		bool rexB = (rexByte & 0x1) != 0;
-		int baseRegister = rm | (rexB ? 0x8 : 0);
-
-		ulong baseValue = ReadCtxU64(contextRecord, GpRegisterContextOffsets[baseRegister]);
-		if (unchecked((ulong)((long)baseValue + disp)) != target)
-		{
-			// Sanity check: the decoded base+disp must actually be the
-			// address that faulted.
-			return false;
-		}
-
-		Console.Error.WriteLine(
-			$"[LOADER][WARN] Guest null-field compare tolerated: rip=0x{rip:X16} reads [0x{target:X}] cmp 0x{(byte)imm8:X2} -> synthesizing 0");
-		Console.Error.Flush();
-
-		int result = -imm8;
-		const int EFlagsOffset = 68;
-		const uint CF = 1u << 0;
-		const uint ZF = 1u << 6;
-		const uint SF = 1u << 7;
-		const uint OF = 1u << 11;
-		uint eflags = ReadCtxU32(contextRecord, EFlagsOffset);
-		eflags &= ~(CF | ZF | SF | OF);
-		if (result == 0)
-		{
-			eflags |= ZF;
-		}
-		if (result < 0)
-		{
-			eflags |= SF;
-		}
-		if (imm8 != 0)
-		{
-			// Subtracting any nonzero value from unsigned 0 always borrows.
-			eflags |= CF;
-		}
-		// OF: both operands fit in a signed byte's range, so 0 - imm8 never
-		// overflows a 32-bit signed subtraction -- OF stays clear.
-		WriteCtxU32(contextRecord, EFlagsOffset, eflags);
-
-		WriteCtxU64(contextRecord, 248, rip + (ulong)index);
-		return true;
-	}
-
-	private static int _sse4aEmulatedLogCount;
-
-	// SSE4A EXTRQ/INSERTQ emulation. Guest code is compiled for the PS5's
-	// Zen 2 and legally uses AMD-only SSE4A bit-field instructions that
-	// raise #UD (0xC000001D) on Intel hosts -- Astro Bot hits EXTRQ
-	// (66 0F 78 C2 28 00) at 0x80047F43B in its RGBA8 color-unpack path.
-	// Emulates all four encodings and resumes, mirroring shadPS4's
-	// cpu_patches.cpp behavior on non-AMD hosts.
-	private static unsafe bool TryHandleSse4aInstruction(void* contextRecord, ulong rip)
-	{
-		if (rip < 65536 || rip >= 140737488355328L || !IsHostRangeReadable(rip, 8))
-		{
-			return false;
-		}
-
-		byte* code = (byte*)rip;
-		int index = 0;
-		byte prefix = code[index++];
-		if (prefix != 0x66 && prefix != 0xF2)
-		{
-			return false;
-		}
-
-		byte rex = 0;
-		if (code[index] >= 0x40 && code[index] <= 0x4F)
-		{
-			rex = code[index];
-			index++;
-		}
-
-		if (code[index] != 0x0F)
-		{
-			return false;
-		}
-		index++;
-
-		byte opcode = code[index];
-		if (opcode != 0x78 && opcode != 0x79)
-		{
-			return false;
-		}
-		index++;
-
-		byte modRm = code[index];
-		index++;
-		if ((modRm >> 6) != 0x3)
-		{
-			// EXTRQ/INSERTQ only exist as register-register forms.
-			return false;
-		}
-
-		bool isInsert = prefix == 0xF2;
-		int regField = ((modRm >> 3) & 0x7) | (((rex & 0x4) != 0) ? 8 : 0);
-		int rmField = (modRm & 0x7) | (((rex & 0x1) != 0) ? 8 : 0);
-		if (!isInsert && opcode == 0x78 && ((modRm >> 3) & 0x7) != 0)
-		{
-			// EXTRQ immediate form is 66 0F 78 /0 -- reg field is an opcode extension.
-			return false;
-		}
-
-		int len;
-		int idx;
-		int dstXmm;
-		int srcXmm;
-		if (opcode == 0x78)
-		{
-			// Immediate forms: modrm is followed by imm8 length, imm8 index.
-			len = code[index] & 0x3F;
-			idx = code[index + 1] & 0x3F;
-			index += 2;
-			dstXmm = isInsert ? regField : rmField;
-			srcXmm = rmField;
-		}
-		else
-		{
-			// Register forms: length/index come from the source register.
-			dstXmm = regField;
-			srcXmm = rmField;
-			ulong* selector = XmmContextSlot(contextRecord, srcXmm);
-			if (isInsert)
-			{
-				// INSERTQ xmm1, xmm2: length = xmm2[69:64], index = xmm2[77:72].
-				len = (int)(selector[1] & 0x3F);
-				idx = (int)((selector[1] >> 8) & 0x3F);
-			}
-			else
-			{
-				// EXTRQ xmm1, xmm2: length = xmm2[5:0], index = xmm2[13:8].
-				len = (int)(selector[0] & 0x3F);
-				idx = (int)((selector[0] >> 8) & 0x3F);
-			}
-		}
-
-		// Per AMD APM: a length field of 0 selects 64 bits.
-		ulong mask = len == 0 ? ulong.MaxValue : (1UL << len) - 1;
-		ulong* dst = XmmContextSlot(contextRecord, dstXmm);
-		if (isInsert)
-		{
-			ulong* src = XmmContextSlot(contextRecord, srcXmm);
-			dst[0] = (dst[0] & ~(mask << idx)) | ((src[0] & mask) << idx);
-		}
-		else
-		{
-			dst[0] = (dst[0] >> idx) & mask;
-		}
-
-		if (_sse4aEmulatedLogCount < 16 && ++_sse4aEmulatedLogCount <= 16)
-		{
-			Console.Error.WriteLine(
-				$"[LOADER][WARN] SSE4A {(isInsert ? "INSERTQ" : "EXTRQ")} emulated at rip=0x{rip:X16} len={(len == 0 ? 64 : len)} idx={idx}");
-			Console.Error.Flush();
-		}
-
-		WriteCtxU64(contextRecord, 248, rip + (ulong)index);
-		return true;
-	}
-
-	// Xmm0 lives at offset 0x1A0 in the amd64 CONTEXT record: this file
-	// already indexes the same CONTEXT layout raw (Rax=0x78, Rsp=0x98,
-	// Rip=0xF8, EFlags=0x44); FltSave (XSAVE_FORMAT) is at 0x100 and
-	// XmmRegisters at 0xA0 within it, 16 bytes per register.
-	private static unsafe ulong* XmmContextSlot(void* contextRecord, int register)
-	{
-		return (ulong*)((byte*)contextRecord + 0x1A0 + register * 16);
-	}
-
-	private static unsafe bool TryReadGuestAssertMessage(ulong address, out string message)
-	{
-		message = string.Empty;
-		const int maxLength = 400;
-		if (!IsHostRangeReadable(address, 1))
-		{
-			return false;
-		}
-
-		var bytes = new List<byte>(maxLength);
-		for (var i = 0; i < maxLength; i++)
-		{
-			var current = address + (ulong)i;
-			if ((current & 0xFFFUL) == 0 && !IsHostRangeReadable(current, 1))
-			{
-				break;
-			}
-
-			var b = *(byte*)current;
-			if (b == 0)
-			{
-				break;
-			}
-
-			bytes.Add(b);
-		}
-
-		if (bytes.Count == 0)
-		{
-			return false;
-		}
-
-		message = System.Text.Encoding.ASCII.GetString(bytes.ToArray())
-			.Replace("\r\n", " | ", StringComparison.Ordinal)
-			.Replace('\n', ' ')
-			.Trim();
-		return message.Length > 0;
-	}
-
 	private unsafe bool TryHandleLazyCommittedPage(EXCEPTION_RECORD* exceptionRecord, ulong rip, ulong rsp)
 	{
 		if (exceptionRecord->NumberParameters < 2)
@@ -1649,25 +1366,25 @@ public sealed partial class DirectExecutionBackend
 		{
 			return false;
 		}
-		if (!_hostMemory.Query(faultAddress, out var mbi))
+		if (VirtualQuery((void*)faultAddress, out var mbi, (nuint)sizeof(MEMORY_BASIC_INFORMATION64)) == 0)
 		{
 			return false;
 		}
 
 		ulong pageBase = faultAddress & 0xFFFFFFFFFFFFF000uL;
-		uint commitProtect = ResolveLazyCommitProtection(accessType, mbi.RawAllocationProtection);
+		uint commitProtect = ResolveLazyCommitProtection(accessType, mbi.AllocationProtect);
 		int traceIndex = Interlocked.Increment(ref _lazyCommitTraceCount);
 		bool traceLazyCommit = ShouldTraceLazyCommit(traceIndex);
 		if (traceLazyCommit)
 		{
-			Console.Error.WriteLine($"[LOADER][TRACE] lazy-query#{traceIndex}: fault=0x{faultAddress:X16} owner={owner} rip=0x{rip:X16} rsp=0x{rsp:X16} state=0x{mbi.RawState:X08} base=0x{mbi.BaseAddress:X16} size=0x{mbi.RegionSize:X16} alloc=0x{mbi.RawAllocationProtection:X08} prot=0x{mbi.RawProtection:X08}");
+			Console.Error.WriteLine($"[LOADER][TRACE] lazy-query#{traceIndex}: fault=0x{faultAddress:X16} owner={owner} rip=0x{rip:X16} rsp=0x{rsp:X16} state=0x{mbi.State:X08} base=0x{mbi.BaseAddress:X16} size=0x{mbi.RegionSize:X16} alloc=0x{mbi.AllocationProtect:X08} prot=0x{mbi.Protect:X08}");
 		}
 
-		if (mbi.State == HostRegionState.Committed && IsAccessCompatible(accessType, mbi.RawProtection))
+		if (mbi.State == 4096 && IsAccessCompatible(accessType, mbi.Protect))
 		{
 			if (traceLazyCommit)
 			{
-				Console.Error.WriteLine($"[LOADER][TRACE] lazy-commit-race#{traceIndex}: fault=0x{faultAddress:X16} protect=0x{mbi.RawProtection:X08}");
+				Console.Error.WriteLine($"[LOADER][TRACE] lazy-commit-race#{traceIndex}: fault=0x{faultAddress:X16} protect=0x{mbi.Protect:X08}");
 			}
 			return true;
 		}
@@ -1676,10 +1393,10 @@ public sealed partial class DirectExecutionBackend
 		ulong committedBase = 0;
 		ulong committedSize = 0;
 
-		if (mbi.State == HostRegionState.Free)
+		if (mbi.State == 65536)
 		{
 			if (TryGetLazyCommitWindow(faultAddress, mbi.BaseAddress, mbi.RegionSize, out var windowBase, out var windowSize) &&
-				TryReserveThenCommit(_hostMemory, windowBase, windowSize, windowBase, windowSize, commitProtect))
+				TryReserveThenCommit(windowBase, windowSize, windowBase, windowSize, commitProtect))
 			{
 				committed = true;
 				committedBase = windowBase;
@@ -1688,7 +1405,7 @@ public sealed partial class DirectExecutionBackend
 			else
 			{
 				ulong largeBase = faultAddress & 0xFFFFFFFFFFE00000uL;
-				if (TryReserveThenCommit(_hostMemory, largeBase, 2097152uL, largeBase, 2097152uL, commitProtect))
+				if (TryReserveThenCommit(largeBase, 2097152uL, largeBase, 2097152uL, commitProtect))
 				{
 					committed = true;
 					committedBase = largeBase;
@@ -1699,13 +1416,13 @@ public sealed partial class DirectExecutionBackend
 			if (!committed)
 			{
 				ulong region64kBase = faultAddress & 0xFFFFFFFFFFFF0000uL;
-				if (TryReserveThenCommit(_hostMemory, region64kBase, 65536uL, region64kBase, 65536uL, commitProtect))
+				if (TryReserveThenCommit(region64kBase, 65536uL, region64kBase, 65536uL, commitProtect))
 				{
 					committed = true;
 					committedBase = region64kBase;
 					committedSize = 65536uL;
 				}
-				else if (TryReserveThenCommit(_hostMemory, pageBase, 4096uL, pageBase, 4096uL, commitProtect))
+				else if (TryReserveThenCommit(pageBase, 4096uL, pageBase, 4096uL, commitProtect))
 				{
 					committed = true;
 					committedBase = pageBase;
@@ -1718,8 +1435,7 @@ public sealed partial class DirectExecutionBackend
 				return false;
 			}
 
-			TryCommitRange(_hostMemory, pageBase + 4096, 4096uL, commitProtect);
-			BackStackPointerIfNeeded(rsp);
+			TryCommitRange(pageBase + 4096, 4096uL, commitProtect);
 			if (traceLazyCommit)
 			{
 				Console.Error.WriteLine($"[LOADER][TRACE] lazy-reserve-commit#{traceIndex}: addr=0x{committedBase:X16} size=0x{committedSize:X16} access={accessType} protect=0x{commitProtect:X8}");
@@ -1727,13 +1443,13 @@ public sealed partial class DirectExecutionBackend
 			return true;
 		}
 
-		if (mbi.State != HostRegionState.Reserved)
+		if (mbi.State != 8192)
 		{
 			return false;
 		}
 
 		if (TryGetLazyCommitWindow(faultAddress, mbi.BaseAddress, mbi.RegionSize, out var commitWindowBase, out var commitWindowSize) &&
-			TryCommitRange(_hostMemory, commitWindowBase, commitWindowSize, commitProtect))
+			TryCommitRange(commitWindowBase, commitWindowSize, commitProtect))
 		{
 			committed = true;
 			committedBase = commitWindowBase;
@@ -1742,7 +1458,7 @@ public sealed partial class DirectExecutionBackend
 		else
 		{
 			ulong largeCommitBase = faultAddress & 0xFFFFFFFFFFE00000uL;
-			if (TryCommitRange(_hostMemory, largeCommitBase, 2097152uL, commitProtect))
+			if (TryCommitRange(largeCommitBase, 2097152uL, commitProtect))
 			{
 				committed = true;
 				committedBase = largeCommitBase;
@@ -1753,19 +1469,19 @@ public sealed partial class DirectExecutionBackend
 		if (!committed)
 		{
 			ulong region64kBase = faultAddress & 0xFFFFFFFFFFFF0000uL;
-			if (TryCommitRange(_hostMemory, region64kBase, 65536uL, commitProtect))
+			if (TryCommitRange(region64kBase, 65536uL, commitProtect))
 			{
 				committed = true;
 				committedBase = region64kBase;
 				committedSize = 65536uL;
 			}
-			else if (TryCommitRange(_hostMemory, pageBase, 8192uL, commitProtect))
+			else if (TryCommitRange(pageBase, 8192uL, commitProtect))
 			{
 				committed = true;
 				committedBase = pageBase;
 				committedSize = 8192uL;
 			}
-			else if (TryCommitRange(_hostMemory, pageBase, 4096uL, commitProtect))
+			else if (TryCommitRange(pageBase, 4096uL, commitProtect))
 			{
 				committed = true;
 				committedBase = pageBase;
@@ -1778,57 +1494,12 @@ public sealed partial class DirectExecutionBackend
 			return false;
 		}
 
-		TryCommitRange(_hostMemory, pageBase + 4096, 4096uL, commitProtect);
-		BackStackPointerIfNeeded(rsp);
+		TryCommitRange(pageBase + 4096, 4096uL, commitProtect);
 		if (traceLazyCommit)
 		{
 			Console.Error.WriteLine($"[LOADER][TRACE] lazy-commit#{traceIndex}: addr=0x{committedBase:X16} size=0x{committedSize:X16} access={accessType} protect=0x{commitProtect:X8}");
 		}
 		return true;
-
-		// Backing the fault address is not enough: exception dispatch itself
-		// writes a trap frame onto the faulting thread's OWN stack, below its
-		// current RSP, before any handler -- including this one -- gets to
-		// run. If RSP is sitting in guest-owned memory we manage lazily (this
-		// pool's downward headroom, or a guest-provided lazy stack) and that
-		// page is still unbacked, the NEXT fault on this thread (a stack push,
-		// or the dispatch frame for any unrelated fault) cannot be delivered
-		// at all: no VEH, no managed hook, no watchdog line, just a silent
-		// process kill. Proactively commit around RSP too, best-effort.
-		void BackStackPointerIfNeeded(ulong stackPointer)
-		{
-			if (stackPointer < 65536 || stackPointer >= 140737488355328L)
-			{
-				return;
-			}
-			if (!IsGuestOwnedLazyCommitAddress(stackPointer, out _))
-			{
-				return;
-			}
-			if (!_hostMemory.Query(stackPointer, out var spMbi) ||
-				spMbi.State == HostRegionState.Committed)
-			{
-				return;
-			}
-
-			ulong spPageBase = stackPointer & 0xFFFFFFFFFFFFF000uL;
-			if (spMbi.State == HostRegionState.Free)
-			{
-				if (!TryGetLazyCommitWindow(stackPointer, spMbi.BaseAddress, spMbi.RegionSize, out var spWindowBase, out var spWindowSize) ||
-					!TryReserveThenCommit(_hostMemory, spWindowBase, spWindowSize, spWindowBase, spWindowSize, commitProtect))
-				{
-					TryReserveThenCommit(_hostMemory, spPageBase, 65536uL, spPageBase, 65536uL, commitProtect);
-				}
-			}
-			else if (spMbi.State == HostRegionState.Reserved)
-			{
-				if (!TryGetLazyCommitWindow(stackPointer, spMbi.BaseAddress, spMbi.RegionSize, out var spCommitBase, out var spCommitSize) ||
-					!TryCommitRange(_hostMemory, spCommitBase, spCommitSize, commitProtect))
-				{
-					TryCommitRange(_hostMemory, spPageBase, 65536uL, commitProtect);
-				}
-			}
-		}
 
 		static bool TryGetLazyCommitWindow(ulong fault, ulong regionBase, ulong regionSize, out ulong baseAddress, out ulong length)
 		{
@@ -1864,33 +1535,31 @@ public sealed partial class DirectExecutionBackend
 			return true;
 		}
 
-		// The commit protection is one of the two raw values ResolveLazyCommitProtection
-		// produces (0x40 RWX / 0x04 RW); the enum mapping reproduces those exactly.
-		static bool TryCommitRange(IHostMemory hostMemory, ulong baseAddress, ulong length, uint protection)
+		static unsafe bool TryCommitRange(ulong baseAddress, ulong length, uint protection)
 		{
 			if (length == 0)
 			{
 				return false;
 			}
-			return hostMemory.Commit(baseAddress, length, protection == 64u ? HostPageProtection.ReadWriteExecute : HostPageProtection.ReadWrite);
+			return VirtualAlloc((void*)baseAddress, (nuint)length, 4096u, protection) != null;
 		}
 
-		static bool TryReserveRange(IHostMemory hostMemory, ulong baseAddress, ulong length)
+		static unsafe bool TryReserveRange(ulong baseAddress, ulong length)
 		{
 			if (length == 0)
 			{
 				return false;
 			}
-			return hostMemory.Reserve(baseAddress, length, HostPageProtection.ReadWrite) != 0;
+			return VirtualAlloc((void*)baseAddress, (nuint)length, 8192u, 4u) != null;
 		}
 
-		static bool TryReserveThenCommit(IHostMemory hostMemory, ulong reserveAddress, ulong reserveSize, ulong commitAddress, ulong commitSize, uint protection)
+		static bool TryReserveThenCommit(ulong reserveAddress, ulong reserveSize, ulong commitAddress, ulong commitSize, uint protection)
 		{
-			if (!TryReserveRange(hostMemory, reserveAddress, reserveSize))
+			if (!TryReserveRange(reserveAddress, reserveSize))
 			{
 				return false;
 			}
-			return TryCommitRange(hostMemory, commitAddress, commitSize, protection);
+			return TryCommitRange(commitAddress, commitSize, protection);
 		}
 
 		static bool IsAccessCompatible(ulong accessType, uint protection)

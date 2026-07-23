@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using SharpEmu.HLE;
+using System.Buffers.Binary;
+
 namespace SharpEmu.Libs.SaveData;
 
 public static class SaveDataDialogExports
@@ -15,18 +17,14 @@ public static class SaveDataDialogExports
     private const int ErrorNotInitialized = unchecked((int)0x80B80003);
     private const int ErrorAlreadyInitialized = unchecked((int)0x80B80004);
     private const int ErrorNotFinished = unchecked((int)0x80B80005);
-    private const int ErrorInvalidState = unchecked((int)0x80B80006);
-    private const int ErrorParamInvalid = unchecked((int)0x80B8000A);
     private const int ErrorNotRunning = unchecked((int)0x80B8000B);
     private const int ErrorArgNull = unchecked((int)0x80B8000D);
-    private const int ErrorNotSupported = unchecked((int)0x80B8000F);
 
+    private const int ResultSize = 0x48;
     private const int ButtonIdAffirmative = 1;
-    private const int ModeProgressBar = 5;
     private static int _status;
     private static int _lastMode;
     private static ulong _lastUserData;
-    private static uint _progress;
 
     [SysAbiExport(
         Nid = "s9e3+YpRnzw",
@@ -56,24 +54,13 @@ public static class SaveDataDialogExports
             return ctx.SetReturn(ErrorArgNull);
         }
 
-        if (Volatile.Read(ref _status) is not (StatusInitialized or StatusFinished))
+        if (_status is not (StatusInitialized or StatusFinished))
         {
-            return ctx.SetReturn(ErrorInvalidState);
+            return ctx.SetReturn(ErrorNotInitialized);
         }
 
-        if (!TryReadInt32(ctx, paramAddress + 0x34, out var mode) || mode is < 0 or > ModeProgressBar)
-        {
-            if (!TryReadInt32(ctx, paramAddress, out mode))
-            {
-                return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
-            }
-        }
-
-        _lastMode = mode;
-        _lastUserData = ctx.TryReadUInt64(paramAddress + 0x70, out var userData)
-            ? userData
-            : ctx.TryReadUInt64(paramAddress + 0xC8, out userData) ? userData : 0;
-        _progress = 0;
+        _lastMode = TryReadInt32(ctx, paramAddress, out var mode) ? mode : 0;
+        _lastUserData = ctx.TryReadUInt64(paramAddress + 0xC8, out var userData) ? userData : 0;
 
         // There is no host save dialog yet. Enter RUNNING so the close path sees a live
         // dialog; the guest's next status poll auto-dismisses it (see PollStatus).
@@ -131,11 +118,16 @@ public static class SaveDataDialogExports
             return ctx.SetReturn(ErrorNotFinished);
         }
 
-        // Preserve the caller's dirName and param pointers at +0x10 and +0x18.
-        if (!ctx.TryWriteUInt32(resultAddress, unchecked((uint)_lastMode)) ||
-            !ctx.TryWriteUInt32(resultAddress + 0x04, 0) ||
-            !ctx.TryWriteUInt32(resultAddress + 0x08, ButtonIdAffirmative) ||
-            !ctx.TryWriteUInt64(resultAddress + 0x20, _lastUserData))
+        // Report the affirmative button so save prompts take the confirming branch;
+        // buttonId 0 is the "invalid" sentinel and games may treat it as an error.
+        Span<byte> result = stackalloc byte[ResultSize];
+        result.Clear();
+        BinaryPrimitives.WriteInt32LittleEndian(result[0x00..], _lastMode);
+        BinaryPrimitives.WriteInt32LittleEndian(result[0x04..], 0);
+        BinaryPrimitives.WriteInt32LittleEndian(result[0x08..], ButtonIdAffirmative);
+        BinaryPrimitives.WriteUInt64LittleEndian(result[0x20..], _lastUserData);
+
+        if (!ctx.Memory.TryWrite(resultAddress, result))
         {
             return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
         }
@@ -172,7 +164,6 @@ public static class SaveDataDialogExports
 
         _lastMode = 0;
         _lastUserData = 0;
-        _progress = 0;
         return ctx.SetReturn(ErrorOk);
     }
 
@@ -181,60 +172,26 @@ public static class SaveDataDialogExports
         ExportName = "sceSaveDataDialogProgressBarInc",
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libSceSaveDataDialog")]
-    public static int SaveDataDialogProgressBarInc(CpuContext ctx)
-    {
-        var validation = ValidateProgressRequest(ctx);
-        if (validation != ErrorOk)
-        {
-            return ctx.SetReturn(validation);
-        }
-
-        _progress = Math.Min(100, _progress + unchecked((uint)ctx[CpuRegister.Rsi]));
-        return ctx.SetReturn(ErrorOk);
-    }
+    public static int SaveDataDialogProgressBarInc(CpuContext ctx) => ctx.SetReturn(ErrorOk);
 
     [SysAbiExport(
         Nid = "hay1CfTmLyA",
         ExportName = "sceSaveDataDialogProgressBarSetValue",
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libSceSaveDataDialog")]
-    public static int SaveDataDialogProgressBarSetValue(CpuContext ctx)
-    {
-        var validation = ValidateProgressRequest(ctx);
-        if (validation != ErrorOk)
-        {
-            return ctx.SetReturn(validation);
-        }
-
-        var value = unchecked((uint)ctx[CpuRegister.Rsi]);
-        if (value > 100)
-        {
-            return ctx.SetReturn(ErrorParamInvalid);
-        }
-
-        _progress = value;
-        return ctx.SetReturn(ErrorOk);
-    }
-
-    private static int ValidateProgressRequest(CpuContext ctx)
-    {
-        if (Volatile.Read(ref _status) != StatusRunning)
-        {
-            return ErrorNotRunning;
-        }
-
-        if (_lastMode != ModeProgressBar)
-        {
-            return ErrorNotSupported;
-        }
-
-        return ctx[CpuRegister.Rdi] == 0 ? ErrorOk : ErrorParamInvalid;
-    }
+    public static int SaveDataDialogProgressBarSetValue(CpuContext ctx) => ctx.SetReturn(ErrorOk);
 
     private static bool TryReadInt32(CpuContext ctx, ulong address, out int value)
     {
         value = 0;
-        return ctx.TryReadInt32(address, out value);
+        Span<byte> bytes = stackalloc byte[sizeof(int)];
+        if (!ctx.Memory.TryRead(address, bytes))
+        {
+            return false;
+        }
+
+        value = BinaryPrimitives.ReadInt32LittleEndian(bytes);
+        return true;
     }
 
     private static void TraceSaveDataDialog(string message)

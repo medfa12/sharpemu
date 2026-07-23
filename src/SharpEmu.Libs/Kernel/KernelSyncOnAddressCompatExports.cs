@@ -2,26 +2,55 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using System.Collections.Concurrent;
-using System.Diagnostics;
+using System.Threading;
 using SharpEmu.HLE;
 
 namespace SharpEmu.Libs.Kernel;
 
+// libKernel's address-wait primitives (sceKernelSyncOnAddress*) are the PS5's
+// futex-style wait/wake: a thread parks on a guest address until another thread
+// wakes that address. Guest runtimes (seen driving Juicy Realm, PPSA19268)
+// build their own spinlocks/queues on top of it and call the wait in a hot
+// loop; left unimplemented, every wait returns immediately and the runtime
+// busy-spins forever (millions of calls, no forward progress).
+//
+// This implements wait/wake over the existing cooperative-block scheduler,
+// keyed on the address. The real primitive takes a compare value so the wait
+// only sleeps while the address still holds the expected value; that exact
+// value is not recovered here, so each wait is given a bounded deadline and
+// treated as a spurious-wakeup-tolerant park: a genuinely missed wake
+// self-heals when the deadline expires and the guest re-checks its own
+// condition, which futex callers already tolerate. A matching wake releases
+// waiters immediately through the same key.
 public static class KernelSyncOnAddressCompatExports
 {
-    private sealed class AddressWaitState
-    {
-        public object Gate { get; } = new();
-        public LinkedList<AddressWaiter> Waiters { get; } = new();
-    }
+    // Safety-net poll interval. Real releases come from the wake side (generation
+    // bump + WakeBlockedThreads); this only bounds how long a wait that genuinely
+    // raced/missed its wake stays parked before the guest re-evaluates. Kept
+    // large: a short interval turns every parked waiter into a hot re-poll that
+    // steals scheduler bandwidth from the threads that actually make progress
+    // (including the ones that would issue the wake), so it must be a rare last
+    // resort, not a spin substitute.
+    private static readonly TimeSpan WaitSelfHealTimeout = TimeSpan.FromMilliseconds(100);
 
-    private sealed class AddressWaiter
-    {
-        public bool Released { get; set; }
-        public LinkedListNode<AddressWaiter>? Node { get; set; }
-    }
+    // Per-address host gate for the non-cooperative (host main thread) fallback,
+    // which cannot use the guest-thread scheduler's block mechanism.
+    private static readonly ConcurrentDictionary<ulong, object> _hostAddressGates = new();
 
-    private static readonly ConcurrentDictionary<ulong, AddressWaitState> _addressStates = new();
+    // Per-address wake generation. A wait captures the current generation and
+    // its wake predicate stays unsatisfied (keeps the thread parked) until a
+    // wake bumps it. This is what actually holds the thread blocked: a bare
+    // "always satisfied" predicate is treated as an immediate late-arrival by
+    // the dispatcher's race guard and never yields, leaving the guest to
+    // busy-spin. The generation also closes the register-vs-park race for free:
+    // a wake landing in that window bumps the generation, so the predicate is
+    // already satisfied and the guest correctly resumes at once.
+    private static readonly ConcurrentDictionary<ulong, long> _wakeGenerations = new();
+
+    private static long CurrentGeneration(ulong address) =>
+        _wakeGenerations.TryGetValue(address, out var generation) ? generation : 0;
+
+    private static string WakeKey(ulong address) => $"sceKernelSyncOnAddress:{address:X16}";
 
     [SysAbiExport(
         Nid = "Hc4CaR6JBL0",
@@ -31,35 +60,40 @@ public static class KernelSyncOnAddressCompatExports
     public static int SyncOnAddressWait(CpuContext ctx)
     {
         var address = ctx[CpuRegister.Rdi];
-        var expectedValue = ctx[CpuRegister.Rsi];
-        var size = ctx[CpuRegister.Rdx];
-        var timeoutMicroseconds = ctx[CpuRegister.Rcx];
-
-        if (address == 0 || !IsSupportedSize(size))
+        if (address == 0)
         {
-            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
         }
 
-        var state = _addressStates.GetOrAdd(address, static _ => new AddressWaitState());
-        lock (state.Gate)
+        var observedGeneration = CurrentGeneration(address);
+        var deadline = GuestThreadExecution.ComputeDeadlineTimestamp(WaitSelfHealTimeout);
+
+        // Cooperative path: stay parked until a wake bumps this address's
+        // generation (or the deadline expires as a self-heal). The guest
+        // re-evaluates its own condition after resuming.
+        if (GuestThreadExecution.RequestCurrentThreadBlock(
+                ctx,
+                "sceKernelSyncOnAddressWait",
+                WakeKey(address),
+                resumeHandler: () => (int)OrbisGen2Result.ORBIS_GEN2_OK,
+                wakeHandler: () => CurrentGeneration(address) != observedGeneration,
+                deadline))
         {
-            if (!TryReadValue(ctx, address, size, out var currentValue))
-            {
-                return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
-            }
-
-            if (currentValue != MaskExpectedValue(expectedValue, size))
-            {
-                return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
-            }
-
-            if (timeoutMicroseconds == 0)
-            {
-                return WaitWithoutTimeout(ctx, state);
-            }
-
-            return WaitWithTimeout(ctx, state, timeoutMicroseconds);
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK);
         }
+
+        // Non-cooperative caller (host main thread): bounded host wait so a
+        // missed wake self-heals instead of hanging.
+        var gate = _hostAddressGates.GetOrAdd(address, static _ => new object());
+        lock (gate)
+        {
+            if (CurrentGeneration(address) == observedGeneration)
+            {
+                Monitor.Wait(gate, WaitSelfHealTimeout);
+            }
+        }
+
+        return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK);
     }
 
     [SysAbiExport(
@@ -70,155 +104,37 @@ public static class KernelSyncOnAddressCompatExports
     public static int SyncOnAddressWake(CpuContext ctx)
     {
         var address = ctx[CpuRegister.Rdi];
-        var requestedCount = ctx[CpuRegister.Rsi];
         if (address == 0)
         {
-            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
         }
 
-        if (requestedCount == 0 || !_addressStates.TryGetValue(address, out var state))
-        {
-            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
-        }
+        // rsi carries the number of waiters to release (1 = wake-one, a large
+        // value = wake-all); default to all if it looks unset.
+        var requested = unchecked((long)ctx[CpuRegister.Rsi]);
+        var wakeCount = requested is > 0 and < int.MaxValue ? (int)requested : int.MaxValue;
 
-        lock (state.Gate)
+        // Bump the generation first so a wait that has registered but not yet
+        // parked sees the change and resumes instead of missing this wake.
+        _wakeGenerations.AddOrUpdate(address, 1, static (_, current) => current + 1);
+
+        GuestThreadExecution.Scheduler?.WakeBlockedThreads(WakeKey(address), wakeCount);
+
+        if (_hostAddressGates.TryGetValue(address, out var gate))
         {
-            var remaining = requestedCount;
-            while (remaining != 0 && state.Waiters.First is { } node)
+            lock (gate)
             {
-                state.Waiters.RemoveFirst();
-                node.Value.Node = null;
-                node.Value.Released = true;
-                remaining--;
+                Monitor.PulseAll(gate);
             }
-
-            Monitor.PulseAll(state.Gate);
         }
 
-        return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
+        return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK);
     }
 
-    private static int WaitWithoutTimeout(CpuContext ctx, AddressWaitState state)
+    private static int SetReturn(CpuContext ctx, OrbisGen2Result result)
     {
-        var waiter = EnqueueWaiter(state);
-        try
-        {
-            while (!waiter.Released && !GuestThreadBlocking.ShutdownRequested)
-            {
-                _ = Monitor.Wait(state.Gate, GuestThreadBlocking.WaitSliceMilliseconds);
-            }
-
-            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
-        }
-        finally
-        {
-            RemoveWaiter(state, waiter);
-        }
-    }
-
-    private static int WaitWithTimeout(CpuContext ctx, AddressWaitState state, ulong timeoutMicroseconds)
-    {
-        var timeout = TimeSpan.FromTicks((long)Math.Min(timeoutMicroseconds, (ulong)(TimeSpan.MaxValue.Ticks / 10)) * 10L);
-        var startedAt = Stopwatch.GetTimestamp();
-        var waiter = EnqueueWaiter(state);
-        try
-        {
-            while (!waiter.Released && !GuestThreadBlocking.ShutdownRequested)
-            {
-                var remaining = timeout - Stopwatch.GetElapsedTime(startedAt);
-                if (remaining <= TimeSpan.Zero)
-                {
-                    return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_TIMED_OUT);
-                }
-
-                var waitMilliseconds = (int)Math.Min(
-                    Math.Max(1, Math.Ceiling(remaining.TotalMilliseconds)),
-                    GuestThreadBlocking.WaitSliceMilliseconds);
-                _ = Monitor.Wait(state.Gate, waitMilliseconds);
-            }
-
-            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
-        }
-        finally
-        {
-            RemoveWaiter(state, waiter);
-        }
-    }
-
-    private static AddressWaiter EnqueueWaiter(AddressWaitState state)
-    {
-        var waiter = new AddressWaiter();
-        waiter.Node = state.Waiters.AddLast(waiter);
-        return waiter;
-    }
-
-    private static void RemoveWaiter(AddressWaitState state, AddressWaiter waiter)
-    {
-        if (waiter.Node is { } node)
-        {
-            state.Waiters.Remove(node);
-            waiter.Node = null;
-        }
-    }
-
-    private static bool IsSupportedSize(ulong size) => size is 1 or 2 or 4 or 8;
-
-    private static ulong MaskExpectedValue(ulong value, ulong size) => size switch
-    {
-        1 => value & byte.MaxValue,
-        2 => value & ushort.MaxValue,
-        4 => value & uint.MaxValue,
-        _ => value,
-    };
-
-    private static bool TryReadValue(CpuContext ctx, ulong address, ulong size, out ulong value)
-    {
-        switch (size)
-        {
-            case 1:
-                if (ctx.TryReadByte(address, out var byteValue))
-                {
-                    value = byteValue;
-                    return true;
-                }
-                break;
-            case 2:
-                if (ctx.TryReadUInt16(address, out var uint16Value))
-                {
-                    value = uint16Value;
-                    return true;
-                }
-                break;
-            case 4:
-                if (ctx.TryReadUInt32(address, out var uint32Value))
-                {
-                    value = uint32Value;
-                    return true;
-                }
-                break;
-            case 8:
-                return ctx.TryReadUInt64(address, out value);
-        }
-
-        value = 0;
-        return false;
-    }
-
-    internal static int GetWaiterCountForTests(ulong address)
-    {
-        if (!_addressStates.TryGetValue(address, out var state))
-        {
-            return 0;
-        }
-
-        lock (state.Gate)
-        {
-            return state.Waiters.Count;
-        }
-    }
-
-    internal static void ResetForTests()
-    {
-        _addressStates.Clear();
+        var value = (int)result;
+        ctx[CpuRegister.Rax] = unchecked((ulong)value);
+        return value;
     }
 }

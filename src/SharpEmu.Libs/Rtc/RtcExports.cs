@@ -1,35 +1,21 @@
 // Copyright (C) 2026 SharpEmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-using System.Buffers.Binary;
-using System.Globalization;
 using SharpEmu.HLE;
+using System.Buffers.Binary;
 
 namespace SharpEmu.Libs.Rtc;
 
 public static class RtcExports
 {
-    private const ulong DateTimeTicksPerMicrosecond = 10;
-    private const ulong MicrosecondsPerSecond = 1_000_000;
-    private const ulong MicrosecondsPerMinute = 60_000_000;
-    private const ulong MicrosecondsPerHour = 3_600_000_000;
-    private const ulong MicrosecondsPerDay = 86_400_000_000;
-    private const ulong MicrosecondsPerWeek = 604_800_000_000;
-    private const ulong UnixEpochTicks = 62_135_596_800_000_000;
-    private const ulong Win32FileTimeEpochTicks = 50_491_123_200_000_000;
-    private const ulong MaximumRtcTick = 315_537_897_599_999_999;
-
-    private const int RtcErrorDateTimeUninitialized = 0x7FFEF9FE;
-    private const int RtcErrorInvalidPointer = unchecked((int)0x80B50002);
-    private const int RtcErrorInvalidValue = unchecked((int)0x80B50003);
-    private const int RtcErrorInvalidArgument = unchecked((int)0x80B50004);
-    private const int RtcErrorInvalidYear = unchecked((int)0x80B50008);
-    private const int RtcErrorInvalidMonth = unchecked((int)0x80B50009);
-    private const int RtcErrorInvalidDay = unchecked((int)0x80B5000A);
-    private const int RtcErrorInvalidHour = unchecked((int)0x80B5000B);
-    private const int RtcErrorInvalidMinute = unchecked((int)0x80B5000C);
-    private const int RtcErrorInvalidSecond = unchecked((int)0x80B5000D);
-    private const int RtcErrorInvalidMicrosecond = unchecked((int)0x80B5000E);
+    private const long DateTimeTicksPerMicrosecond = 10;
+    private const ulong MicrosecondsPerSecond = 1_000_000UL;
+    private const ulong MicrosecondsPerMinute = 60_000_000UL;
+    private const ulong MicrosecondsPerHour = 3_600_000_000UL;
+    private const ulong MicrosecondsPerDay = 86_400_000_000UL;
+    private const ulong MicrosecondsPerWeek = 604_800_000_000UL;
+    private const ulong UnixEpochTicks = 62_135_596_800_000_000UL;
+    private const ulong Win32FileTimeEpochTicks = 50_491_123_200_000_000UL;
 
     [SysAbiExport(
         Nid = "lPEBYdVX0XQ",
@@ -41,15 +27,15 @@ public static class RtcExports
         var timeAddress = ctx[CpuRegister.Rdi];
         if (timeAddress == 0)
         {
-            return ctx.SetReturn(RtcErrorInvalidPointer);
+            return unchecked((int)0x80B50002);
         }
 
         if (!TryReadRtcDateTime(ctx, timeAddress, out var time))
         {
-            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }
 
-        return ctx.SetReturn(ValidateRtcDateTime(time));
+        return ValidateRtcDateTime(time);
     }
 
     [SysAbiExport(
@@ -59,20 +45,19 @@ public static class RtcExports
         LibraryName = "libSceRtc")]
     public static int RtcCompareTick(CpuContext ctx)
     {
-        var firstAddress = ctx[CpuRegister.Rdi];
-        var secondAddress = ctx[CpuRegister.Rsi];
-        if (firstAddress == 0 || secondAddress == 0)
+        var tick1Address = ctx[CpuRegister.Rdi];
+        var tick2Address = ctx[CpuRegister.Rsi];
+        if (tick1Address == 0 || tick2Address == 0)
         {
-            return ctx.SetReturn(RtcErrorInvalidPointer);
+            return unchecked((int)0x80B50002);
         }
 
-        if (!ctx.TryReadUInt64(firstAddress, out var first) ||
-            !ctx.TryReadUInt64(secondAddress, out var second))
+        if (!ctx.TryReadUInt64(tick1Address, out var tick1) || !ctx.TryReadUInt64(tick2Address, out var tick2))
         {
-            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }
 
-        return ctx.SetReturn(first <= second ? 1 : 0);
+        return tick1 < tick2 ? -1 : tick1 > tick2 ? 1 : 0;
     }
 
     [SysAbiExport(
@@ -82,36 +67,45 @@ public static class RtcExports
         LibraryName = "libSceRtc")]
     public static int RtcConvertLocalTimeToUtc(CpuContext ctx)
     {
-        var localAddress = ctx[CpuRegister.Rdi];
-        var utcAddress = ctx[CpuRegister.Rsi];
-        if (localAddress == 0 || utcAddress == 0)
+        var tickLocalAddress = ctx[CpuRegister.Rdi];
+        var tickUtcAddress = ctx[CpuRegister.Rsi];
+        if (tickLocalAddress == 0 || tickUtcAddress == 0)
         {
-            return ctx.SetReturn(RtcErrorInvalidPointer);
+            return unchecked((int)0x80B50002);
         }
 
-        if (!ctx.TryReadUInt64(localAddress, out var localTick))
+        if (!ctx.TryReadUInt64(tickLocalAddress, out var tickLocal))
         {
-            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }
 
-        if (!TryConvertTickToDateTime(localTick, DateTimeKind.Unspecified, out var localTime))
+        if (!TryConvertTickToDateTime(tickLocal, out var localDateTime))
         {
-            return ctx.SetReturn(RtcErrorInvalidValue);
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
         }
 
-        DateTime utcTime;
+        // TryConvertTickToDateTime yields a Utc-kind DateTime, but here the tick is a local
+        // wall-clock time. ConvertTimeToUtc throws ArgumentException when a Utc-kind value is
+        // paired with a non-UTC source zone, so on any host not set to UTC this would always
+        // fail. Re-tag as Unspecified so the value is interpreted as local time and converted.
+        localDateTime = DateTime.SpecifyKind(localDateTime, DateTimeKind.Unspecified);
+
+        DateTime utcDateTime;
         try
         {
-            utcTime = TimeZoneInfo.ConvertTimeToUtc(localTime, TimeZoneInfo.Local);
+            utcDateTime = TimeZoneInfo.ConvertTimeToUtc(localDateTime, TimeZoneInfo.Local);
         }
         catch (ArgumentException)
         {
-            return ctx.SetReturn(RtcErrorInvalidArgument);
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
         }
 
-        return ctx.TryWriteUInt64(utcAddress, ToTick(utcTime))
-            ? ctx.SetReturn(0)
-            : ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        if (!TryWriteTickFromDateTime(ctx, tickUtcAddress, utcDateTime))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
     [SysAbiExport(
@@ -121,36 +115,39 @@ public static class RtcExports
         LibraryName = "libSceRtc")]
     public static int RtcConvertUtcToLocalTime(CpuContext ctx)
     {
-        var utcAddress = ctx[CpuRegister.Rdi];
-        var localAddress = ctx[CpuRegister.Rsi];
-        if (utcAddress == 0 || localAddress == 0)
+        var tickUtcAddress = ctx[CpuRegister.Rdi];
+        var tickLocalAddress = ctx[CpuRegister.Rsi];
+        if (tickUtcAddress == 0 || tickLocalAddress == 0)
         {
-            return ctx.SetReturn(RtcErrorInvalidPointer);
+            return unchecked((int)0x80B50002);
         }
 
-        if (!ctx.TryReadUInt64(utcAddress, out var utcTick))
+        if (!ctx.TryReadUInt64(tickUtcAddress, out var tickUtc))
         {
-            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }
 
-        if (!TryConvertTickToDateTime(utcTick, DateTimeKind.Utc, out var utcTime))
+        if (!TryConvertTickToDateTime(tickUtc, out var utcDateTime))
         {
-            return ctx.SetReturn(RtcErrorInvalidValue);
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
         }
 
-        DateTime localTime;
+        DateTime localDateTime;
         try
         {
-            localTime = TimeZoneInfo.ConvertTimeFromUtc(utcTime, TimeZoneInfo.Local);
+            localDateTime = TimeZoneInfo.ConvertTimeFromUtc(utcDateTime, TimeZoneInfo.Local);
         }
         catch (ArgumentException)
         {
-            return ctx.SetReturn(RtcErrorInvalidArgument);
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
         }
 
-        return ctx.TryWriteUInt64(localAddress, ToTick(localTime))
-            ? ctx.SetReturn(0)
-            : ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        if (!TryWriteTickFromDateTime(ctx, tickLocalAddress, localDateTime))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
     [SysAbiExport(
@@ -158,14 +155,17 @@ public static class RtcExports
         ExportName = "sceRtcEnd",
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libSceRtc")]
-    public static int RtcEnd(CpuContext ctx) => ctx.SetReturn(0);
+    public static int RtcEnd(CpuContext ctx)
+    {
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
 
     [SysAbiExport(
         Nid = "LN3Zcb72Q0c",
         ExportName = "sceRtcGetCurrentAdNetworkTick",
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libSceRtc")]
-    public static int RtcGetCurrentAdNetworkTick(CpuContext ctx) => GetCurrentNetworkTick(ctx);
+    public static int RtcGetCurrentAdNetworkTick(CpuContext ctx) => RtcGetCurrentTick(ctx);
 
     [SysAbiExport(
         Nid = "8lfvnRMqwEM",
@@ -177,20 +177,26 @@ public static class RtcExports
         var timeAddress = ctx[CpuRegister.Rdi];
         if (timeAddress == 0)
         {
-            return ctx.SetReturn(RtcErrorDateTimeUninitialized);
+            return unchecked((int)0x80B50002);
         }
 
         var timeZoneMinutes = unchecked((int)ctx[CpuRegister.Rsi]);
-        var utcTick = ToTick(DateTime.UtcNow);
-        var adjustedTick = unchecked(utcTick + (ulong)(unchecked((long)timeZoneMinutes * (long)MicrosecondsPerMinute)));
-        if (!TryConvertTickToRtcDateTime(adjustedTick, out var time))
+        DateTimeOffset currentTime;
+        try
         {
-            return ctx.SetReturn(RtcErrorInvalidValue);
+            currentTime = DateTimeOffset.UtcNow.ToOffset(TimeSpan.FromMinutes(timeZoneMinutes));
+        }
+        catch (ArgumentOutOfRangeException)
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
         }
 
-        return TryWriteRtcDateTime(ctx, timeAddress, time)
-            ? ctx.SetReturn(0)
-            : ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        if (!TryWriteRtcDateTime(ctx, timeAddress, ToRtcDateTime(currentTime.DateTime)))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
     [SysAbiExport(
@@ -203,12 +209,15 @@ public static class RtcExports
         var timeAddress = ctx[CpuRegister.Rdi];
         if (timeAddress == 0)
         {
-            return ctx.SetReturn(RtcErrorDateTimeUninitialized);
+            return unchecked((int)0x80B50002);
         }
 
-        return TryWriteRtcDateTime(ctx, timeAddress, ToRtcDateTime(DateTime.Now))
-            ? ctx.SetReturn(0)
-            : ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        if (!TryWriteRtcDateTime(ctx, timeAddress, ToRtcDateTime(DateTimeOffset.Now.DateTime)))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
     [SysAbiExport(
@@ -216,21 +225,79 @@ public static class RtcExports
         ExportName = "sceRtcGetCurrentDebugNetworkTick",
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libSceRtc")]
-    public static int RtcGetCurrentDebugNetworkTick(CpuContext ctx) => GetCurrentNetworkTick(ctx);
+    public static int RtcGetCurrentDebugNetworkTick(CpuContext ctx) => RtcGetCurrentTick(ctx);
 
     [SysAbiExport(
         Nid = "zO9UL3qIINQ",
         ExportName = "sceRtcGetCurrentNetworkTick",
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libSceRtc")]
-    public static int RtcGetCurrentNetworkTick(CpuContext ctx) => GetCurrentNetworkTick(ctx);
+    public static int RtcGetCurrentNetworkTick(CpuContext ctx) => RtcGetCurrentTick(ctx);
 
     [SysAbiExport(
         Nid = "HWxHOdbM-Pg",
         ExportName = "sceRtcGetCurrentRawNetworkTick",
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libSceRtc")]
-    public static int RtcGetCurrentRawNetworkTick(CpuContext ctx) => GetCurrentNetworkTick(ctx);
+    public static int RtcGetCurrentRawNetworkTick(CpuContext ctx) => RtcGetCurrentTick(ctx);
+
+    // Diagnostic: middleware busy-wait loops typically poll sceRtcGetCurrentTick, so the
+    // caller's return address pinpoints the loop. SHARPEMU_RTC_PROBE_RANGE=<start>-<end>
+    // (hex guest addresses) dumps 0x100 bytes of code around the first matching caller,
+    // once, for offline disassembly. Costs nothing when the variable is unset.
+    private static readonly ulong[]? _rtcProbeRange = ParseRtcProbeRange();
+    private static int _rtcProbeDone;
+
+    private static ulong[]? ParseRtcProbeRange()
+    {
+        var value = Environment.GetEnvironmentVariable("SHARPEMU_RTC_PROBE_RANGE");
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return null;
+        }
+
+        var parts = value.Split('-', 2, StringSplitOptions.TrimEntries);
+        return parts.Length == 2 &&
+               TryParseHexAddress(parts[0], out var start) &&
+               TryParseHexAddress(parts[1], out var end) &&
+               start < end
+            ? [start, end]
+            : null;
+    }
+
+    private static bool TryParseHexAddress(string value, out ulong address)
+    {
+        if (value.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+        {
+            value = value[2..];
+        }
+
+        return ulong.TryParse(
+            value,
+            System.Globalization.NumberStyles.HexNumber,
+            null,
+            out address);
+    }
+
+    private static void ProbeRtcCaller(CpuContext ctx)
+    {
+        if (Volatile.Read(ref _rtcProbeDone) != 0 ||
+            !ctx.TryReadUInt64(ctx[CpuRegister.Rsp], out var ret) ||
+            ret < _rtcProbeRange![0] ||
+            ret >= _rtcProbeRange[1] ||
+            Interlocked.CompareExchange(ref _rtcProbeDone, 1, 0) != 0)
+        {
+            return;
+        }
+
+        var start = ret - 0x60;
+        Span<byte> code = stackalloc byte[0x100];
+        if (ctx.Memory.TryRead(start, code))
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][DIAG] rtc.caller_code ret=0x{ret:X} @0x{start:X}: {System.Convert.ToHexString(code)}");
+        }
+    }
 
     [SysAbiExport(
         Nid = "18B2NS1y9UU",
@@ -242,12 +309,21 @@ public static class RtcExports
         var tickAddress = ctx[CpuRegister.Rdi];
         if (tickAddress == 0)
         {
-            return ctx.SetReturn(RtcErrorDateTimeUninitialized);
+            return unchecked((int)0x80B50002);
         }
 
-        return ctx.TryWriteUInt64(tickAddress, ToTick(DateTime.UtcNow))
-            ? ctx.SetReturn(0)
-            : ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        if (_rtcProbeRange is not null)
+        {
+            ProbeRtcCaller(ctx);
+        }
+
+        var tickValue = unchecked((ulong)(DateTime.UtcNow.Ticks / DateTimeTicksPerMicrosecond));
+        if (!ctx.TryWriteUInt64(tickAddress, tickValue))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
     [SysAbiExport(
@@ -260,23 +336,12 @@ public static class RtcExports
         var year = unchecked((int)ctx[CpuRegister.Rdi]);
         var month = unchecked((int)ctx[CpuRegister.Rsi]);
         var day = unchecked((int)ctx[CpuRegister.Rdx]);
-
-        if (year < 1 || year > 9999)
+        if (!IsValidCalendarDate(year, month, day))
         {
-            return ctx.SetReturn(RtcErrorInvalidYear);
+            return unchecked((int)0x80B50004);
         }
 
-        if (month < 1 || month > 12)
-        {
-            return ctx.SetReturn(RtcErrorInvalidMonth);
-        }
-
-        if (day < 1 || day > DateTime.DaysInMonth(year, month))
-        {
-            return ctx.SetReturn(RtcErrorInvalidDay);
-        }
-
-        return ctx.SetReturn((int)new DateTime(year, month, day).DayOfWeek);
+        return (int)new DateTime(year, month, day).DayOfWeek;
     }
 
     [SysAbiExport(
@@ -290,15 +355,15 @@ public static class RtcExports
         var month = unchecked((int)ctx[CpuRegister.Rsi]);
         if (year < 1 || year > 9999)
         {
-            return ctx.SetReturn(RtcErrorInvalidYear);
+            return unchecked((int)0x80B50008);
         }
 
         if (month < 1 || month > 12)
         {
-            return ctx.SetReturn(RtcErrorInvalidMonth);
+            return unchecked((int)0x80B50009);
         }
 
-        return ctx.SetReturn(DateTime.DaysInMonth(year, month));
+        return DateTime.DaysInMonth(year, month);
     }
 
     [SysAbiExport(
@@ -312,18 +377,18 @@ public static class RtcExports
         var dosTimeAddress = ctx[CpuRegister.Rsi];
         if (timeAddress == 0 || dosTimeAddress == 0)
         {
-            return ctx.SetReturn(RtcErrorInvalidPointer);
+            return unchecked((int)0x80B50002);
         }
 
         if (!TryReadRtcDateTime(ctx, timeAddress, out var time))
         {
-            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }
 
         var validationResult = ValidateRtcDateTime(time);
-        if (validationResult != 0)
+        if (validationResult != (int)OrbisGen2Result.ORBIS_GEN2_OK)
         {
-            return ctx.SetReturn(validationResult);
+            return validationResult;
         }
 
         uint dosTime = 0;
@@ -334,9 +399,12 @@ public static class RtcExports
         dosTime |= (uint)(time.Month & 0x0F) << 21;
         dosTime |= (uint)((time.Year - 1980) & 0x7F) << 25;
 
-        return ctx.TryWriteUInt32(dosTimeAddress, dosTime)
-            ? ctx.SetReturn(0)
-            : ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        if (!ctx.TryWriteUInt32(dosTimeAddress, dosTime))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
     [SysAbiExport(
@@ -350,24 +418,31 @@ public static class RtcExports
         var tickAddress = ctx[CpuRegister.Rsi];
         if (timeAddress == 0 || tickAddress == 0)
         {
-            return ctx.SetReturn(RtcErrorInvalidPointer);
+            return unchecked((int)0x80B50002);
         }
 
         if (!TryReadRtcDateTime(ctx, timeAddress, out var time))
         {
-            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }
 
         var validationResult = ValidateRtcDateTime(time);
-        if (validationResult != 0)
+        if (validationResult != (int)OrbisGen2Result.ORBIS_GEN2_OK)
         {
-            return ctx.SetReturn(validationResult);
+            return validationResult;
         }
 
-        var tick = ConvertRtcDateTimeToTick(time);
-        return ctx.TryWriteUInt64(tickAddress, tick)
-            ? ctx.SetReturn(0)
-            : ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        if (!TryConvertRtcDateTimeToTick(time, out var tick))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+
+        if (!ctx.TryWriteUInt64(tickAddress, tick))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
     [SysAbiExport(
@@ -375,7 +450,10 @@ public static class RtcExports
         ExportName = "sceRtcGetTickResolution",
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libSceRtc")]
-    public static int RtcGetTickResolution(CpuContext ctx) => ctx.SetReturn((int)MicrosecondsPerSecond);
+    public static int RtcGetTickResolution(CpuContext ctx)
+    {
+        return (int)MicrosecondsPerSecond;
+    }
 
     [SysAbiExport(
         Nid = "BtqmpTRXHgk",
@@ -385,28 +463,35 @@ public static class RtcExports
     public static int RtcGetTimeT(CpuContext ctx)
     {
         var timeAddress = ctx[CpuRegister.Rdi];
-        var secondsAddress = ctx[CpuRegister.Rsi];
-        if (timeAddress == 0 || secondsAddress == 0)
+        var timeTAddress = ctx[CpuRegister.Rsi];
+        if (timeAddress == 0 || timeTAddress == 0)
         {
-            return ctx.SetReturn(RtcErrorInvalidPointer);
+            return unchecked((int)0x80B50002);
         }
 
         if (!TryReadRtcDateTime(ctx, timeAddress, out var time))
         {
-            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }
 
         var validationResult = ValidateRtcDateTime(time);
-        if (validationResult != 0)
+        if (validationResult != (int)OrbisGen2Result.ORBIS_GEN2_OK)
         {
-            return ctx.SetReturn(validationResult);
+            return validationResult;
         }
 
-        var tick = ConvertRtcDateTimeToTick(time);
-        var seconds = tick < UnixEpochTicks ? 0 : (tick - UnixEpochTicks) / MicrosecondsPerSecond;
-        return ctx.TryWriteUInt64(secondsAddress, seconds)
-            ? ctx.SetReturn(0)
-            : ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        if (!TryConvertRtcDateTimeToTick(time, out var tick))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+
+        var unixSeconds = tick < UnixEpochTicks ? 0UL : (tick - UnixEpochTicks) / MicrosecondsPerSecond;
+        if (!ctx.TryWriteUInt64(timeTAddress, unixSeconds))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
     [SysAbiExport(
@@ -420,25 +505,32 @@ public static class RtcExports
         var fileTimeAddress = ctx[CpuRegister.Rsi];
         if (timeAddress == 0 || fileTimeAddress == 0)
         {
-            return ctx.SetReturn(RtcErrorInvalidPointer);
+            return unchecked((int)0x80B50002);
         }
 
         if (!TryReadRtcDateTime(ctx, timeAddress, out var time))
         {
-            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }
 
         var validationResult = ValidateRtcDateTime(time);
-        if (validationResult != 0)
+        if (validationResult != (int)OrbisGen2Result.ORBIS_GEN2_OK)
         {
-            return ctx.SetReturn(validationResult);
+            return validationResult;
         }
 
-        var tick = ConvertRtcDateTimeToTick(time);
-        var fileTime = tick < Win32FileTimeEpochTicks ? 0 : (tick - Win32FileTimeEpochTicks) * 10;
-        return ctx.TryWriteUInt64(fileTimeAddress, fileTime)
-            ? ctx.SetReturn(0)
-            : ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        if (!TryConvertRtcDateTimeToTick(time, out var tick))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+
+        var win32Time = tick < Win32FileTimeEpochTicks ? 0UL : (tick - Win32FileTimeEpochTicks) * 10UL;
+        if (!ctx.TryWriteUInt64(fileTimeAddress, win32Time))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
     [SysAbiExport(
@@ -446,7 +538,10 @@ public static class RtcExports
         ExportName = "sceRtcInit",
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libSceRtc")]
-    public static int RtcInit(CpuContext ctx) => ctx.SetReturn(0);
+    public static int RtcInit(CpuContext ctx)
+    {
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
 
     [SysAbiExport(
         Nid = "Ug8pCwQvh0c",
@@ -458,10 +553,10 @@ public static class RtcExports
         var year = unchecked((int)ctx[CpuRegister.Rdi]);
         if (year < 1 || year > 9999)
         {
-            return ctx.SetReturn(RtcErrorInvalidYear);
+            return unchecked((int)0x80B50008);
         }
 
-        return ctx.SetReturn(DateTime.IsLeapYear(year) ? 1 : 0);
+        return DateTime.IsLeapYear(year) ? 1 : 0;
     }
 
     [SysAbiExport(
@@ -469,63 +564,69 @@ public static class RtcExports
         ExportName = "sceRtcTickAddDays",
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libSceRtc")]
-    public static int RtcTickAddDays(CpuContext ctx) => AddTickDelta(ctx, MicrosecondsPerDay, true);
+    public static int RtcTickAddDays(CpuContext ctx) => AddTickDelta(ctx, MicrosecondsPerDay);
 
     [SysAbiExport(
         Nid = "MDc5cd8HfCA",
         ExportName = "sceRtcTickAddHours",
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libSceRtc")]
-    public static int RtcTickAddHours(CpuContext ctx) => AddTickDelta(ctx, MicrosecondsPerHour, true);
+    public static int RtcTickAddHours(CpuContext ctx) => AddTickDelta(ctx, MicrosecondsPerHour);
 
     [SysAbiExport(
         Nid = "XPIiw58C+GM",
         ExportName = "sceRtcTickAddMicroseconds",
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libSceRtc")]
-    public static int RtcTickAddMicroseconds(CpuContext ctx) => AddTickDelta(ctx, 1, false);
+    public static int RtcTickAddMicroseconds(CpuContext ctx) => AddTickDelta(ctx, 1UL);
 
     [SysAbiExport(
         Nid = "mn-tf4QiFzk",
         ExportName = "sceRtcTickAddMinutes",
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libSceRtc")]
-    public static int RtcTickAddMinutes(CpuContext ctx) => AddTickDelta(ctx, MicrosecondsPerMinute, false);
+    public static int RtcTickAddMinutes(CpuContext ctx) => AddTickDelta(ctx, MicrosecondsPerMinute);
 
     [SysAbiExport(
         Nid = "CL6y9q-XbuQ",
         ExportName = "sceRtcTickAddMonths",
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libSceRtc")]
-    public static int RtcTickAddMonths(CpuContext ctx) => AddCalendarMonths(ctx);
+    public static int RtcTickAddMonths(CpuContext ctx)
+    {
+        return AddCalendarDelta(ctx, dateTime => dateTime.AddMonths(unchecked((int)ctx[CpuRegister.Rdx])));
+    }
 
     [SysAbiExport(
         Nid = "07O525HgICs",
         ExportName = "sceRtcTickAddSeconds",
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libSceRtc")]
-    public static int RtcTickAddSeconds(CpuContext ctx) => AddTickDelta(ctx, MicrosecondsPerSecond, false);
+    public static int RtcTickAddSeconds(CpuContext ctx) => AddTickDelta(ctx, MicrosecondsPerSecond);
 
     [SysAbiExport(
         Nid = "AqVMssr52Rc",
         ExportName = "sceRtcTickAddTicks",
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libSceRtc")]
-    public static int RtcTickAddTicks(CpuContext ctx) => AddTickDelta(ctx, 1, false);
+    public static int RtcTickAddTicks(CpuContext ctx) => AddTickDelta(ctx, 1UL);
 
     [SysAbiExport(
         Nid = "gI4t194c2W8",
         ExportName = "sceRtcTickAddWeeks",
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libSceRtc")]
-    public static int RtcTickAddWeeks(CpuContext ctx) => AddTickDelta(ctx, MicrosecondsPerWeek, true);
+    public static int RtcTickAddWeeks(CpuContext ctx) => AddTickDelta(ctx, MicrosecondsPerWeek);
 
     [SysAbiExport(
         Nid = "-5y2uJ62qS8",
         ExportName = "sceRtcTickAddYears",
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libSceRtc")]
-    public static int RtcTickAddYears(CpuContext ctx) => AddCalendarYears(ctx);
+    public static int RtcTickAddYears(CpuContext ctx)
+    {
+        return AddCalendarDelta(ctx, dateTime => dateTime.AddYears(unchecked((int)ctx[CpuRegister.Rdx])));
+    }
 
     [SysAbiExport(
         Nid = "ueega6v3GUw",
@@ -538,22 +639,25 @@ public static class RtcExports
         var tickAddress = ctx[CpuRegister.Rsi];
         if (timeAddress == 0 || tickAddress == 0)
         {
-            return ctx.SetReturn(RtcErrorInvalidPointer);
+            return unchecked((int)0x80B50002);
         }
 
-        if (!ctx.TryReadUInt64(tickAddress, out var tick))
+        if (!ctx.TryReadUInt64(tickAddress, out var tickValue))
         {
-            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }
 
-        if (!TryConvertTickToRtcDateTime(tick, out var time))
+        if (!TryConvertTickToRtcDateTime(tickValue, out var time))
         {
-            return ctx.SetReturn(RtcErrorInvalidValue);
+            return unchecked((int)0x80B50004);
         }
 
-        return TryWriteRtcDateTime(ctx, timeAddress, time)
-            ? ctx.SetReturn(0)
-            : ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        if (!TryWriteRtcDateTime(ctx, timeAddress, time))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
     [SysAbiExport(
@@ -566,7 +670,7 @@ public static class RtcExports
         var timeAddress = ctx[CpuRegister.Rdi];
         if (timeAddress == 0)
         {
-            return ctx.SetReturn(RtcErrorInvalidPointer);
+            return unchecked((int)0x80B50002);
         }
 
         var dosTime = unchecked((uint)ctx[CpuRegister.Rsi]);
@@ -579,9 +683,12 @@ public static class RtcExports
             (ushort)((dosTime << 1) & 0x3E),
             0);
 
-        return TryWriteRtcDateTime(ctx, timeAddress, time)
-            ? ctx.SetReturn(0)
-            : ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        if (!TryWriteRtcDateTime(ctx, timeAddress, time))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
     [SysAbiExport(
@@ -594,24 +701,27 @@ public static class RtcExports
         var timeAddress = ctx[CpuRegister.Rdi];
         if (timeAddress == 0)
         {
-            return ctx.SetReturn(RtcErrorInvalidPointer);
+            return unchecked((int)0x80B50002);
         }
 
-        var seconds = unchecked((long)ctx[CpuRegister.Rsi]);
-        if (seconds < 0 || (ulong)seconds > (MaximumRtcTick - UnixEpochTicks) / MicrosecondsPerSecond)
+        var timeSeconds = unchecked((long)ctx[CpuRegister.Rsi]);
+        if (timeSeconds < 0)
         {
-            return ctx.SetReturn(RtcErrorInvalidValue);
+            return unchecked((int)0x80B50003);
         }
 
-        var tick = UnixEpochTicks + (ulong)seconds * MicrosecondsPerSecond;
+        var tick = UnixEpochTicks + unchecked((ulong)timeSeconds) * MicrosecondsPerSecond;
         if (!TryConvertTickToRtcDateTime(tick, out var time))
         {
-            return ctx.SetReturn(RtcErrorInvalidValue);
+            return unchecked((int)0x80B50003);
         }
 
-        return TryWriteRtcDateTime(ctx, timeAddress, time)
-            ? ctx.SetReturn(0)
-            : ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        if (!TryWriteRtcDateTime(ctx, timeAddress, time))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
     [SysAbiExport(
@@ -624,418 +734,150 @@ public static class RtcExports
         var timeAddress = ctx[CpuRegister.Rdi];
         if (timeAddress == 0)
         {
-            return ctx.SetReturn(RtcErrorInvalidPointer);
+            return unchecked((int)0x80B50002);
         }
 
-        var fileTime = ctx[CpuRegister.Rsi];
-        if (fileTime / 10 > MaximumRtcTick - Win32FileTimeEpochTicks)
+        var fileTime = unchecked((long)ctx[CpuRegister.Rsi]);
+        if (fileTime < 0)
         {
-            return ctx.SetReturn(RtcErrorInvalidValue);
+            return unchecked((int)0x80B50003);
         }
 
-        var tick = Win32FileTimeEpochTicks + fileTime / 10;
+        var tick = Win32FileTimeEpochTicks + unchecked((ulong)fileTime / 10UL);
         if (!TryConvertTickToRtcDateTime(tick, out var time))
         {
-            return ctx.SetReturn(RtcErrorInvalidValue);
+            return unchecked((int)0x80B50003);
         }
 
-        return TryWriteRtcDateTime(ctx, timeAddress, time)
-            ? ctx.SetReturn(0)
-            : ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        if (!TryWriteRtcDateTime(ctx, timeAddress, time))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
-    [SysAbiExport(
-        Nid = "eiuobaF-hK4",
-        ExportName = "sceRtcFormatRFC2822",
-        Target = Generation.Gen4 | Generation.Gen5,
-        LibraryName = "libSceRtc")]
-    public static int RtcFormatRfc2822(CpuContext ctx) =>
-        FormatRfc2822(ctx, unchecked((int)ctx[CpuRegister.Rdx]));
-
-    [SysAbiExport(
-        Nid = "AxHBk3eat04",
-        ExportName = "sceRtcFormatRFC2822LocalTime",
-        Target = Generation.Gen4 | Generation.Gen5,
-        LibraryName = "libSceRtc")]
-    public static int RtcFormatRfc2822LocalTime(CpuContext ctx) =>
-        FormatRfc2822(ctx, GetLocalOffsetMinutes(ctx, ctx[CpuRegister.Rsi]));
-
-    [SysAbiExport(
-        Nid = "WJ3rqFwymew",
-        ExportName = "sceRtcFormatRFC3339",
-        Target = Generation.Gen4 | Generation.Gen5,
-        LibraryName = "libSceRtc")]
-    public static int RtcFormatRfc3339(CpuContext ctx) =>
-        FormatRfc3339(ctx, unchecked((int)ctx[CpuRegister.Rdx]), precise: false);
-
-    [SysAbiExport(
-        Nid = "DwuHIlLGW8I",
-        ExportName = "sceRtcFormatRFC3339LocalTime",
-        Target = Generation.Gen4 | Generation.Gen5,
-        LibraryName = "libSceRtc")]
-    public static int RtcFormatRfc3339LocalTime(CpuContext ctx) =>
-        FormatRfc3339(ctx, GetLocalOffsetMinutes(ctx, ctx[CpuRegister.Rsi]), precise: false);
-
-    [SysAbiExport(
-        Nid = "lja0nNPWojg",
-        ExportName = "sceRtcFormatRFC3339Precise",
-        Target = Generation.Gen4 | Generation.Gen5,
-        LibraryName = "libSceRtc")]
-    public static int RtcFormatRfc3339Precise(CpuContext ctx) =>
-        FormatRfc3339(ctx, unchecked((int)ctx[CpuRegister.Rdx]), precise: true);
-
-    [SysAbiExport(
-        Nid = "tOZ6fwwHZOA",
-        ExportName = "sceRtcFormatRFC3339PreciseLocalTime",
-        Target = Generation.Gen4 | Generation.Gen5,
-        LibraryName = "libSceRtc")]
-    public static int RtcFormatRfc3339PreciseLocalTime(CpuContext ctx) =>
-        FormatRfc3339(ctx, GetLocalOffsetMinutes(ctx, ctx[CpuRegister.Rsi]), precise: true);
-
-    [SysAbiExport(
-        Nid = "NxEI1KByvCI",
-        ExportName = "sceRtcParseDateTime",
-        Target = Generation.Gen4 | Generation.Gen5,
-        LibraryName = "libSceRtc")]
-    public static int RtcParseDateTime(CpuContext ctx) => ParseDateTime(ctx, rfc3339Only: false);
-
-    [SysAbiExport(
-        Nid = "99bMGglFW3I",
-        ExportName = "sceRtcParseRFC3339",
-        Target = Generation.Gen4 | Generation.Gen5,
-        LibraryName = "libSceRtc")]
-    public static int RtcParseRfc3339(CpuContext ctx) => ParseDateTime(ctx, rfc3339Only: true);
-
-    [SysAbiExport(
-        Nid = "fFLgmNUpChg",
-        ExportName = "sceRtcSetConf",
-        Target = Generation.Gen4 | Generation.Gen5,
-        LibraryName = "libSceRtc")]
-    public static int RtcSetConf(CpuContext ctx)
+    private static int AddTickDelta(CpuContext ctx, ulong microsecondsPerUnit)
     {
-        Volatile.Write(ref _configuredMinutesWest, unchecked((int)ctx[CpuRegister.Rdx]));
-        Volatile.Write(ref _configuredDstTime, unchecked((int)ctx[CpuRegister.Rcx]));
-        return ctx.SetReturn(0);
+        var destinationAddress = ctx[CpuRegister.Rdi];
+        var sourceAddress = ctx[CpuRegister.Rsi];
+        var delta = unchecked((long)ctx[CpuRegister.Rdx]);
+        if (destinationAddress == 0 || sourceAddress == 0)
+        {
+            return unchecked((int)0x80B50002);
+        }
+
+        if (!ctx.TryReadUInt64(sourceAddress, out var sourceTick))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        try
+        {
+            var resultTick = checked((long)sourceTick + checked(delta * (long)microsecondsPerUnit));
+            if (resultTick < 0)
+            {
+                return unchecked((int)0x80B50003);
+            }
+
+            if (!ctx.TryWriteUInt64(destinationAddress, unchecked((ulong)resultTick)))
+            {
+                return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+            }
+        }
+        catch (OverflowException)
+        {
+            return unchecked((int)0x80B50003);
+        }
+
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
-    [SysAbiExport(Nid = "sV2tK+yOhBU", ExportName = "sceRtcSetCurrentAdNetworkTick", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceRtc")]
-    public static int RtcSetCurrentAdNetworkTick(CpuContext ctx) => SetCurrentClockTick(ctx);
-
-    [SysAbiExport(Nid = "VLDUPKmw5L8", ExportName = "sceRtcSetCurrentDebugNetworkTick", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceRtc")]
-    public static int RtcSetCurrentDebugNetworkTick(CpuContext ctx) => SetCurrentClockTick(ctx);
-
-    [SysAbiExport(Nid = "qhDBtIo+auw", ExportName = "sceRtcSetCurrentNetworkTick", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceRtc")]
-    public static int RtcSetCurrentNetworkTick(CpuContext ctx) => SetCurrentClockTick(ctx);
-
-    [SysAbiExport(Nid = "d4fHLCGmY80", ExportName = "sceRtcSetCurrentTick", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceRtc")]
-    public static int RtcSetCurrentTick(CpuContext ctx) => SetCurrentClockTick(ctx);
-
-    private static int _configuredMinutesWest;
-    private static int _configuredDstTime;
-
-    private static int FormatRfc2822(CpuContext ctx, int offsetMinutes)
-    {
-        if (!TryGetFormatDateTime(ctx, offsetMinutes, out var time, out var error))
-        {
-            return ctx.SetReturn(error);
-        }
-
-        var text = time.ToString("ddd, dd MMM yyyy HH:mm:ss zzz", CultureInfo.InvariantCulture)
-            .Remove(29, 1);
-        return WriteDateTimeString(ctx, ctx[CpuRegister.Rdi], text);
-    }
-
-    private static int FormatRfc3339(CpuContext ctx, int offsetMinutes, bool precise)
-    {
-        if (!TryGetFormatDateTime(ctx, offsetMinutes, out var time, out var error))
-        {
-            return ctx.SetReturn(error);
-        }
-
-        var format = precise ? "yyyy-MM-dd'T'HH:mm:ss.ffffff" : "yyyy-MM-dd'T'HH:mm:ss";
-        var suffix = time.Offset == TimeSpan.Zero
-            ? "Z"
-            : time.ToString("zzz", CultureInfo.InvariantCulture);
-        var text = time.ToString(format, CultureInfo.InvariantCulture) + suffix;
-        return WriteDateTimeString(ctx, ctx[CpuRegister.Rdi], text);
-    }
-
-    private static bool TryGetFormatDateTime(
-        CpuContext ctx,
-        int offsetMinutes,
-        out DateTimeOffset time,
-        out int error)
-    {
-        time = default;
-        if (ctx[CpuRegister.Rdi] == 0)
-        {
-            error = RtcErrorInvalidPointer;
-            return false;
-        }
-
-        var tickAddress = ctx[CpuRegister.Rsi];
-        ulong tick;
-        if (tickAddress == 0)
-        {
-            tick = ToTick(DateTime.UtcNow);
-        }
-        else if (!ctx.TryReadUInt64(tickAddress, out tick))
-        {
-            error = (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
-            return false;
-        }
-
-        if (!TryConvertTickToDateTime(tick, DateTimeKind.Utc, out var utcTime) ||
-            offsetMinutes is < -1439 or > 1439)
-        {
-            error = RtcErrorInvalidValue;
-            return false;
-        }
-
-        var offset = TimeSpan.FromMinutes(offsetMinutes);
-        time = new DateTimeOffset(utcTime).ToOffset(offset);
-        error = 0;
-        return true;
-    }
-
-    private static int WriteDateTimeString(CpuContext ctx, ulong address, string value)
-    {
-        var bytes = System.Text.Encoding.ASCII.GetBytes(value + '\0');
-        return ctx.Memory.TryWrite(address, bytes)
-            ? ctx.SetReturn(0)
-            : ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
-    }
-
-    private static int ParseDateTime(CpuContext ctx, bool rfc3339Only)
-    {
-        var tickAddress = ctx[CpuRegister.Rdi];
-        var textAddress = ctx[CpuRegister.Rsi];
-        if (tickAddress == 0 || textAddress == 0)
-        {
-            return ctx.SetReturn(RtcErrorInvalidPointer);
-        }
-        if (!ctx.TryReadNullTerminatedUtf8(textAddress, 128, out var text))
-        {
-            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
-        }
-
-        DateTimeOffset parsed;
-        var styles = DateTimeStyles.AllowWhiteSpaces | DateTimeStyles.AssumeUniversal;
-        var parsedOk = rfc3339Only
-            ? DateTimeOffset.TryParseExact(
-                text,
-                new[]
-                {
-                    "yyyy-MM-dd'T'HH:mm:ssK",
-                    "yyyy-MM-dd'T'HH:mm:ss.FFFFFFK",
-                },
-                CultureInfo.InvariantCulture,
-                styles,
-                out parsed)
-            : DateTimeOffset.TryParse(text, CultureInfo.InvariantCulture, styles, out parsed);
-        if (!parsedOk)
-        {
-            return ctx.SetReturn(RtcErrorInvalidValue);
-        }
-
-        var tick = unchecked((ulong)(parsed.UtcDateTime.Ticks / (long)DateTimeTicksPerMicrosecond));
-        return ctx.TryWriteUInt64(tickAddress, tick)
-            ? ctx.SetReturn(0)
-            : ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
-    }
-
-    private static int SetCurrentClockTick(CpuContext ctx)
-    {
-        var tickAddress = ctx[CpuRegister.Rdi];
-        if (tickAddress == 0)
-        {
-            return ctx.SetReturn(RtcErrorInvalidPointer);
-        }
-        if (!ctx.TryReadUInt64(tickAddress, out var tick))
-        {
-            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
-        }
-        return ctx.SetReturn(tick <= UnixEpochTicks || tick > MaximumRtcTick
-            ? RtcErrorInvalidValue
-            : 0);
-    }
-
-    private static int GetLocalOffsetMinutes(CpuContext ctx, ulong tickAddress)
-    {
-        if (Volatile.Read(ref _configuredMinutesWest) != 0 || Volatile.Read(ref _configuredDstTime) != 0)
-        {
-            return -Volatile.Read(ref _configuredMinutesWest) +
-                   (Volatile.Read(ref _configuredDstTime) != 0 ? 60 : 0);
-        }
-
-        if (tickAddress != 0 &&
-            ctx.TryReadUInt64(tickAddress, out var tick) &&
-            TryConvertTickToDateTime(tick, DateTimeKind.Utc, out var utcTime))
-        {
-            return (int)TimeZoneInfo.Local.GetUtcOffset(utcTime).TotalMinutes;
-        }
-        return (int)TimeZoneInfo.Local.GetUtcOffset(DateTime.UtcNow).TotalMinutes;
-    }
-
-    private static int GetCurrentNetworkTick(CpuContext ctx)
-    {
-        var tickAddress = ctx[CpuRegister.Rdi];
-        if (tickAddress == 0)
-        {
-            return ctx.SetReturn(RtcErrorInvalidPointer);
-        }
-
-        return ctx.TryWriteUInt64(tickAddress, ToTick(DateTime.UtcNow))
-            ? ctx.SetReturn(0)
-            : ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
-    }
-
-    private static int AddTickDelta(CpuContext ctx, ulong microsecondsPerUnit, bool isInt32)
+    private static int AddCalendarDelta(CpuContext ctx, Func<DateTime, DateTime> transform)
     {
         var destinationAddress = ctx[CpuRegister.Rdi];
         var sourceAddress = ctx[CpuRegister.Rsi];
         if (destinationAddress == 0 || sourceAddress == 0)
         {
-            return ctx.SetReturn(RtcErrorInvalidPointer);
+            return unchecked((int)0x80B50002);
         }
 
         if (!ctx.TryReadUInt64(sourceAddress, out var sourceTick))
         {
-            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }
 
-        var delta = isInt32
-            ? unchecked((int)ctx[CpuRegister.Rdx])
-            : unchecked((long)ctx[CpuRegister.Rdx]);
-        var offset = unchecked(delta * (long)microsecondsPerUnit);
-        var resultTick = unchecked(sourceTick + (ulong)offset);
-        return ctx.TryWriteUInt64(destinationAddress, resultTick)
-            ? ctx.SetReturn(0)
-            : ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
-    }
-
-    private static int AddCalendarMonths(CpuContext ctx)
-    {
-        if (!TryReadCalendarOperands(ctx, out var destinationAddress, out var sourceTime, out var error))
+        if (!TryConvertTickToDateTime(sourceTick, out var sourceDateTime))
         {
-            return ctx.SetReturn(error);
+            return unchecked((int)0x80B50003);
         }
 
-        var delta = unchecked((int)ctx[CpuRegister.Rdx]);
-        var monthIndex = ((long)sourceTime.Year - 1) * 12 + sourceTime.Month - 1 + delta;
-        if (monthIndex < 0 || monthIndex >= 9999L * 12)
+        DateTime resultDateTime;
+        try
         {
-            return ctx.SetReturn(RtcErrorInvalidYear);
+            resultDateTime = transform(sourceDateTime);
         }
-
-        var year = (int)(monthIndex / 12) + 1;
-        var month = (int)(monthIndex % 12) + 1;
-        var day = Math.Min(sourceTime.Day, DateTime.DaysInMonth(year, month));
-        var result = sourceTime with { Year = (ushort)year, Month = (ushort)month, Day = (ushort)day };
-        return WriteCalendarResult(ctx, destinationAddress, result);
-    }
-
-    private static int AddCalendarYears(CpuContext ctx)
-    {
-        if (!TryReadCalendarOperands(ctx, out var destinationAddress, out var sourceTime, out var error))
+        catch (ArgumentOutOfRangeException)
         {
-            return ctx.SetReturn(error);
+            return unchecked((int)0x80B50003);
         }
 
-        var year = (long)sourceTime.Year + unchecked((int)ctx[CpuRegister.Rdx]);
-        if (year < 1 || year > 9999)
+        if (!TryWriteTickFromDateTime(ctx, destinationAddress, resultDateTime))
         {
-            return ctx.SetReturn(RtcErrorInvalidYear);
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }
 
-        var result = sourceTime with { Year = (ushort)year };
-        var validationResult = ValidateRtcDateTime(result);
-        if (validationResult != 0)
-        {
-            return ctx.SetReturn(validationResult);
-        }
-
-        return WriteCalendarResult(ctx, destinationAddress, result);
-    }
-
-    private static bool TryReadCalendarOperands(
-        CpuContext ctx,
-        out ulong destinationAddress,
-        out RtcDateTime sourceTime,
-        out int error)
-    {
-        destinationAddress = ctx[CpuRegister.Rdi];
-        var sourceAddress = ctx[CpuRegister.Rsi];
-        if (destinationAddress == 0 || sourceAddress == 0)
-        {
-            sourceTime = default;
-            error = RtcErrorInvalidPointer;
-            return false;
-        }
-
-        if (!ctx.TryReadUInt64(sourceAddress, out var sourceTick))
-        {
-            sourceTime = default;
-            error = (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
-            return false;
-        }
-
-        if (!TryConvertTickToRtcDateTime(sourceTick, out sourceTime))
-        {
-            error = RtcErrorInvalidValue;
-            return false;
-        }
-
-        error = 0;
-        return true;
-    }
-
-    private static int WriteCalendarResult(CpuContext ctx, ulong destinationAddress, RtcDateTime time)
-    {
-        var tick = ConvertRtcDateTimeToTick(time);
-        return ctx.TryWriteUInt64(destinationAddress, tick)
-            ? ctx.SetReturn(0)
-            : ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
     private static int ValidateRtcDateTime(RtcDateTime time)
     {
         if (time.Year < 1 || time.Year > 9999)
         {
-            return RtcErrorInvalidYear;
+            return unchecked((int)0x80B50008);
         }
 
         if (time.Month < 1 || time.Month > 12)
         {
-            return RtcErrorInvalidMonth;
+            return unchecked((int)0x80B50009);
         }
 
         if (time.Day < 1 || time.Day > DateTime.DaysInMonth(time.Year, time.Month))
         {
-            return RtcErrorInvalidDay;
+            return unchecked((int)0x80B5000A);
         }
 
         if (time.Hour > 23)
         {
-            return RtcErrorInvalidHour;
+            return unchecked((int)0x80B5000B);
         }
 
         if (time.Minute > 59)
         {
-            return RtcErrorInvalidMinute;
+            return unchecked((int)0x80B5000C);
         }
 
         if (time.Second > 59)
         {
-            return RtcErrorInvalidSecond;
+            return unchecked((int)0x80B5000D);
         }
 
         if (time.Microsecond > 999_999)
         {
-            return RtcErrorInvalidMicrosecond;
+            return unchecked((int)0x80B5000E);
         }
 
-        return 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    private static bool IsValidCalendarDate(int year, int month, int day)
+    {
+        if (year < 1 || year > 9999 || month < 1 || month > 12)
+        {
+            return false;
+        }
+
+        return day >= 1 && day <= DateTime.DaysInMonth(year, month);
     }
 
     private static bool TryReadRtcDateTime(CpuContext ctx, ulong address, out RtcDateTime time)
@@ -1058,122 +900,117 @@ public static class RtcExports
         return true;
     }
 
-    private static bool TryWriteRtcDateTime(CpuContext ctx, ulong address, RtcDateTime time)
+    private static bool TryWriteRtcDateTime(CpuContext ctx, ulong address, RtcDateTime dateTime)
     {
         Span<byte> buffer = stackalloc byte[16];
-        BinaryPrimitives.WriteUInt16LittleEndian(buffer[0..2], time.Year);
-        BinaryPrimitives.WriteUInt16LittleEndian(buffer[2..4], time.Month);
-        BinaryPrimitives.WriteUInt16LittleEndian(buffer[4..6], time.Day);
-        BinaryPrimitives.WriteUInt16LittleEndian(buffer[6..8], time.Hour);
-        BinaryPrimitives.WriteUInt16LittleEndian(buffer[8..10], time.Minute);
-        BinaryPrimitives.WriteUInt16LittleEndian(buffer[10..12], time.Second);
-        BinaryPrimitives.WriteUInt32LittleEndian(buffer[12..16], time.Microsecond);
+        BinaryPrimitives.WriteUInt16LittleEndian(buffer[0..2], dateTime.Year);
+        BinaryPrimitives.WriteUInt16LittleEndian(buffer[2..4], dateTime.Month);
+        BinaryPrimitives.WriteUInt16LittleEndian(buffer[4..6], dateTime.Day);
+        BinaryPrimitives.WriteUInt16LittleEndian(buffer[6..8], dateTime.Hour);
+        BinaryPrimitives.WriteUInt16LittleEndian(buffer[8..10], dateTime.Minute);
+        BinaryPrimitives.WriteUInt16LittleEndian(buffer[10..12], dateTime.Second);
+        BinaryPrimitives.WriteUInt32LittleEndian(buffer[12..16], dateTime.Microsecond);
         return ctx.Memory.TryWrite(address, buffer);
     }
 
-    private static ulong ToTick(DateTime time) => (ulong)time.Ticks / DateTimeTicksPerMicrosecond;
-
-    private static RtcDateTime ToRtcDateTime(DateTime time)
+    private static RtcDateTime ToRtcDateTime(DateTime dateTime)
     {
         return new RtcDateTime(
-            (ushort)time.Year,
-            (ushort)time.Month,
-            (ushort)time.Day,
-            (ushort)time.Hour,
-            (ushort)time.Minute,
-            (ushort)time.Second,
-            (uint)((ulong)time.Ticks % TimeSpan.TicksPerSecond / DateTimeTicksPerMicrosecond));
+            (ushort)dateTime.Year,
+            (ushort)dateTime.Month,
+            (ushort)dateTime.Day,
+            (ushort)dateTime.Hour,
+            (ushort)dateTime.Minute,
+            (ushort)dateTime.Second,
+            (uint)(dateTime.Ticks % TimeSpan.TicksPerSecond / DateTimeTicksPerMicrosecond));
     }
 
-    private static bool TryConvertTickToDateTime(ulong tick, DateTimeKind kind, out DateTime time)
+    private static RtcDateTime ToRtcDateTime(DateTimeOffset dateTimeOffset)
     {
-        if (tick > MaximumRtcTick)
+        return ToRtcDateTime(dateTimeOffset.DateTime);
+    }
+
+    private static bool TryWriteTickFromDateTime(CpuContext ctx, ulong address, DateTime dateTime)
+    {
+        return ctx.TryWriteUInt64(address, unchecked((ulong)(dateTime.Ticks / DateTimeTicksPerMicrosecond)));
+    }
+
+    private static bool TryConvertTickToDateTime(ulong tick, out DateTime dateTime)
+    {
+        var maxSupportedTick = unchecked((ulong)(DateTime.MaxValue.Ticks / DateTimeTicksPerMicrosecond));
+        if (tick > maxSupportedTick)
         {
-            time = default;
+            dateTime = default;
             return false;
         }
 
-        time = new DateTime((long)(tick * DateTimeTicksPerMicrosecond), kind);
-        return true;
+        try
+        {
+            dateTime = new DateTime(checked((long)(tick * (ulong)DateTimeTicksPerMicrosecond)), DateTimeKind.Utc);
+            return true;
+        }
+        catch (ArgumentOutOfRangeException)
+        {
+            dateTime = default;
+            return false;
+        }
     }
 
-    private static ulong ConvertRtcDateTimeToTick(RtcDateTime time)
+    private static bool TryConvertRtcDateTimeToTick(RtcDateTime time, out ulong tick)
     {
-        ulong year = time.Year;
-        ulong month = time.Month;
-        if (month > 2)
+        try
         {
-            month -= 3;
+            var year = time.Year;
+            var month = time.Month;
+            var day = time.Day;
+            if (month > 2)
+            {
+                month -= 3;
+            }
+            else
+            {
+                month += 9;
+                year -= 1;
+            }
+
+            var century = year / 100;
+            var yearOfCentury = year - (100 * century);
+
+            ulong days = ((146097UL * (ulong)century) >> 2)
+                + ((1461UL * (ulong)yearOfCentury) >> 2)
+                + ((153UL * (ulong)month + 2UL) / 5UL)
+                + day;
+            days -= 307UL;
+            days *= MicrosecondsPerDay;
+
+            var timeOfDay = (ulong)time.Hour * MicrosecondsPerHour
+                + (ulong)time.Minute * MicrosecondsPerMinute
+                + (ulong)time.Second * MicrosecondsPerSecond
+                + time.Microsecond;
+
+            tick = days + timeOfDay;
+            return true;
         }
-        else
+        catch (OverflowException)
         {
-            month += 9;
-            year--;
+            tick = 0;
+            return false;
         }
-
-        var century = year / 100;
-        var yearOfCentury = year - 100 * century;
-        var days = ((146097 * century) >> 2)
-            + ((1461 * yearOfCentury) >> 2)
-            + (153 * month + 2) / 5
-            + time.Day
-            - 307;
-
-        return days * MicrosecondsPerDay
-            + (ulong)time.Hour * MicrosecondsPerHour
-            + (ulong)time.Minute * MicrosecondsPerMinute
-            + (ulong)time.Second * MicrosecondsPerSecond
-            + time.Microsecond;
     }
 
     private static bool TryConvertTickToRtcDateTime(ulong tick, out RtcDateTime time)
     {
-        var days = tick / MicrosecondsPerDay;
-        var microseconds = tick % MicrosecondsPerDay;
-        days += 307;
-
-        var intermediate = (days << 2) - 1;
-        var year = intermediate / 146097;
-        intermediate -= 146097 * year;
-        var day = intermediate >> 2;
-        intermediate = ((day << 2) + 3) / 1461;
-        day = (((day << 2) + 7) - 1461 * intermediate) >> 2;
-        var month = (5 * day - 3) / 153;
-        day = (5 * day + 2 - 153 * month) / 5;
-        year = 100 * year + intermediate;
-
-        if (month < 10)
+        try
         {
-            month += 3;
+            var dateTime = new DateTime(checked((long)(tick * DateTimeTicksPerMicrosecond)), DateTimeKind.Utc);
+            time = ToRtcDateTime(dateTime);
+            return true;
         }
-        else
-        {
-            month -= 9;
-            year++;
-        }
-
-        if (year is < 1 or > 9999)
+        catch (ArgumentOutOfRangeException)
         {
             time = default;
             return false;
         }
-
-        var hour = microseconds / MicrosecondsPerHour;
-        microseconds %= MicrosecondsPerHour;
-        var minute = microseconds / MicrosecondsPerMinute;
-        microseconds %= MicrosecondsPerMinute;
-        var second = microseconds / MicrosecondsPerSecond;
-        var microsecond = microseconds % MicrosecondsPerSecond;
-
-        time = new RtcDateTime(
-            (ushort)year,
-            (ushort)month,
-            (ushort)day,
-            (ushort)hour,
-            (ushort)minute,
-            (ushort)second,
-            (uint)microsecond);
-        return ValidateRtcDateTime(time) == 0;
     }
 
     private readonly record struct RtcDateTime(

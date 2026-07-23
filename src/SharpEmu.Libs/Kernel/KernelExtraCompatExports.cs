@@ -134,9 +134,7 @@ public static class KernelExtraCompatExports
 
     [SysAbiExport(Nid = "pG70GT5yRo4", ExportName = "Libraries", LibraryName = "libkernel", Target = Generation.Gen5)]
     public static int Libraries01(CpuContext ctx) => KernelSocketCompatExports.Socket(ctx);
-    [SysAbiExport(Nid = "6O8EwYOgH9Y", ExportName = "Libraries", LibraryName = "libkernel", Target = Generation.Gen5)]
     public static int Libraries02(CpuContext ctx) => SocketGetsockopt(ctx);
-    [SysAbiExport(Nid = "fFxGkxF2bVo", ExportName = "Libraries", LibraryName = "libkernel", Target = Generation.Gen5)]
     public static int Libraries03(CpuContext ctx) => Ok(ctx);
     [SysAbiExport(Nid = "pxnCmagrtao", ExportName = "Libraries", LibraryName = "libkernel", Target = Generation.Gen5)]
     public static int Libraries04(CpuContext ctx) => Ok(ctx);
@@ -148,7 +146,6 @@ public static class KernelExtraCompatExports
     public static int Libraries07(CpuContext ctx) => SocketPair(ctx);
     [SysAbiExport(Nid = "K1S8oc61xiM", ExportName = "Libraries", LibraryName = "libkernel", Target = Generation.Gen5)]
     public static int Libraries08(CpuContext ctx) { var value = unchecked((uint)ctx[CpuRegister.Rdi]); ctx[CpuRegister.Rax] = BinaryPrimitives.ReverseEndianness(value); return 0; }
-    [SysAbiExport(Nid = "fZOeZIOEmLw", ExportName = "Libraries", LibraryName = "libkernel", Target = Generation.Gen5)]
     public static int Libraries09(CpuContext ctx) => KernelMemoryCompatExports.KernelWrite(ctx);
     [SysAbiExport(Nid = "oBr313PppNE", ExportName = "Libraries", LibraryName = "libkernel", Target = Generation.Gen5)]
     public static int Libraries10(CpuContext ctx) => KernelMemoryCompatExports.KernelWrite(ctx);
@@ -161,7 +158,6 @@ public static class KernelExtraCompatExports
     public static int PosixLibraries01(CpuContext ctx) => SocketRecvmsg(ctx);
     [SysAbiExport(Nid = "TXFFFiNldU8", ExportName = "Libraries", LibraryName = "libScePosix", Target = Generation.Gen5)]
     public static int PosixLibraries02(CpuContext ctx) => SocketGetpeername(ctx);
-    [SysAbiExport(Nid = "5jRCs2axtr4", ExportName = "Libraries", LibraryName = "libScePosix", Target = Generation.Gen5)]
     public static int PosixLibraries03(CpuContext ctx) => SocketInetNtop(ctx);
     [SysAbiExport(Nid = "aNeavPDNKzA", ExportName = "Libraries", LibraryName = "libScePosix", Target = Generation.Gen5)]
     public static int PosixLibraries04(CpuContext ctx) { ctx[CpuRegister.Rax] = 0; return 0; }
@@ -222,8 +218,10 @@ public static class KernelExtraCompatExports
     [SysAbiExport(Nid = "FJmglmTMdr4", ExportName = "getargv", LibraryName = "libkernel", Target = Generation.Gen5)]
     public static int GetArgv(CpuContext ctx) { ctx[CpuRegister.Rax] = 0; return 0; }
 
+    #pragma warning disable SHEM004
     [SysAbiExport(Nid = "sfKygSjIbI8", ExportName = "getdirentries", LibraryName = "libkernel", Target = Generation.Gen5)]
     public static int Getdirentries(CpuContext ctx) => KernelMemoryCompatExports.KernelGetdirentries(ctx);
+    #pragma warning restore SHEM004
 
     [SysAbiExport(Nid = "PfccT7qURYE", ExportName = "kernel_ioctl", LibraryName = "libkernel", Target = Generation.Gen5)]
     public static int KernelIoctl01(CpuContext ctx) => KernelIoctlCore(ctx);
@@ -240,7 +238,6 @@ public static class KernelExtraCompatExports
         return Ok(ctx);
     }
 
-    [SysAbiExport(Nid = "smIj7eqzZE8", ExportName = "posix_clock_getres", LibraryName = "libkernel", Target = Generation.Gen5)]
     public static int PosixClockGetres(CpuContext ctx) => ClockGetresCore(ctx, posix: true);
 
     [SysAbiExport(Nid = "wRYVA5Zolso", ExportName = "sceKernelClockGetres", LibraryName = "libkernel", Target = Generation.Gen5)]
@@ -260,7 +257,6 @@ public static class KernelExtraCompatExports
         return ctx.Memory.TryWrite(address, timespec) ? Ok(ctx) : (posix ? PosixFailure(ctx, 14) : Fault(ctx));
     }
 
-    [SysAbiExport(Nid = "NhpspxdjEKU", ExportName = "posix_nanosleep", LibraryName = "libkernel", Target = Generation.Gen5)]
     public static int PosixNanosleep(CpuContext ctx)
     {
         var requestAddress = ctx[CpuRegister.Rdi];
@@ -295,7 +291,6 @@ public static class KernelExtraCompatExports
     [SysAbiExport(Nid = "-ZR+hG7aDHw", ExportName = "sceKernelSleep", LibraryName = "libkernel", Target = Generation.Gen5)]
     public static int KernelSleep(CpuContext ctx) => PosixSleep(ctx);
 
-    [SysAbiExport(Nid = "k+AXqu2-eBc", ExportName = "posix_getpagesize", LibraryName = "libkernel", Target = Generation.Gen5)]
     public static int PosixGetpagesize(CpuContext ctx) { ctx[CpuRegister.Rax] = 0x4000; return 0; }
     [SysAbiExport(Nid = "kg4x8Prhfxw", ExportName = "posix_getuid", LibraryName = "libkernel", Target = Generation.Gen5)]
     public static int PosixGetuid(CpuContext ctx) { ctx[CpuRegister.Rax] = 1; return 0; }
@@ -330,11 +325,9 @@ public static class KernelExtraCompatExports
         return ctx.TryWriteUInt64(resultAddress, mappedAddress) ? Ok(ctx) : Fault(ctx);
     }
 
-    [SysAbiExport(Nid = "YQOfxL4QfeU", ExportName = "posix_mprotect", LibraryName = "libkernel", Target = Generation.Gen5)]
     public static int PosixMprotect(CpuContext ctx) => KernelMemoryCompatExports.KernelMprotect(ctx);
     [SysAbiExport(Nid = "tZY4+SZNFhA", ExportName = "posix_msync", LibraryName = "libkernel", Target = Generation.Gen5)]
     public static int PosixMsync(CpuContext ctx) => Ok(ctx);
-    [SysAbiExport(Nid = "UqDGjXA5yUM", ExportName = "posix_munmap", LibraryName = "libkernel", Target = Generation.Gen5)]
     public static int PosixMunmap(CpuContext ctx) => KernelMemoryCompatExports.KernelMunmap(ctx);
     [SysAbiExport(Nid = "3k6kx-zOOSQ", ExportName = "sceKernelMlock", LibraryName = "libkernel", Target = Generation.Gen5)]
     public static int KernelMlock(CpuContext ctx) => ctx[CpuRegister.Rdi] == 0 && ctx[CpuRegister.Rsi] != 0 ? Invalid(ctx) : Ok(ctx);
@@ -356,7 +349,6 @@ public static class KernelExtraCompatExports
         return Ok(ctx);
     }
 
-    [SysAbiExport(Nid = "yDBwVAolDgg", ExportName = "sceKernelIsStack", LibraryName = "libkernel", Target = Generation.Gen5)]
     public static int KernelIsStack(CpuContext ctx)
     {
         if (ctx[CpuRegister.Rsi] != 0 && !ctx.TryWriteUInt64(ctx[CpuRegister.Rsi], 0)) return Fault(ctx);
@@ -476,13 +468,10 @@ public static class KernelExtraCompatExports
         return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND);
     }
 
-    [SysAbiExport(Nid = "VW3TVZiM4-E", ExportName = "sceKernelFtruncate", LibraryName = "libkernel", Target = Generation.Gen5)]
     public static int KernelFtruncate(CpuContext ctx) => Ok(ctx);
-    [SysAbiExport(Nid = "ih4CD9-gghM", ExportName = "posix_ftruncate", LibraryName = "libkernel", Target = Generation.Gen5)]
     public static int PosixFtruncate(CpuContext ctx) => Ok(ctx);
     [SysAbiExport(Nid = "2G6i6hMIUUY", ExportName = "posix_getdents", LibraryName = "libkernel", Target = Generation.Gen5)]
     public static int PosixGetdents(CpuContext ctx) => KernelMemoryCompatExports.KernelGetdents(ctx);
-    [SysAbiExport(Nid = "juWbTNM+8hw", ExportName = "posix_fsync", LibraryName = "libScePosix", Target = Generation.Gen5)]
     public static int PosixFsync(CpuContext ctx) => KernelMemoryCompatExports.KernelFsync(ctx);
     [SysAbiExport(Nid = "JGMio+21L4c", ExportName = "posix_mkdir", LibraryName = "libScePosix", Target = Generation.Gen5)]
     public static int PosixMkdir(CpuContext ctx) => KernelMemoryCompatExports.KernelMkdir(ctx);
@@ -490,33 +479,32 @@ public static class KernelExtraCompatExports
     public static int PosixRmdir(CpuContext ctx) => KernelMemoryCompatExports.KernelRmdir(ctx);
     [SysAbiExport(Nid = "VAzswvTOCzI", ExportName = "posix_unlink", LibraryName = "libkernel", Target = Generation.Gen5)]
     public static int PosixUnlink(CpuContext ctx) => KernelMemoryCompatExports.KernelUnlink(ctx);
-    [SysAbiExport(Nid = "52NcYU9+lEo", ExportName = "sceKernelRename", LibraryName = "libkernel", Target = Generation.Gen5)]
     public static int KernelRename(CpuContext ctx) => Ok(ctx);
-    [SysAbiExport(Nid = "NN01qLRhiqU", ExportName = "posix_rename", LibraryName = "libScePosix", Target = Generation.Gen5)]
     public static int PosixRename(CpuContext ctx) => Ok(ctx);
     [SysAbiExport(Nid = "uWyW3v98sU4", ExportName = "sceKernelCheckReachability", LibraryName = "libkernel", Target = Generation.Gen5)]
     public static int KernelCheckReachability(CpuContext ctx) => ctx[CpuRegister.Rdi] == 0 ? Invalid(ctx) : Ok(ctx);
 
-    [SysAbiExport(Nid = "ezv-RSBNKqI", ExportName = "posix_pread", LibraryName = "libScePosix", Target = Generation.Gen5)]
     public static int PosixPread(CpuContext ctx) => KernelMemoryCompatExports.KernelPread(ctx);
     [SysAbiExport(Nid = "yTj62I7kw4s", ExportName = "sceKernelPreadv", LibraryName = "libkernel", Target = Generation.Gen5)]
     public static int KernelPreadv(CpuContext ctx) => VectorIo(ctx, VectorIoKind.Pread);
-    [SysAbiExport(Nid = "C2kJ-byS5rM", ExportName = "posix_pwrite", LibraryName = "libkernel", Target = Generation.Gen5)]
     public static int PosixPwrite(CpuContext ctx) => PwriteCore(ctx);
-    [SysAbiExport(Nid = "nKWi-N2HBV4", ExportName = "sceKernelPwrite", LibraryName = "libkernel", Target = Generation.Gen5)]
     public static int KernelPwrite(CpuContext ctx) => PwriteCore(ctx);
     [SysAbiExport(Nid = "FCcmRZhWtOk", ExportName = "posix_pwritev", LibraryName = "libScePosix", Target = Generation.Gen5)]
     public static int PosixPwritev(CpuContext ctx) => VectorIo(ctx, VectorIoKind.Pwrite);
     [SysAbiExport(Nid = "mBd4AfLP+u8", ExportName = "sceKernelPwritev", LibraryName = "libkernel", Target = Generation.Gen5)]
     public static int KernelPwritev(CpuContext ctx) => VectorIo(ctx, VectorIoKind.Pwrite);
+    #pragma warning disable SHEM004
     [SysAbiExport(Nid = "+WRlkKjZvag", ExportName = "readv", LibraryName = "libkernel", Target = Generation.Gen5)]
     public static int Readv(CpuContext ctx) => VectorIo(ctx, VectorIoKind.Read);
+    #pragma warning restore SHEM004
     [SysAbiExport(Nid = "R74tt43xP6k", ExportName = "sceKernelAddHRTimerEvent", LibraryName = "libkernel", Target = Generation.Gen5)]
     public static int KernelAddHRTimerEvent(CpuContext ctx) => Ok(ctx);
     [SysAbiExport(Nid = "kAt6VDbHmro", ExportName = "sceKernelWritev", LibraryName = "libkernel", Target = Generation.Gen5)]
     public static int KernelWritev(CpuContext ctx) => VectorIo(ctx, VectorIoKind.Write);
+    #pragma warning disable SHEM004
     [SysAbiExport(Nid = "YSHRBRLn2pI", ExportName = "writev", LibraryName = "libkernel", Target = Generation.Gen5)]
     public static int Writev(CpuContext ctx) => VectorIo(ctx, VectorIoKind.Write);
+    #pragma warning restore SHEM004
 
     private enum VectorIoKind { Read, Pread, Write, Pwrite }
 
@@ -617,9 +605,7 @@ public static class KernelExtraCompatExports
     public static int PosixRwlockTimedRead(CpuContext ctx) => Ok(ctx);
     [SysAbiExport(Nid = "9zklzAl9CGM", ExportName = "posix_pthread_rwlock_timedwrlock", LibraryName = "libkernel", Target = Generation.Gen5)]
     public static int PosixRwlockTimedWrite(CpuContext ctx) => Ok(ctx);
-    [SysAbiExport(Nid = "SFxTMOfuCkE", ExportName = "posix_pthread_rwlock_tryrdlock", LibraryName = "libkernel", Target = Generation.Gen5)]
     public static int PosixRwlockTryRead(CpuContext ctx) => Ok(ctx);
-    [SysAbiExport(Nid = "XhWHn6P5R7U", ExportName = "posix_pthread_rwlock_trywrlock", LibraryName = "libkernel", Target = Generation.Gen5)]
     public static int PosixRwlockTryWrite(CpuContext ctx) => Ok(ctx);
 
     [SysAbiExport(Nid = "xFebsA4YsFI", ExportName = "posix_pthread_rwlockattr_init", LibraryName = "libkernel", Target = Generation.Gen5)]
@@ -711,7 +697,6 @@ public static class KernelExtraCompatExports
         return ctx.TryWriteUInt64(address, bits) ? Ok(ctx) : PosixFailure(ctx, 14);
     }
 
-    [SysAbiExport(Nid = "GEnUkDZoUwY", ExportName = "scePthreadSemInit", LibraryName = "libkernel", Target = Generation.Gen5)]
     public static int PthreadSemInit(CpuContext ctx)
     {
         var semAddress = ctx[CpuRegister.Rdi];
@@ -722,20 +707,15 @@ public static class KernelExtraCompatExports
         ctx[CpuRegister.Rdx] = savedRdx;
         return KernelPosixSemExports.SemInit(ctx);
     }
-    [SysAbiExport(Nid = "Vwc+L05e6oE", ExportName = "scePthreadSemDestroy", LibraryName = "libkernel", Target = Generation.Gen5)]
     public static int PthreadSemDestroy(CpuContext ctx) { var result = KernelPosixSemExports.SemDestroy(ctx); _ = ctx.TryWriteUInt64(ctx[CpuRegister.Rdi], 0); return result; }
     [SysAbiExport(Nid = "DjpBvGlaWbQ", ExportName = "scePthreadSemGetvalue", LibraryName = "libkernel", Target = Generation.Gen5)]
     public static int PthreadSemGetvalue(CpuContext ctx) => KernelPosixSemExports.SemGetvalue(ctx);
-    [SysAbiExport(Nid = "aishVAiFaYM", ExportName = "scePthreadSemPost", LibraryName = "libkernel", Target = Generation.Gen5)]
     public static int PthreadSemPost(CpuContext ctx) => KernelPosixSemExports.SemPost(ctx);
-    [SysAbiExport(Nid = "H2a+IN9TP0E", ExportName = "scePthreadSemTrywait", LibraryName = "libkernel", Target = Generation.Gen5)]
     public static int PthreadSemTrywait(CpuContext ctx) => KernelPosixSemExports.SemTrywait(ctx);
     [SysAbiExport(Nid = "fjN6NQHhK8k", ExportName = "scePthreadSemTimedwait", LibraryName = "libkernel", Target = Generation.Gen5)]
     public static int PthreadSemTimedwait(CpuContext ctx) => KernelPosixSemExports.SemTrywait(ctx);
-    [SysAbiExport(Nid = "C36iRE0F5sE", ExportName = "scePthreadSemWait", LibraryName = "libkernel", Target = Generation.Gen5)]
     public static int PthreadSemWait(CpuContext ctx) => KernelPosixSemExports.SemTrywait(ctx);
 
-    [SysAbiExport(Nid = "Ucsu-OK+els", ExportName = "posix_pthread_attr_get_np", LibraryName = "libScePosix", Target = Generation.Gen5)]
     public static int PosixAttrGetNp(CpuContext ctx)
     {
         var outAttributeAddress = ctx[CpuRegister.Rsi];
@@ -751,15 +731,15 @@ public static class KernelExtraCompatExports
         if (ctx[CpuRegister.Rsi] < 8 || ctx[CpuRegister.Rdx] == 0) return Invalid(ctx);
         return CallWithRsi(ctx, ctx[CpuRegister.Rdx], KernelPthreadExtendedCompatExports.PthreadAttrGetaffinity);
     }
-    [SysAbiExport(Nid = "VUT1ZSrHT0I", ExportName = "posix_pthread_attr_getdetachstate", LibraryName = "libScePosix", Target = Generation.Gen5)] public static int PosixAttrGetdetachstate(CpuContext ctx) => KernelPthreadExtendedCompatExports.PthreadAttrGetdetachstate(ctx);
-    [SysAbiExport(Nid = "JNkVVsVDmOk", ExportName = "posix_pthread_attr_getguardsize", LibraryName = "libScePosix", Target = Generation.Gen5)] public static int PosixAttrGetguardsize(CpuContext ctx) => KernelPthreadExtendedCompatExports.PthreadAttrGetguardsize(ctx);
+    public static int PosixAttrGetdetachstate(CpuContext ctx) => KernelPthreadExtendedCompatExports.PthreadAttrGetdetachstate(ctx);
+    public static int PosixAttrGetguardsize(CpuContext ctx) => KernelPthreadExtendedCompatExports.PthreadAttrGetguardsize(ctx);
     [SysAbiExport(Nid = "oLjPqUKhzes", ExportName = "posix_pthread_attr_getinheritsched", LibraryName = "libScePosix", Target = Generation.Gen5)] public static int PosixAttrGetinheritsched(CpuContext ctx) => WriteInt32(ctx, ctx[CpuRegister.Rsi], _attributeExtensions.GetOrAdd(ctx[CpuRegister.Rdi], _ => new()).InheritSched);
-    [SysAbiExport(Nid = "qlk9pSLsUmM", ExportName = "posix_pthread_attr_getschedparam", LibraryName = "libScePosix", Target = Generation.Gen5)] public static int PosixAttrGetschedparam(CpuContext ctx) => KernelPthreadExtendedCompatExports.PthreadAttrGetschedparam(ctx);
+    public static int PosixAttrGetschedparam(CpuContext ctx) => KernelPthreadExtendedCompatExports.PthreadAttrGetschedparam(ctx);
     [SysAbiExport(Nid = "RtLRV-pBTTY", ExportName = "posix_pthread_attr_getschedpolicy", LibraryName = "libScePosix", Target = Generation.Gen5)] public static int PosixAttrGetschedpolicy(CpuContext ctx) => WriteInt32(ctx, ctx[CpuRegister.Rsi], _attributeExtensions.GetOrAdd(ctx[CpuRegister.Rdi], _ => new()).Policy);
     [SysAbiExport(Nid = "e2G+cdEkOmU", ExportName = "posix_pthread_attr_getscope", LibraryName = "libScePosix", Target = Generation.Gen5)] public static int PosixAttrGetscope(CpuContext ctx) => WriteInt32(ctx, ctx[CpuRegister.Rsi], _attributeExtensions.GetOrAdd(ctx[CpuRegister.Rdi], _ => new()).Scope);
-    [SysAbiExport(Nid = "vQm4fDEsWi8", ExportName = "posix_pthread_attr_getstack", LibraryName = "libScePosix", Target = Generation.Gen5)] public static int PosixAttrGetstack(CpuContext ctx) => KernelPthreadExtendedCompatExports.PthreadAttrGetstack(ctx);
+    public static int PosixAttrGetstack(CpuContext ctx) => KernelPthreadExtendedCompatExports.PthreadAttrGetstack(ctx);
     [SysAbiExport(Nid = "DxmIMUQ-wXY", ExportName = "posix_pthread_attr_getstackaddr", LibraryName = "libScePosix", Target = Generation.Gen5)] public static int PosixAttrGetstackaddr(CpuContext ctx) => KernelPthreadExtendedCompatExports.PthreadAttrGetstackaddr(ctx);
-    [SysAbiExport(Nid = "0qOtCR-ZHck", ExportName = "posix_pthread_attr_getstacksize", LibraryName = "libScePosix", Target = Generation.Gen5)] public static int PosixAttrGetstacksize(CpuContext ctx) => KernelPthreadExtendedCompatExports.PthreadAttrGetstacksize(ctx);
+    public static int PosixAttrGetstacksize(CpuContext ctx) => KernelPthreadExtendedCompatExports.PthreadAttrGetstacksize(ctx);
 
     [SysAbiExport(Nid = "o8pd4juNbgc", ExportName = "posix_pthread_attr_setaffinity_np", LibraryName = "libScePosix", Target = Generation.Gen5)]
     public static int PosixAttrSetaffinity(CpuContext ctx)
@@ -769,12 +749,10 @@ public static class KernelExtraCompatExports
     }
     [SysAbiExport(Nid = "Q2y5IqSDZGs", ExportName = "posix_pthread_attr_setcreatesuspend_np", LibraryName = "libScePosix", Target = Generation.Gen5)]
     public static int PosixAttrSetcreatesuspend(CpuContext ctx) { _attributeExtensions.GetOrAdd(ctx[CpuRegister.Rdi], _ => new()).CreateSuspended = unchecked((int)ctx[CpuRegister.Rsi]); return Ok(ctx); }
-    [SysAbiExport(Nid = "E+tyo3lp5Lw", ExportName = "posix_pthread_attr_setdetachstate", LibraryName = "libScePosix", Target = Generation.Gen5)] public static int PosixAttrSetdetachstate(CpuContext ctx) => KernelPthreadExtendedCompatExports.PthreadAttrSetdetachstate(ctx);
-    [SysAbiExport(Nid = "JKyG3SWyA10", ExportName = "posix_pthread_attr_setguardsize", LibraryName = "libScePosix", Target = Generation.Gen5)] public static int PosixAttrSetguardsize(CpuContext ctx) => KernelPthreadExtendedCompatExports.PthreadAttrSetguardsize(ctx);
-    [SysAbiExport(Nid = "7ZlAakEf0Qg", ExportName = "posix_pthread_attr_setinheritsched", LibraryName = "libScePosix", Target = Generation.Gen5)]
+    public static int PosixAttrSetdetachstate(CpuContext ctx) => KernelPthreadExtendedCompatExports.PthreadAttrSetdetachstate(ctx);
+    public static int PosixAttrSetguardsize(CpuContext ctx) => KernelPthreadExtendedCompatExports.PthreadAttrSetguardsize(ctx);
     public static int PosixAttrSetinheritsched(CpuContext ctx) { _attributeExtensions.GetOrAdd(ctx[CpuRegister.Rdi], _ => new()).InheritSched = unchecked((int)ctx[CpuRegister.Rsi]); return KernelPthreadExtendedCompatExports.PthreadAttrSetinheritsched(ctx); }
-    [SysAbiExport(Nid = "euKRgm0Vn2M", ExportName = "posix_pthread_attr_setschedparam", LibraryName = "libScePosix", Target = Generation.Gen5)] public static int PosixAttrSetschedparam(CpuContext ctx) => KernelPthreadExtendedCompatExports.PthreadAttrSetschedparam(ctx);
-    [SysAbiExport(Nid = "JarMIy8kKEY", ExportName = "posix_pthread_attr_setschedpolicy", LibraryName = "libScePosix", Target = Generation.Gen5)]
+    public static int PosixAttrSetschedparam(CpuContext ctx) => KernelPthreadExtendedCompatExports.PthreadAttrSetschedparam(ctx);
     public static int PosixAttrSetschedpolicy(CpuContext ctx) { _attributeExtensions.GetOrAdd(ctx[CpuRegister.Rdi], _ => new()).Policy = unchecked((int)ctx[CpuRegister.Rsi]); return KernelPthreadExtendedCompatExports.PthreadAttrSetschedpolicy(ctx); }
     [SysAbiExport(Nid = "xesmlSI-KCI", ExportName = "posix_pthread_attr_setscope", LibraryName = "libScePosix", Target = Generation.Gen5)]
     public static int PosixAttrSetscope(CpuContext ctx) { _attributeExtensions.GetOrAdd(ctx[CpuRegister.Rdi], _ => new()).Scope = unchecked((int)ctx[CpuRegister.Rsi]); return Ok(ctx); }
@@ -801,16 +779,15 @@ public static class KernelExtraCompatExports
     [SysAbiExport(Nid = "K953PF5u6Pc", ExportName = "posix_pthread_cond_reltimedwait_np", LibraryName = "libScePosix", Target = Generation.Gen5)] public static int PosixCondReltimedwait(CpuContext ctx) => ctx.SetReturn(60);
     [SysAbiExport(Nid = "CI6Qy73ae10", ExportName = "posix_pthread_cond_signalto_np", LibraryName = "libScePosix", Target = Generation.Gen5)] public static int PosixCondSignalto(CpuContext ctx) => KernelPthreadCompatExports.PthreadCondSignal(ctx);
 
-    [SysAbiExport(Nid = "FIs3-UQT9sg", ExportName = "posix_pthread_getschedparam", LibraryName = "libScePosix", Target = Generation.Gen5)] public static int PosixPthreadGetschedparam(CpuContext ctx) => KernelPthreadExtendedCompatExports.PthreadGetschedparam(ctx);
-    [SysAbiExport(Nid = "9vyP6Z7bqzc", ExportName = "posix_pthread_rename_np", LibraryName = "libScePosix", Target = Generation.Gen5)] public static int PosixPthreadRename(CpuContext ctx) => KernelPthreadCompatExports.PthreadRename(ctx);
+    public static int PosixPthreadGetschedparam(CpuContext ctx) => KernelPthreadExtendedCompatExports.PthreadGetschedparam(ctx);
+    public static int PosixPthreadRename(CpuContext ctx) => KernelPthreadCompatExports.PthreadRename(ctx);
     [SysAbiExport(Nid = "lZzFeSxPl08", ExportName = "posix_pthread_setcancelstate", LibraryName = "libScePosix", Target = Generation.Gen5)]
     public static int PosixPthreadSetcancelstate(CpuContext ctx)
     {
         if (ctx[CpuRegister.Rsi] != 0 && !ctx.TryWriteInt32(ctx[CpuRegister.Rsi], 0)) return Fault(ctx);
         return Ok(ctx);
     }
-    [SysAbiExport(Nid = "a2P9wYGeZvc", ExportName = "posix_pthread_setprio", LibraryName = "libScePosix", Target = Generation.Gen5)] public static int PosixPthreadSetprio(CpuContext ctx) => KernelPthreadExtendedCompatExports.PthreadSetprio(ctx);
-    [SysAbiExport(Nid = "Z4QosVuAsA0", ExportName = "posix_pthread_once", LibraryName = "libScePosix", Target = Generation.Gen5)]
+    public static int PosixPthreadSetprio(CpuContext ctx) => KernelPthreadExtendedCompatExports.PthreadSetprio(ctx);
     public static int PosixPthreadOnce(CpuContext ctx)
     {
         var control = ctx[CpuRegister.Rdi];
@@ -890,9 +867,9 @@ public static class KernelExtraCompatExports
     public static int KernelCloseEventFlag(CpuContext ctx) => KernelEventFlagCompatExports.KernelDeleteEventFlag(ctx);
 
     [SysAbiExport(Nid = "9WK-vhNXimw", ExportName = "sceKernelAioSetParam", LibraryName = "libkernel", Target = Generation.Gen5)] public static int AioSetParam(CpuContext ctx) => Ok(ctx);
-    [SysAbiExport(Nid = "HgX7+AORI58", ExportName = "sceKernelAioSubmitReadCommands", LibraryName = "libkernel", Target = Generation.Gen5)] public static int AioSubmitRead(CpuContext ctx) => AioSubmit(ctx, multiple: false);
-    [SysAbiExport(Nid = "lXT0m3P-vs4", ExportName = "sceKernelAioSubmitReadCommandsMultiple", LibraryName = "libkernel", Target = Generation.Gen5)] public static int AioSubmitReadMultiple(CpuContext ctx) => AioSubmit(ctx, multiple: true);
-    [SysAbiExport(Nid = "XQ8C8y+de+E", ExportName = "sceKernelAioSubmitWriteCommands", LibraryName = "libkernel", Target = Generation.Gen5)] public static int AioSubmitWrite(CpuContext ctx) => AioSubmit(ctx, multiple: false);
+    public static int AioSubmitRead(CpuContext ctx) => AioSubmit(ctx, multiple: false);
+    public static int AioSubmitReadMultiple(CpuContext ctx) => AioSubmit(ctx, multiple: true);
+    public static int AioSubmitWrite(CpuContext ctx) => AioSubmit(ctx, multiple: false);
     [SysAbiExport(Nid = "xT3Cpz0yh6Y", ExportName = "sceKernelAioSubmitWriteCommandsMultiple", LibraryName = "libkernel", Target = Generation.Gen5)] public static int AioSubmitWriteMultiple(CpuContext ctx) => AioSubmit(ctx, multiple: true);
 
     private static int AioSubmit(CpuContext ctx, bool multiple)
@@ -920,9 +897,7 @@ public static class KernelExtraCompatExports
 
     [SysAbiExport(Nid = "2pOuoWoCxdk", ExportName = "sceKernelAioPollRequest", LibraryName = "libkernel", Target = Generation.Gen5)]
     public static int AioPollRequest(CpuContext ctx) => WriteInt32(ctx, ctx[CpuRegister.Rsi], _aioStates.TryGetValue(unchecked((int)ctx[CpuRegister.Rdi]), out var state) ? state : AioAborted);
-    [SysAbiExport(Nid = "o7O4z3jwKzo", ExportName = "sceKernelAioPollRequests", LibraryName = "libkernel", Target = Generation.Gen5)]
     public static int AioPollRequests(CpuContext ctx) => AioArrayOperation(ctx, abort: false, remove: false);
-    [SysAbiExport(Nid = "fR521KIGgb8", ExportName = "sceKernelAioCancelRequest", LibraryName = "libkernel", Target = Generation.Gen5)]
     public static int AioCancelRequest(CpuContext ctx)
     {
         var id = unchecked((int)ctx[CpuRegister.Rdi]);
@@ -930,7 +905,6 @@ public static class KernelExtraCompatExports
         return WriteInt32(ctx, ctx[CpuRegister.Rsi], id == 0 ? 2 : AioAborted);
     }
     [SysAbiExport(Nid = "3Lca1XBrQdY", ExportName = "sceKernelAioCancelRequests", LibraryName = "libkernel", Target = Generation.Gen5)] public static int AioCancelRequests(CpuContext ctx) => AioArrayOperation(ctx, abort: true, remove: false);
-    [SysAbiExport(Nid = "5TgME6AYty4", ExportName = "sceKernelAioDeleteRequest", LibraryName = "libkernel", Target = Generation.Gen5)]
     public static int AioDeleteRequest(CpuContext ctx)
     {
         _aioStates.TryRemove(unchecked((int)ctx[CpuRegister.Rdi]), out _);
@@ -938,7 +912,7 @@ public static class KernelExtraCompatExports
     }
     [SysAbiExport(Nid = "Ft3EtsZzAoY", ExportName = "sceKernelAioDeleteRequests", LibraryName = "libkernel", Target = Generation.Gen5)] public static int AioDeleteRequests(CpuContext ctx) => AioArrayOperation(ctx, abort: true, remove: true);
     [SysAbiExport(Nid = "KOF-oJbQVvc", ExportName = "sceKernelAioWaitRequest", LibraryName = "libkernel", Target = Generation.Gen5)] public static int AioWaitRequest(CpuContext ctx) => AioPollRequest(ctx);
-    [SysAbiExport(Nid = "lgK+oIWkJyA", ExportName = "sceKernelAioWaitRequests", LibraryName = "libkernel", Target = Generation.Gen5)] public static int AioWaitRequests(CpuContext ctx) => AioArrayOperation(ctx, abort: false, remove: false);
+    public static int AioWaitRequests(CpuContext ctx) => AioArrayOperation(ctx, abort: false, remove: false);
 
     private static int AioArrayOperation(CpuContext ctx, bool abort, bool remove)
     {
@@ -965,7 +939,6 @@ public static class KernelExtraCompatExports
         return Ok(ctx);
     }
 
-    [SysAbiExport(Nid = "T8fER+tIGgk", ExportName = "posix_select", LibraryName = "libScePosix", Target = Generation.Gen5)]
     public static int PosixSelect(CpuContext ctx)
     {
         var nfds = unchecked((int)ctx[CpuRegister.Rdi]);

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using SharpEmu.HLE;
+using SharpEmu.Libs.Gpu;
 using SharpEmu.Libs.VideoOut;
 using System.Buffers.Binary;
 
@@ -10,51 +11,91 @@ namespace SharpEmu.Libs.SystemService;
 public static class SystemServiceExports
 {
     private const int OrbisSystemServiceErrorParameter = unchecked((int)0x80A10003);
-    private const int OrbisSystemServiceErrorNoEvent = unchecked((int)0x80A10004);
     private const int SystemServiceStatusSize = 0x0C;
     private const int DisplaySafeAreaInfoSize = sizeof(float) + 128;
-    private const int HdrToneMapLuminanceSize = 3 * sizeof(float);
-    private const int DaemonEventSize = sizeof(int) + 8192;
-    private const int TitleWorkaroundInfoSize = 16;
-    private static readonly object _stateGate = new();
-    private static bool _musicPlayerDisabled;
-    private static bool _applicationSuspended;
-    private static bool _personalEyeDistanceSettingEnabled = true;
-    private static bool _suspendConfirmationEnabled = true;
-    private static int _gpuLoadEmulationMode;
-    private static int _renderingMode;
+    private const int HdrToneMapLuminanceSize = sizeof(float) * 3;
 
-    internal static bool MusicPlayerDisabled
+    private const int TitleIdFieldSize = 0x10;
+
+    private static string? _mainAppTitleId;
+    private static int _noticeScreenSkipFlag;
+
+    public static void ConfigureApplicationInfo(string? titleId)
     {
-        get
-        {
-            lock (_stateGate)
-            {
-                return _musicPlayerDisabled;
-            }
-        }
+        _mainAppTitleId = string.IsNullOrWhiteSpace(titleId) ? null : titleId.Trim();
     }
 
-    internal static bool PersonalEyeDistanceSettingEnabled
+    [SysAbiExport(
+        Nid = "3RQ5aQfnstU",
+        ExportName = "sceSystemServiceGetNoticeScreenSkipFlag",
+        Target = Generation.Gen5,
+        LibraryName = "libSceSystemService")]
+    public static int SystemServiceGetNoticeScreenSkipFlag(CpuContext ctx)
     {
-        get
+        var flagAddress = ctx[CpuRegister.Rdi];
+        if (flagAddress == 0)
         {
-            lock (_stateGate)
-            {
-                return _personalEyeDistanceSettingEnabled;
-            }
+            return ctx.SetReturn(OrbisSystemServiceErrorParameter);
         }
+
+        // Keep the flag state even though the emulator does not display the
+        // system notice screen. Titles use this service as a normal preference
+        // store and expect a later get to observe the value they set.
+        Span<byte> flagBytes = stackalloc byte[1];
+        flagBytes[0] = unchecked((byte)Volatile.Read(ref _noticeScreenSkipFlag));
+        return ctx.Memory.TryWrite(flagAddress, flagBytes)
+            ? ctx.SetReturn(0)
+            : ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
     }
 
-    internal static bool SuspendConfirmationEnabled
+    [SysAbiExport(
+        Nid = "8Lo6Zv94aho",
+        ExportName = "sceSystemServiceDisableNoticeScreenSkipFlagAutoSet",
+        Target = Generation.Gen5,
+        LibraryName = "libSceSystemService")]
+    public static int SystemServiceDisableNoticeScreenSkipFlagAutoSet(CpuContext ctx) =>
+        ctx.SetReturn(0);
+
+    // Settings entry calls this immediately before spawning SaveModTime/Load
+    // threads. An unresolved stub returns NOT_FOUND and the title can stall in
+    // that path; accept the write and report success.
+    [SysAbiExport(
+        Nid = "Q3utJvma4Mo",
+        ExportName = "sceSystemServiceSetNoticeScreenSkipFlag",
+        Target = Generation.Gen5,
+        LibraryName = "libSceSystemService")]
+    public static int SystemServiceSetNoticeScreenSkipFlag(CpuContext ctx)
     {
-        get
+        // The native API takes the flag value in the first argument. Treat any
+        // non-zero value as true, matching the bool-like PS5 ABI.
+        Volatile.Write(ref _noticeScreenSkipFlag, ctx[CpuRegister.Rdi] != 0 ? 1 : 0);
+        return ctx.SetReturn(0);
+    }
+
+    [SysAbiExport(
+        Nid = "4veE0XiIugA",
+        ExportName = "sceSystemServiceGetMainAppTitleId",
+        Target = Generation.Gen5,
+        LibraryName = "libSceSystemService")]
+    public static int SystemServiceGetMainAppTitleId(CpuContext ctx)
+    {
+        var titleIdAddress = ctx[CpuRegister.Rdi];
+        if (titleIdAddress == 0)
         {
-            lock (_stateGate)
-            {
-                return _suspendConfirmationEnabled;
-            }
+            return ctx.SetReturn(OrbisSystemServiceErrorParameter);
         }
+
+        // Title IDs are a fixed 9-char format written into a 0x10-byte field;
+        // bound the length so a malformed param.json cannot drive an unbounded
+        // stack allocation or overrun the guest buffer.
+        var titleId = _mainAppTitleId ?? "PPSA00000";
+        var length = Math.Min(titleId.Length, TitleIdFieldSize - 1);
+        Span<byte> titleIdBytes = stackalloc byte[TitleIdFieldSize];
+        titleIdBytes.Clear();
+        System.Text.Encoding.ASCII.GetBytes(titleId.AsSpan(0, length), titleIdBytes);
+        return ctx.Memory.TryWrite(titleIdAddress, titleIdBytes[..(length + 1)])
+            ? ctx.SetReturn(0)
+            : ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
     }
 
     [SysAbiExport(
@@ -81,6 +122,35 @@ public static class SystemServiceExports
         Span<byte> valueBytes = stackalloc byte[sizeof(int)];
         BinaryPrimitives.WriteInt32LittleEndian(valueBytes, value);
         return ctx.Memory.TryWrite(valueAddress, valueBytes)
+            ? ctx.SetReturn(0)
+            : ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+    }
+
+    [SysAbiExport(
+        Nid = "SsC-m-S9JTA",
+        ExportName = "sceSystemServiceParamGetString",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceSystemService")]
+    public static int SystemServiceParamGetString(CpuContext ctx)
+    {
+        _ = unchecked((int)ctx[CpuRegister.Rdi]); // parameter id (nickname, etc.)
+        var bufferAddress = ctx[CpuRegister.Rsi];
+        var bufferSize = unchecked((int)ctx[CpuRegister.Rdx]);
+        if (bufferAddress == 0 || bufferSize <= 0)
+        {
+            return ctx.SetReturn(OrbisSystemServiceErrorParameter);
+        }
+
+        // String params are typically the user nickname. Callers that gate UI
+        // or text setup on a successful read (and skip it on failure) stall on
+        // a black screen when this returns NOT_FOUND, so return a neutral
+        // non-empty default and success.
+        var value = System.Text.Encoding.UTF8.GetBytes("SharpEmu");
+        var writeLength = Math.Min(value.Length, bufferSize - 1);
+        Span<byte> output = stackalloc byte[writeLength + 1];
+        value.AsSpan(0, writeLength).CopyTo(output);
+        output[writeLength] = 0;
+        return ctx.Memory.TryWrite(bufferAddress, output)
             ? ctx.SetReturn(0)
             : ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
     }
@@ -131,59 +201,12 @@ public static class SystemServiceExports
     }
 
     [SysAbiExport(
-        Nid = "Vo5V8KAwCmk",
-        ExportName = "sceSystemServiceHideSplashScreen",
-        Target = Generation.Gen4 | Generation.Gen5,
-        LibraryName = "libSceSystemService")]
-    public static int SystemServiceHideSplashScreen(CpuContext ctx)
-    {
-        VulkanVideoPresenter.HideSplashScreen();
-        return ctx.SetReturn(0);
-    }
-
-    [SysAbiExport(
-        Nid = "656LMQSrg6U",
-        ExportName = "sceSystemServiceReceiveEvent",
-        Target = Generation.Gen4 | Generation.Gen5,
-        LibraryName = "libSceSystemService")]
-    public static int SystemServiceReceiveEvent(CpuContext ctx)
-    {
-        // No system events (resume, entitlement updates, url open, ...) are
-        // ever queued; games poll this each frame and treat NO_EVENT as idle.
-        var eventAddress = ctx[CpuRegister.Rdi];
-        return eventAddress == 0
-            ? ctx.SetReturn(OrbisSystemServiceErrorParameter)
-            : ctx.SetReturn(OrbisSystemServiceErrorNoEvent);
-    }
-
-    [SysAbiExport(
-        Nid = "3RQ5aQfnstU",
-        ExportName = "sceSystemServiceGetNoticeScreenSkipFlag",
-        Target = Generation.Gen5,
-        LibraryName = "libSceSystemService")]
-    public static int SystemServiceGetNoticeScreenSkipFlag(CpuContext ctx)
-    {
-        // Skip flag off: the title shows its own startup notices as usual.
-        var flagAddress = ctx[CpuRegister.Rdi];
-        if (flagAddress == 0)
-        {
-            return ctx.SetReturn(OrbisSystemServiceErrorParameter);
-        }
-
-        return ctx.TryWriteInt32(flagAddress, 0)
-            ? ctx.SetReturn(0)
-            : ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
-    }
-
-    [SysAbiExport(
         Nid = "mPpPxv5CZt4",
         ExportName = "sceSystemServiceGetHdrToneMapLuminance",
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libSceSystemService")]
     public static int SystemServiceGetHdrToneMapLuminance(CpuContext ctx)
     {
-        // Out-parameter is three floats {max, maxFrameAverage, min} in nits;
-        // report bright-HDR-display defaults so titles pick a sane tone map.
         var luminanceAddress = ctx[CpuRegister.Rdi];
         if (luminanceAddress == 0)
         {
@@ -200,395 +223,23 @@ public static class SystemServiceExports
     }
 
     [SysAbiExport(
+        Nid = "Vo5V8KAwCmk",
+        ExportName = "sceSystemServiceHideSplashScreen",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceSystemService")]
+    public static int SystemServiceHideSplashScreen(CpuContext ctx)
+    {
+        GuestGpu.Current.HideSplashScreen();
+        return ctx.SetReturn(0);
+    }
+
+    [SysAbiExport(
         Nid = "3s8cHiCBKBE",
         ExportName = "sceSystemServiceReportAbnormalTermination",
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libSceSystemService")]
     public static int SystemServiceReportAbnormalTermination(CpuContext ctx) => ctx.SetReturn(0);
 
-    [SysAbiExport(Nid = "0z7srulNt7U", ExportName = "sceSystemServiceAcquireFb0", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSystemService")]
-    public static int SystemServiceAcquireFb0(CpuContext ctx) => SystemServiceOk(ctx);
-
-    [SysAbiExport(Nid = "0cl8SuwosPQ", ExportName = "sceSystemServiceAddLocalProcess", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSystemService")]
-    public static int SystemServiceAddLocalProcess(CpuContext ctx) => SystemServiceOk(ctx);
-
-    [SysAbiExport(Nid = "cltshBrDLC0", ExportName = "sceSystemServiceAddLocalProcessForPsmKit", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSystemService")]
-    public static int SystemServiceAddLocalProcessForPsmKit(CpuContext ctx) => SystemServiceOk(ctx);
-
-    [SysAbiExport(Nid = "FI+VqGdttvI", ExportName = "sceSystemServiceChangeAcpClock", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSystemService")]
-    public static int SystemServiceChangeAcpClock(CpuContext ctx) => SystemServiceOk(ctx);
-
-    [SysAbiExport(Nid = "ec72vt3WEQo", ExportName = "sceSystemServiceChangeCpuClock", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSystemService")]
-    public static int SystemServiceChangeCpuClock(CpuContext ctx) => SystemServiceOk(ctx);
-
-    [SysAbiExport(Nid = "Z5RgV4Chwxg", ExportName = "sceSystemServiceChangeGpuClock", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSystemService")]
-    public static int SystemServiceChangeGpuClock(CpuContext ctx) => SystemServiceOk(ctx);
-
-    [SysAbiExport(Nid = "LFo00RWzqRU", ExportName = "sceSystemServiceChangeMemoryClock", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSystemService")]
-    public static int SystemServiceChangeMemoryClock(CpuContext ctx) => SystemServiceOk(ctx);
-
-    [SysAbiExport(Nid = "MyBXslDE+2o", ExportName = "sceSystemServiceChangeMemoryClockToBaseMode", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSystemService")]
-    public static int SystemServiceChangeMemoryClockToBaseMode(CpuContext ctx) => SystemServiceOk(ctx);
-
-    [SysAbiExport(Nid = "qv+X8gozqF4", ExportName = "sceSystemServiceChangeMemoryClockToDefault", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSystemService")]
-    public static int SystemServiceChangeMemoryClockToDefault(CpuContext ctx) => SystemServiceOk(ctx);
-
-    [SysAbiExport(Nid = "fOsE5pTieqY", ExportName = "sceSystemServiceChangeMemoryClockToMultiMediaMode", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSystemService")]
-    public static int SystemServiceChangeMemoryClockToMultiMediaMode(CpuContext ctx) => SystemServiceOk(ctx);
-
-    [SysAbiExport(Nid = "5MLppFJZyX4", ExportName = "sceSystemServiceChangeNumberOfGpuCu", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSystemService")]
-    public static int SystemServiceChangeNumberOfGpuCu(CpuContext ctx) => SystemServiceOk(ctx);
-
-    [SysAbiExport(Nid = "lgTlIAEJ33M", ExportName = "sceSystemServiceChangeSamuClock", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSystemService")]
-    public static int SystemServiceChangeSamuClock(CpuContext ctx) => SystemServiceOk(ctx);
-
-    [SysAbiExport(Nid = "BQUi7AW+2tQ", ExportName = "sceSystemServiceChangeUvdClock", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSystemService")]
-    public static int SystemServiceChangeUvdClock(CpuContext ctx) => SystemServiceOk(ctx);
-
-    [SysAbiExport(Nid = "fzguXBQzNvI", ExportName = "sceSystemServiceChangeVceClock", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSystemService")]
-    public static int SystemServiceChangeVceClock(CpuContext ctx) => SystemServiceOk(ctx);
-
-    [SysAbiExport(Nid = "x1UB9bwDSOw", ExportName = "sceSystemServiceDisableMusicPlayer", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSystemService")]
-    public static int SystemServiceDisableMusicPlayer(CpuContext ctx)
-    {
-        lock (_stateGate)
-        {
-            _musicPlayerDisabled = true;
-        }
-
-        return SystemServiceOk(ctx);
-    }
-
-    [SysAbiExport(Nid = "Mr1IgQaRff0", ExportName = "sceSystemServiceDisablePersonalEyeToEyeDistanceSetting", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSystemService")]
-    public static int SystemServiceDisablePersonalEyeToEyeDistanceSetting(CpuContext ctx)
-    {
-        lock (_stateGate)
-        {
-            _personalEyeDistanceSettingEnabled = false;
-        }
-
-        return SystemServiceOk(ctx);
-    }
-
-    [SysAbiExport(Nid = "PQ+SjXAg3EM", ExportName = "sceSystemServiceDisableSuspendConfirmationDialog", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSystemService")]
-    public static int SystemServiceDisableSuspendConfirmationDialog(CpuContext ctx)
-    {
-        lock (_stateGate)
-        {
-            _suspendConfirmationEnabled = false;
-        }
-
-        return SystemServiceOk(ctx);
-    }
-
-    [SysAbiExport(Nid = "O3irWUQ2s-g", ExportName = "sceSystemServiceEnablePersonalEyeToEyeDistanceSetting", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSystemService")]
-    public static int SystemServiceEnablePersonalEyeToEyeDistanceSetting(CpuContext ctx)
-    {
-        lock (_stateGate)
-        {
-            _personalEyeDistanceSettingEnabled = true;
-        }
-
-        return SystemServiceOk(ctx);
-    }
-
-    [SysAbiExport(Nid = "Rn32O5PDlmo", ExportName = "sceSystemServiceEnableSuspendConfirmationDialog", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSystemService")]
-    public static int SystemServiceEnableSuspendConfirmationDialog(CpuContext ctx)
-    {
-        lock (_stateGate)
-        {
-            _suspendConfirmationEnabled = true;
-        }
-
-        return SystemServiceOk(ctx);
-    }
-
-    [SysAbiExport(Nid = "xjE7xLfrLUk", ExportName = "sceSystemServiceGetAppFocusedAppStatus", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSystemService")]
-    public static int SystemServiceGetAppFocusedAppStatus(CpuContext ctx) => ctx.SetReturn(1);
-
-    [SysAbiExport(Nid = "f4oDTxAJCHE", ExportName = "sceSystemServiceGetAppIdOfBigApp", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSystemService")]
-    public static int SystemServiceGetAppIdOfBigApp(CpuContext ctx) => ctx.SetReturn(1);
-
-    [SysAbiExport(Nid = "BBSmGrxok5o", ExportName = "sceSystemServiceGetAppIdOfMiniApp", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSystemService")]
-    public static int SystemServiceGetAppIdOfMiniApp(CpuContext ctx) => ctx.SetReturn(0);
-
-    [SysAbiExport(Nid = "t5ShV0jWEFE", ExportName = "sceSystemServiceGetAppStatus", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSystemService")]
-    public static int SystemServiceGetAppStatus(CpuContext ctx)
-    {
-        lock (_stateGate)
-        {
-            return ctx.SetReturn(_applicationSuspended ? 1 : 0);
-        }
-    }
-
-    [SysAbiExport(Nid = "YLbhAXS20C0", ExportName = "sceSystemServiceGetAppType", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSystemService")]
-    public static int SystemServiceGetAppType(CpuContext ctx) => ctx.SetReturn(0);
-
-    [SysAbiExport(Nid = "JFg3az5ITN4", ExportName = "sceSystemServiceGetEventForDaemon", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSystemService")]
-    public static int SystemServiceGetEventForDaemon(CpuContext ctx)
-    {
-        var eventAddress = ctx[CpuRegister.Rdi];
-        if (eventAddress == 0)
-        {
-            return ctx.SetReturn(OrbisSystemServiceErrorParameter);
-        }
-
-        Span<byte> eventData = stackalloc byte[DaemonEventSize];
-        eventData.Clear();
-        BinaryPrimitives.WriteInt32LittleEndian(eventData, -1);
-        if (!ctx.Memory.TryWrite(eventAddress, eventData))
-        {
-            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
-        }
-
-        return ctx.SetReturn(OrbisSystemServiceErrorNoEvent);
-    }
-
-    [SysAbiExport(Nid = "4imyVMxX5-8", ExportName = "sceSystemServiceGetGpuLoadEmulationMode", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSystemService")]
-    public static int SystemServiceGetGpuLoadEmulationMode(CpuContext ctx)
-    {
-        lock (_stateGate)
-        {
-            return ctx.SetReturn(_gpuLoadEmulationMode);
-        }
-    }
-
-    [SysAbiExport(Nid = "ZNIuJjqdtgI", ExportName = "sceSystemServiceGetLocalProcessStatusList", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSystemService")]
-    public static int SystemServiceGetLocalProcessStatusList(CpuContext ctx)
-    {
-        var countAddress = ctx[CpuRegister.Rdx];
-        if (countAddress != 0 && !ctx.TryWriteUInt32(countAddress, 0))
-        {
-            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
-        }
-
-        return SystemServiceOk(ctx);
-    }
-
-    [SysAbiExport(Nid = "gbUBqHCEgAI", ExportName = "sceSystemServiceGetPSButtonEvent", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSystemService")]
-    public static int SystemServiceGetPSButtonEvent(CpuContext ctx) => WriteInt32Output(ctx, ctx[CpuRegister.Rdi], 0);
-
-    [SysAbiExport(Nid = "UMIlrOlGNQU", ExportName = "sceSystemServiceGetParentSocket", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSystemService")]
-    public static int SystemServiceGetParentSocket(CpuContext ctx) => ctx.SetReturn(0);
-
-    [SysAbiExport(Nid = "4ZYuSI8i2aM", ExportName = "sceSystemServiceGetParentSocketForPsmKit", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSystemService")]
-    public static int SystemServiceGetParentSocketForPsmKit(CpuContext ctx) => ctx.SetReturn(0);
-
-    [SysAbiExport(Nid = "jA629PcMCKU", ExportName = "sceSystemServiceGetRenderingMode", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSystemService")]
-    public static int SystemServiceGetRenderingMode(CpuContext ctx)
-    {
-        lock (_stateGate)
-        {
-            return ctx.SetReturn(_renderingMode);
-        }
-    }
-
-    [SysAbiExport(Nid = "VrvpoJEoSSU", ExportName = "sceSystemServiceGetTitleWorkaroundInfo", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSystemService")]
-    public static int SystemServiceGetTitleWorkaroundInfo(CpuContext ctx) => WriteZeroOutput(ctx, ctx[CpuRegister.Rdi], TitleWorkaroundInfoSize);
-
-    [SysAbiExport(Nid = "s4OcLqLsKn0", ExportName = "sceSystemServiceGetVersionNumberOfCameraCalibrationData", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSystemService")]
-    public static int SystemServiceGetVersionNumberOfCameraCalibrationData(CpuContext ctx) => ctx.SetReturn(0);
-
-    [SysAbiExport(Nid = "d-15YTCUMVU", ExportName = "sceSystemServiceIsAppSuspended", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSystemService")]
-    public static int SystemServiceIsAppSuspended(CpuContext ctx)
-    {
-        lock (_stateGate)
-        {
-            return ctx.SetReturn(_applicationSuspended ? 1 : 0);
-        }
-    }
-
-    [SysAbiExport(Nid = "SYqaqLuQU6w", ExportName = "sceSystemServiceIsBgmPlaying", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSystemService")]
-    public static int SystemServiceIsBgmPlaying(CpuContext ctx)
-        => ctx.SetReturn(0);
-
-    [SysAbiExport(Nid = "O4x1B7aXRYE", ExportName = "sceSystemServiceIsEyeToEyeDistanceAdjusted", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSystemService")]
-    public static int SystemServiceIsEyeToEyeDistanceAdjusted(CpuContext ctx)
-        => ctx.SetReturn(0);
-
-    [SysAbiExport(Nid = "bMDbofWFNfQ", ExportName = "sceSystemServiceIsScreenSaverOn", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSystemService")]
-    public static int SystemServiceIsScreenSaverOn(CpuContext ctx) => ctx.SetReturn(0);
-
-    [SysAbiExport(Nid = "KQFyDkgAjVs", ExportName = "sceSystemServiceIsShellUiFgAndGameBgCpuMode", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSystemService")]
-    public static int SystemServiceIsShellUiFgAndGameBgCpuMode(CpuContext ctx) => ctx.SetReturn(0);
-
-    [SysAbiExport(Nid = "N4RkyJh7FtA", ExportName = "sceSystemServiceKillApp", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSystemService")]
-    public static int SystemServiceKillApp(CpuContext ctx) => SetApplicationSuspended(ctx, true);
-
-    [SysAbiExport(Nid = "6jpZY0WUwLM", ExportName = "sceSystemServiceKillLocalProcess", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSystemService")]
-    public static int SystemServiceKillLocalProcess(CpuContext ctx) => SystemServiceOk(ctx);
-
-    [SysAbiExport(Nid = "7cTc7seJLfQ", ExportName = "sceSystemServiceKillLocalProcessForPsmKit", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSystemService")]
-    public static int SystemServiceKillLocalProcessForPsmKit(CpuContext ctx) => SystemServiceOk(ctx);
-
-    [SysAbiExport(Nid = "l4FB3wNa-Ac", ExportName = "sceSystemServiceLaunchApp", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSystemService")]
-    public static int SystemServiceLaunchApp(CpuContext ctx) => SetApplicationSuspended(ctx, false);
-
-    [SysAbiExport(Nid = "wX9wVFaegaM", ExportName = "sceSystemServiceLaunchEventDetails", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSystemService")]
-    public static int SystemServiceLaunchEventDetails(CpuContext ctx) => SystemServiceOk(ctx);
-
-    [SysAbiExport(Nid = "G5AwzWnHxks", ExportName = "sceSystemServiceLaunchTournamentList", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSystemService")]
-    public static int SystemServiceLaunchTournamentList(CpuContext ctx) => SystemServiceOk(ctx);
-
-    [SysAbiExport(Nid = "wIc92b0x6hk", ExportName = "sceSystemServiceLaunchTournamentsTeamProfile", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSystemService")]
-    public static int SystemServiceLaunchTournamentsTeamProfile(CpuContext ctx) => SystemServiceOk(ctx);
-
-    [SysAbiExport(Nid = "-+3hY+y8bNo", ExportName = "sceSystemServiceLaunchWebBrowser", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSystemService")]
-    public static int SystemServiceLaunchWebBrowser(CpuContext ctx) => SystemServiceOk(ctx);
-
-    [SysAbiExport(Nid = "JoBqSQt1yyA", ExportName = "sceSystemServiceLoadExec", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSystemService")]
-    public static int SystemServiceLoadExec(CpuContext ctx) => SystemServiceOk(ctx);
-
-    [SysAbiExport(Nid = "9ScDVErRRgw", ExportName = "sceSystemServiceNavigateToAnotherApp", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSystemService")]
-    public static int SystemServiceNavigateToAnotherApp(CpuContext ctx) => SystemServiceOk(ctx);
-
-    [SysAbiExport(Nid = "e4E3MIEAS2A", ExportName = "sceSystemServiceNavigateToGoBack", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSystemService")]
-    public static int SystemServiceNavigateToGoBack(CpuContext ctx) => SystemServiceOk(ctx);
-
-    [SysAbiExport(Nid = "ZeubLhPDitw", ExportName = "sceSystemServiceNavigateToGoBackWithValue", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSystemService")]
-    public static int SystemServiceNavigateToGoBackWithValue(CpuContext ctx) => SystemServiceOk(ctx);
-
-    [SysAbiExport(Nid = "x2-o9eBw3ZU", ExportName = "sceSystemServiceNavigateToGoHome", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSystemService")]
-    public static int SystemServiceNavigateToGoHome(CpuContext ctx) => SystemServiceOk(ctx);
-
-    [SysAbiExport(Nid = "SsC-m-S9JTA", ExportName = "sceSystemServiceParamGetString", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSystemService")]
-    public static int SystemServiceParamGetString(CpuContext ctx)
-    {
-        var parameterId = unchecked((int)ctx[CpuRegister.Rdi]);
-        var bufferAddress = ctx[CpuRegister.Rsi];
-        var bufferSize = ctx[CpuRegister.Rdx];
-        if (bufferAddress == 0 || bufferSize == 0)
-        {
-            return ctx.SetReturn(OrbisSystemServiceErrorParameter);
-        }
-
-        ReadOnlySpan<byte> value = parameterId == 6 ? "SharpEmu\0"u8 : "\0"u8;
-        if (bufferSize < (ulong)value.Length)
-        {
-            return ctx.SetReturn(OrbisSystemServiceErrorParameter);
-        }
-
-        return ctx.Memory.TryWrite(bufferAddress, value)
-            ? ctx.SetReturn(0)
-            : ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
-    }
-
-    [SysAbiExport(Nid = "XbbJC3E+L5M", ExportName = "sceSystemServicePowerTick", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSystemService")]
-    public static int SystemServicePowerTick(CpuContext ctx) => SystemServiceOk(ctx);
-
-    [SysAbiExport(Nid = "2xenlv7M-UU", ExportName = "sceSystemServiceRaiseExceptionLocalProcess", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSystemService")]
-    public static int SystemServiceRaiseExceptionLocalProcess(CpuContext ctx) => SystemServiceOk(ctx);
-
-    [SysAbiExport(Nid = "9kPCz7Or+1Y", ExportName = "sceSystemServiceReenableMusicPlayer", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSystemService")]
-    public static int SystemServiceReenableMusicPlayer(CpuContext ctx)
-    {
-        lock (_stateGate)
-        {
-            _musicPlayerDisabled = false;
-        }
-
-        return SystemServiceOk(ctx);
-    }
-
-    [SysAbiExport(Nid = "Pi3K47Xw0ss", ExportName = "sceSystemServiceRegisterDaemon", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSystemService")]
-    public static int SystemServiceRegisterDaemon(CpuContext ctx) => SystemServiceOk(ctx);
-
-    [SysAbiExport(Nid = "Oms065qIClY", ExportName = "sceSystemServiceReleaseFb0", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSystemService")]
-    public static int SystemServiceReleaseFb0(CpuContext ctx) => SystemServiceOk(ctx);
-
-    [SysAbiExport(Nid = "3ZFpzcRqYsk", ExportName = "sceSystemServiceRequestCameraCalibration", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSystemService")]
-    public static int SystemServiceRequestCameraCalibration(CpuContext ctx) => SystemServiceOk(ctx);
-
-    [SysAbiExport(Nid = "P71fvnHyFTQ", ExportName = "sceSystemServiceRequestToChangeRenderingMode", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSystemService")]
-    public static int SystemServiceRequestToChangeRenderingMode(CpuContext ctx)
-    {
-        lock (_stateGate)
-        {
-            _renderingMode = unchecked((int)ctx[CpuRegister.Rdi]);
-        }
-
-        return SystemServiceOk(ctx);
-    }
-
-    [SysAbiExport(Nid = "tMuzuZcUIcA", ExportName = "sceSystemServiceResumeLocalProcess", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSystemService")]
-    public static int SystemServiceResumeLocalProcess(CpuContext ctx) => SystemServiceOk(ctx);
-
-    [SysAbiExport(Nid = "DNE77sfNw5Y", ExportName = "sceSystemServiceSetControllerFocusPermission", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSystemService")]
-    public static int SystemServiceSetControllerFocusPermission(CpuContext ctx) => SystemServiceOk(ctx);
-
-    [SysAbiExport(Nid = "eLWnPuja+Y8", ExportName = "sceSystemServiceSetGpuLoadEmulationMode", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSystemService")]
-    public static int SystemServiceSetGpuLoadEmulationMode(CpuContext ctx)
-    {
-        lock (_stateGate)
-        {
-            _gpuLoadEmulationMode = unchecked((int)ctx[CpuRegister.Rdi]);
-        }
-
-        return SystemServiceOk(ctx);
-    }
-
-    [SysAbiExport(Nid = "Xn-eH9-Fu60", ExportName = "sceSystemServiceSetOutOfVrPlayAreaFlag", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSystemService")]
-    public static int SystemServiceSetOutOfVrPlayAreaFlag(CpuContext ctx) => SystemServiceOk(ctx);
-
-    [SysAbiExport(Nid = "sgRPNJjrWjg", ExportName = "sceSystemServiceSetOutOfVrPlayZoneWarning", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSystemService")]
-    public static int SystemServiceSetOutOfVrPlayZoneWarning(CpuContext ctx) => SystemServiceOk(ctx);
-
-    [SysAbiExport(Nid = "w9wlKcHrmm8", ExportName = "sceSystemServiceShowControllerSettings", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSystemService")]
-    public static int SystemServiceShowControllerSettings(CpuContext ctx) => SystemServiceOk(ctx);
-
-    [SysAbiExport(Nid = "tPfQU2pD4-M", ExportName = "sceSystemServiceShowDisplaySafeAreaSettings", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSystemService")]
-    public static int SystemServiceShowDisplaySafeAreaSettings(CpuContext ctx) => SystemServiceOk(ctx);
-
-    [SysAbiExport(Nid = "f8eZvJ8hV6o", ExportName = "sceSystemServiceShowEyeToEyeDistanceSetting", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSystemService")]
-    public static int SystemServiceShowEyeToEyeDistanceSetting(CpuContext ctx) => SystemServiceOk(ctx);
-
-    [SysAbiExport(Nid = "vY1-RZtvvbk", ExportName = "sceSystemServiceSuspendBackgroundApp", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSystemService")]
-    public static int SystemServiceSuspendBackgroundApp(CpuContext ctx) => SetApplicationSuspended(ctx, true);
-
-    [SysAbiExport(Nid = "kTiAx7e2zU4", ExportName = "sceSystemServiceSuspendLocalProcess", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSystemService")]
-    public static int SystemServiceSuspendLocalProcess(CpuContext ctx) => SystemServiceOk(ctx);
-
-    [SysAbiExport(Nid = "zlXqkzPY-ds", ExportName = "sceSystemServiceTickVideoPlayback", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSystemService")]
-    public static int SystemServiceTickVideoPlayback(CpuContext ctx) => SystemServiceOk(ctx);
-
-    [SysAbiExport(Nid = "vOhqz-IMiW4", ExportName = "sceSystemServiceTurnOffScreenSaver", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSystemService")]
-    public static int SystemServiceTurnOffScreenSaver(CpuContext ctx) => SystemServiceOk(ctx);
-
-    private static int SystemServiceOk(CpuContext ctx) => ctx.SetReturn(0);
-
-    private static int SetApplicationSuspended(CpuContext ctx, bool suspended)
-    {
-        lock (_stateGate)
-        {
-            _applicationSuspended = suspended;
-        }
-
-        return SystemServiceOk(ctx);
-    }
-
-    private static int WriteInt32Output(CpuContext ctx, ulong outputAddress, int value)
-    {
-        if (outputAddress == 0)
-        {
-            return ctx.SetReturn(OrbisSystemServiceErrorParameter);
-        }
-
-        return ctx.TryWriteInt32(outputAddress, value)
-            ? ctx.SetReturn(0)
-            : ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
-    }
-
-    private static int WriteZeroOutput(CpuContext ctx, ulong outputAddress, int size)
-    {
-        if (outputAddress == 0)
-        {
-            return ctx.SetReturn(OrbisSystemServiceErrorParameter);
-        }
-
-        Span<byte> output = stackalloc byte[size];
-        output.Clear();
-        return ctx.Memory.TryWrite(outputAddress, output)
-            ? ctx.SetReturn(0)
-            : ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
-    }
+    internal static void ResetForTests() =>
+        Volatile.Write(ref _noticeScreenSkipFlag, 0);
 }

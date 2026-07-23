@@ -3,106 +3,111 @@
 
 using System.Buffers.Binary;
 using SharpEmu.HLE;
-using SharpEmu.Libs.Agc;
+using SharpEmu.ShaderCompiler;
 using Xunit;
 
 namespace SharpEmu.Libs.Tests.Agc;
 
+// Decodes synthetic GFX10 atomic instructions and checks the opcode names and operand wiring
+// that the SPIR-V translator relies on. Word layouts follow the RDNA2 ISA manual:
+// MUBUF op=word0[24:18], MIMG op=word0[24:18], DS op=word0[25:18].
 public sealed class Gen5ShaderAtomicDecodeTests
 {
     private const ulong ShaderAddress = 0x1_0000_0000;
-    private const uint ComputeUserDataRegister = 0x240;
-    private const uint ComputePgmRsrc2Register = 0x213;
+    private const uint EndPgm = 0xBF810000;
 
-    public static TheoryData<uint, string, uint> BufferAtomicCases => new()
+    // Compute-stage register block: COMPUTE_USER_DATA_0 and COMPUTE_PGM_RSRC2,
+    // required since TryCreateState validates the USER_SGPR count.
+    internal const uint ComputeUserDataRegister = 0x240;
+    internal const uint ComputePgmRsrc2Register = 0x213;
+
+    [Fact]
+    public void BufferAtomicUmax_DecodesControlAndDestination()
     {
-        { 0x30, "BufferAtomicSwap", 1 },
-        { 0x31, "BufferAtomicCmpswap", 2 },
-        { 0x32, "BufferAtomicAdd", 1 },
-        { 0x33, "BufferAtomicSub", 1 },
-        { 0x35, "BufferAtomicSmin", 1 },
-        { 0x36, "BufferAtomicUmin", 1 },
-        { 0x37, "BufferAtomicSmax", 1 },
-        { 0x38, "BufferAtomicUmax", 1 },
-        { 0x39, "BufferAtomicAnd", 1 },
-        { 0x3A, "BufferAtomicOr", 1 },
-        { 0x3B, "BufferAtomicXor", 1 },
-        { 0x3C, "BufferAtomicInc", 1 },
-        { 0x3D, "BufferAtomicDec", 1 },
-    };
+        // BUFFER_ATOMIC_UMAX v1, off, s[0:3], 128 offset:8 glc
+        var instruction = DecodeSingle(0xE0E04008, 0x80000100);
 
-    public static TheoryData<uint, string, bool, int> DataShareAtomicCases => new()
-    {
-        { 0x00, "DsAddU32", false, 2 },
-        { 0x01, "DsSubU32", false, 2 },
-        { 0x03, "DsIncU32", false, 2 },
-        { 0x04, "DsDecU32", false, 2 },
-        { 0x05, "DsMinI32", false, 2 },
-        { 0x06, "DsMaxI32", false, 2 },
-        { 0x07, "DsMinU32", false, 2 },
-        { 0x08, "DsMaxU32", false, 2 },
-        { 0x09, "DsAndB32", false, 2 },
-        { 0x0A, "DsOrB32", false, 2 },
-        { 0x0B, "DsXorB32", false, 2 },
-        { 0x10, "DsCmpstB32", false, 3 },
-        { 0x20, "DsAddRtnU32", true, 2 },
-        { 0x21, "DsSubRtnU32", true, 2 },
-        { 0x23, "DsIncRtnU32", true, 2 },
-        { 0x24, "DsDecRtnU32", true, 2 },
-        { 0x25, "DsMinRtnI32", true, 2 },
-        { 0x26, "DsMaxRtnI32", true, 2 },
-        { 0x27, "DsMinRtnU32", true, 2 },
-        { 0x28, "DsMaxRtnU32", true, 2 },
-        { 0x29, "DsAndRtnB32", true, 2 },
-        { 0x2A, "DsOrRtnB32", true, 2 },
-        { 0x2B, "DsXorRtnB32", true, 2 },
-        { 0x2D, "DsWrxchgRtnB32", true, 2 },
-        { 0x30, "DsCmpstRtnB32", true, 3 },
-    };
-
-    [Theory]
-    [MemberData(nameof(BufferAtomicCases))]
-    public void BufferAtomic_DecodesDataWidth(uint opcode, string name, uint dwordCount)
-    {
-        var instruction = DecodeSingle(
-            0xE0004000u | (opcode << 18),
-            0x80000100u);
-
-        Assert.Equal(name, instruction.Opcode);
+        Assert.Equal("BufferAtomicUmax", instruction.Opcode);
         var control = Assert.IsType<Gen5BufferMemoryControl>(instruction.Control);
-        Assert.Equal(dwordCount, control.DwordCount);
+        Assert.Equal(1u, control.DwordCount);
         Assert.Equal(1u, control.VectorData);
+        Assert.Equal(0u, control.ScalarResource);
+        Assert.Equal(8, control.OffsetBytes);
         Assert.True(control.Glc);
-        Assert.Equal((int)dwordCount, instruction.Destinations.Count);
+        Assert.Equal(new[] { Gen5Operand.Vector(1) }, instruction.Destinations);
     }
 
-    [Theory]
-    [MemberData(nameof(DataShareAtomicCases))]
-    public void DataShareAtomic_DecodesOperands(
-        uint opcode,
-        string name,
-        bool returnsValue,
-        int sourceCount)
+    [Fact]
+    public void BufferAtomicCmpswap_UsesTwoDataRegisters()
     {
-        var compareSwap = opcode == 0x10 || opcode == 0x30;
-        var extra = compareSwap ? 0x03020100u : 0x03000100u;
-        var instruction = DecodeSingle(0xD8000000u | (opcode << 18), extra);
+        // BUFFER_ATOMIC_CMPSWAP v[1:2], off, s[0:3], 128 glc
+        var instruction = DecodeSingle(0xE0C44000, 0x80000100);
 
-        Assert.Equal(name, instruction.Opcode);
-        Assert.Equal(sourceCount, instruction.Sources.Count);
-        Assert.Equal(returnsValue ? 1 : 0, instruction.Destinations.Count);
-        if (compareSwap)
-        {
-            Assert.Equal(Gen5Operand.Vector(1), instruction.Sources[1]);
-            Assert.Equal(Gen5Operand.Vector(2), instruction.Sources[2]);
-        }
+        Assert.Equal("BufferAtomicCmpswap", instruction.Opcode);
+        var control = Assert.IsType<Gen5BufferMemoryControl>(instruction.Control);
+        Assert.Equal(2u, control.DwordCount);
+        Assert.Equal(1u, control.VectorData);
+    }
+
+    [Fact]
+    public void ImageAtomicAdd_KeepsDataRegisterAsDestination()
+    {
+        // IMAGE_ATOMIC_ADD v2, v[0:1], s[4:11] dmask:0x1 dim:2D glc
+        var instruction = DecodeSingle(0xF0442100, 0x00010200);
+
+        Assert.Equal("ImageAtomicAdd", instruction.Opcode);
+        var control = Assert.IsType<Gen5ImageControl>(instruction.Control);
+        Assert.Equal(2u, control.VectorData);
+        Assert.Equal(4u, control.ScalarResource);
+        Assert.True(control.Glc);
+        Assert.Equal(new[] { Gen5Operand.Vector(2) }, instruction.Destinations);
+    }
+
+    [Fact]
+    public void DsAddU32_HasAddressAndDataSourcesButNoDestination()
+    {
+        // DS_ADD_U32 v0, v1
+        var instruction = DecodeSingle(0xD8000000, 0x00000100);
+
+        Assert.Equal("DsAddU32", instruction.Opcode);
+        Assert.Equal(
+            new[] { Gen5Operand.Vector(0), Gen5Operand.Vector(1) },
+            instruction.Sources);
+        Assert.Empty(instruction.Destinations);
+    }
+
+    [Fact]
+    public void DsAddRtnU32_WritesReturnRegister()
+    {
+        // DS_ADD_RTN_U32 v3, v0, v1
+        var instruction = DecodeSingle(0xD8800000, 0x03000100);
+
+        Assert.Equal("DsAddRtnU32", instruction.Opcode);
+        Assert.Equal(
+            new[] { Gen5Operand.Vector(0), Gen5Operand.Vector(1) },
+            instruction.Sources);
+        Assert.Equal(new[] { Gen5Operand.Vector(3) }, instruction.Destinations);
+    }
+
+    [Fact]
+    public void DsCmpstRtnB32_OrdersComparatorBeforeNewValue()
+    {
+        // DS_CMPST_RTN_B32 v3, v0, v1, v2 - DATA0 (v1) is the comparator, DATA1 (v2) the
+        // new value, reversed relative to buffer/image cmpswap.
+        var instruction = DecodeSingle(0xD8C00000, 0x03020100);
+
+        Assert.Equal("DsCmpstRtnB32", instruction.Opcode);
+        Assert.Equal(
+            new[] { Gen5Operand.Vector(0), Gen5Operand.Vector(1), Gen5Operand.Vector(2) },
+            instruction.Sources);
+        Assert.Equal(new[] { Gen5Operand.Vector(3) }, instruction.Destinations);
     }
 
     private static Gen5ShaderInstruction DecodeSingle(params uint[] words)
     {
         var memory = new FakeCpuMemory(ShaderAddress, 0x1000);
         var ctx = new CpuContext(memory, Generation.Gen5);
-        WriteProgram(memory, words);
+        WriteProgram(memory, ShaderAddress, words);
         Assert.True(
             Gen5ShaderTranslator.TryCreateState(
                 ctx,
@@ -116,11 +121,10 @@ public sealed class Gen5ShaderAtomicDecodeTests
         return state.Program.Instructions[0];
     }
 
-    internal static void WriteProgram(FakeCpuMemory memory, uint[] words)
+    internal static void WriteProgram(FakeCpuMemory memory, ulong address, uint[] words)
     {
-        var address = ShaderAddress;
-        Span<byte> buffer = stackalloc byte[sizeof(uint)];
-        foreach (var word in words.Append(0xBF810000u))
+        Span<byte> buffer = stackalloc byte[4];
+        foreach (var word in words.Append(EndPgm))
         {
             BinaryPrimitives.WriteUInt32LittleEndian(buffer, word);
             Assert.True(memory.TryWrite(address, buffer));

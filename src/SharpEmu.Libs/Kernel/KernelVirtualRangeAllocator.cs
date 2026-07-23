@@ -18,7 +18,8 @@ internal static class KernelVirtualRangeAllocator
         bool allowSearch,
         bool allowAllocateAtAlternative,
         string traceName,
-        out ulong mappedAddress)
+        out ulong mappedAddress,
+        bool backPartialOverlap = false)
     {
         mappedAddress = 0;
         if (length == 0)
@@ -42,6 +43,18 @@ internal static class KernelVirtualRangeAllocator
                 return true;
             }
 
+            // Fixed mappings must cover the whole requested window even when part of
+            // it is already backed by another allocation. The single-call AllocateAt
+            // below is all-or-nothing and fails outright on partial overlap, leaving
+            // the untouched pages unmapped for the guest to fault into. Fill the free
+            // pages directly instead.
+            if (backPartialOverlap &&
+                addressSpace.TryBackFixedRange(desiredAddress, length, executable))
+            {
+                mappedAddress = desiredAddress;
+                return true;
+            }
+
             var allocated = addressSpace.AllocateAt(desiredAddress, length, executable, allowAllocateAtAlternative);
             if (allocated == 0)
             {
@@ -54,7 +67,10 @@ internal static class KernelVirtualRangeAllocator
         }
         catch
         {
-            Console.Error.WriteLine($"[LOADER][TRACE] {traceName}: AllocateAt invocation threw");
+            // Expected when a fixed-address request cannot be satisfied on
+            // this host; the caller falls back or reports the failure.
+            Console.Error.WriteLine(
+                $"[LOADER][TRACE] {traceName}: no host mapping at 0x{desiredAddress:X16} len=0x{length:X}");
             return false;
         }
     }

@@ -3,34 +3,36 @@
 
 using System.Buffers.Binary;
 using System.Text;
+using SharpEmu.Core.Cpu.Debugging;
 using SharpEmu.Core.Cpu.Native;
 using SharpEmu.Core.Loader;
 using SharpEmu.Core.Memory;
 using SharpEmu.HLE;
-using SharpEmu.HLE.Host;
-using SharpEmu.Logging;
 
 namespace SharpEmu.Core.Cpu;
 
 public sealed class CpuDispatcher : ICpuDispatcher, IDisposable
 {
-    private static readonly SharpEmuLogger Log = SharpEmuLog.For("Dispatcher");
-
     private enum EntryFrameKind
     {
         ProcessEntry,
         ModuleInitializer,
     }
 
-    private const ulong StackBaseAddress = 0x7FFF_F000_0000UL;
+    // The larger local stack reservation is retained while upstream's
+    // host-specific address slots avoid POSIX dyld/vdso mappings.
+    private static readonly ulong StackBaseAddress = OperatingSystem.IsWindows() ? 0x7FFF_F000_0000UL : 0x6FFF_F000_0000UL;
     private const ulong StackSize = 0x0080_0000UL;
-    private const ulong TlsBaseAddress = 0x7FFE_0000_0000UL;
+    private static readonly ulong TlsBaseAddress = OperatingSystem.IsWindows() ? 0x7FFE_0000_0000UL : 0x6FFE_0000_0000UL;
     private const ulong TlsSize = 0x0001_0000UL;
-    private const ulong TlsPrefixSize = 0x0000_1000UL;
-    private const ulong BootstrapStubBaseAddress = 0x7FFD_F000_0000UL;
-    private const ulong BootstrapPayloadBaseAddress = 0x7FFD_E000_0000UL;
-    private const ulong DynlibFallbackStubBaseAddress = 0x7FFD_D000_0000UL;
-    private const ulong ReturnToHostStubBaseAddress = 0x7FFD_C000_0000UL;
+    // The static TLS blocks live at negative offsets from the TCB (FreeBSD
+    // amd64 variant II). Keep every host in sync with GuestTlsTemplate's
+    // startup reservation; PS5 modules routinely reach beyond one host page.
+    private const ulong TlsPrefixSize = GuestTlsTemplate.StartupStaticTlsReservation;
+    private static readonly ulong BootstrapStubBaseAddress = OperatingSystem.IsWindows() ? 0x7FFD_F000_0000UL : 0x6FFD_F000_0000UL;
+    private static readonly ulong BootstrapPayloadBaseAddress = OperatingSystem.IsWindows() ? 0x7FFD_E000_0000UL : 0x6FFD_E000_0000UL;
+    private static readonly ulong DynlibFallbackStubBaseAddress = OperatingSystem.IsWindows() ? 0x7FFD_D000_0000UL : 0x6FFD_D000_0000UL;
+    private static readonly ulong ReturnToHostStubBaseAddress = OperatingSystem.IsWindows() ? 0x7FFD_C000_0000UL : 0x6FFD_C000_0000UL;
     private const ulong BootstrapRegionSize = 0x0000_1000UL;
     private const ulong ReturnToHostStubStride = 0x0100_0000UL;
     private const ulong BootstrapPayloadResultOffset = 0x28UL;
@@ -42,19 +44,16 @@ public sealed class CpuDispatcher : ICpuDispatcher, IDisposable
     ];
     private readonly IVirtualMemory _virtualMemory;
     private readonly IModuleManager _moduleManager;
-    private readonly IHostPlatform? _hostPlatform;
     private INativeCpuBackend? _nativeCpuBackend;
 
     public CpuDispatcher(
         IVirtualMemory virtualMemory,
         IModuleManager moduleManager,
-        INativeCpuBackend? nativeCpuBackend = null,
-        IHostPlatform? hostPlatform = null)
+        INativeCpuBackend? nativeCpuBackend = null)
     {
         _virtualMemory = virtualMemory ?? throw new ArgumentNullException(nameof(virtualMemory));
         _moduleManager = moduleManager ?? throw new ArgumentNullException(nameof(moduleManager));
         _nativeCpuBackend = nativeCpuBackend;
-        _hostPlatform = hostPlatform;
     }
 
     public ulong? LastEntryPoint { get; private set; }
@@ -87,8 +86,8 @@ public sealed class CpuDispatcher : ICpuDispatcher, IDisposable
         string processImageName = "eboot.bin",
         CpuExecutionOptions executionOptions = default)
     {
-        Log.Debug("=== DispatchEntry START ===");
-        Log.Debug($"entryPoint=0x{entryPoint:X16}, generation={generation}");
+        Console.Error.WriteLine("[DISPATCHER] === DispatchEntry START ===");
+        Console.Error.WriteLine($"[DISPATCHER] entryPoint=0x{entryPoint:X16}, generation={generation}");
 
         try
         {
@@ -96,7 +95,8 @@ public sealed class CpuDispatcher : ICpuDispatcher, IDisposable
         }
         catch (Exception ex)
         {
-            Log.Critical($"FATAL EXCEPTION in DispatchEntry: {ex.GetType().Name}: {ex.Message}", ex);
+            Console.Error.WriteLine($"[DISPATCHER] FATAL EXCEPTION in DispatchEntry: {ex.GetType().Name}: {ex.Message}");
+            Console.Error.WriteLine($"[DISPATCHER] Stack trace: {ex.StackTrace}");
             throw;
         }
     }
@@ -109,8 +109,8 @@ public sealed class CpuDispatcher : ICpuDispatcher, IDisposable
         string moduleName = "module",
         CpuExecutionOptions executionOptions = default)
     {
-        Log.Debug("=== DispatchModuleInitializer START ===");
-        Log.Debug($"moduleInit=0x{entryPoint:X16}, generation={generation}, module={moduleName}");
+        Console.Error.WriteLine("[DISPATCHER] === DispatchModuleInitializer START ===");
+        Console.Error.WriteLine($"[DISPATCHER] moduleInit=0x{entryPoint:X16}, generation={generation}, module={moduleName}");
 
         try
         {
@@ -125,7 +125,8 @@ public sealed class CpuDispatcher : ICpuDispatcher, IDisposable
         }
         catch (Exception ex)
         {
-            Log.Critical($"FATAL EXCEPTION in DispatchModuleInitializer: {ex.GetType().Name}: {ex.Message}", ex);
+            Console.Error.WriteLine($"[DISPATCHER] FATAL EXCEPTION in DispatchModuleInitializer: {ex.GetType().Name}: {ex.Message}");
+            Console.Error.WriteLine($"[DISPATCHER] Stack trace: {ex.StackTrace}");
             throw;
         }
     }
@@ -139,7 +140,7 @@ public sealed class CpuDispatcher : ICpuDispatcher, IDisposable
         CpuExecutionOptions executionOptions = default,
         EntryFrameKind frameKind = EntryFrameKind.ProcessEntry)
     {
-        Log.Debug("DispatchEntryCore STARTING...");
+        Console.Error.WriteLine("[DISPATCHER] DispatchEntryCore STARTING...");
 
         LastEntryPoint = entryPoint;
         LastTrapInfo = null;
@@ -270,7 +271,23 @@ public sealed class CpuDispatcher : ICpuDispatcher, IDisposable
             entryFrameDiagnostic,
             Environment.NewLine,
             "CpuEngine: native-only");
-        _nativeCpuBackend ??= new DirectExecutionBackend(_moduleManager, _hostPlatform);
+        // Frame boundaries an attached debugger observes; null hook = a branch.
+        var debugHook = executionOptions.DebugHook;
+        var debugFrame = debugHook is null
+            ? null
+            : new CpuContextDebugFrame(
+                frameKind == EntryFrameKind.ProcessEntry
+                    ? CpuDebugFrameKind.ProcessEntry
+                    : CpuDebugFrameKind.ModuleInitializer,
+                entryPoint,
+                processImageName,
+                context,
+                effectiveImportStubs);
+        debugHook?.OnFrameEnter(debugFrame!);
+
+        _nativeCpuBackend ??= new DirectExecutionBackend(_moduleManager);
+        // Let backend stall reports reference the same frame as entry.
+        (_nativeCpuBackend as DirectExecutionBackend)?.SetActiveDebugFrame(debugFrame);
         if (_nativeCpuBackend.TryExecute(
                 context,
                 entryPoint,
@@ -280,6 +297,7 @@ public sealed class CpuDispatcher : ICpuDispatcher, IDisposable
                 executionOptions,
                 out var nativeResult))
         {
+            debugHook?.OnFrameExit(debugFrame!, nativeResult);
             LastSessionSummary = new CpuSessionSummary(
                 nativeResult,
                 nativeResult == OrbisGen2Result.ORBIS_GEN2_OK
@@ -293,6 +311,8 @@ public sealed class CpuDispatcher : ICpuDispatcher, IDisposable
                 uniqueNidsHit: 0);
             return nativeResult;
         }
+
+        debugHook?.OnFrameExit(debugFrame!, OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_IMPLEMENTED);
 
         var backendName = string.IsNullOrWhiteSpace(_nativeCpuBackend.BackendName)
             ? "native-backend"
@@ -311,7 +331,7 @@ public sealed class CpuDispatcher : ICpuDispatcher, IDisposable
             LastMilestoneLog,
             Environment.NewLine,
             $"CpuEngine native-only failed: {backendError}");
-        Log.Error($"Native backend FAILED: {backendError}");
+        Console.Error.WriteLine($"[DISPATCHER] Native backend FAILED: {backendError}");
         return FailEarly(
             OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_IMPLEMENTED,
             CpuExitReason.NativeBackendUnavailable);
@@ -370,15 +390,19 @@ public sealed class CpuDispatcher : ICpuDispatcher, IDisposable
 
     private static bool InitializeTls(CpuContext context, ulong tlsBase)
     {
-        // Seed the module's PT_TLS init image (Variant II: block below the
-        // thread pointer) after the legacy below-TP zero write so the image
-        // bytes win, and before the TCB qwords are written above the TP.
-        return context.TryWriteUInt64(tlsBase - 0xF0, 0) &&
-               GuestTlsImage.TrySeedThreadBlock(context.Memory, tlsBase, TlsPrefixSize) &&
-               context.TryWriteUInt64(tlsBase + 0x00, tlsBase) &&
-               context.TryWriteUInt64(tlsBase + 0x10, tlsBase) &&
-               context.TryWriteUInt64(tlsBase + 0x28, 0xC0DEC0DECAFEBABEUL) &&
-               context.TryWriteUInt64(tlsBase + 0x60, tlsBase);
+        if (!context.TryWriteUInt64(tlsBase - 0xF0, 0) ||
+            !context.TryWriteUInt64(tlsBase + 0x00, tlsBase) ||
+            !context.TryWriteUInt64(tlsBase + 0x10, tlsBase) ||
+            !context.TryWriteUInt64(tlsBase + 0x28, 0xC0DEC0DECAFEBA00UL) ||
+            !context.TryWriteUInt64(tlsBase + 0x60, tlsBase))
+        {
+            return false;
+        }
+
+        // Seed the static TLS block below the thread pointer with the main
+        // module's initialized thread-locals (variant II layout).
+        SharpEmu.HLE.GuestTlsTemplate.SeedThreadBlock(context, tlsBase);
+        return true;
     }
 
     private static bool InitializeGuestFrameChainSentinel(CpuContext context)
@@ -404,33 +428,52 @@ public sealed class CpuDispatcher : ICpuDispatcher, IDisposable
         ulong programExitHandlerAddress)
     {
         var imageName = string.IsNullOrWhiteSpace(processImageName) ? "eboot.bin" : processImageName;
-        var encodedNameLength = Encoding.UTF8.GetByteCount(imageName);
-        Span<byte> argv0Buffer = encodedNameLength + 1 <= 512
-            ? stackalloc byte[encodedNameLength + 1]
-            : new byte[encodedNameLength + 1];
-        if (Encoding.UTF8.GetBytes(imageName.AsSpan(), argv0Buffer) != encodedNameLength)
+        var arguments = new List<string>(3) { imageName };
+        var configuredArguments = Environment.GetEnvironmentVariable("SHARPEMU_GUEST_ARGS");
+        if (!string.IsNullOrWhiteSpace(configuredArguments))
         {
-            return false;
+            // The PS5 entry-parameter ABI exposes three inline argv pointers.
+            // Two compatibility arguments are therefore safe without changing
+            // the fixed 0x20-byte structure expected by existing titles.
+            var compatibilityArguments = configuredArguments.Split(
+                (char[]?)null,
+                StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            arguments.AddRange(compatibilityArguments.Take(2));
         }
 
-        argv0Buffer[encodedNameLength] = 0;
         var cursor = context[CpuRegister.Rsp];
-
-        var argv0Address = AlignDown(cursor - (ulong)argv0Buffer.Length, 16);
-        if (!context.Memory.TryWrite(argv0Address, argv0Buffer))
+        var argumentAddresses = new ulong[arguments.Count];
+        for (var index = arguments.Count - 1; index >= 0; index--)
         {
-            return false;
+            var encoded = Encoding.UTF8.GetBytes(arguments[index] + '\0');
+            cursor = AlignDown(cursor - (ulong)encoded.Length, 16);
+            if (!context.Memory.TryWrite(cursor, encoded))
+            {
+                return false;
+            }
+
+            argumentAddresses[index] = cursor;
         }
 
         const ulong entryParamsSize = 0x20;
-        var entryParamsAddress = AlignDown(argv0Address - entryParamsSize, 16);
-        if (!context.TryWriteUInt32(entryParamsAddress + 0x00, 1) ||
-            !context.TryWriteUInt32(entryParamsAddress + 0x04, 0) ||
-            !context.TryWriteUInt64(entryParamsAddress + 0x08, argv0Address) ||
-            !context.TryWriteUInt64(entryParamsAddress + 0x10, 0) ||
-            !context.TryWriteUInt64(entryParamsAddress + 0x18, 0))
+        var entryParamsAddress = AlignDown(cursor - entryParamsSize, 16);
+        if (!TryWriteUInt32(context, entryParamsAddress + 0x00, (uint)arguments.Count) ||
+            !TryWriteUInt32(context, entryParamsAddress + 0x04, 0) ||
+            !context.TryWriteUInt64(entryParamsAddress + 0x08, argumentAddresses[0]) ||
+            !context.TryWriteUInt64(
+                entryParamsAddress + 0x10,
+                argumentAddresses.Length > 1 ? argumentAddresses[1] : 0) ||
+            !context.TryWriteUInt64(
+                entryParamsAddress + 0x18,
+                argumentAddresses.Length > 2 ? argumentAddresses[2] : 0))
         {
             return false;
+        }
+
+        if (arguments.Count > 1)
+        {
+            Console.Error.WriteLine(
+                $"[DISPATCHER] Guest arguments: {string.Join(' ', arguments.Skip(1))}");
         }
 
         var entryStackPointer = entryParamsAddress - sizeof(ulong);
@@ -463,6 +506,13 @@ public sealed class CpuDispatcher : ICpuDispatcher, IDisposable
     private static ulong AlignDown(ulong value, ulong alignment)
     {
         return value & ~(alignment - 1);
+    }
+
+    private static bool TryWriteUInt32(CpuContext context, ulong address, uint value)
+    {
+        Span<byte> buffer = stackalloc byte[sizeof(uint)];
+        BinaryPrimitives.WriteUInt32LittleEndian(buffer, value);
+        return context.Memory.TryWrite(address, buffer);
     }
 
     private static string BuildEntryFrameDiagnostic(
@@ -661,6 +711,13 @@ public sealed class CpuDispatcher : ICpuDispatcher, IDisposable
         return _virtualMemory.TryWrite(address, buffer);
     }
 
+    /// <summary>
+    /// True when the disposed native backend left its session state alive
+    /// because guest workers were still executing guest code. The guest
+    /// address space must then stay mapped as well.
+    /// </summary>
+    internal bool NativeSessionLeaked { get; private set; }
+
     public void Dispose()
     {
         if (_nativeCpuBackend is IDisposable disposableBackend)
@@ -668,6 +725,7 @@ public sealed class CpuDispatcher : ICpuDispatcher, IDisposable
             disposableBackend.Dispose();
         }
 
+        NativeSessionLeaked = _nativeCpuBackend is DirectExecutionBackend { GuestSessionLeaked: true };
         _nativeCpuBackend = null;
     }
 }

@@ -10,7 +10,6 @@ public static class RandomExports
 {
     private const int ErrorInvalid = unchecked((int)0x817C0016);
 
-    [SysAbiExport(Nid = "PI7jIZj4pcE", ExportName = "sceRandomGetRandomNumber", Target = Generation.Gen5, LibraryName = "libSceRandom")]
     public static int GetRandomNumber(CpuContext ctx)
     {
         var address = ctx[CpuRegister.Rdi];
