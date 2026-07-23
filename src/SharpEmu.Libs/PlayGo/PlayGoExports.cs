@@ -22,6 +22,10 @@ public static class PlayGoExports
     private const ulong PlayGoInitBufSizeOffset = 8;
     private const uint PlayGoMinimumInitBufferSize = 0x200000;
     private const uint PlayGoHandle = 1;
+    // Synthetic per-chunk installed size used to report chunks as fully local
+    // (progressSize == totalSize). Any nonzero value satisfies the game's
+    // "install complete" checks; 16 MiB/chunk keeps multi-chunk sums plausible.
+    private const ulong PlayGoInstalledChunkBytes = 0x0100_0000UL;
     private const int PlayGoLocusNotDownloaded = 0;
     private const int PlayGoLocusLocalSlow = 2;
     private const int PlayGoLocusLocalFast = 3;
@@ -464,10 +468,19 @@ public static class PlayGoExports
             return chunkError;
         }
 
-        TracePlayGo($"get_progress entries={numberOfEntries}");
+        // Report the queried chunks as fully installed on local storage:
+        // ScePlayGoProgress { uint64_t progressSize; uint64_t totalSize; } with
+        // progressSize == totalSize (100%). The game's boot flow polls this to
+        // decide when the title data is ready; returning {0,0} reads as "0 of 0"
+        // (a div-by-zero / never-complete for a progress check), stranding the
+        // title on its pre-menu loading screen. A nonzero total that equals the
+        // progress is the fully-local signal (consistent with GetEta==0 and
+        // GetLocus==LocalFast).
+        var installedSize = (ulong)numberOfEntries * PlayGoInstalledChunkBytes;
+        TracePlayGo($"get_progress entries={numberOfEntries} installed={installedSize}");
         Span<byte> progress = stackalloc byte[sizeof(ulong) * 2];
-        BinaryPrimitives.WriteUInt64LittleEndian(progress, 0);
-        BinaryPrimitives.WriteUInt64LittleEndian(progress[sizeof(ulong)..], 0);
+        BinaryPrimitives.WriteUInt64LittleEndian(progress, installedSize);
+        BinaryPrimitives.WriteUInt64LittleEndian(progress[sizeof(ulong)..], installedSize);
         return ctx.Memory.TryWrite(outProgress, progress)
             ? (int)OrbisGen2Result.ORBIS_GEN2_OK
             : (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
