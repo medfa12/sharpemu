@@ -1131,8 +1131,40 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		var buf = stackalloc byte[192];
 		foreach (var tok in spec.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
 		{
-			var t = tok.StartsWith("0x", StringComparison.OrdinalIgnoreCase) ? tok[2..] : tok;
-			if (!ulong.TryParse(t, System.Globalization.NumberStyles.HexNumber, null, out var addr))
+			// Pointer-chase syntax: "0xBASE>OFF>OFF>..." walks the pointer chain:
+			// addr=BASE; for each ">OFF": addr = read8(addr) + OFF. Dumps the code
+			// at the final address. Lets a singleton -> vtable -> virtual-method
+			// chain be resolved and disassembled in one boot.
+			var parts = tok.Split('>');
+			var baseStr = parts[0].StartsWith("0x", StringComparison.OrdinalIgnoreCase) ? parts[0][2..] : parts[0];
+			if (!ulong.TryParse(baseStr, System.Globalization.NumberStyles.HexNumber, null, out var addr))
+			{
+				continue;
+			}
+
+			var chaseOk = true;
+			for (var pi = 1; pi < parts.Length; pi++)
+			{
+				var offStr = parts[pi].StartsWith("0x", StringComparison.OrdinalIgnoreCase) ? parts[pi][2..] : parts[pi];
+				ulong off = 0;
+				if (parts[pi].Length > 0 && !ulong.TryParse(offStr, System.Globalization.NumberStyles.HexNumber, null, out off))
+				{
+					chaseOk = false;
+					break;
+				}
+
+				ulong ptr;
+				if (!ReadProcessMemory(proc, addr, &ptr, (nuint)sizeof(ulong), out var pr) || pr < (nuint)sizeof(ulong))
+				{
+					Console.Error.WriteLine($"[LOADER][CODEDUMP] chase '{tok}' unreadable ptr at 0x{addr:X}");
+					chaseOk = false;
+					break;
+				}
+
+				addr = ptr + off;
+			}
+
+			if (!chaseOk)
 			{
 				continue;
 			}
