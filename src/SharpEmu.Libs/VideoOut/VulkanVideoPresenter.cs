@@ -3065,7 +3065,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     "1",
                     StringComparison.Ordinal));
 
-        private int _frameDumpBudget = 24;
+        private int _frameDumpBudget = 48;
         private bool _swapchainReadbackPending;
         private bool _deviceLost;
         private bool _deviceLostLogged;
@@ -12215,7 +12215,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 StringComparison.Ordinal);
             var traceDestination =
                 (ShouldTracePresentedGuestImageContentsForDiagnostics() || dumpSwapchain) &&
-                _swapchainCaptureCount < 400 &&
+                _swapchainCaptureCount < 2000 &&
                 (_totalPresentCount <= 40 || _totalPresentCount % 8 == 0);
             if (traceDestination)
             {
@@ -12430,7 +12430,11 @@ internal static unsafe partial class VulkanVideoPresenter
                     "1",
                     StringComparison.Ordinal);
                 var contentThreshold = (long)_extent.Width * _extent.Height / 50;
-                if (_frameDumpBudget > 0 && (forceDump || nonblackPixels > contentThreshold))
+                // When force-dumping, sample every 16th presented frame so the
+                // budget spans the whole boot (captures the menu as it develops)
+                // instead of only the first N early frames.
+                var forceSample = forceDump && (_swapchainCaptureCount % 16 == 0);
+                if (_frameDumpBudget > 0 && (forceSample || (!forceDump && nonblackPixels > contentThreshold)))
                 {
                     _frameDumpBudget--;
                     const int outWidth = 384;
