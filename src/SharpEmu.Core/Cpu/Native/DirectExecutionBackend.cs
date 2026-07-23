@@ -1135,7 +1135,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			// addr=BASE; for each ">OFF": addr = read8(addr) + OFF. Dumps the code
 			// at the final address. Lets a singleton -> vtable -> virtual-method
 			// chain be resolved and disassembled in one boot.
-			var parts = tok.Split('>');
+			var parts = tok.Split(':');
 			var baseStr = parts[0].StartsWith("0x", StringComparison.OrdinalIgnoreCase) ? parts[0][2..] : parts[0];
 			if (!ulong.TryParse(baseStr, System.Globalization.NumberStyles.HexNumber, null, out var addr))
 			{
