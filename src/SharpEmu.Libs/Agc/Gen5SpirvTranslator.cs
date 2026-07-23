@@ -212,6 +212,33 @@ internal static partial class Gen5SpirvTranslator
         return context.TryCompile(out shader, out error);
     }
 
+    public static bool TryCompileAmplifyCaptureShader(
+        Gen5ShaderState state,
+        Gen5ShaderEvaluation evaluation,
+        uint localSizeX,
+        uint localSizeY,
+        uint localSizeZ,
+        NggAmplifyCapture capture,
+        out Gen5SpirvShader shader,
+        out string error)
+    {
+        // NGG amplify bridge: implemented in a later pass.
+        var passthroughCapture = new NggComputeCapture(
+            capture.VertexBufferBindingIndex,
+            (uint)capture.PositionDwordStride,
+            (uint)capture.VertexIndexVgpr,
+            (uint)capture.ParamCount);
+        return TryCompileComputeShader(
+            state,
+            evaluation,
+            localSizeX,
+            localSizeY,
+            localSizeZ,
+            passthroughCapture,
+            out shader,
+            out error);
+    }
+
     private sealed partial class CompilationContext
     {
         private readonly SpirvModuleBuilder _module = new();
@@ -3700,6 +3727,27 @@ internal static partial class Gen5SpirvTranslator
                 }
             });
 
+            return true;
+        }
+
+        private bool TryEmitAmplifyCaptureExport(
+            Gen5ShaderInstruction instruction,
+            Gen5ExportControl export,
+            NggAmplifyCapture capture,
+            out string error)
+        {
+            // NGG amplify bridge: implemented in a later pass.
+            error = string.Empty;
+            return true;
+        }
+
+        private bool TryEmitAmplifyControl(
+            Gen5ShaderInstruction instruction,
+            NggAmplifyCapture capture,
+            out string error)
+        {
+            // NGG amplify bridge: implemented in a later pass.
+            error = string.Empty;
             return true;
         }
 
