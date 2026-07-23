@@ -5441,6 +5441,15 @@ public static class AgcExports
         // captured attribute is one vec4, laid out after the position vec4, so
         // the per-vertex stride grows to 4 * (1 + paramCount) dwords.
         var paramCount = CountNggParamExports(exportState);
+        if (string.Equals(
+                Environment.GetEnvironmentVariable("SHARPEMU_LOG_INDIRECT"),
+                "1",
+                StringComparison.Ordinal))
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][NGGPARAM] es=0x{exportShaderAddress:X16} paramCount={paramCount} " +
+                $"vertexIndexVgpr={vertexIndexVgpr} globalBindings={computeEvaluation.GlobalMemoryBindings.Count}");
+        }
         var capture = new NggComputeCapture(
             computeEvaluation.GlobalMemoryBindings.Count,
             4u * (1u + paramCount),
