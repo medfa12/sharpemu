@@ -14,6 +14,9 @@ public static class AudioOut2Exports
     private const uint AudioOut2DefaultQueueDepth = 1;
     private const uint AudioOut2GrainSamples = 512;
     private const uint AudioOut2SampleRate = 48000;
+    private const uint AudioOut2PortStateFlag3dAvailable = 1u << 0;
+    private const uint AudioOut2SpeakerInfoFlag3dAvailable = 1u << 0;
+    private const uint AudioOut2StereoSpeakerBits = (1u << 0) | (1u << 1);
     private const int AudioOut2ErrorInvalidParam = unchecked((int)0x80268001);
     private const int AudioOut2ErrorNotReady = unchecked((int)0x80268008);
     private const int AudioOut2ErrorInvalidPort = unchecked((int)0x80268009);
@@ -697,28 +700,36 @@ public static class AudioOut2Exports
             return ctx.SetReturn(AudioOut2ErrorInvalidPort);
         }
 
-        // SceAudioOut2PortState (0x40 bytes, Kyty layout): u16 output, u8
-        // numChannels, u8 pad, i16 volume, u16 rerouteCounter, u32 flags, then
-        // reserved zeros. Volume is 0..127; the earlier -1 here fed a negative
-        // volume into Astro Bot's mixer gain math. Output and channel count
-        // come from the port's creation params (see AudioOut2PortCreate): the
-        // low type byte selects the output (3 = pad speaker, bit 6, which the
-        // Sndz main loop tests at eboot 0x800EB3890), and the channel count is
-        // the data format's (fmt >> 8) & 0xFF with 0 meaning stereo, capped at
-        // 16, exactly as Kyty's audioout2_data_format_channels does.
+        // SDK 4.00 SceAudioOut2PortState is 0x40 bytes: output +0x00,
+        // numChannels +0x02, volume +0x04, rerouteCounter +0x06, and flags
+        // +0x08. The public firmware wrapper passes this buffer to the low
+        // state query at 0x42006-0x42018. MAIN/BGM describe the connected
+        // primary output, not their eight-channel input bed, so expose one
+        // coherent retail TV/stereo endpoint. SDK bit 0 at flags +0x08 is
+        // SCE_AUDIO_OUT2_PORT_STATE_FLAG_3D_AVAILABLE.
         var isPadSpeaker = (port.PortType & 0xFF) == 3;
+        var isPrimaryBed = (port.PortType & 0x100) == 0 &&
+            (port.PortType & 0xFF) is 0 or 1;
         var output = isPadSpeaker ? 0x40 : 0x01;
         var channels = (int)((port.DataFormat >> 8) & 0xFF);
         channels = channels == 0 ? 2 : Math.Min(channels, 16);
+        if (isPrimaryBed)
+        {
+            channels = 2;
+        }
+
         Span<byte> state = stackalloc byte[0x40];
         state.Clear();
         BinaryPrimitives.WriteUInt16LittleEndian(state[0x00..], unchecked((ushort)output));
         state[0x02] = unchecked((byte)channels);
         BinaryPrimitives.WriteInt16LittleEndian(state[0x04..], 127);
+        BinaryPrimitives.WriteUInt32LittleEndian(
+            state[0x08..],
+            isPrimaryBed ? AudioOut2PortStateFlag3dAvailable : 0);
 
         if (_traceAudio)
         {
-            Trace($"port_get_state handle=0x{handle:X} type=0x{port.PortType:X} output=0x{output:X} channels={channels}");
+            Trace($"port_get_state handle=0x{handle:X} type=0x{port.PortType:X} output=0x{output:X} channels={channels} flags=0x{BinaryPrimitives.ReadUInt32LittleEndian(state[0x08..]):X}");
         }
         return ctx.Memory.TryWrite(stateAddress, state)
             ? ctx.SetReturn(0)
@@ -738,20 +749,16 @@ public static class AudioOut2Exports
             return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
         }
 
-        // SceAudioOut2SpeakerInfo (0x50 bytes, Kyty layout): u8 type, pad[3],
-        // u32 availableBits, u32 flags, u32 pad, then 16 {i16 azimuth, i16
-        // elevation} speaker angles. Astro Bot's SceSndzAudioOutMain thread
-        // re-reads this on its speaker-reconfig path (eboot 0x800DED1A8+): it
-        // walks availableBits per channel, converts the i16 azimuths, and on
-        // any change rewrites its speaker layout records and panning matrices.
-        // The old reply (u32 1, u32 2, u32 48000) marked front-left absent and
-        // put a sample rate in the flags field, and the resulting bad rebuild
-        // smashed a 16-byte gain row over the propagation mixer's shared_ptr
-        // at +0x58 (AV at 0x800F6053E). Stereo is type 0, bits 0x3, angles
-        // -30/+30 degrees, matching real hardware defaults.
+        // SDK 4.00 SceAudioOut2SpeakerInfo is 0x50 bytes: type +0x00,
+        // availableBits +0x04, flags +0x08, then 16 angle pairs at +0x10.
+        // TV is type 0; availableBits 0 and 1 are front-left/front-right; and
+        // SDK bit 0 at flags +0x08 is
+        // SCE_AUDIO_OUT2_SPEAKER_INFO_FLAG_3D_AVAILABLE. This matches the
+        // primary PortState above as one stereo speaker group.
         Span<byte> info = stackalloc byte[0x50];
         info.Clear();
-        BinaryPrimitives.WriteUInt32LittleEndian(info[0x04..], 0x3);
+        BinaryPrimitives.WriteUInt32LittleEndian(info[0x04..], AudioOut2StereoSpeakerBits);
+        BinaryPrimitives.WriteUInt32LittleEndian(info[0x08..], AudioOut2SpeakerInfoFlag3dAvailable);
         BinaryPrimitives.WriteInt16LittleEndian(info[0x10..], -30);
         BinaryPrimitives.WriteInt16LittleEndian(info[0x14..], 30);
 

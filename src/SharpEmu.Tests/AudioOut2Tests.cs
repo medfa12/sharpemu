@@ -465,7 +465,7 @@ public sealed class AudioOut2Tests
         Assert.True(ctx.TryReadUInt32(0x8004, out var availableBits));
         Assert.Equal(0x3u, availableBits); // front-left | front-right
         Assert.True(ctx.TryReadUInt32(0x8008, out var flags));
-        Assert.Equal(0u, flags); // no sample rate smuggled into flags
+        Assert.Equal(1u, flags); // SCE_AUDIO_OUT2_SPEAKER_INFO_FLAG_3D_AVAILABLE
         Assert.True(ctx.TryReadUInt16(0x8010, out var azimuth0));
         Assert.Equal(-30, unchecked((short)azimuth0));
         Assert.True(ctx.TryReadUInt16(0x8012, out var elevation0));
