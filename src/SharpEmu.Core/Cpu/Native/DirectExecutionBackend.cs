@@ -357,6 +357,12 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	private bool _logBootstrap;
 
 	private bool _logAllImports;
+	// SHARPEMU_LOG_HLE_HIST: count every resolved HLE import by Library:Name and
+	// periodically dump the top callers. Reveals the per-frame poll loop a stuck
+	// screen spins on (individual imports are otherwise only 1-in-100000 sampled).
+	private bool _logHleHist;
+	private readonly System.Collections.Concurrent.ConcurrentDictionary<string, long> _hleHist = new();
+	private long _hleHistNextDump;
 
 	private bool _logImportFrames;
 
@@ -1028,6 +1034,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		_logFiber = string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_FIBER"), "1", StringComparison.Ordinal);
 		_logBootstrap = string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_BOOTSTRAP"), "1", StringComparison.Ordinal);
 		_logAllImports = string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_ALL_IMPORTS"), "1", StringComparison.Ordinal);
+		_logHleHist = string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_HLE_HIST"), "1", StringComparison.Ordinal);
 		_logImportFrames = string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_IMPORT_FRAMES"), "1", StringComparison.Ordinal);
 		_logImportRecent = string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_IMPORT_RECENT"), "1", StringComparison.Ordinal);
 		_logStackCheck = string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_STACK_CHK"), "1", StringComparison.Ordinal);

@@ -313,6 +313,21 @@ public sealed partial class DirectExecutionBackend
 		{
 			flag5 = importStubEntry.Nid.Contains(_importFilter!, StringComparison.OrdinalIgnoreCase);
 		}
+		if (_logHleHist && matchedExport is not null && !flag0)
+		{
+			var histKey = matchedExport.LibraryName + ":" + matchedExport.Name;
+			_hleHist.AddOrUpdate(histKey, 1, static (_, v) => v + 1);
+			// Dump the top callers every ~300k imports so the steady-state poll
+			// loop of a stuck screen surfaces without flooding the log.
+			if (num >= System.Threading.Interlocked.Read(ref _hleHistNextDump))
+			{
+				System.Threading.Interlocked.Exchange(ref _hleHistNextDump, num + 300000);
+				var top = _hleHist.ToArray();
+				System.Array.Sort(top, static (a, b) => b.Value.CompareTo(a.Value));
+				var line = string.Join(" | ", top.Take(20).Select(kv => $"{kv.Key}={kv.Value}"));
+				Console.Error.WriteLine($"[LOADER][HLEHIST] import#{num} top20: {line}");
+			}
+		}
 		bool flag6 = _logAllImports || flag5;
 		if (!flag0 && (flag6 || periodicTrace))
 		{
