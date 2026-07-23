@@ -1119,6 +1119,40 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		}
 	}
 
+	private unsafe void DumpRuntimeCode()
+	{
+		var spec = Environment.GetEnvironmentVariable("SHARPEMU_DUMP_CODE");
+		if (string.IsNullOrWhiteSpace(spec))
+		{
+			return;
+		}
+
+		var proc = GetCurrentProcess();
+		var buf = stackalloc byte[192];
+		foreach (var tok in spec.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+		{
+			var t = tok.StartsWith("0x", StringComparison.OrdinalIgnoreCase) ? tok[2..] : tok;
+			if (!ulong.TryParse(t, System.Globalization.NumberStyles.HexNumber, null, out var addr))
+			{
+				continue;
+			}
+
+			if (ReadProcessMemory(proc, addr, buf, 160, out var got) && got > 0)
+			{
+				var sb = new System.Text.StringBuilder();
+				for (var i = 0; i < (int)got; i++)
+				{
+					sb.Append(buf[i].ToString("x2"));
+				}
+				Console.Error.WriteLine($"[LOADER][CODEDUMP] addr=0x{addr:X10} bytes={sb}");
+			}
+			else
+			{
+				Console.Error.WriteLine($"[LOADER][CODEDUMP] addr=0x{addr:X10} unreadable");
+			}
+		}
+	}
+
 	[System.Runtime.InteropServices.DllImport("kernel32.dll")]
 	private static extern nint GetCurrentProcess();
 
@@ -1132,6 +1166,12 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		{
 			// Give the loader time to reach guest execution before sampling.
 			Thread.Sleep(3000);
+
+			// SHARPEMU_DUMP_CODE=0xADDR,0xADDR: one-shot runtime disassembly aid.
+			// Dump 160 bytes at each guest address (the static eboot does not match
+			// relocated runtime code, so runtime bytes are required to trace the
+			// engine state-machine call chain off-box).
+			DumpRuntimeCode();
 			var ripHist = new Dictionary<ulong, long>();
 			// Return-address (call-site) histogram: scanning each sampled thread's
 			// stack for guest-code-range qwords reveals the CALL CHAIN of the busy
