@@ -4587,6 +4587,19 @@ public static class AgcExports
         // leaves the G-buffer empty.
         var flattenInstanceToVertex = false;
         var passthroughCompute = false;
+        if ((state.NggEsPassthroughGeometry || state.NggEsAmplifying) &&
+            string.Equals(
+                Environment.GetEnvironmentVariable("SHARPEMU_LOG_INDIRECT"),
+                "1",
+                StringComparison.Ordinal))
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][NGGGATE] es=0x{(hasExportShader ? exportShaderAddress : 0):X16} " +
+                $"passthrough={state.NggEsPassthroughGeometry} amplify={state.NggEsAmplifying} " +
+                $"vcount={vertexCount} indInst={state.IndirectInstanceCount} " +
+                $"idxBufCount={state.IndexBufferCount} " +
+                $"expandGate={(state.NggEsPassthroughGeometry && vertexCount <= 1 && state.IndirectInstanceCount > 1 && state.IndexBufferCount == 0)}");
+        }
         if (state.NggEsPassthroughGeometry &&
             vertexCount <= 1 &&
             state.IndirectInstanceCount > 1 &&
@@ -5391,6 +5404,16 @@ public static class AgcExports
         var effectiveCount = recordCount is > 0 and <= 1_048_576
             ? Math.Min(recordCount, invocationCount)
             : invocationCount;
+        if (string.Equals(
+                Environment.GetEnvironmentVariable("SHARPEMU_LOG_INDIRECT"),
+                "1",
+                StringComparison.Ordinal))
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][NGGCAP] es=0x{exportShaderAddress:X16} recordCount={recordCount} " +
+                $"invocationIn={invocationCount} effective={effectiveCount} " +
+                $"vertexInputs={vertexInputs.Count}");
+        }
         invocationCount = effectiveCount;
 
         var vertexIndexVgpr = RecoverNggVertexIndexVgpr(exportState, vertexInputs);
