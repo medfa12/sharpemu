@@ -10914,7 +10914,8 @@ internal static unsafe partial class VulkanVideoPresenter
                     var isRgba8 = image.Format == Format.R8G8B8A8Unorm;
                     var isHdr16 = image.Format == Format.R16G16B16A16Sfloat;
                     var isHdr32 = image.Format == Format.R32G32B32A32Sfloat;
-                    if (nonblackPixels > 0 && (isRgba8 || isHdr16 || isHdr32))
+                    var isA2R10 = image.Format == Format.A2R10G10B10UnormPack32;
+                    if (nonblackPixels > 0 && (isRgba8 || isHdr16 || isHdr32 || isA2R10))
                     {
                         const int outWidth = 960;
                         const int outHeight = 540;
@@ -10934,6 +10935,17 @@ internal static unsafe partial class VulkanVideoPresenter
                                     rgb[di] = bytes[si];
                                     rgb[di + 1] = bytes[si + 1];
                                     rgb[di + 2] = bytes[si + 2];
+                                }
+                                else if (isA2R10)
+                                {
+                                    // A2R10G10B10UnormPack32: packed uint32,
+                                    // B[9:0] G[19:10] R[29:20] A[31:30]. Take the
+                                    // high 8 bits of each 10-bit channel.
+                                    var si = (sy * srcW + sx) * 4;
+                                    var packed = BitConverter.ToUInt32(bytes.Slice(si, 4));
+                                    rgb[di] = (byte)(((packed >> 20) & 0x3FF) >> 2);
+                                    rgb[di + 1] = (byte)(((packed >> 10) & 0x3FF) >> 2);
+                                    rgb[di + 2] = (byte)((packed & 0x3FF) >> 2);
                                 }
                                 else if (isHdr16)
                                 {
