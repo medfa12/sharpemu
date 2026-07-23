@@ -1116,6 +1116,10 @@ public sealed partial class DirectExecutionBackend
 			Console.Error.WriteLine($"[LOADER][WARN] Guest engine assert (int 0x{vector:X2}, non-fatal, continuing): {message}");
 			if (message.Contains("defaultBusses", StringComparison.Ordinal))
 			{
+				ulong r14dbg = ReadCtxU64(contextRecord, 232);
+				ulong backenddbg = (r14dbg > 65536 && IsHostRangeReadable(r14dbg + 8, 8)) ? *(ulong*)(r14dbg + 8) : 0xDEAD;
+				Console.Error.WriteLine($"[LOADER][SNDBG] assert rip=0x{rip:X16} r14=0x{r14dbg:X16} backend=[r14+8]=0x{backenddbg:X16}");
+				Console.Error.Flush();
 				TryPatchEmptyDefaultBusses(contextRecord);
 			}
 		}
