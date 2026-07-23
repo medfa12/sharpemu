@@ -75,6 +75,25 @@ internal readonly record struct NggComputeCapture(
     uint VertexIndexVgpr,
     uint ParamCount);
 
+/// <summary>
+/// Optional configuration that turns an amplifying NGG export shader compiled
+/// as a compute shader into a geometry-capture kernel: exported vertices and
+/// emitted indices are written to device-local storage buffers, while atomic
+/// counts are written to a counter buffer for an indirect indexed draw. When
+/// inactive, compute translation remains identical to a plain dispatch.
+/// </summary>
+internal readonly record struct NggAmplifyCapture(
+    int VertexBufferBindingIndex,
+    int IndexBufferBindingIndex,
+    int CounterBufferBindingIndex,
+    int PositionDwordStride,
+    int ParamCount,
+    int VertexIndexVgpr,
+    uint GsMaxVertOut,
+    uint OutPrimType,
+    uint MaxOutputVerts,
+    bool IsAmplifying);
+
 internal sealed record Gen5SpirvShader(
     byte[] Spirv,
     IReadOnlyList<Gen5GlobalMemoryBinding> GlobalMemoryBindings,

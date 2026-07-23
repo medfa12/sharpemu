@@ -5426,6 +5426,19 @@ public static class AgcExports
             $"vtxInputs=[{vtxAddrs}] vtx0=[{vtxHead}]");
     }
 
+    private static bool TryAttachNggAmplifyCapture(
+        CpuContext ctx,
+        SubmittedDcbState state,
+        ulong exportShaderAddress,
+        Gen5ShaderState exportState,
+        IReadOnlyList<Gen5VertexInputBinding> vertexInputs,
+        uint invocationCount,
+        ref TranslatedGuestDraw draw)
+    {
+        // NGG amplify bridge: implemented in a later pass.
+        return false;
+    }
+
     /// <summary>
     /// Recovers the VGPR the export shader reads as its per-vertex fetch index:
     /// the <c>VectorAddress</c> of the index-enabled MUBUF that the scalar
