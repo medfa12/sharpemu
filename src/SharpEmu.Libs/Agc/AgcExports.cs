@@ -4706,6 +4706,26 @@ public static class AgcExports
             }
 
             var firstTarget = translatedDraw.RenderTargets.FirstOrDefault();
+            if (firstTarget.Address == 0)
+            {
+                // Diagnostic (#3 export-filter false-negative): a scene color draw
+                // whose bound color target got filtered out because the pixel
+                // shader's color export was not classified at that slot. It then
+                // diverts to depth-only (color discarded) or is dropped, leaving
+                // the HDR scene surface empty -> grey tonemap.
+                var unfilteredColor = renderTargets
+                    .FirstOrDefault(t => t.Address != 0);
+                if (unfilteredColor.Address != 0)
+                {
+                    TraceAgcShader(
+                        $"agc.color_export_filtered ps=0x{translatedDraw.PixelShaderAddress:X16} " +
+                        $"dropped_color=0x{unfilteredColor.Address:X16} " +
+                        $"{unfilteredColor.Width}x{unfilteredColor.Height} " +
+                        $"slot={unfilteredColor.Slot} fmt={unfilteredColor.Format} " +
+                        $"unfiltered_rts={renderTargets.Count} filtered_rts={translatedDraw.RenderTargets.Count} " +
+                        $"vcount={translatedDraw.VertexCount}");
+                }
+            }
             TraceFlipDraw(
                 $"seq={drawSequence} rt_count={translatedDraw.RenderTargets.Count} " +
                 $"target=0x{firstTarget.Address:X16} fmt={firstTarget.Format} " +
