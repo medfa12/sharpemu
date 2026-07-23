@@ -598,7 +598,8 @@ public static class AgcExports
         bool IsStorage,
         uint MipLevel,
         IReadOnlyList<uint> SamplerDescriptor,
-        bool IsArrayed = false);
+        bool IsArrayed = false,
+        bool IsWritable = false);
 
     private readonly record struct RenderTargetWriter(
         ulong Sequence,
@@ -6268,7 +6269,7 @@ public static class AgcExports
                     binding.IsArrayed,
                     out var texture))
             {
-                textures.Add(texture);
+                textures.Add(texture with { IsWritable = binding.IsWritable });
                 if (texture.IsFallback)
                 {
                     fallbackTextureCount++;
@@ -6299,7 +6300,8 @@ public static class AgcExports
 
     private static IReadOnlyList<VulkanGuestMemoryBuffer> CreateVulkanGuestMemoryBuffers(
         IReadOnlyList<Gen5GlobalMemoryBinding> bindings,
-        CpuContext? ctx = null)
+        CpuContext? ctx = null,
+        Gen5ShaderProgram? program = null)
     {
         var buffers = new VulkanGuestMemoryBuffer[bindings.Count];
         for (var index = 0; index < bindings.Count; index++)
@@ -6320,10 +6322,23 @@ public static class AgcExports
 
             buffers[index] = new VulkanGuestMemoryBuffer(
                 binding.BaseAddress,
-                data);
+                data,
+                IsWritable: program is not null &&
+                    IsGlobalMemoryBindingWritable(binding, program));
         }
 
         return buffers;
+    }
+
+    internal static bool IsGlobalMemoryBindingWritable(
+        Gen5GlobalMemoryBinding binding,
+        Gen5ShaderProgram program)
+    {
+        var instructionPcs = binding.InstructionPcs.ToHashSet();
+        return program.Instructions.Any(instruction =>
+            instructionPcs.Contains(instruction.Pc) &&
+            (instruction.Opcode.StartsWith("BufferStore", StringComparison.Ordinal) ||
+             instruction.Opcode.StartsWith("BufferAtomic", StringComparison.Ordinal)));
     }
 
     private static IReadOnlyList<VulkanGuestVertexBuffer> CreateVulkanGuestVertexBuffers(
@@ -6859,6 +6874,7 @@ public static class AgcExports
         var descriptions = new List<string>(bindings.Count);
         var translatedBindings = new List<TranslatedImageBinding>(bindings.Count);
         var hasStorageBinding = false;
+        var computeWritebackEnabled = VulkanVideoPresenter.ComputeWritebackEnabled;
         foreach (var binding in bindings)
         {
             var isStorage = Gen5ShaderTranslator.IsStorageImageOperation(binding.Opcode);
@@ -6874,7 +6890,10 @@ public static class AgcExports
                     isStorage,
                     binding.MipLevel ?? 0,
                     binding.SamplerDescriptor,
-                    IsArrayedImageBinding(binding)));
+                    IsArrayedImageBinding(binding),
+                    IsWritable: computeWritebackEnabled &&
+                        (binding.Opcode.StartsWith("ImageStore", StringComparison.Ordinal) ||
+                         binding.Opcode.StartsWith("ImageAtomic", StringComparison.Ordinal))));
             hasStorageBinding |= isStorage;
 
             var descriptorState = descriptorValid ? string.Empty : "/invalid-desc";
@@ -6949,7 +6968,10 @@ public static class AgcExports
                     translatedBindings,
                     out _);
                 var globalMemoryBuffers =
-                    CreateVulkanGuestMemoryBuffers(evaluation.GlobalMemoryBindings, ctx);
+                    CreateVulkanGuestMemoryBuffers(
+                        evaluation.GlobalMemoryBindings,
+                        ctx,
+                        computeWritebackEnabled ? shaderState.Program : null);
                 VulkanVideoPresenter.SubmitComputeDispatch(
                     shaderAddress,
                     computeSpirv,
@@ -6957,7 +6979,10 @@ public static class AgcExports
                     globalMemoryBuffers,
                     dispatch.GroupCountX,
                     dispatch.GroupCountY,
-                    dispatch.GroupCountZ);
+                    dispatch.GroupCountZ,
+                    VulkanVideoPresenter.SelectComputeWritebackMemory(
+                        ctx.Memory,
+                        computeWritebackEnabled));
                 gpuDispatch = true;
             }
         }
